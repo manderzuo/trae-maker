@@ -1,0 +1,965 @@
+use std::sync::{Arc, Mutex};
+
+use tauri::{Manager, State};
+
+use crate::fs_utils;
+use crate::models::{
+    AccountCooldownsFile, ApiPoolFile, ApiServiceStatus, DeviceMap, PoolStatus,
+    RemainingCreditsFile,
+};
+use crate::state::AppState;
+
+use crate::api_server::models_sync;
+use crate::api_server::pool::ApiPool;
+use crate::api_server::server::{start_api_server, ApiServerHandle};
+use crate::api_server::{ApiLogger, ApiSharedState};
+
+/// 运行时状态：服务器句柄 + 共享状态
+pub struct ApiServerRuntime {
+    pub handle: ApiServerHandle,
+    pub shared: Arc<ApiSharedState>,
+    pub started_at: u64,
+}
+
+/// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
+fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ==================== 启停命令 ====================
+
+/// 启动 API 服务核心逻辑（页面命令 / 托盘菜单共用）。
+/// 成功后同步托盘菜单文本并发送系统通知。
+pub async fn do_start(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
+) -> Result<ApiServiceStatus, String> {
+    // 检查是否已运行
+    {
+        let guard = safe_lock(runtime);
+        if guard.is_some() {
+            return Err("API 服务已在运行".into());
+        }
+    }
+
+    // 网关设置（§8.1/§9.2）：port / default_model 改读 data/api_gateway_settings.json；
+    // 新文件缺失时从 app_settings.json 旧字段一次性迁移（旧字段保留不删，防回滚）。
+    // load 已将空 default_model 兜底为内置默认，无需再 trim 判空
+    let gw = crate::api_server::gateway_settings::load(&state.data_dir);
+    // 恢复跨重启仍可查询的视频任务，并清理过期产物。任务索引目录跟随
+    // AppState/AIWORK_DATA_DIR，视频文件目录可由 AIWORK_VIDEO_DIR 独立指定。
+    crate::api_server::video::load_persisted(&state.data_dir);
+    // 清理参考图/参考视频的过期暂存文件；资源本身仍按 API Key 隔离。
+    crate::api_server::assets::cleanup(&state.data_dir);
+    let port = gw.port;
+    let listen_host = gw.listen_host.clone();
+
+    // 代理循环说明：ureq 2.12 未启用 proxy-from-env feature，构建 Agent 时
+    // 既不读 HTTP(S)_PROXY/NO_PROXY 环境变量、也不读系统代理，Agent 未显式
+    // 配置 proxy 即直连，不会形成 127.0.0.1:8899 回环。
+    // 旧实现曾进程级 set_var("NO_PROXY","*")：多线程下 setenv 有竞态
+    // （Rust 2024 已标 unsafe），且污染 python 签到等子进程的代理行为，已移除
+    let default_model = gw.default_model;
+    let cors_origins = gw.cors_origins.clone();
+
+    // LAN 监听不可在无 API Key 的情况下启动，避免把本机凭证池直接暴露给同网段设备。
+    let lan_listener = !matches!(listen_host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    if lan_listener {
+        let keys = crate::api_server::api_keys::load(&state.data_dir);
+        if !keys.has_enabled() {
+            return Err("局域网监听必须先创建并启用至少一个 API Key".into());
+        }
+    }
+
+    // 读取账号数据、冷却状态、剩余积分（账号经 vault 解密还原明文 jwt）
+    let accounts = crate::vault::load_accounts(state);
+    let pool_file: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
+    let groups_file: crate::models::GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let cooldowns_file: AccountCooldownsFile =
+        fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let credits_file: RemainingCreditsFile =
+        fs_utils::read_json(&state.path("remaining_credits.json"));
+    let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+
+    // 调度策略（T10）：api_pool.json.strategy，空/未知值回退 expire_first
+    let strategy = crate::api_server::pool::PoolStrategy::parse(&pool_file.strategy);
+
+    // ===== 启动诊断日志：详细记录账号池资源情况 =====
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-账号池诊断: total_accounts={} enabled_in_pool={} strategy={} group_filter={} cooldowns={} credits_entries={}",
+            accounts.accounts.len(),
+            pool_file.enabled_uids.len(),
+            strategy.as_str(),
+            if pool_file.group_ids.is_empty() { "all".to_string() } else { pool_file.group_ids.join(",") },
+            cooldowns_file.cooldowns.len(),
+            credits_file.credits.len(),
+        ),
+    );
+
+    // 逐账号诊断：哪些会被加入池，哪些会被跳过及原因
+    let enabled_set: std::collections::HashSet<&str> =
+        pool_file.enabled_uids.iter().map(|s| s.as_str()).collect();
+    let group_filter: Option<std::collections::HashSet<&str>> = if pool_file.group_ids.is_empty() {
+        None
+    } else {
+        Some(pool_file.group_ids.iter().map(|s| s.as_str()).collect())
+    };
+    for a in &accounts.accounts {
+        let uid = a.user_id.as_deref().unwrap_or("(none)");
+        let name = &a.name;
+        if !enabled_set.contains(uid) {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("  账号池跳过: name={} uid={} reason=not_in_enabled_list", name, uid),
+            );
+        } else if !group_filter.as_ref().map_or(true, |f| {
+            groups_file.membership.get(uid).map_or(false, |g| f.contains(g.as_str()))
+        }) {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("  账号池跳过: name={} uid={} reason=not_in_selected_group", name, uid),
+            );
+        } else {
+            // 检查冷却和积分状态
+            let cd = cooldowns_file.cooldowns.get(uid);
+            let credits = credits_file.credits.get(uid).copied();
+            let expire = credits_file.expire_times.get(uid).copied();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let status = if cd.map_or(false, |c| c.error_type == "SessionDead") {
+                "SessionDead(disabled)".to_string()
+            } else if cd.map_or(false, |c| c.until > 0 && now < c.until) {
+                format!("cooldown(remaining={}s)", cd.unwrap().until - now)
+            } else if let Some(exp) = expire {
+                if exp > 0 && exp < now {
+                    "credits_expired".to_string()
+                } else if let Some(c) = credits {
+                    if c <= 0.0 {
+                        "zero_credits".to_string()
+                    } else {
+                        "healthy".to_string()
+                    }
+                } else {
+                    "healthy(no_credits_info)".to_string()
+                }
+            } else {
+                "healthy(no_expiry)".to_string()
+            };
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "  账号池纳入: name={} uid={} credits={} expire={} status={}",
+                    name, uid,
+                    credits.map(|c| format!("{:.0}", c)).unwrap_or_else(|| "None".into()),
+                    expire.map(|e| e.to_string()).unwrap_or_else(|| "None".into()),
+                    status,
+                ),
+            );
+        }
+    }
+
+    // 创建池并同步（含调度策略与分组筛选）
+    let pool = ApiPool::new();
+    pool.set_strategy(strategy);
+    // 池启动时同时装载 total/general/work 三套余额。旧 `credits` 字段仍保持
+    // 通用积分语义；文字资源使用通用积分，Seedance 视频路由按 Work 积分独立取号。
+    pool.sync_from_accounts_with_balances(
+        &accounts.accounts,
+        &pool_file.enabled_uids,
+        &pool_file.group_ids,
+        &groups_file.membership,
+        &cooldowns_file.cooldowns,
+        &credits_file.credits,
+        &credits_file.general,
+        &credits_file.work,
+        &credits_file.expire_times,
+        &device_map,
+    );
+
+    let pool_count = pool.count();
+    let healthy_count = pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-池状态: pool_size={} healthy={} port={}",
+            pool_count, healthy_count, port,
+        ),
+    );
+
+    // ===== WorkBuddy 上游池装配（T2.1）=====
+    let wb_accounts = crate::commands::workbuddy::wb_upstream_accounts(state);
+    let wb_pool = ApiPool::new();
+    wb_pool.sync_from_wb(&wb_accounts, &pool_file.enabled_uids);
+    let wb_count = wb_pool.count();
+    let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
+    // Buddy 池策略：wb_strategy 独立配置优先；空 = 跟随 Trae 池（与 pool_set 热应用逻辑一致）
+    let wb_strategy = crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-WB上游池: enabled={} accounts={} healthy={} strategy={}",
+            pool_file.wb_enabled,
+            wb_count,
+            wb_healthy,
+            wb_strategy.as_str(),
+        ),
+    );
+    wb_pool.set_strategy(wb_strategy);
+
+    // 池为空时给出明确警告
+    if pool_count == 0 {
+        fs_utils::app_log(
+            &state.data_dir,
+            "警告: 账号池为空！请在API服务页面勾选账号并保存后再启动。当前 api_pool.json 中 enabled_uids 为空。",
+        );
+    } else if healthy_count == 0 {
+        fs_utils::app_log(
+            &state.data_dir,
+            "警告: 池中无健康账号！所有账号可能处于冷却/积分过期/SessionDead 状态。请检查账号状态或清除冷却。",
+        );
+    }
+
+    let shared = Arc::new(ApiSharedState {
+        pool,
+        wb_pool,
+        wb_enabled: std::sync::atomic::AtomicBool::new(pool_file.wb_enabled),
+        wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+        // T5.3/T5.5/T5.6③ 开关（api_pool.json，serde default 兼容旧文件）
+        wb_default_thinking: std::sync::atomic::AtomicBool::new(pool_file.wb_default_thinking),
+        wb_tool_exec: std::sync::atomic::AtomicBool::new(pool_file.wb_tool_exec),
+        wb_bg_downgrade: std::sync::atomic::AtomicBool::new(pool_file.wb_bg_downgrade),
+        wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
+        pool_sticky: Mutex::new(std::collections::HashMap::new()),
+        model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        default_model,
+        data_dir: state.data_dir.clone(),
+        cors_origins,
+        total_requests: std::sync::atomic::AtomicU64::new(0),
+        inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        limiter: crate::api_server::limits::RateLimiter::from_env(),
+        active_uid: Mutex::new(None),
+        last_error: Mutex::new(None),
+        logger: ApiLogger::new(state.logs_dir()),
+        debug_enabled: std::sync::atomic::AtomicBool::new(false),
+        usage: Mutex::new(crate::api_server::usage::load(&state.data_dir)),
+        wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+    });
+
+    let handle = start_api_server(&listen_host, port, shared.clone()).await?;
+
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!("API 服务已启动: {}:{} pool_accounts={}", listen_host, port, pool_count),
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let status = ApiServiceStatus {
+        running: true,
+        host: listen_host.clone(),
+        port,
+        total_requests: 0,
+        active_uid: None,
+        last_error: None,
+        started_at: Some(now),
+    };
+
+    *safe_lock(runtime) = Some(ApiServerRuntime {
+        handle,
+        shared: shared.clone(),
+        started_at: now,
+    });
+
+    // 同步托盘菜单文本 + 系统通知
+    sync_tray_api_text(app, true);
+    crate::notify::notify(
+        app,
+        "API 网关已启动",
+        &format!("监听 {}:{}，池内 {} 个账号", listen_host, port, pool_count),
+    );
+
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn api_server_start(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Result<ApiServiceStatus, String> {
+    do_start(&app, &state, &runtime).await
+}
+
+/// 停止 API 服务核心逻辑（页面命令 / 托盘菜单共用）
+pub async fn do_stop(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
+) -> Result<(), String> {
+    let mut guard = safe_lock(runtime);
+    if let Some(mut rt) = guard.take() {
+        rt.handle.stop();
+        fs_utils::app_log(&state.data_dir, "API 服务已停止");
+        drop(guard);
+        sync_tray_api_text(app, false);
+        crate::notify::notify(app, "API 网关已停止", "本地网关已关闭");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn api_server_stop(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Result<(), String> {
+    do_stop(&app, &state, &runtime).await
+}
+
+/// 同步托盘「API 服务」菜单文本（服务未运行显示"启动"，运行中显示"停止"）
+fn sync_tray_api_text(app: &tauri::AppHandle, running: bool) {
+    if let Some(tray) = app.try_state::<crate::TrayMenu>() {
+        let _ = tray
+            .api_item
+            .set_text(if running { "停止 API 服务" } else { "启动 API 服务" });
+    }
+}
+
+#[tauri::command]
+pub fn api_server_status(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> ApiServiceStatus {
+    let guard = safe_lock(&runtime);
+    // 端口显示与 do_start 同源（gateway_settings，§8.2），避免双源显示漂移
+    let port = crate::api_server::gateway_settings::load(&state.data_dir).port;
+    let host = crate::api_server::gateway_settings::load(&state.data_dir).listen_host;
+    match guard.as_ref() {
+        Some(rt) => {
+            let total = rt
+                .shared
+                .total_requests
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let active = safe_lock(&rt.shared.active_uid).clone();
+            let last_err = safe_lock(&rt.shared.last_error).clone();
+            ApiServiceStatus {
+                running: true,
+                host: host.clone(),
+                port,
+                total_requests: total,
+                active_uid: active,
+                last_error: last_err,
+                started_at: Some(rt.started_at),
+            }
+        }
+        None => ApiServiceStatus {
+            running: false,
+            host,
+            port,
+            total_requests: 0,
+            active_uid: None,
+            last_error: None,
+            started_at: None,
+        },
+    }
+}
+
+/// 等待本地网关没有正在进行的上游请求。
+///
+/// 切换 Trae Work 登录态前由前端调用，避免在生成中途替换快照。服务未运行时
+/// 视为闲置；超时只返回错误，不会强制中断现有请求或修改账号数据。
+#[tauri::command(async)]
+pub fn api_server_wait_idle(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    timeout_ms: Option<u64>,
+) -> Result<(), String> {
+    let timeout = timeout_ms.unwrap_or(120_000).clamp(1_000, 300_000);
+    let started = std::time::Instant::now();
+    loop {
+        let inflight = {
+            let guard = safe_lock(&runtime);
+            guard
+                .as_ref()
+                .map(|rt| rt.shared.inflight.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(0)
+        };
+        if inflight == 0 {
+            return Ok(());
+        }
+        if started.elapsed() >= std::time::Duration::from_millis(timeout) {
+            return Err(format!("仍有 {inflight} 个生成请求进行中，已等待 {timeout}ms"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+// ==================== 池管理命令 ====================
+
+#[tauri::command]
+pub fn pool_list(state: State<'_, AppState>) -> ApiPoolFile {
+    fs_utils::read_json(&state.path("api_pool.json"))
+}
+
+/// pool_set 字段合并（纯函数，便于单测）：未传（None）保留 existing 原值，传值覆盖。
+/// 注意 strategy/wb_strategy 的显式空串是合法值（"跟随默认"语义），与 None（未传）区分；
+/// group_ids 显式空数组 = 清空分组，None = 保留（语义与其他字段统一）。
+fn merge_pool_set(
+    existing: &ApiPoolFile,
+    uids: Vec<String>,
+    strategy: Option<String>,
+    wb_strategy: Option<String>,
+    group_ids: Option<Vec<String>>,
+    wb_enabled: Option<bool>,
+    wb_default_thinking: Option<bool>,
+    wb_tool_exec: Option<bool>,
+    wb_bg_downgrade: Option<bool>,
+) -> ApiPoolFile {
+    ApiPoolFile {
+        enabled_uids: uids,
+        strategy: strategy.unwrap_or_else(|| existing.strategy.clone()),
+        wb_strategy: wb_strategy.unwrap_or_else(|| existing.wb_strategy.clone()),
+        group_ids: group_ids.unwrap_or_else(|| existing.group_ids.clone()),
+        wb_enabled: wb_enabled.unwrap_or(existing.wb_enabled),
+        wb_default_thinking: wb_default_thinking.unwrap_or(existing.wb_default_thinking),
+        wb_tool_exec: wb_tool_exec.unwrap_or(existing.wb_tool_exec),
+        wb_bg_downgrade: wb_bg_downgrade.unwrap_or(existing.wb_bg_downgrade),
+    }
+}
+
+/// 批量设置池中的账号 UID 列表 + 调度策略 + 分组筛选（T10）+ WB 上游开关（T2.1）
+/// + T5.3 默认深度思考 / T5.5 工具代执行 / T5.6③ 后台任务降级（未传字段保留原值）。
+/// 策略部分热应用：运行中池立即生效（成员/分组变更仍需重启重建池）。
+#[tauri::command]
+pub fn pool_set(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    uids: Vec<String>,
+    strategy: Option<String>,
+    wb_strategy: Option<String>,
+    group_ids: Option<Vec<String>>,
+    wb_enabled: Option<bool>,
+    wb_default_thinking: Option<bool>,
+    wb_tool_exec: Option<bool>,
+    wb_bg_downgrade: Option<bool>,
+) -> Result<(), String> {
+    let existing: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
+    let pool_file = merge_pool_set(
+        &existing,
+        uids,
+        strategy,
+        wb_strategy,
+        group_ids,
+        wb_enabled,
+        wb_default_thinking,
+        wb_tool_exec,
+        wb_bg_downgrade,
+    );
+    fs_utils::write_json(&state.path("api_pool.json"), &pool_file)?;
+    // 热应用：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
+    if let Some(rt) = safe_lock(&runtime).as_ref() {
+        rt.shared
+            .pool
+            .set_strategy(crate::api_server::pool::PoolStrategy::parse(&pool_file.strategy));
+        rt.shared.wb_pool.set_strategy(
+            crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy),
+        );
+    }
+    Ok(())
+}
+
+/// 返回运行中池的实时状态（冷却/积分等）；服务未运行时返回空数组
+#[tauri::command]
+pub fn pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<PoolStatus> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => rt.shared.pool.status_list(),
+        None => vec![],
+    }
+}
+
+/// 列出 API 日志可用日期列表
+#[tauri::command]
+pub fn api_logs_list(state: State<'_, AppState>) -> Vec<String> {
+    let logger = ApiLogger::new(state.logs_dir());
+    logger.list_dates(30)
+}
+
+/// 读取指定日期的 API 日志内容
+#[tauri::command]
+pub fn api_logs_detail(state: State<AppState>, date: String) -> Option<String> {
+    let logger = ApiLogger::new(state.logs_dir());
+    logger.read_log(&date)
+}
+
+/// 按时间段和关键字搜索 API 日志
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiLogSearchOpts {
+    pub date: String,
+    #[serde(default)]
+    pub start_time: Option<String>,
+    #[serde(default)]
+    pub end_time: Option<String>,
+    #[serde(default)]
+    pub keyword: Option<String>,
+}
+
+#[tauri::command]
+pub fn api_logs_search(state: State<AppState>, opts: ApiLogSearchOpts) -> Option<String> {
+    let logger = ApiLogger::new(state.logs_dir());
+    logger.search_log(
+        &opts.date,
+        opts.start_time.as_deref().unwrap_or(""),
+        opts.end_time.as_deref().unwrap_or(""),
+        opts.keyword.as_deref().unwrap_or(""),
+    )
+}
+
+/// 切换 API Debug 模式（开启后记录完整请求/响应）
+#[tauri::command]
+pub fn api_debug_toggle(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Result<bool, String> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => {
+            let current = rt
+                .shared
+                .debug_enabled
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let new_val = !current;
+            rt.shared
+                .debug_enabled
+                .store(new_val, std::sync::atomic::Ordering::Relaxed);
+            Ok(new_val)
+        }
+        None => Err("API 服务未运行".into()),
+    }
+}
+
+/// 查询 API Debug 模式状态
+#[tauri::command]
+pub fn api_debug_status(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> bool {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => rt
+            .shared
+            .debug_enabled
+            .load(std::sync::atomic::Ordering::Relaxed),
+        None => false,
+    }
+}
+
+// ==================== 模型列表命令 ====================
+
+/// 读取模型列表（api_models.json，缺失时写入默认列表）
+#[tauri::command]
+pub fn api_models_list(state: State<'_, AppState>) -> Vec<models_sync::ModelOption> {
+    models_sync::load_models(&state.data_dir)
+}
+
+/// 从官网配置接口同步模型列表（batch_get_detail_param，不消耗积分）
+#[tauri::command]
+pub async fn api_models_sync(
+    state: State<'_, AppState>,
+) -> Result<Vec<models_sync::ModelOption>, String> {
+    let data_dir = state.data_dir.clone();
+    // 预先在调用方解密账号（vault 依赖 AppState，阻塞线程内不便访问）
+    let accounts = crate::vault::load_accounts(&state);
+    // 阻塞网络请求放入阻塞线程池，避免卡住异步运行时
+    tauri::async_runtime::spawn_blocking(move || models_sync::fetch_official(&data_dir, accounts))
+        .await
+        .map_err(|e| format!("同步任务执行失败: {e}"))?
+}
+
+/// 从 WB 上游模型目录接口同步 wb_model_catalog.json（T5.1/F-37，动态替换；
+/// 网关启动时已自动做一次，此命令供手动刷新）。取任一含凭证的 WB 账号。
+#[tauri::command]
+pub async fn api_wb_catalog_sync(state: State<'_, AppState>) -> Result<usize, String> {
+    let data_dir = state.data_dir.clone();
+    let accounts = crate::commands::workbuddy::wb_upstream_accounts(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let acct = accounts.first().ok_or("无可用 WB 账号凭证，无法拉取上游目录")?;
+        crate::api_server::wb_catalog::fetch_and_replace(
+            &data_dir,
+            &acct.uid,
+            &acct.token,
+            &acct.domain,
+            &acct.enterprise_id,
+            acct.global_region,
+        )
+    })
+    .await
+    .map_err(|e| format!("同步任务执行失败: {e}"))?
+}
+
+/// 列出 wb_model_catalog.json 中的 WB 模型（Buddy API 服务页展示模型 id/倍率/档位）
+#[tauri::command]
+pub fn api_wb_catalog_list(state: State<'_, AppState>) -> Vec<crate::api_server::wb_catalog::WbModel> {
+    crate::api_server::wb_catalog::load(&state.data_dir)
+}
+
+/// 查询最近 N 天的 API 用量统计（Trae 模型请求桶，按日聚合，直接读盘，服务未运行也可查）
+#[tauri::command]
+pub fn api_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(14).clamp(1, 90);
+    crate::api_server::usage::query_recent(&state.data_dir, days, false)
+}
+
+/// 查询最近 N 天的 WB 上游用量统计（wb_days 桶，Buddy「API 服务」页专用，与 Trae 侧分账）
+#[tauri::command]
+pub fn api_wb_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(14).clamp(1, 90);
+    crate::api_server::usage::query_recent(&state.data_dir, days, true)
+}
+
+/// 查询最近 N 天的自定义模型用量统计（custom_days 桶，API 管理·用量统计「自定义」筛选专用）
+#[tauri::command]
+pub fn api_custom_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(14).clamp(1, 90);
+    crate::api_server::usage::query_recent_in(
+        &state.data_dir,
+        days,
+        crate::api_server::usage::UsageBucket::Custom,
+    )
+}
+
+/// 列出本地 API 会话存档索引。仅读取本机 conversations.sqlite3，不触碰上游凭证。
+#[tauri::command]
+pub fn api_conversations_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::api_server::conversation::ConversationSummary>, String> {
+    crate::api_server::conversation::list_summaries(&state.data_dir)
+}
+
+/// 导出本地 API 会话为 Markdown + JSON。用于账号切换后的可读存档，文件只落本机。
+#[tauri::command]
+pub fn api_conversations_export(
+    state: State<'_, AppState>,
+) -> Result<crate::api_server::conversation::ConversationExportResult, String> {
+    crate::api_server::conversation::export_archive(&state.data_dir)
+}
+
+#[tauri::command]
+pub fn api_conversations_settings_get(
+    state: State<'_, AppState>,
+) -> crate::api_server::conversation::ConversationSettings {
+    crate::api_server::conversation::load_settings(&state.data_dir)
+}
+
+#[tauri::command]
+pub fn api_conversations_settings_set(
+    state: State<'_, AppState>,
+    settings: crate::api_server::conversation::ConversationSettings,
+) -> Result<crate::api_server::conversation::ConversationSettings, String> {
+    crate::api_server::conversation::save_settings(&state.data_dir, settings)
+}
+
+#[tauri::command]
+pub fn api_conversations_delete(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<bool, String> {
+    crate::api_server::conversation::delete_conversation(&state.data_dir, &conversation_id)
+}
+
+// ==================== 多 API Key 命令 ====================
+
+/// 读取 API Key 列表与鉴权开关
+#[tauri::command]
+pub fn api_keys_list(
+    state: State<'_, AppState>,
+) -> crate::api_server::api_keys::ApiKeysFile {
+    crate::api_server::api_keys::load(&state.data_dir)
+}
+
+/// 保存 API Key 列表（整表写盘；每次请求重读文件，改动立即生效）。
+/// `auth_disabled` 不传时保留现值（避免整表保存覆盖鉴权开关）。
+#[tauri::command]
+pub fn api_keys_save(
+    state: State<'_, AppState>,
+    keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
+    auth_disabled: Option<bool>,
+) -> Result<(), String> {
+    let prev = crate::api_server::api_keys::load(&state.data_dir);
+    let file = crate::api_server::api_keys::ApiKeysFile {
+        keys,
+        auth_disabled: auth_disabled.unwrap_or(prev.auth_disabled),
+    };
+    crate::api_server::api_keys::save(&state.data_dir, &file);
+    Ok(())
+}
+
+// ==================== 统一网关命令（Phase 1 §8.1） ====================
+
+/// 统一模型目录聚合视图（实时派生，不落盘）。
+/// `available_only=true`：过滤全部来源不可用的模型。
+/// 服务运行中用实时池健康派生 enabled 标记；未运行时放宽（池健康视为可选，
+/// wb_enabled 读落盘值）——目录展示不因服务停启而失真（§3.3 #5）
+#[tauri::command]
+pub fn api_unified_models(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    available_only: Option<bool>,
+) -> Vec<crate::api_server::unified_catalog::UnifiedModel> {
+    let (wb_enabled, trae_ok, buddy_ok) = match safe_lock(&runtime).as_ref() {
+        Some(rt) => {
+            let s = &rt.shared;
+            (
+                s.wb_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                s.pool.has_selectable(),
+                s.wb_pool.has_selectable(),
+            )
+        }
+        None => {
+            let pf: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
+            (pf.wb_enabled, true, true)
+        }
+    };
+    let data_dir = state.data_dir.clone();
+    let mut list = crate::api_server::unified_catalog::unified_models(
+        &data_dir,
+        wb_enabled,
+        trae_ok,
+        buddy_ok,
+    );
+    if available_only.unwrap_or(false) {
+        list.retain(|m| m.sources.iter().any(|s| s.enabled));
+    }
+    list
+}
+
+/// 读取调度策略（规范化后视图：非法池名/空优先级已回退默认）
+#[tauri::command]
+pub fn dispatch_policy_get(
+    state: State<'_, AppState>,
+) -> crate::api_server::dispatch::DispatchPolicy {
+    crate::api_server::dispatch::load_policy(&state.data_dir)
+}
+
+/// 保存调度策略；返回规范化后的生效值（前端展示以返回值为准）
+#[tauri::command]
+pub fn dispatch_policy_set(
+    state: State<'_, AppState>,
+    policy: crate::api_server::dispatch::DispatchPolicy,
+) -> Result<crate::api_server::dispatch::DispatchPolicy, String> {
+    crate::api_server::dispatch::save_policy(&state.data_dir, &policy)?;
+    Ok(crate::api_server::dispatch::load_policy(&state.data_dir))
+}
+
+/// 读取网关设置（port / default_model；缺失时从 app_settings 旧字段一次性迁移）
+#[tauri::command]
+pub fn gateway_settings_get(
+    state: State<'_, AppState>,
+) -> crate::api_server::gateway_settings::GatewaySettings {
+    crate::api_server::gateway_settings::load(&state.data_dir)
+}
+
+/// 保存网关设置（端口改动在下次启动 API 服务后生效；返回规范化后的生效值）
+#[tauri::command]
+pub fn gateway_settings_set(
+    state: State<'_, AppState>,
+    settings: crate::api_server::gateway_settings::GatewaySettings,
+) -> Result<crate::api_server::gateway_settings::GatewaySettings, String> {
+    crate::api_server::gateway_settings::save(&state.data_dir, settings)?;
+    Ok(crate::api_server::gateway_settings::load(&state.data_dir))
+}
+
+// ==================== 自定义模型资源池（custom_models.json） ====================
+
+/// 自定义模型列表（OpenAI 兼容上游直通；命中即直达，§custom_models）
+#[tauri::command]
+pub fn custom_models_list(
+    state: State<'_, AppState>,
+) -> Vec<crate::api_server::custom_models::CustomModel> {
+    crate::api_server::custom_models::load(&state.data_dir)
+}
+
+/// 保存自定义模型（upsert：id 为空新增并生成 cm- id，存在则整条覆盖；
+/// 校验 name/base_url 必填 + 名称 canonical 唯一；返回保存后的完整列表）
+#[tauri::command]
+pub fn custom_models_save(
+    state: State<'_, AppState>,
+    model: crate::api_server::custom_models::CustomModel,
+) -> Result<Vec<crate::api_server::custom_models::CustomModel>, String> {
+    crate::api_server::custom_models::upsert(&state.data_dir, model)
+}
+
+/// 删除自定义模型（按 id）；返回是否确有删除
+#[tauri::command]
+pub fn custom_models_remove(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    crate::api_server::custom_models::remove(&state.data_dir, &id)
+}
+
+/// 自定义模型连通性测试：向上游发一条最小 chat 请求（max_tokens=16），
+/// 成功返回摘要、失败返回原因（保存/编辑前的前置校验入口）。
+/// 阻塞 IO 放 spawn_blocking，外加 30s 总超时（覆盖连接 10s + 首字 10s + 出字余量）。
+#[tauri::command]
+pub async fn custom_model_test(
+    model: crate::api_server::custom_models::CustomModel,
+) -> Result<String, String> {
+    // 与保存同口径的参数预检：给出明确错误而非透传上游 4xx
+    let mut cm = model;
+    cm.name = cm.name.trim().to_string();
+    cm.base_url = cm.base_url.trim().trim_end_matches('/').to_string();
+    if cm.name.is_empty() {
+        return Err("请先填写模型名称".into());
+    }
+    if !cm.base_url.starts_with("http://") && !cm.base_url.starts_with("https://") {
+        return Err("API 地址必须以 http:// 或 https:// 开头".into());
+    }
+    let handle = tokio::task::spawn_blocking(move || crate::api_server::custom_route::probe(&cm));
+    match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => Err(format!("测试任务失败: {e}")),
+        Err(_) => Err("测试超时（30 秒）".into()),
+    }
+}
+
+/// Trae 模型元数据人工覆盖（L1 覆盖层，键 canonical_id；编辑后聚合视图即时生效）
+#[tauri::command]
+pub fn trae_model_meta_set(
+    state: State<'_, AppState>,
+    model: String,
+    meta: crate::api_server::unified_catalog::TraeModelMeta,
+) -> Result<(), String> {
+    crate::api_server::unified_catalog::meta_set(&state.data_dir, &model, meta)
+}
+
+/// 读取 Trae 模型元数据人工覆盖（编辑弹框回显用；None = 无人工值，交由自动来源链）
+#[tauri::command]
+pub fn trae_model_meta_get(
+    state: State<'_, AppState>,
+    model: String,
+) -> Option<crate::api_server::unified_catalog::TraeModelMeta> {
+    crate::api_server::unified_catalog::load_meta(&state.data_dir)
+        .remove(&crate::api_server::unified_catalog::canonical_id(&model))
+}
+
+/// 清除 Trae 模型元数据人工覆盖；返回是否存在过
+#[tauri::command]
+pub fn trae_model_meta_clear(state: State<'_, AppState>, model: String) -> Result<bool, String> {
+    crate::api_server::unified_catalog::meta_clear(&state.data_dir, &model)
+}
+
+// ==================== 单元测试：pool_set 合并语义（调度策略收口） ====================
+
+#[cfg(test)]
+mod pool_merge_tests {
+    use super::merge_pool_set;
+    use crate::models::ApiPoolFile;
+
+    /// 模拟已存在的 api_pool.json（各字段均非默认值，验证"保留"是否生效）
+    fn existing() -> ApiPoolFile {
+        ApiPoolFile {
+            enabled_uids: vec!["u1".into()],
+            strategy: "weighted".into(),
+            wb_strategy: "p2c".into(),
+            group_ids: vec!["g1".into()],
+            wb_enabled: true,
+            wb_default_thinking: true,
+            wb_tool_exec: false,
+            wb_bg_downgrade: false,
+        }
+    }
+
+    #[test]
+    fn none_fields_preserve_existing() {
+        // 只改成员（uids 必传覆盖），其余未传 → 全部保留原值
+        let m = merge_pool_set(
+            &existing(),
+            vec!["u2".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
+        assert_eq!(m.strategy, "weighted");
+        assert_eq!(m.wb_strategy, "p2c");
+        assert_eq!(m.group_ids, vec!["g1".to_string()]);
+        assert!(m.wb_enabled);
+        assert!(m.wb_default_thinking);
+        assert!(!m.wb_tool_exec);
+        assert!(!m.wb_bg_downgrade);
+    }
+
+    #[test]
+    fn some_fields_override_and_empty_string_is_legal_value() {
+        // 显式空串 = "跟随默认"合法值（区别于 None 未传）；显式空数组 = 清空分组
+        let m = merge_pool_set(
+            &existing(),
+            vec![],
+            Some("p2c".into()),
+            Some("".into()),
+            Some(vec![]),
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(true),
+        );
+        assert_eq!(m.strategy, "p2c");
+        assert_eq!(m.wb_strategy, "");
+        assert!(m.group_ids.is_empty());
+        assert!(!m.wb_enabled);
+        assert!(!m.wb_default_thinking);
+        assert!(m.wb_tool_exec);
+        assert!(m.wb_bg_downgrade);
+    }
+
+    #[test]
+    fn strategy_only_caller_does_not_touch_wb_and_flags() {
+        // Trae 资源调度页收口后只保存成员/分组：不传 strategy/wb_strategy/开关组 → 均保留
+        let m = merge_pool_set(
+            &existing(),
+            vec!["u1".into(), "u3".into()],
+            None,
+            None,
+            Some(vec!["g2".into()]),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(m.enabled_uids.len(), 2);
+        assert_eq!(m.group_ids, vec!["g2".to_string()]);
+        assert_eq!(m.strategy, "weighted");
+        assert_eq!(m.wb_strategy, "p2c");
+        assert!(m.wb_enabled);
+    }
+
+    #[test]
+    fn empty_existing_preserves_nothing_but_fills_defaults() {
+        // 旧版 api_pool.json（无策略字段）+ 只传成员：策略落为空串（运行时 parse 回退 expire_first）
+        let m = merge_pool_set(
+            &ApiPoolFile::default(),
+            vec!["u1".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(m.strategy, "");
+        assert_eq!(m.wb_strategy, "");
+        assert!(m.group_ids.is_empty());
+        assert!(!m.wb_enabled);
+    }
+}

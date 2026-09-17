@@ -1,0 +1,1067 @@
+//! Trae Work CN Seedance 视频网关。
+//!
+//! 请求体沿用 Trae Work CN 原生 `tool_text_to_video_stream` 契约，
+//! 通过账号池里的 Work 积分账号直连上游 SSE；任务索引与视频产物按配置持久化，
+//! 不把 JWT、Cookie 或提示词写入日志。视频文件默认落在 `data/videos`，可由
+//! `AIWORK_VIDEO_DIR` 指定独立磁盘目录。
+
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
+use std::net::IpAddr;
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::pool::PickedAccount;
+use super::pool::ResourceKind;
+use super::{ApiSharedState, ErrKind, APP_ID, AGENT_HOST, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
+
+#[derive(Clone, Serialize)]
+pub struct VideoTask {
+    pub id: String,
+    pub object: String,
+    pub model: String,
+    pub status: String,
+    pub prompt: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 传输层状态，便于客户端区分异步任务桥与其它资源类型。
+    pub transport: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_duration: Option<f64>,
+    /// 网关内可鉴权访问的相对资源地址；上游地址不可用时客户端优先使用它。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_url: Option<String>,
+    /// 生成成功但本地缓存失败时给客户端的可读提示；不影响上游 video_url。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_error: Option<String>,
+    /// 进程重启后恢复幂等键；只保存哈希后的内部键，不保存客户端原文。
+    #[serde(skip)]
+    request_key: Option<String>,
+    /// 本地 API Key 所有权；只用于任务查询隔离，不序列化到客户端。
+    #[serde(skip)]
+    pub(crate) owner_key_id: String,
+}
+
+static TASKS: OnceLock<Mutex<HashMap<String, VideoTask>>> = OnceLock::new();
+static SEQ: OnceLock<Mutex<u64>> = OnceLock::new();
+static IDEMPOTENCY: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static TASK_DATA_DIR: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+const MAX_IN_MEMORY_TASKS: usize = 2048;
+const TERMINAL_TASK_RETENTION_SECS: u64 = 24 * 60 * 60;
+const TASKS_FILE: &str = "video_tasks.json";
+
+fn default_owner_key() -> String {
+    "anonymous".into()
+}
+
+/// 落盘 DTO：API 不序列化 owner_key_id，但重启后仍需要保留 Key 隔离信息。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedVideoTask {
+    id: String,
+    object: String,
+    model: String,
+    status: String,
+    prompt: String,
+    created_at: u64,
+    updated_at: u64,
+    error: Option<String>,
+    transport: String,
+    video_url: Option<String>,
+    resource_uri: Option<String>,
+    video_duration: Option<f64>,
+    #[serde(default)]
+    content_url: Option<String>,
+    #[serde(default)]
+    artifact_error: Option<String>,
+    #[serde(default)]
+    request_key: Option<String>,
+    #[serde(default = "default_owner_key")]
+    owner_key_id: String,
+}
+
+fn task_data_dir() -> &'static Mutex<Option<std::path::PathBuf>> {
+    TASK_DATA_DIR.get_or_init(|| Mutex::new(None))
+}
+
+/// 配置任务索引目录；桌面端和未来无头服务器都通过此入口指定运行目录。
+pub fn configure(data_dir: &std::path::Path) {
+    let mut guard = task_data_dir().lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(data_dir.to_path_buf());
+}
+
+fn tasks() -> &'static Mutex<HashMap<String, VideoTask>> {
+    TASKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn idempotency() -> &'static Mutex<HashMap<String, String>> {
+    IDEMPOTENCY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn task_store_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("data").join(TASKS_FILE)
+}
+
+fn persisted(task: &VideoTask) -> PersistedVideoTask {
+    PersistedVideoTask {
+        id: task.id.clone(),
+        object: task.object.clone(),
+        model: task.model.clone(),
+        status: task.status.clone(),
+        prompt: task.prompt.clone(),
+        created_at: task.created_at,
+        updated_at: task.updated_at,
+        error: task.error.clone(),
+        transport: task.transport.clone(),
+        video_url: task.video_url.clone(),
+        resource_uri: task.resource_uri.clone(),
+        video_duration: task.video_duration,
+        content_url: task.content_url.clone(),
+        artifact_error: task.artifact_error.clone(),
+        request_key: task.request_key.clone(),
+        owner_key_id: task.owner_key_id.clone(),
+    }
+}
+
+fn restored(task: PersistedVideoTask) -> VideoTask {
+    VideoTask {
+        id: task.id,
+        object: task.object,
+        model: task.model,
+        status: task.status,
+        prompt: task.prompt,
+        created_at: task.created_at,
+        updated_at: task.updated_at,
+        error: task.error,
+        transport: task.transport,
+        video_url: task.video_url,
+        resource_uri: task.resource_uri,
+        video_duration: task.video_duration,
+        content_url: task.content_url,
+        artifact_error: task.artifact_error,
+        request_key: task.request_key,
+        owner_key_id: task.owner_key_id,
+    }
+}
+
+fn persist_all(data_dir: &std::path::Path) {
+    let values: Vec<PersistedVideoTask> = tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .map(persisted)
+        .collect();
+    let path = task_store_path(data_dir);
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(data_dir));
+    let _ = crate::fs_utils::write_json(&path, &values);
+}
+
+fn persist_current(_task_id: &str) {
+    let dir = task_data_dir()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(dir) = dir {
+        persist_all(&dir);
+    }
+}
+
+/// 启动网关时恢复最近任务，并清理过期索引与视频文件。
+pub fn load_persisted(data_dir: &std::path::Path) {
+    configure(data_dir);
+    let path = task_store_path(data_dir);
+    let list: Vec<PersistedVideoTask> = crate::fs_utils::read_json(&path);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    // 任务索引是当前数据目录的完整快照；重启或切换数据目录时，不能让旧目录
+    // 遗留的幂等键继续指向已经不可见的任务。
+    idempotency()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    let mut map = tasks().lock().unwrap_or_else(|e| e.into_inner());
+    map.clear();
+    for item in list {
+        if item.id.trim().is_empty()
+            || (matches!(item.status.as_str(), "completed" | "failed")
+                && now.saturating_sub(item.updated_at) > TERMINAL_TASK_RETENTION_SECS)
+        {
+            continue;
+        }
+        let task = restored(item);
+        if let Some(key) = task.request_key.clone() {
+            if !key.is_empty() {
+                idempotency()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, task.id.clone());
+            }
+        }
+        map.insert(task.id.clone(), task);
+    }
+    drop(map);
+    let _ = crate::api_server::video_store::cleanup(data_dir, TERMINAL_TASK_RETENTION_SECS);
+    persist_all(data_dir);
+}
+
+fn next_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let mut seq = SEQ
+        .get_or_init(|| Mutex::new(0))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *seq = seq.wrapping_add(1);
+    format!("video-{now}-{}", *seq)
+}
+
+fn insecure_reference_urls_allowed() -> bool {
+    matches!(
+        std::env::var("AIWORK_ALLOW_INSECURE_ASSET_BASE")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn private_or_reserved_ip(host: &str) -> bool {
+    let Ok(ip) = host.parse::<IpAddr>() else { return false };
+    match ip {
+        IpAddr::V4(value) => {
+            let octets = value.octets();
+            octets[0] == 0
+                || value.is_unspecified()
+                || value.is_loopback()
+                || value.is_private()
+                || value.is_link_local()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0)
+                || (octets[0] == 192 && octets[1] == 2)
+                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 224
+        }
+        IpAddr::V6(value) => {
+            value.to_ipv4_mapped()
+                .map(|mapped| private_or_reserved_ip(&mapped.to_string()))
+                .unwrap_or(false)
+                || value.is_unspecified()
+                || value.is_loopback()
+                || value.is_unique_local()
+                || value.is_unicast_link_local()
+                || value.is_multicast()
+        }
+    }
+}
+
+fn validate_reference_url(value: &str, allow_insecure_http: bool) -> Result<(), String> {
+    let raw = value.trim();
+    let parsed = url::Url::parse(raw).map_err(|_| "参考素材 URL 无效".to_string())?;
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return Err("参考素材 URL 只允许 http(s)".into());
+    }
+    if parsed.scheme() == "http" && !allow_insecure_http {
+        return Err("参考素材 URL 默认必须使用 HTTPS".into());
+    }
+    if parsed.username().is_empty() == false || parsed.password().is_some() {
+        return Err("参考素材 URL 不允许携带用户名或密码".into());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "参考素材 URL 缺少主机名".to_string())?;
+    let host_lower = host.to_ascii_lowercase();
+    let ip_host = host.trim_start_matches('[').trim_end_matches(']');
+    if host_lower == "localhost"
+        || host_lower.ends_with(".localhost")
+        || host_lower.ends_with(".local")
+        || host_lower.ends_with(".lan")
+        || host_lower.ends_with(".internal")
+        || private_or_reserved_ip(ip_host)
+    {
+        return Err("参考素材 URL 不允许回环、私网或保留地址".into());
+    }
+    Ok(())
+}
+
+pub fn validate_request(body: &Value) -> Result<(String, String), String> {
+    let prompt = body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "prompt 不能为空".to_string())?;
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("seedance")
+        .to_string();
+    if model.len() > 96 {
+        return Err("model 过长（最多 96 个字符）".into());
+    }
+    if let Some(duration) = body.get("duration") {
+        let valid = duration
+            .as_u64()
+            .map(|v| (2..=15).contains(&v))
+            .unwrap_or(false);
+        if !valid {
+            return Err("duration 必须是 2-15 秒的整数".into());
+        }
+    }
+    if let Some(resolution) = body.get("resolution").and_then(Value::as_str) {
+        let normalized = resolution.trim().to_ascii_lowercase();
+        if !matches!(normalized.as_str(), "480p" | "720p" | "1080p" | "4k") {
+            return Err("resolution 仅支持 480p、720p、1080p 或 4K".into());
+        }
+    }
+    if let Some(ratio) = body.get("ratio").and_then(Value::as_str) {
+        if !matches!(ratio.trim(), "16:9" | "9:16" | "1:1" | "4:3" | "3:4" | "21:9") {
+            return Err("ratio 不是支持的画面比例".into());
+        }
+    }
+    // 网关进程不能读取远端调用方的 C:\\ / 本地路径，也不把 Base64 大字段混入
+    // 任务请求；MCP 桥会先调用 /v1/assets，再改用 asset_ids。直接 HTTP 客户端
+    // 给出明确错误，避免把内部字段静默转发到 Trae 原生接口。
+    for key in ["image_paths", "video_paths", "image_data", "video_data"] {
+        if body.get(key).is_some() {
+            return Err(format!(
+                "{key} 只能由本地 MCP 桥预处理；请先 POST /v1/assets，再使用 image_asset_ids/video_asset_ids"
+            ));
+        }
+    }
+    for key in ["image_urls", "video_urls", "image_asset_ids", "video_asset_ids"] {
+        if let Some(values) = body.get(key) {
+            let Some(items) = values.as_array() else {
+                return Err(format!("{key} 必须是字符串数组"));
+            };
+            if items.len() > 10 || items.iter().any(|v| v.as_str().map(str::trim).map_or(true, str::is_empty)) {
+                return Err(format!("{key} 最多 10 个非空字符串"));
+            }
+            if matches!(key, "image_urls" | "video_urls") {
+                for value in items {
+                    let url = value.as_str().expect("non-empty string checked above");
+                    validate_reference_url(url, insecure_reference_urls_allowed())?;
+                }
+            }
+        }
+    }
+    Ok((model, prompt.to_string()))
+}
+
+/// 把网关本地素材转换成 Trae 可回取的 HTTPS/HTTP 地址。
+///
+/// 本地路径不能直接交给 Trae 上游：Trae 服务端无法读取调用方磁盘。只有在
+/// 用户显式设置 `AIWORK_ASSET_PUBLIC_BASE_URL` 或在网关设置页配置后，才会为 API Key 所有的素材
+/// 生成短时地址并放入原生 `image_urls`/`video_urls`。未配置时明确失败，
+/// 不会把 `C:\` 路径或 data URL 猜测性地转发给上游。
+pub fn resolve_asset_references(
+    data_dir: &std::path::Path,
+    owner_key_id: &str,
+    input: &Value,
+) -> Result<Value, String> {
+    let mut body = input.clone();
+    let obj = body
+        .as_object_mut()
+        .ok_or_else(|| "video request 必须是 JSON 对象".to_string())?;
+
+    for (asset_key, url_key, label) in [
+        ("image_asset_ids", "image_urls", "图片"),
+        ("video_asset_ids", "video_urls", "参考视频"),
+    ] {
+        let Some(ids) = obj.remove(asset_key) else { continue };
+        let Some(ids) = ids.as_array() else {
+            return Err(format!("{asset_key} 必须是字符串数组"));
+        };
+        let mut urls = obj
+            .remove(url_key)
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let Some(urls) = urls.as_array_mut() else {
+            return Err(format!("{url_key} 必须是字符串数组"));
+        };
+        for id in ids {
+            let id = id
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("{asset_key} 只能包含非空字符串"))?;
+            let url = super::assets::public_url_for_owned(data_dir, owner_key_id, id)
+                .map_err(|error| format!("{label}素材 {id} 无法传给上游：{error}"))?;
+            urls.push(Value::String(url));
+        }
+        if urls.len() > 10 {
+            return Err(format!("{url_key} 最多 10 个非空字符串"));
+        }
+        obj.insert(url_key.to_string(), Value::Array(urls.clone()));
+    }
+    Ok(body)
+}
+
+pub fn create_pending_for(model: String, prompt: String, owner_key_id: &str) -> VideoTask {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let task = VideoTask {
+        id: next_id(),
+        object: "video".into(),
+        model,
+        status: "queued".to_string(),
+        prompt,
+        created_at: now,
+        updated_at: now,
+        error: None,
+        transport: "trae_work_native_sse".into(),
+        video_url: None,
+        resource_uri: None,
+        video_duration: None,
+        content_url: None,
+        artifact_error: None,
+        request_key: None,
+        owner_key_id: if owner_key_id.trim().is_empty() {
+            "anonymous".into()
+        } else {
+            owner_key_id.trim().to_string()
+        },
+    };
+    let mut map = tasks().lock().unwrap_or_else(|e| e.into_inner());
+    let cutoff = now.saturating_sub(TERMINAL_TASK_RETENTION_SECS);
+    map.retain(|_, item| {
+        !matches!(item.status.as_str(), "completed" | "failed") || item.updated_at >= cutoff
+    });
+    if map.len() >= MAX_IN_MEMORY_TASKS {
+        let mut terminal: Vec<(String, u64)> = map
+            .iter()
+            .filter(|(_, item)| matches!(item.status.as_str(), "completed" | "failed"))
+            .map(|(id, item)| (id.clone(), item.updated_at))
+            .collect();
+        terminal.sort_by_key(|(_, updated)| *updated);
+        let remove = map.len().saturating_sub(MAX_IN_MEMORY_TASKS - 1);
+        for (id, _) in terminal.into_iter().take(remove) {
+            map.remove(&id);
+        }
+    }
+    map.insert(task.id.clone(), task.clone());
+    drop(map);
+    persist_current(&task.id);
+    task
+}
+
+/// 测试/内部调用的匿名任务构造器；HTTP 路由使用 `create_pending_for` 绑定 Key。
+pub fn create_pending(model: String, prompt: String) -> VideoTask {
+    create_pending_for(model, prompt, "anonymous")
+}
+
+pub fn visible_to(task: &VideoTask, owner_key_id: &str) -> bool {
+    let owner = if owner_key_id.trim().is_empty() {
+        "anonymous"
+    } else {
+        owner_key_id.trim()
+    };
+    task.owner_key_id == owner
+}
+
+/// 返回幂等键对应的仍然可查询任务；键只保存任务 ID，不落盘正文或凭证。
+pub fn find_idempotent(key: &str) -> Option<VideoTask> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let task_id = idempotency()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .cloned()?;
+    get(&task_id)
+}
+
+/// 将客户端幂等键限制在 API Key 命名空间内，避免两个调用方使用同名键
+/// 时互相看到对方的任务或提示词。`scope` 仅使用已鉴权的 Key ID（或
+/// `anonymous`），不写入日志。
+pub fn scoped_idempotency_key(scope: &str, key: &str) -> String {
+    let scope = scope.trim();
+    let key = key.trim();
+    let raw = format!("{}:{}", if scope.is_empty() { "anonymous" } else { scope }, key);
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(raw.as_bytes());
+    format!("idem-{:x}", digest.finalize())
+}
+
+/// Seedance HTTP 错误有时把额度/会话错误包在 400 响应里，不能只按状态码
+/// 归类。优先读取业务 code/message，再回退到通用 HTTP 分类。
+fn classify_video_error(status: u16, body: &str) -> ErrKind {
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        let code = value
+            .get("code")
+            .or_else(|| value.get("error_code"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let message = value
+            .get("message")
+            .or_else(|| value.get("error").and_then(|v| v.get("message")))
+            .and_then(Value::as_str)
+            .unwrap_or(body);
+        let kind = super::classify_solo_error(code, message);
+        if kind != ErrKind::Server || code != 0 {
+            return kind;
+        }
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("insufficient credit")
+        || lower.contains("credits exhausted")
+        || lower.contains("积分不足")
+        || lower.contains("余额不足")
+    {
+        return ErrKind::HardCredit;
+    }
+    super::classify_error(status, body)
+}
+
+fn retryable_account_error(kind: ErrKind) -> bool {
+    matches!(kind, ErrKind::HardCredit | ErrKind::PlanLimit | ErrKind::SessionDead)
+}
+
+fn video_error_message(data: &str) -> String {
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .or_else(|| value.get("error").and_then(|v| v.get("message")))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| data.chars().take(240).collect())
+}
+
+/// 建立幂等键映射并限制内存增长。已存在的键由路由层先返回，不会覆盖原任务。
+pub fn remember_idempotent(key: &str, task_id: &str) {
+    let key = key.trim();
+    if key.is_empty() {
+        return;
+    }
+    let mut map = idempotency().lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= 1024 {
+        let remove = map.len() - 1023;
+        let keys: Vec<String> = map.keys().take(remove).cloned().collect();
+        for old in keys {
+            map.remove(&old);
+        }
+    }
+    map.insert(key.to_string(), task_id.to_string());
+}
+
+/// 将已隔离/哈希后的幂等键绑定到任务并持久化，网关重启后仍能正确重放。
+pub fn bind_idempotency(key: &str, task_id: &str) {
+    let key = key.trim();
+    if key.is_empty() {
+        return;
+    }
+    remember_idempotent(key, task_id);
+    if let Some(task) = tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(task_id)
+    {
+        task.request_key = Some(key.to_string());
+    }
+    persist_current(task_id);
+}
+
+fn update_task(task_id: &str, update: impl FnOnce(&mut VideoTask)) {
+    let changed = if let Some(task) = tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(task_id)
+    {
+        update(task);
+        task.updated_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        true
+    } else {
+        false
+    };
+    if changed {
+        persist_current(task_id);
+    }
+}
+
+fn now_id(prefix: &str) -> String {
+    format!("{}-{}", prefix, crate::commands::oauth::random_hex(24))
+}
+
+fn build_request_body(input: &Value) -> Value {
+    let mut body = input.clone();
+    let obj = body.as_object_mut().expect("video request is object");
+    obj.entry("image_urls").or_insert_with(|| Value::Array(Vec::new()));
+    obj.entry("video_urls").or_insert_with(|| Value::Array(Vec::new()));
+    obj.entry("resolution").or_insert_with(|| Value::String("480p".into()));
+    obj.entry("ratio").or_insert_with(|| Value::String("16:9".into()));
+    obj.entry("duration").or_insert_with(|| Value::from(4));
+    obj.entry("mode_type").or_insert_with(|| Value::from(1));
+    obj.entry("request_type").or_insert_with(|| Value::String("solo_work_lite".into()));
+    obj.entry("chat_mode").or_insert_with(|| Value::from(0));
+    obj.entry("session_id").or_insert_with(|| Value::String(now_id("video-session")));
+    obj.entry("access_type").or_insert_with(|| Value::from(1));
+    obj.entry("watermark").or_insert_with(|| Value::Bool(false));
+    // 资产 ID 只在网关内部使用，不能污染 Trae 原生请求体。
+    obj.remove("image_asset_ids");
+    obj.remove("video_asset_ids");
+    body
+}
+
+fn result_fields(value: &Value) -> (Option<String>, Option<String>, Option<f64>) {
+    let mut values = vec![value];
+    for key in ["data", "result", "video"] {
+        if let Some(nested) = value.get(key) {
+            values.push(nested);
+        }
+    }
+    let uri = values.iter().find_map(|item| {
+        ["uri", "resource_uri", "video_uri"]
+            .into_iter()
+            .find_map(|key| item.get(key).and_then(Value::as_str).map(str::to_string))
+    });
+    let url = values.iter().find_map(|item| {
+        item.get("url")
+            .and_then(Value::as_str)
+            .filter(|s| s.starts_with("https://"))
+            .map(str::to_string)
+    });
+    let duration = values.iter().find_map(|item| {
+        item.get("video_duration")
+            .or_else(|| item.get("duration"))
+            .and_then(Value::as_f64)
+    });
+    (uri, url, duration)
+}
+
+fn parse_sse_event(event: &str, data: &str, task_id: &str) -> Result<bool, String> {
+    if event == "result" || event == "output" {
+        let value: Value = serde_json::from_str(data)
+            .map_err(|e| format!("Seedance {event} JSON 无效: {e}"))?;
+        let (uri, url, duration) = result_fields(&value);
+        if uri.is_some() || url.is_some() || duration.is_some() {
+            update_task(task_id, |task| {
+                if uri.is_some() { task.resource_uri = uri; }
+                if url.is_some() { task.video_url = url; }
+                if duration.is_some() { task.video_duration = duration; }
+            });
+        }
+    } else if event == "done" {
+        // “done” 没有 result 资源时不能向调用方报告成功，否则会得到一个
+        // 永远无法下载的空任务。允许 done 携带最后一条结果数据作为兜底。
+        if !data.trim().is_empty() {
+            if let Ok(value) = serde_json::from_str::<Value>(data) {
+                let (uri, url, duration) = result_fields(&value);
+                if uri.is_some() || url.is_some() || duration.is_some() {
+                    update_task(task_id, |task| {
+                        if uri.is_some() { task.resource_uri = uri; }
+                        if url.is_some() { task.video_url = url; }
+                        if duration.is_some() { task.video_duration = duration; }
+                    });
+                }
+            }
+        }
+        let has_resource = get(task_id)
+            .map(|task| task.resource_uri.is_some() || task.video_url.is_some())
+            .unwrap_or(false);
+        update_task(task_id, |task| {
+            if has_resource {
+                task.status = "completed".into();
+            } else {
+                task.status = "failed".into();
+                task.error = Some("Seedance 已结束但未返回视频资源".into());
+            }
+        });
+        return Ok(true);
+    } else if event == "error" {
+        let message = video_error_message(data);
+        update_task(task_id, |task| {
+            task.status = "failed".into();
+            task.error = Some(message);
+        });
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn resolve_resource_url(account: &PickedAccount, uri: &str) -> Result<String, String> {
+    let url = format!("{}{}", AGENT_HOST, "/api/ide/v1/get_resource_url");
+    let body = serde_json::json!({ "uri_list": [uri] });
+    let trace = now_id("trace");
+    let trace_short = trace.chars().take(32).collect::<String>();
+    let response = super::streaming_agent()
+        .post(&url)
+        .set("content-type", "application/json")
+        .set("accept", "*/*")
+        .set("user-agent", "TraeClient/TTNet")
+        .set("x-ide-token", &account.jwt)
+        .set("x-app-id", APP_ID)
+        .set("x-device-type", "windows")
+        .set("x-device-brand", "H610E-B")
+        .set("x-device-cpu", "Intel")
+        .set("x-device-id", &account.device_id)
+        .set("x-machine-id", &account.machine_id)
+        .set("x-os-version", "Windows 10 Pro")
+        .set("x-ide-version", IDE_VERSION)
+        .set("x-ide-version-code", IDE_VERSION_CODE)
+        .set("x-ide-version-type", "stable")
+        .set("x-custom-trace-id", &trace_short)
+        .send_json(body)
+        .map_err(|error| format!("获取视频资源地址失败: {error}"))?;
+    let value: Value = response
+        .into_json()
+        .map_err(|error| format!("解析视频资源地址失败: {error}"))?;
+    value
+        .get("url_map")
+        .and_then(|map| map.get(uri))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|url| url.starts_with("https://"))
+        .ok_or_else(|| "上游未返回可用视频地址".into())
+}
+
+/// 启动后台 Seedance SSE 任务；不阻塞网关 tokio worker。
+pub fn start_native_task(state: std::sync::Arc<ApiSharedState>, task_id: String, input: Value, account: PickedAccount) {
+    thread::spawn(move || {
+        let body = build_request_body(&input);
+        // HTTP 层尚未收到 SSE 前允许切到下一个 Work 账号；一旦进入 SSE，
+        // 不再重放，避免重复扣费或重复创建视频任务。
+        let mut account = account;
+        let mut tried = HashSet::from([account.uid.clone()]);
+        let response = loop {
+            let trace = now_id("trace");
+            let url = format!("{}{}", AGENT_HOST, "/api/ide/v1/tool_text_to_video_stream");
+            let referer = format!("{}{}", REFERER_BASE, "/api/ide/v1/tool_text_to_video_stream");
+            let request_id = now_id("req");
+            let trace_short = trace.chars().take(32).collect::<String>();
+            let response = super::streaming_agent()
+                .post(&url)
+                .set("content-type", "application/json")
+                .set("accept", "text/event-stream")
+                .set("accept-encoding", "gzip, deflate")
+                .set("user-agent", "TraeClient/TTNet")
+                .set("x-ide-token", &account.jwt)
+                .set("x-app-id", APP_ID)
+                .set("x-app-version", "default")
+                .set("x-app-version-code", IDE_VERSION_CODE)
+                .set("x-ide-version", IDE_VERSION)
+                .set("x-ide-version-code", IDE_VERSION_CODE)
+                .set("x-ide-version-type", "stable")
+                .set("x-device-type", "windows")
+                .set("x-device-brand", "H610E-B")
+                .set("x-device-cpu", "Intel")
+                .set("x-device-id", &account.device_id)
+                .set("x-machine-id", &account.machine_id)
+                .set("x-os-version", "Windows 10 Pro")
+                .set("request-traffic-type", "prod")
+                .set("package-type", "stable_cn")
+                .set("x-lgw-req-sdk-type", "3")
+                .set("x-lscbd-aid", "787976")
+                .set("x-lscbd-platform", "windows")
+                .set("x-ss-dp", "787976")
+                .set("app-version", IDE_VERSION)
+                .set("x-custom-trace-id", &trace_short)
+                .set("x-request-id", &request_id)
+                .set("referer", &referer)
+                .send_json(body.clone());
+            match response {
+                Ok(response) if (200..300).contains(&response.status()) => break response,
+                Ok(response) => {
+                    let status = response.status();
+                    let text = response.into_string().unwrap_or_default();
+                    let kind = classify_video_error(status, &text);
+                    state.pool.note_error(&account.uid, kind);
+                    if retryable_account_error(kind) {
+                        if let Some(next) = state.pool.pick_excluding_for(&tried, ResourceKind::Work) {
+                            tried.insert(next.uid.clone());
+                            account = next;
+                            continue;
+                        }
+                    }
+                    update_task(&task_id, |task| {
+                        task.status = "failed".into();
+                        task.error = Some(format!(
+                            "Seedance 上游 HTTP {status}: {}",
+                            text.chars().take(240).collect::<String>()
+                        ));
+                    });
+                    return;
+                }
+                Err(ureq::Error::Status(status, response)) => {
+                    let text = response.into_string().unwrap_or_default();
+                    let kind = classify_video_error(status, &text);
+                    state.pool.note_error(&account.uid, kind);
+                    if retryable_account_error(kind) {
+                        if let Some(next) = state.pool.pick_excluding_for(&tried, ResourceKind::Work) {
+                            tried.insert(next.uid.clone());
+                            account = next;
+                            continue;
+                        }
+                    }
+                    update_task(&task_id, |task| {
+                        task.status = "failed".into();
+                        task.error = Some(format!(
+                            "Seedance 上游 HTTP {status}: {}",
+                            text.chars().take(240).collect::<String>()
+                        ));
+                    });
+                    return;
+                }
+                Err(error) => {
+                    state.pool.note_error(&account.uid, ErrKind::Server);
+                    update_task(&task_id, |task| {
+                        task.status = "failed".into();
+                        task.error = Some(format!("Seedance 上游连接失败: {error}"));
+                    });
+                    return;
+                }
+            }
+        };
+        update_task(&task_id, |task| task.status = "processing".into());
+        let mut event_name = String::new();
+        let mut event_data = String::new();
+        let reader = BufReader::new(response.into_reader());
+        let mut terminal = false;
+        for line in reader.lines().flatten() {
+            if line.trim().is_empty() {
+                if !event_data.is_empty() {
+                    if event_name == "error" {
+                        // SSE 错误通常已经进入原生任务阶段，不能安全重放；仍要把
+                        // 额度/会话错误写入账号状态，避免下一次继续命中同一账号。
+                        let kind = classify_video_error(0, &event_data);
+                        state.pool.note_error(&account.uid, kind);
+                    }
+                    match parse_sse_event(&event_name, &event_data, &task_id) {
+                        Ok(true) => terminal = true,
+                        Ok(false) => {}
+                        Err(error) => {
+                            update_task(&task_id, |task| {
+                                task.status = "failed".into();
+                                task.error = Some(error);
+                            });
+                            terminal = true;
+                        }
+                    }
+                }
+                event_name.clear();
+                event_data.clear();
+                if terminal { break; }
+            } else if let Some(value) = line.strip_prefix("event:") {
+                event_name = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("data:") {
+                if !event_data.is_empty() { event_data.push('\n'); }
+                event_data.push_str(value.trim_start());
+            }
+        }
+        if !terminal && !event_data.is_empty() {
+            if event_name == "error" {
+                let kind = classify_video_error(0, &event_data);
+                state.pool.note_error(&account.uid, kind);
+            }
+            match parse_sse_event(&event_name, &event_data, &task_id) {
+                Ok(_) => {}
+                Err(error) => update_task(&task_id, |task| {
+                    task.status = "failed".into();
+                    task.error = Some(error);
+                }),
+            }
+        }
+        let task_status = get(&task_id).map(|task| task.status).unwrap_or_default();
+        if task_status == "completed" {
+            if let Some(uri) = get(&task_id).and_then(|task| task.resource_uri) {
+                if let Ok(url) = resolve_resource_url(&account, &uri) {
+                    update_task(&task_id, |task| task.video_url = Some(url));
+                }
+            }
+            // 生成完成后将上游地址缓存为本地受鉴权资源。失败时保留上游 URL，
+            // 让客户端仍可立即取回视频，同时在任务中给出缓存失败原因。
+            if let Some(url) = get(&task_id).and_then(|task| task.video_url) {
+                match super::video_store::download_from_url(&state.data_dir, &task_id, &url) {
+                    Ok((_path, _size)) => update_task(&task_id, |task| {
+                        task.content_url = super::video_store::content_url(&task.id).ok();
+                        task.artifact_error = None;
+                    }),
+                    Err(error) => update_task(&task_id, |task| {
+                        task.artifact_error = Some(error.chars().take(240).collect());
+                    }),
+                }
+            }
+            state.pool.note_success(&account.uid);
+        } else if task_status == "processing" {
+            update_task(&task_id, |task| {
+                task.status = "failed".into();
+                task.error = Some("Seedance SSE 在 done 事件前结束".into());
+            });
+            state.pool.note_error(&account.uid, super::ErrKind::Server);
+        }
+    });
+}
+
+pub fn get(task_id: &str) -> Option<VideoTask> {
+    tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(task_id)
+        .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_urls_allow_public_https_only_by_default() {
+        assert!(validate_reference_url("https://cdn.example.com/frame.png", false).is_ok());
+        assert!(validate_reference_url("https://localhost/frame.png", false).is_err());
+        assert!(validate_reference_url("https://127.0.0.1/frame.png", false).is_err());
+        assert!(validate_reference_url("https://192.168.1.5/frame.png", false).is_err());
+        assert!(validate_reference_url("https://10.0.0.5/frame.png", false).is_err());
+        assert!(validate_reference_url("https://192.0.2.1/frame.png", false).is_err());
+        assert!(validate_reference_url("https://[::ffff:127.0.0.1]/frame.png", false).is_err());
+        assert!(validate_reference_url("https://[fc00::1]/frame.png", false).is_err());
+        assert!(validate_reference_url("https://asset.lan/frame.png", false).is_err());
+        assert!(validate_reference_url("file:///C:/secret.png", false).is_err());
+        assert!(validate_reference_url("data:image/png;base64,AAAA", false).is_err());
+        assert!(validate_reference_url("ftp://cdn.example.com/frame.png", false).is_err());
+        assert!(validate_reference_url("http://cdn.example.com/frame.png", false).is_err());
+        assert!(validate_reference_url("http://cdn.example.com/frame.png", true).is_ok());
+    }
+
+    #[test]
+    fn validates_prompt_and_defaults_model() {
+        let (model, prompt) = validate_request(&serde_json::json!({"prompt":"  cat  "})).unwrap();
+        assert_eq!(model, "seedance");
+        assert_eq!(prompt, "cat");
+        assert!(validate_request(&serde_json::json!({"prompt":"  "})).is_err());
+    }
+
+    #[test]
+    fn pending_task_is_queryable() {
+        let task = create_pending("seedance".into(), "test".into());
+        assert_eq!(task.status, "queued");
+        assert_eq!(get(&task.id).unwrap().id, task.id);
+    }
+
+    #[test]
+    fn validates_video_shape_and_rejects_invalid_values() {
+        let ok = serde_json::json!({"prompt":"cat", "duration": 8, "resolution":"720p", "ratio":"9:16"});
+        assert!(validate_request(&ok).is_ok());
+        assert!(validate_request(&serde_json::json!({"prompt":"cat", "duration": 1})).is_err());
+        assert!(validate_request(&serde_json::json!({"prompt":"cat", "resolution":"2k"})).is_err());
+        assert!(validate_request(&serde_json::json!({"prompt":"cat", "ratio":"2:1"})).is_err());
+        assert!(validate_request(&serde_json::json!({"prompt":"cat", "image_urls":"not-array"})).is_err());
+        assert!(validate_request(&serde_json::json!({"prompt":"cat", "image_asset_ids":["asset-1"]})).is_ok());
+        assert!(validate_request(&serde_json::json!({"prompt":"cat", "image_paths":["C:\\cat.png"]})).is_err());
+    }
+
+    #[test]
+    fn native_body_does_not_leak_internal_asset_ids() {
+        let body = build_request_body(&serde_json::json!({
+            "prompt": "cat",
+            "image_asset_ids": ["asset-1"],
+            "video_asset_ids": ["asset-2"],
+        }));
+        assert!(body.get("image_asset_ids").is_none());
+        assert!(body.get("video_asset_ids").is_none());
+    }
+
+    #[test]
+    fn idempotency_returns_same_task() {
+        let task = create_pending("seedance".into(), "same".into());
+        let key = scoped_idempotency_key("key-a", "test-idempotency");
+        remember_idempotent(&key, &task.id);
+        assert_eq!(find_idempotent(&key).unwrap().id, task.id);
+        assert!(find_idempotent(&scoped_idempotency_key("key-b", "test-idempotency")).is_none());
+    }
+
+    #[test]
+    fn result_then_done_requires_a_resource() {
+        let task = create_pending("seedance".into(), "result".into());
+        assert!(!parse_sse_event("result", r#"{"uri":"tos://video-1","video_duration":4}"#, &task.id).unwrap());
+        assert!(parse_sse_event("done", "{}", &task.id).unwrap());
+        let completed = get(&task.id).unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.resource_uri.as_deref(), Some("tos://video-1"));
+        assert_eq!(completed.video_duration, Some(4.0));
+    }
+
+    #[test]
+    fn done_without_resource_is_not_success() {
+        let task = create_pending("seedance".into(), "empty".into());
+        assert!(parse_sse_event("done", "{}", &task.id).unwrap());
+        let failed = get(&task.id).unwrap();
+        assert_eq!(failed.status, "failed");
+        assert!(failed.error.as_deref().unwrap_or("").contains("未返回视频资源"));
+    }
+
+    #[test]
+    fn video_credit_http_errors_are_account_specific() {
+        assert_eq!(
+            classify_video_error(400, r#"{"code":0,"message":"积分不足，请切换账号"}"#),
+            ErrKind::HardCredit
+        );
+        assert_eq!(
+            classify_video_error(401, "unauthorized"),
+            ErrKind::SessionDead
+        );
+        assert!(retryable_account_error(ErrKind::HardCredit));
+        assert!(!retryable_account_error(ErrKind::Server));
+    }
+
+    #[test]
+    fn task_visibility_is_scoped_to_owner_key() {
+        let task = create_pending_for("seedance".into(), "private".into(), "key-a");
+        assert!(visible_to(&task, "key-a"));
+        assert!(!visible_to(&task, "key-b"));
+        let anonymous = create_pending("seedance".into(), "anonymous".into());
+        assert!(visible_to(&anonymous, ""));
+        assert!(!visible_to(&anonymous, "key-a"));
+    }
+
+    #[test]
+    fn persisted_task_roundtrip_keeps_owner_and_artifact_fields() {
+        let task = VideoTask {
+            id: "video-test".into(),
+            object: "video".into(),
+            model: "seedance".into(),
+            status: "completed".into(),
+            prompt: "a quiet lake".into(),
+            created_at: 1,
+            updated_at: 2,
+            error: None,
+            transport: "trae_work_native_sse".into(),
+            video_url: Some("https://example.invalid/video.mp4".into()),
+            resource_uri: Some("tos://video".into()),
+            video_duration: Some(4.0),
+            content_url: Some("/v1/videos/video-test/content".into()),
+            artifact_error: None,
+            request_key: Some("idem-test".into()),
+            owner_key_id: "key-a".into(),
+        };
+        let restored = restored(persisted(&task));
+        assert_eq!(restored.owner_key_id, "key-a");
+        assert_eq!(restored.content_url.as_deref(), Some("/v1/videos/video-test/content"));
+        assert_eq!(restored.video_url, task.video_url);
+    }
+}

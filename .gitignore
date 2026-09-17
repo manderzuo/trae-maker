@@ -1,0 +1,78 @@
+# Build
+dist/
+node_modules/
+src-tauri/target/
+target/
+src-tauri/gen/
+
+# Logs
+*.log
+logs/
+
+# 临时文件
+tmp/
+temp
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# WorkBuddy 自动产物（严禁提交）
+.workbuddy/
+
+# 运行时数据（证书、账号状态等）
+data/
+
+# Local credentials and deployment secrets (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# test_proxy 抓包产物（完整体另存目录）
+proxy_bodies/
+# test_proxy 系统代理崩溃自愈恢复记录
+.proxy_recovery.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Python 运行时残骸防误提交：v3.2.x 曾因 src-python/ 混入残缺 Python 运行时（缺 Lib/encodings）
+# 被打包进 resources/python/，state.rs 优先内嵌导致签到必崩（v3.2.3 修复：已移除运行时，
+# 探测改用 import encodings 自举验证）。若未来支持内嵌 Python，须先保证可完整自举。
+src-python/.extracted
+src-python/DLLs/
+src-python/Lib/
+src-python/Scripts/
+src-python/include/
+src-python/libs/
+src-python/python.exe
+src-python/python3.cmd
+src-python/python3.dll
+src-python/python3.exe
+src-python/python313.dll
+src-python/python313.zip
+src-python/python313._pth
+src-python/pythonw.exe
+src-python/vcruntime140.dll
+src-python/vcruntime140_1.dll
+src-python/LICENSE.txt
+
+# Packaging outputs (installers) — disk에 보관(배포용), git에는 제외
+release/
+
+# MSI/NSIS 빌드 중 생성되는 WiX 소스
+*.wxs
+
+# WorkBuddy 산출물
+overview.md
+# tauri dev 动态端口合并配置（scripts/dev-tauri.mjs 生成）
+tauri.dev.conf.json
+# 本地素材导出产物（promo banner 等）
+out/

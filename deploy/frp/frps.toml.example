@@ -1,0 +1,15 @@
+# 复制为 frps.toml 后再替换占位符。
+# frps 所在机器可以是多路由器网络中的共同可达主机，也可以是腾讯云服务器。
+
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+auth.method = "token"
+auth.token = "__REPLACE_WITH_LONG_RANDOM_TOKEN__"
+
+# 生产/跨网段环境建议开启；frpc 的 tls_enable 必须同步为 true。
+transport.tls.force = true
+
+# 只给 Nginx 使用的业务远程端口范围。防火墙仍应限制 17864 不对普通客户端开放。
+allowPorts = [{ start = 17864, end = 17864 }]
+

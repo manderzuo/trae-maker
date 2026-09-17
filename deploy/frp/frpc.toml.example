@@ -1,0 +1,17 @@
+# AI Work 主机上的 frpc 示例。
+# 应用界面会按同等结构自动生成 data/frp/frpc.toml；不要把真实 token 提交到仓库。
+
+serverAddr = "__RELAY_LAN_OR_CLOUD_IP__"
+serverPort = 7000
+
+auth.method = "token"
+auth.token = "__REPLACE_WITH_SAME_TOKEN_AS_FRPS__"
+transport.tls.enable = true
+
+[[proxies]]
+name = "aiwork-gateway"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 7864
+remotePort = 17864
+
