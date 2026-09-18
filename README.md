@@ -107,8 +107,3 @@ python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64
 - [产品优化需求清单](docs/product-optimization-backlog.md) — 全项目唯一待办依据（需求概述/实现路径/验证依据）
 - [技术架构设计](docs/tech-framework.md) — 架构/数据模型/协议参考（含 WorkBuddy、豆包协议附录与实现方向映射）/开发运维
 
-## License
-
-本项目采用 [MIT License](LICENSE)，版权归 AI Work Assistant 项目所有。
-
-Fork / 二次开发请保留 `LICENSE` 及版权声明，并在变更说明中注明修改范围。

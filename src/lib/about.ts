@@ -8,7 +8,7 @@ export const APP_TAGLINE = '多账号签到与管理 · 一站式工作台';
 export const APP_OVERVIEW =
   'Windows 桌面端多账号签到与管理一站式工作台（Tauri 2 + React 18 + Rust）。' +
   '深度支持 Trae Work 与 Trae（Trae CN IDE）双应用：多账号签到、登录态双应用独立切换、设备隔离、积分看板与 OpenAI / Anthropic 兼容 API 网关，数据全部本地存储。';
-export const APP_COPYRIGHT = 'Copyright © 2026 AI Work Assistant project · MIT License';
+export const APP_COPYRIGHT = 'Copyright © 2026 AI Work Assistant project';
 export const APP_DISCLAIMER =
   '本工具与 Trae / WorkBuddy / 豆包等官方均无关联，仅供学习研究，请仅管理本人合法持有的账号，风险自担。';
 
