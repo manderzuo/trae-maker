@@ -356,8 +356,16 @@ pub fn sync_upstream_accounts(store: &CoreStore, data_dir: &Path, principal: &Pr
                     input.state = old.state;
                     input.cooldown_reason = old.cooldown_reason.clone();
                 }
-                input.cooldown_until_ms = input.cooldown_until_ms.max(old.cooldown_until_ms);
-                input.consecutive_errors = input.consecutive_errors.max(old.consecutive_errors);
+            }
+            // Available is a routing state, not evidence that persisted health
+            // counters or cooldown metadata have been reset by Core.
+            input.consecutive_errors = input.consecutive_errors.max(old.consecutive_errors);
+            if old.cooldown_until_ms > input.cooldown_until_ms {
+                input.cooldown_until_ms = old.cooldown_until_ms;
+                input.cooldown_reason = old.cooldown_reason.clone();
+            } else if input.cooldown_reason.is_none()
+                && old.cooldown_reason.as_deref() != Some("directory_disabled") {
+                input.cooldown_reason = old.cooldown_reason.clone();
             }
             if *old == input { continue; }
         }
@@ -690,5 +698,62 @@ mod tests {
         assert_eq!(latest.status, ObservationStatus::Failed);
         assert_eq!(latest.observed_value, Some(1200));
         assert_eq!(latest.value_scale, 100);
+    }
+
+    #[test]
+    fn scheduler_failed_refresh_preserves_value_and_scale_from_same_fresh_row() {
+        for null_status in [ObservationStatus::Fresh, ObservationStatus::Stale] {
+            let f = Fixture::new();
+            let directory = directory();
+            sync_upstream_accounts(&f.store, &f.dir, &f.admin, &directory).unwrap();
+            let id = directory.accounts[0].id.clone();
+            f.store.append_upstream_observation(UpstreamObservation::new(
+                "fresh-scaled".into(), id.clone(), "chat.general".into(), Some(1000), 100,
+                "reader".into(), ObservationStatus::Fresh, NOW, NOW + 60000,
+                json!({"available":1000, "value_scale":100}),
+            )).unwrap();
+            f.store.append_upstream_observation(UpstreamObservation::new(
+                "later-null".into(), id.clone(), "chat.general".into(), None, 1,
+                "reader".into(), null_status, NOW + 1, NOW + 60000, json!({}),
+            )).unwrap();
+            let runtime = f.runtime(SchedulerMode::Shadow);
+            for now_ms in [NOW + 2, NOW + 3] {
+                assert!(runtime.refresh_observation(ObservationRequest {
+                    account_ref: id.clone(), provider: "trae".into(), resource_kind: "chat.general".into(),
+                }, now_ms).is_err());
+                let latest = f.store.get_latest_observation(&id, "chat.general").unwrap().unwrap();
+                assert_eq!(latest.status, ObservationStatus::Failed);
+                assert_eq!((latest.observed_value, latest.value_scale), (Some(1000), 100));
+            }
+            assert_eq!(f.store.count_rows("quota_ledger").unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn scheduler_sync_preserves_available_core_health_metadata() {
+        let f = Fixture::new();
+        let mut directory = directory();
+        sync_upstream_accounts(&f.store, &f.dir, &f.admin, &directory).unwrap();
+        let mut account = directory.accounts[0].clone();
+        account.state = UpstreamAccountState::Available;
+        account.consecutive_errors = 4;
+        account.cooldown_until_ms = Some(NOW + 60000);
+        account.cooldown_reason = Some("transport_timeout".into());
+        f.store.upsert_upstream_account(account.clone(), &f.admin).unwrap();
+        let audit_count = f.store.count_rows("audit_events").unwrap();
+        assert_eq!(sync_upstream_accounts(&f.store, &f.dir, &f.admin, &directory).unwrap(), 0);
+        assert_eq!(read_directory(&f.dir).unwrap()[&account.id], account);
+        assert_eq!(f.store.count_rows("audit_events").unwrap(), audit_count);
+
+        // A shorter legacy cooldown must not replace the stronger Core cooldown or its reason.
+        directory.accounts[0].state = UpstreamAccountState::Cooling;
+        directory.accounts[0].consecutive_errors = 1;
+        directory.accounts[0].cooldown_until_ms = Some(NOW + 1000);
+        directory.accounts[0].cooldown_reason = Some("legacy_cooldown".into());
+        sync_upstream_accounts(&f.store, &f.dir, &f.admin, &directory).unwrap();
+        let actual = read_directory(&f.dir).unwrap().remove(&account.id).unwrap();
+        assert_eq!(actual.consecutive_errors, 4);
+        assert_eq!(actual.cooldown_until_ms, Some(NOW + 60000));
+        assert_eq!(actual.cooldown_reason.as_deref(), Some("transport_timeout"));
     }
 }

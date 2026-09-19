@@ -268,9 +268,9 @@ impl CoreStore {
             });
         }
         if observation.status == ObservationStatus::Failed {
-            observation.observed_value = transaction
+            let previous = transaction
                 .query_row(
-                    "SELECT observed_value FROM upstream_observations
+                    "SELECT observed_value, value_scale FROM upstream_observations
                      WHERE account_ref = ?1 AND resource_kind = ?2
                        AND status = 'fresh' AND observed_value IS NOT NULL
                        AND observed_at_ms <= ?3
@@ -281,9 +281,18 @@ impl CoreStore {
                         &observation.resource_kind,
                         observation.observed_at_ms,
                     ],
-                    |row| row.get::<_, i64>(0),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?;
+            // The integer and its scale are one measurement. A later null-valued
+            // sample may use another scale and must not reinterpret this value.
+            match previous {
+                Some((value, scale)) => {
+                    observation.observed_value = Some(value);
+                    observation.value_scale = scale;
+                }
+                None => observation.observed_value = None,
+            }
         }
         transaction.execute(
             "INSERT INTO upstream_observations
