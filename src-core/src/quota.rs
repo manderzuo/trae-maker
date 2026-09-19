@@ -61,6 +61,11 @@ impl CoreStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         if let Some(reservation) = Self::reservation_by_request(&transaction, &input.request_id)? {
+            if reservation.user_id != input.user_id || reservation.resource_kind != input.resource_kind {
+                return Err(CoreError::ReservationRequestConflict {
+                    request_id: input.request_id,
+                });
+            }
             transaction.commit()?;
             return Ok(ReserveResult::Existing(reservation));
         }
@@ -209,16 +214,13 @@ impl CoreStore {
         user_id: &str,
         resource_kind: &str,
     ) -> Result<QuotaBalance, CoreError> {
-        let available = connection.query_row(
-            "SELECT COALESCE(SUM(delta), 0) FROM quota_ledger WHERE user_id = ?1 AND resource_kind = ?2",
+        let (available, held) = connection.query_row(
+            "SELECT \
+             COALESCE((SELECT SUM(delta) FROM quota_ledger WHERE user_id = ?1 AND resource_kind = ?2), 0), \
+             COALESCE((SELECT SUM(amount) FROM quota_reservations \
+                       WHERE user_id = ?1 AND resource_kind = ?2 AND state IN ('held', 'unknown')), 0)",
             params![user_id, resource_kind],
-            |row| row.get(0),
-        )?;
-        let held = connection.query_row(
-            "SELECT COALESCE(SUM(amount), 0) FROM quota_reservations \
-             WHERE user_id = ?1 AND resource_kind = ?2 AND state IN ('held', 'unknown')",
-            params![user_id, resource_kind],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(QuotaBalance {
             user_id: user_id.to_owned(),

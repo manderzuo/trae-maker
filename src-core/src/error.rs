@@ -30,6 +30,8 @@ pub enum CoreError {
     ActualAmountExceedsReservation,
     #[error("quota reservation {reservation_id} was not found")]
     ReservationNotFound { reservation_id: String },
+    #[error("quota reservation request id conflict: {request_id}")]
+    ReservationRequestConflict { request_id: String },
     #[error("quota adjustment would overdraw the available balance")]
     QuotaOverdrawn,
 }

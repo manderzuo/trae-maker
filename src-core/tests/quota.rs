@@ -47,17 +47,31 @@ fn test_store_with_grant(amount: i64) -> (Arc<CoreStore>, PathBuf) {
 }
 
 fn reserve(request_id: &str, amount: i64, ttl_ms: i64) -> QuotaReserve {
+    reserve_for("u1", request_id, "chat_request", amount, ttl_ms)
+}
+
+fn reserve_for(
+    user_id: &str,
+    request_id: &str,
+    resource_kind: &str,
+    amount: i64,
+    ttl_ms: i64,
+) -> QuotaReserve {
     QuotaReserve {
-        user_id: "u1".to_owned(),
+        user_id: user_id.to_owned(),
         request_id: request_id.to_owned(),
-        resource_kind: "chat_request".to_owned(),
+        resource_kind: resource_kind.to_owned(),
         amount,
         ttl_ms,
     }
 }
 
 fn created(store: &CoreStore, request_id: &str, amount: i64) -> String {
-    match store.reserve(reserve(request_id, amount, 60_000)).unwrap() {
+    created_with_ttl(store, request_id, amount, 60_000)
+}
+
+fn created_with_ttl(store: &CoreStore, request_id: &str, amount: i64, ttl_ms: i64) -> String {
+    match store.reserve(reserve(request_id, amount, ttl_ms)).unwrap() {
         ReserveResult::Created(reservation) => reservation.id,
         other => panic!("expected created reservation, got {other:?}"),
     }
@@ -115,6 +129,26 @@ fn duplicate_request_id_returns_its_original_reservation_without_a_second_hold()
         other => panic!("expected existing reservation, got {other:?}"),
     }
     assert_eq!(store.balance("u1", "chat_request").unwrap().available, 90);
+}
+
+#[test]
+fn duplicate_request_id_from_another_owner_or_resource_is_rejected_without_disclosure() {
+    let (store, _) = test_store_with_grant(100);
+    let reservation_id = created(&store, "conflicting-request", 10);
+
+    for conflicting_input in [
+        reserve_for("u2", "conflicting-request", "chat_request", 10, 60_000),
+        reserve_for("u1", "conflicting-request", "image_request", 10, 60_000),
+    ] {
+        let error = store.reserve(conflicting_input).expect_err("conflicting request must not return a reservation");
+        assert!(error.to_string().contains("quota reservation request id conflict"));
+    }
+
+    assert_eq!(store.balance("u1", "chat_request").unwrap().available, 90);
+    assert_eq!(
+        store.settle(&reservation_id, Settlement::Release).unwrap().available,
+        100
+    );
 }
 
 #[test]
@@ -193,19 +227,59 @@ fn commit_without_actual_amount_keeps_the_full_hold_and_marks_it_unknown() {
 
 #[test]
 fn unknown_settlement_keeps_the_reservation_held_even_after_its_ttl() {
-    let (store, _) = test_store_with_grant(100);
-    let reservation_id = created(&store, "unknown-request", 10);
+    let (store, dir) = test_store_with_grant(100);
+    let reservation_id = created_with_ttl(&store, "unknown-request", 10, 1);
+    let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
+    let expires_at_ms: i64 = connection
+        .query_row(
+            "SELECT expires_at_ms FROM quota_reservations WHERE id = ?1",
+            [&reservation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        <= expires_at_ms
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            > expires_at_ms
+    );
 
     assert_eq!(
         store.settle(&reservation_id, Settlement::Unknown).unwrap().available,
         90
     );
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    assert_eq!(store.balance("u1", "chat_request").unwrap().available, 90);
+    let balance = store.balance("u1", "chat_request").unwrap();
+    assert_eq!(balance.available, 90);
+    assert_eq!(balance.held, 10);
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM quota_reservations WHERE id = ?1",
+            [&reservation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "unknown");
     assert_eq!(
         store.settle(&reservation_id, Settlement::Unknown).unwrap().available,
         90
     );
+    let state_after_repeat: String = connection
+        .query_row(
+            "SELECT state FROM quota_reservations WHERE id = ?1",
+            [&reservation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state_after_repeat, "unknown");
 }
 
 #[test]
