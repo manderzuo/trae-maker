@@ -567,6 +567,42 @@ impl CoreStore {
     pub fn settle_upstream_lease_with_status(
         &self, principal: &crate::Principal, lease_id: &str, outcome: LeaseOutcome,
     ) -> Result<LeaseSettlement, ScheduleError> {
+        self.settle_upstream_lease_with_status_inner(principal, lease_id, outcome, false)
+    }
+
+    pub fn reconcile_unknown_upstream_lease(
+        &self,
+        principal: &crate::Principal,
+        lease_id: &str,
+        outcome: LeaseOutcome,
+    ) -> Result<LeaseSettlement, ScheduleError> {
+        match &outcome {
+            LeaseOutcome::Success {
+                upstream_request_ref: Some(reference),
+                ..
+            }
+            | LeaseOutcome::Canceled {
+                upstream_request_ref: Some(reference),
+                ..
+            } if !reference.trim().is_empty() => {}
+            LeaseOutcome::Rejected { accepted: false, .. } => {}
+            _ => {
+                return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                    key: "reconcile.evidence".into(),
+                    value: "unknown lease reconciliation requires explicit terminal evidence".into(),
+                }))
+            }
+        }
+        self.settle_upstream_lease_with_status_inner(principal, lease_id, outcome, true)
+    }
+
+    fn settle_upstream_lease_with_status_inner(
+        &self,
+        principal: &crate::Principal,
+        lease_id: &str,
+        outcome: LeaseOutcome,
+        allow_unknown: bool,
+    ) -> Result<LeaseSettlement, ScheduleError> {
         let now = match &outcome {
             LeaseOutcome::Success { now_ms, .. }
             | LeaseOutcome::Rejected { now_ms, .. }
@@ -577,9 +613,24 @@ impl CoreStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let lease = Self::upstream_lease_by_id(&transaction, lease_id)?.ok_or_else(|| ScheduleError::LeaseNotFound(lease_id.into()))?;
         Self::validate_lease_owner(&transaction, &lease, principal)?;
-        if !matches!(lease.state, LeaseState::Held | LeaseState::Active) {
+        if allow_unknown && matches!(lease.state, LeaseState::Held | LeaseState::Active) {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "reconcile.lease".into(),
+                value: "explicit reconciliation requires an unknown lease".into(),
+            }));
+        }
+        let is_unknown_reconciliation = allow_unknown && lease.state == LeaseState::Unknown;
+        if !matches!(lease.state, LeaseState::Held | LeaseState::Active) && !is_unknown_reconciliation {
             transaction.commit()?;
             return Ok(LeaseSettlement { lease, applied: false });
+        }
+        if is_unknown_reconciliation
+            && lease.reconcile_until_ms.map_or(true, |deadline| now > deadline)
+        {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "reconcile.window".into(),
+                value: "unknown lease reconciliation window has expired".into(),
+            }));
         }
         let reservation = Self::reservation_by_request(&transaction, &lease.request_id)?
             .ok_or_else(|| ScheduleError::Core(CoreError::ReservationNotFound { reservation_id: lease.request_id.clone() }))?;
@@ -624,11 +675,22 @@ impl CoreStore {
             Self::settle_request_state(&transaction, &lease.request_id, current_request_state, request_state, result, now)?;
         }
         Self::apply_settlement(&transaction, &reservation, settlement, now)?;
-        transaction.execute(
-            "UPDATE upstream_leases SET state = ?1, reconcile_until_ms = ?2, upstream_request_ref = ?3, error_kind = ?4, updated_at_ms = ?5, settled_at_ms = ?6 WHERE id = ?7 AND state IN ('held', 'active')",
-            params![lease_state.as_str(), reconcile_until_ms, upstream_request_ref, error_kind, now,
-                if lease_state == LeaseState::Unknown { None } else { Some(now) }, lease_id],
-        )?;
+        let updated = if is_unknown_reconciliation {
+            transaction.execute(
+                "UPDATE upstream_leases SET state = ?1, reconcile_until_ms = ?2, upstream_request_ref = ?3, error_kind = ?4, updated_at_ms = ?5, settled_at_ms = ?6 WHERE id = ?7 AND state = 'unknown'",
+                params![lease_state.as_str(), reconcile_until_ms, upstream_request_ref, error_kind, now,
+                    if lease_state == LeaseState::Unknown { None } else { Some(now) }, lease_id],
+            )?
+        } else {
+            transaction.execute(
+                "UPDATE upstream_leases SET state = ?1, reconcile_until_ms = ?2, upstream_request_ref = ?3, error_kind = ?4, updated_at_ms = ?5, settled_at_ms = ?6 WHERE id = ?7 AND state IN ('held', 'active')",
+                params![lease_state.as_str(), reconcile_until_ms, upstream_request_ref, error_kind, now,
+                    if lease_state == LeaseState::Unknown { None } else { Some(now) }, lease_id],
+            )?
+        };
+        if updated != 1 {
+            return Ok(LeaseSettlement { lease, applied: false });
+        }
         if lease.resource_kind == "video_job" {
             let (job_state, attempt_state, reconcile_required) = if canceled_outcome {
                 (JobState::Canceled, JobAttemptState::Canceled, false)

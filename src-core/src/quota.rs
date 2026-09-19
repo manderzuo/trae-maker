@@ -482,23 +482,27 @@ impl CoreStore {
     ) -> Result<(), CoreError> {
         let intermediate: Vec<RequestState> = match final_state {
             RequestState::Succeeded => {
-                let progression = [
-                    RequestState::Reserved,
-                    RequestState::Queued,
-                    RequestState::Dispatched,
-                    RequestState::Completing,
-                    RequestState::Succeeded,
-                ];
-                let Some(position) = progression.iter().position(|state| *state == current) else {
-                    return Err(CoreError::InvalidTransition {
-                        request_id: request_id.to_owned(), expected: current, next: final_state,
-                    });
-                };
-                progression[position + 1..].to_vec()
+                if current == RequestState::Unknown {
+                    vec![RequestState::Succeeded]
+                } else {
+                    let progression = [
+                        RequestState::Reserved,
+                        RequestState::Queued,
+                        RequestState::Dispatched,
+                        RequestState::Completing,
+                        RequestState::Succeeded,
+                    ];
+                    let Some(position) = progression.iter().position(|state| *state == current) else {
+                        return Err(CoreError::InvalidTransition {
+                            request_id: request_id.to_owned(), expected: current, next: final_state,
+                        });
+                    };
+                    progression[position + 1..].to_vec()
+                }
             }
             RequestState::Failed | RequestState::Unknown => vec![final_state],
             RequestState::Canceled => {
-                if current != RequestState::CancelRequested {
+                if current != RequestState::CancelRequested && current != RequestState::Unknown {
                     return Err(CoreError::InvalidTransition {
                         request_id: request_id.to_owned(),
                         expected: current,

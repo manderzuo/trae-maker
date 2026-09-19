@@ -417,6 +417,7 @@ impl JobState {
                 | (Self::Queued, Self::Running | Self::CancelRequested | Self::Failed | Self::Unknown)
                 | (Self::Running, Self::Succeeded | Self::Failed | Self::CancelRequested | Self::Unknown)
                 | (Self::CancelRequested, Self::Canceled | Self::Unknown)
+                | (Self::Unknown, Self::Canceled | Self::Succeeded | Self::Failed)
         )
     }
 }
@@ -646,6 +647,7 @@ impl RequestState {
                 | (Self::Completing, Self::Succeeded | Self::Failed | Self::Unknown)
                 | (Self::Completing, Self::CancelRequested)
                 | (Self::CancelRequested, Self::Canceled | Self::Unknown)
+                | (Self::Unknown, Self::Canceled | Self::Succeeded | Self::Failed)
                 | (Self::Canceled, Self::Settled)
                 | (Self::Succeeded | Self::Failed | Self::Unknown, Self::Settled)
         )

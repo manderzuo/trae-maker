@@ -11,12 +11,15 @@ reservation 和 lease 组织成可恢复的持久队列边界：提交只产生�
 
 ## 当前事实
 
-- Core v9 已持久化 `jobs`/`job_attempts`，但视频路由在 `preflight_video_job` 后立即调用
-  `mark_video_job_running` 和 adapter，缺少独立的 durable claim/worker 边界。
+- Core v11 已持久化 `jobs`/`job_attempts` 以及队列调度约束。视频入队只建立用户额度
+  hold、request、job 和脱敏调度元数据，不选择账号，也不创建 upstream lease。
+- `claim_next_video_job`/`claim_video_job_by_id` 在同一 Immediate transaction 内完成公平领取、
+  账号选择、lease/attempt 创建和 running 转换；`heartbeat_video_job` 只允许当前 worker
+  续期同一 job、attempt 和 lease。
 - `recover_expired_upstream_leases` 已把过期 held/active lease、request、video job 和 attempt
   统一转为 `unknown` 并保留 quota hold；需要把这条恢复逻辑暴露给队列 worker 的启动/心跳流程。
 - 现有 Core scheduler 通过账号 observation、lease 和容量做安全选择；它不应被新的队列层
-  绕过，队列只负责公平排队和领取，账号选择仍由 Core preflight/lease 完成。
+  绕过。队列只决定顺序，账号选择只发生在领取事务中。
 - 真实 adapter 的 accepted、success、rejection、cancel 和费用证据尚未有可核验契约；本阶段
   只使用 `MockVideoAdapter`/fixture。
 
@@ -34,6 +37,9 @@ reservation 和 lease 组织成可恢复的持久队列边界：提交只产生�
    accepted 的 job 只记录取消意图，adapter 明确确认后才释放 hold。
 6. **敏感数据**：队列投影只返回 hash、受限 model/resource label、状态和时间；不持久化 prompt、
    完整 body、JWT、Cookie、credentials 或上游完整响应。
+7. **载荷边界**：当前 job 只持久化输入 hash，不足以在进程重启后重新构造 adapter 输入。因而
+   本阶段的 Tauri 路由只对当前请求的 transient body 立即执行；真正的后台 worker、受保护的
+   任务载荷引用/恢复读取必须作为后续独立设计，不能把“已入队”误报成“可自动完成”。
 
 ## 计划接口
 
@@ -57,6 +63,8 @@ reservation、lease 或 job。
 - 进程重启、租约过期、心跳失败、accepted 无终态、取消未确认都保留 unknown hold，不能自动重试。
 - queued cancel 只释放一次；running/accepted cancel 只记录意图；确认取消才释放一次。
 - Core 全套离线 Mock 回归继续通过；不运行真实网络、真实账号或真实账单测试。
+- 新增的 job heartbeat/recovery 只证明 Core 状态边界，不证明后台 worker 已经能够从重启中
+  读取并执行视频输入。
 
 ## 未解决边界
 

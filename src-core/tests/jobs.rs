@@ -415,6 +415,80 @@ fn expired_claim_recovery_clears_worker_ownership_without_releasing_the_hold() {
 }
 
 #[test]
+fn unknown_video_lease_requires_explicit_success_evidence_to_reconcile_once() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "reconcile-unknown", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "reconcile-unknown-job".into(),
+                input_hash: vec![10; 32],
+            },
+        )
+        .unwrap();
+    let job_id = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job.id,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+    let claim = store
+        .claim_video_job_by_id("reconcile-worker", &job_id, 1_800_000_000_100)
+        .unwrap()
+        .unwrap();
+    let active_reconcile = store.reconcile_unknown_upstream_lease(
+        &principal,
+        &claim.lease.id,
+        LeaseOutcome::Success {
+            actual_units: Some(4),
+            upstream_request_ref: Some("too-early".into()),
+            now_ms: 1_800_000_000_101,
+        },
+    );
+    assert!(matches!(
+        active_reconcile,
+        Err(aiwork_core::ScheduleError::Core(aiwork_core::CoreError::InvalidConfiguration { .. }))
+    ));
+    store
+        .recover_expired_upstream_leases(claim.lease.lease_expires_at_ms + 1)
+        .unwrap();
+
+    let reconciled = store
+        .reconcile_unknown_upstream_lease(
+            &principal,
+            &claim.lease.id,
+            LeaseOutcome::Success {
+                actual_units: Some(4),
+                upstream_request_ref: Some("reconciled-upstream-ref".into()),
+                now_ms: 1_800_000_500_000,
+            },
+        )
+        .unwrap();
+    assert!(reconciled.applied);
+    assert_eq!(reconciled.lease.state, LeaseState::Succeeded);
+    assert_eq!(store.request_state(&claim.job.request_id).unwrap(), aiwork_core::RequestState::Settled);
+    assert_eq!(store.video_job_for_user(&principal, &job_id).unwrap().unwrap().state, aiwork_core::JobState::Succeeded);
+    assert_eq!(store.reservation_for_request(&claim.job.request_id).unwrap().unwrap().state, aiwork_core::ReservationState::Committed);
+    assert_eq!(store.balance("video-user", "video_job").unwrap().held, 0);
+
+    let replay = store
+        .reconcile_unknown_upstream_lease(
+            &principal,
+            &claim.lease.id,
+            LeaseOutcome::Success {
+                actual_units: Some(4),
+                upstream_request_ref: Some("reconciled-upstream-ref".into()),
+                now_ms: 1_800_000_500_001,
+            },
+        )
+        .unwrap();
+    assert!(!replay.applied);
+    assert_eq!(store.balance("video-user", "video_job").unwrap().held, 0);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn bootstrap_creates_authoritative_video_job_tables() {
     let (store, _admin, _principal, dir) = fixture();
     assert_eq!(CURRENT_SCHEMA_VERSION, 11);
