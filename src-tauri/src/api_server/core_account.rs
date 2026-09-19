@@ -53,8 +53,8 @@ fn usage_error_response(error: UsageError) -> Response {
     let (status, code, message) = match error {
         UsageError::NotEnabled => (
             StatusCode::NOT_IMPLEMENTED,
-            "scheduler_endpoint_not_enabled",
-            "this endpoint is not enabled by the Core scheduler",
+            "core_usage_not_enabled",
+            "user usage is not enabled by Core enforce mode",
         ),
         UsageError::Unauthorized => (
             StatusCode::UNAUTHORIZED,
@@ -68,7 +68,7 @@ fn usage_error_response(error: UsageError) -> Response {
         ),
         UsageError::InvalidLimit => (
             StatusCode::BAD_REQUEST,
-            "invalid_limit",
+            "invalid_usage_limit",
             "limit must be between 1 and 100",
         ),
     };
