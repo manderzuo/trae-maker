@@ -1,5 +1,30 @@
 use serde_json::{json, Value};
 
+/// Remove caller-controlled identity and scheduler selectors before a request
+/// crosses the Core lease boundary. The authenticated Core principal and the
+/// lease-selected account are the only sources of those values.
+pub fn sanitize_scheduler_chat_body(body: &Value) -> Value {
+    let mut sanitized = body.clone();
+    if let Some(object) = sanitized.as_object_mut() {
+        for field in [
+            "user",
+            "user_id",
+            "api_key_id",
+            "principal",
+            "account_ref",
+            "credentials_ref",
+            "provider",
+            "allowed_accounts",
+            "dedicated_account",
+            "lease_id",
+            "resource_kind",
+        ] {
+            object.remove(field);
+        }
+    }
+    sanitized
+}
+
 /// 模型显示名 → (canonical config_name, 内部 model_name) 映射
 /// 大小写不敏感：客户端可传入 "doubao-seed-2.1-turbo" 或 "Doubao-Seed-2.1-Turbo"
 /// 与上游 batch_get_detail_param（solo_work_lite，2026-09 实测）同步

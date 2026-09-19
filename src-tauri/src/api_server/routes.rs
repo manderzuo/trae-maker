@@ -10,11 +10,17 @@ use axum::{Extension, Json};
 use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 
-use aiwork_core::{require_scope, ChatExecutionRequest, ChatExecutionResult, ChatExecutor, CoreError, Principal, RequestState, UpstreamError};
+use aiwork_core::{
+    require_scope, ChatExecutionResult, CoreError, LeaseState, Principal, RequestState,
+    UpstreamError, UpstreamLeaseGrant,
+};
 
 use super::custom_route;
 use super::assets;
-use super::core_bridge::ChatOutcome;
+use super::core_bridge::{
+    ChatOutcome, CoreLeaseError, CoreUpstreamExecutor, LeasePreflightResult, LeaseUpstreamAdapter,
+    UpstreamOutcome,
+};
 use super::dispatch::{self, DispatchError, TargetPool};
 use super::retry::{retry_plan, RetryAction};
 use super::sse;
@@ -83,6 +89,7 @@ struct CoreChatContext {
     principal: Principal,
     request_id: String,
     reservation_id: String,
+    lease: Option<UpstreamLeaseGrant>,
     reservation_amount: i64,
 }
 
@@ -138,6 +145,50 @@ fn core_error_response(error: CoreError) -> Response {
     }
 }
 
+fn scheduler_endpoint_not_enabled_response() -> Response {
+    openai_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "scheduler_endpoint_not_enabled",
+        "this endpoint is not enabled by the Core scheduler",
+    )
+}
+
+fn core_lease_error_response(error: CoreLeaseError) -> Response {
+    match error {
+        CoreLeaseError::EndpointNotEnabled => scheduler_endpoint_not_enabled_response(),
+        CoreLeaseError::Core(error) => core_error_response(error),
+        CoreLeaseError::Schedule(error) => match error {
+            aiwork_core::ScheduleError::NoFreshObservation => openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_fresh_observation",
+                "no fresh upstream observation is eligible",
+            ),
+            aiwork_core::ScheduleError::NoUpstreamCapacity
+            | aiwork_core::ScheduleError::CapabilityMismatch
+            | aiwork_core::ScheduleError::AccountCooling => openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_upstream_capacity",
+                "no upstream capacity is eligible",
+            ),
+            aiwork_core::ScheduleError::MissingScope(scope) => core_scope_error(&scope),
+            aiwork_core::ScheduleError::InvalidRequestIdentity => {
+                openai_error(StatusCode::UNAUTHORIZED, "unauthorized", "invalid Core request identity")
+            }
+            aiwork_core::ScheduleError::IdempotencyConflict => openai_error(
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+                "Idempotency-Key was already used for a different request",
+            ),
+            aiwork_core::ScheduleError::Core(error) => core_error_response(error),
+            _ => openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "scheduler_error",
+                "Core scheduler operation failed",
+            ),
+        },
+    }
+}
+
 fn with_core_request_id(mut response: Response, request_id: &str) -> Response {
     if let Ok(value) = HeaderValue::from_str(request_id) {
         response.headers_mut().insert("x-request-id", value);
@@ -146,49 +197,72 @@ fn with_core_request_id(mut response: Response, request_id: &str) -> Response {
 }
 
 fn core_replay_response(preflight: &super::core_bridge::PreflightResult) -> Response {
-    let successful_result = preflight.result.as_ref().filter(|result| {
+    core_replay_response_for(
+        &preflight.request_id,
+        preflight.state,
+        preflight.result.as_ref(),
+        None,
+    )
+}
+
+fn core_lease_replay_response(preflight: &LeasePreflightResult) -> Response {
+    core_replay_response_for(
+        &preflight.request_id,
+        preflight.state,
+        preflight.result.as_ref(),
+        preflight.replay_lease.as_ref().map(|lease| lease.state),
+    )
+}
+
+fn core_replay_response_for(
+    request_id: &str,
+    state: RequestState,
+    result: Option<&aiwork_core::RequestResult>,
+    replay_lease_state: Option<LeaseState>,
+) -> Response {
+    let successful_result = result.filter(|result| {
         matches!(result.status, Some(status) if (200..300).contains(&status))
             && result.error_code.is_none()
     });
-    let (status, code, message, body) = if successful_result.is_some() {
+    let successful_replay = successful_result.is_some()
+        || matches!(replay_lease_state, Some(LeaseState::Succeeded));
+    let (status, code, message, body) = if successful_replay {
         (
             StatusCode::OK,
             "idempotent_replay",
             "request already completed; response replay is safe",
             json!({
-                "id": preflight.request_id,
+                "id": request_id,
                 "object": "chat.completion",
                 "choices": [],
                 "idempotent_replay": true,
             }),
         )
-    } else if preflight.result.is_none()
-        && !matches!(
-            preflight.state,
-            RequestState::Settled | RequestState::Succeeded | RequestState::Failed | RequestState::Unknown
-        ) {
+    } else if result.is_none()
+        && !matches!(state, RequestState::Settled | RequestState::Succeeded | RequestState::Failed | RequestState::Unknown)
+    {
         (
             StatusCode::CONFLICT,
             "request_in_progress",
             "request is already in progress; upstream was not called again",
-            json!({"request_id": preflight.request_id}),
+            json!({"request_id": request_id}),
         )
     } else if matches!(
-        preflight.result.as_ref().and_then(|result| result.error_code.as_deref()),
-        Some("upstream_uncertain")
-    ) || preflight.result.is_none() {
+        result.and_then(|result| result.error_code.as_deref()),
+        Some("upstream_uncertain" | "transport_unknown" | "transport_timeout" | "lease_expired")
+    ) || result.is_none() {
         (
             StatusCode::CONFLICT,
             "idempotent_replay_unknown",
             "request outcome is unknown; upstream was not called again",
-            json!({"request_id": preflight.request_id}),
+            json!({"request_id": request_id}),
         )
     } else {
         (
             StatusCode::CONFLICT,
             "idempotent_replay_failed",
             "request already failed; upstream was not called again",
-            json!({"request_id": preflight.request_id}),
+            json!({"request_id": request_id}),
         )
     };
     let response = if status == StatusCode::OK {
@@ -200,7 +274,7 @@ fn core_replay_response(preflight: &super::core_bridge::PreflightResult) -> Resp
     } else {
         openai_error(status, code, message)
     };
-    with_core_request_id(response, &preflight.request_id)
+    with_core_request_id(response, request_id)
 }
 
 fn settle_core_outcome(
@@ -213,6 +287,59 @@ fn settle_core_outcome(
     match context.bridge.settle_chat(&context.principal, &context.reservation_id, outcome) {
         Ok(()) => with_core_request_id(response, &context.request_id),
         Err(error) => core_error_response(error),
+    }
+}
+
+fn settle_core_lease_outcome(
+    context: &CoreChatContext,
+    mut response: Response,
+    outcome: UpstreamOutcome,
+) -> Response {
+    response.headers_mut().remove("x-aiwork-core-actual-amount");
+    response.headers_mut().remove("x-aiwork-core-outcome");
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let Some(lease) = context.lease.as_ref() else {
+        return scheduler_endpoint_not_enabled_response();
+    };
+    match context.bridge.settle_chat_lease(
+        &context.principal,
+        &lease.lease_id,
+        outcome.lease_outcome(now_ms),
+    ) {
+        Ok(_) => with_core_request_id(response, &context.request_id),
+        Err(error) => core_lease_error_response(error),
+    }
+}
+
+fn settle_core_lease_response(
+    context: &CoreChatContext,
+    outcome: UpstreamOutcome,
+) -> Response {
+    match outcome.response() {
+        Some(result) if (200..300).contains(&result.status) => {
+            let response = Response::builder()
+                .status(StatusCode::from_u16(result.status).unwrap_or(StatusCode::OK))
+                .header("content-type", "application/json")
+                .body(Body::from(result.body.to_string()))
+                .unwrap_or_else(|_| internal_error_response());
+            settle_core_lease_outcome(context, response, outcome)
+        }
+        Some(result) => {
+            let response = openai_error(
+                StatusCode::from_u16(result.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                "upstream_error",
+                &result.body["error"]["code"].as_str().unwrap_or("upstream_rejected"),
+            );
+            settle_core_lease_outcome(context, response, outcome)
+        }
+        None => {
+            let response = openai_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "upstream transport outcome is unknown",
+            );
+            settle_core_lease_outcome(context, response, outcome)
+        }
     }
 }
 
@@ -247,12 +374,12 @@ fn settle_core_response(context: &CoreChatContext, response: Response) -> Respon
 
 #[cfg(test)]
 thread_local! {
-    static CORE_TEST_EXECUTOR: std::cell::RefCell<Option<Arc<dyn ChatExecutor>>> =
+    static CORE_TEST_EXECUTOR: std::cell::RefCell<Option<Arc<dyn LeaseUpstreamAdapter>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
-fn install_core_test_executor(executor: Arc<dyn ChatExecutor>) {
+fn install_core_test_executor(executor: Arc<dyn LeaseUpstreamAdapter>) {
     CORE_TEST_EXECUTOR.with(|slot| *slot.borrow_mut() = Some(executor));
 }
 
@@ -262,8 +389,22 @@ fn clear_core_test_executor() {
 }
 
 #[cfg(test)]
-fn core_test_executor() -> Option<Arc<dyn ChatExecutor>> {
+fn core_test_executor() -> Option<Arc<dyn LeaseUpstreamAdapter>> {
     CORE_TEST_EXECUTOR.with(|slot| slot.borrow().clone())
+}
+
+fn core_route_executor(
+    bridge: &super::CoreBridge,
+) -> Result<CoreUpstreamExecutor, CoreLeaseError> {
+    #[cfg(test)]
+    if let Some(adapter) = core_test_executor() {
+        return Ok(CoreUpstreamExecutor::from_adapter_for_account(
+            adapter,
+            "mock-account",
+            "vault://mock/account",
+        ));
+    }
+    bridge.upstream_executor()
 }
 
 // ==================== Handlers ====================
@@ -616,9 +757,6 @@ pub async fn chat_completions(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
-    let mut core_context: Option<CoreChatContext> = None;
-    #[cfg(test)]
-    let mut core_execution: Option<ChatExecutionRequest> = None;
     if core_enforcing(&state) {
         let principal = match core_principal_or_unauthorized(principal.as_ref()) {
             Ok(principal) => principal,
@@ -628,11 +766,7 @@ pub async fn chat_completions(
             return core_scope_error("chat:invoke");
         }
         if stream {
-            return openai_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "stream_not_enabled_in_phase1",
-                "streaming chat is not enabled in Core phase 1",
-            );
+            return scheduler_endpoint_not_enabled_response();
         }
         let idempotency_key = headers
             .get("idempotency-key")
@@ -652,87 +786,109 @@ pub async fn chat_completions(
         if peek.get("model").is_none() {
             peek["model"] = json!(model.clone());
         }
-        let bridge = state.core.as_ref().expect("Core enforce mode requires a bridge");
-        let preflight = match bridge.preflight_chat(
+        let bridge = match state.core.as_ref() {
+            Some(bridge) => bridge.clone(),
+            None => return scheduler_endpoint_not_enabled_response(),
+        };
+        // Keep request validation and quota errors ahead of executor readiness,
+        // but do this read-only so a missing binding can never leave a hold or
+        // lease behind. The lease preflight repeats the authoritative checks.
+        let sanitized_body = super::payload::sanitize_scheduler_chat_body(&peek);
+        let estimate = match bridge
+            .store
+            .estimate_cost("chat", &model, &sanitized_body)
+        {
+            Ok(estimate) => estimate,
+            Err(error) => return core_error_response(error),
+        };
+        if principal.key_id != key_str {
+            return core_error_response(CoreError::InvalidRequestIdentity {
+                user_id: principal.user_id.clone(),
+                api_key_id: key_str.clone(),
+            });
+        }
+        // Resolve the registered executor/explicit account binding before Core
+        // can create a user reservation or upstream lease. A missing runtime
+        // binding is never permission to enter the legacy ApiPool path. For
+        // that fail-closed branch, perform the quota check read-only so a
+        // valid but unfunded request still reports quota before 501; when an
+        // executor exists, the authoritative lease preflight handles quota
+        // and idempotent replay together.
+        let executor = match core_route_executor(&bridge) {
+            Ok(executor) => executor,
+            Err(error) => {
+                let balance = match bridge
+                    .store
+                    .balance(&principal.user_id, &estimate.resource_kind)
+                {
+                    Ok(balance) => balance,
+                    Err(error) => return core_error_response(error),
+                };
+                if balance.available < estimate.reserve_amount {
+                    return core_error_response(CoreError::QuotaInsufficient {
+                        available: balance.available,
+                        required: estimate.reserve_amount,
+                    });
+                }
+                return core_lease_error_response(error);
+            }
+        };
+        let bound_account_refs = executor.bound_account_refs();
+        let preflight = match bridge.preflight_chat_with_lease_for_accounts(
             &principal,
             &key_str,
             Some(idempotency_key),
             &peek,
+            &bound_account_refs,
         ) {
             Ok(preflight) => preflight,
-            Err(error) => return core_error_response(error),
+            Err(error) => return core_lease_error_response(error),
         };
         if preflight.execution.is_none() {
-            return core_replay_response(&preflight);
+            return core_lease_replay_response(&preflight);
         }
+        let lease = match preflight.lease {
+            Some(lease) => lease,
+            None => return scheduler_endpoint_not_enabled_response(),
+        };
+        let execution = match preflight.execution {
+            Some(execution) => execution,
+            None => return scheduler_endpoint_not_enabled_response(),
+        };
         let reservation = match preflight.reservation.as_ref() {
             Some(reservation) => reservation,
-            None => return core_error_response(CoreError::ReservationNotFound {
-                reservation_id: preflight.request_id,
-            }),
+            None => {
+                let request_id = preflight.request_id.clone();
+                let context = CoreChatContext {
+                    bridge,
+                    principal,
+                    request_id: request_id.clone(),
+                    reservation_id: request_id,
+                    lease: Some(lease.clone()),
+                    reservation_amount: 0,
+                };
+                return settle_core_lease_response(
+                    &context,
+                    UpstreamOutcome::TransportUnknown {
+                        reason: "lease_context_incomplete".into(),
+                        upstream_request_ref: None,
+                    },
+                );
+            }
         };
-        #[cfg(test)]
-        {
-            core_execution = preflight.execution;
-        }
-        core_context = Some(CoreChatContext {
-            bridge: state.core.as_ref().unwrap().clone(),
+        let context = CoreChatContext {
+            bridge,
             principal,
             request_id: preflight.request_id,
             reservation_id: reservation.id.clone(),
+            lease: Some(lease.clone()),
             reservation_amount: reservation.amount,
-        });
+        };
+        let outcome = executor.execute_nonstream_chat(&lease, execution);
+        return settle_core_lease_response(&context, outcome);
     }
 
     let body_vec = serde_json::to_vec(&peek).unwrap_or_else(|_| body.to_vec());
-
-    #[cfg(test)]
-    if let (Some(context), Some(execution), Some(executor)) =
-        (core_context.as_ref(), core_execution.take(), core_test_executor())
-    {
-        let result = executor.execute(execution);
-        let response = match result {
-            Ok(result) => {
-                let is_success = (200..300).contains(&result.status);
-                let settlement_result = ChatExecutionResult {
-                    status: result.status,
-                    body: result.body.clone(),
-                    actual_amount: result
-                        .actual_amount
-                        .filter(|actual_amount| *actual_amount >= 0 && *actual_amount <= context.reservation_amount),
-                };
-                let mut response = Response::builder()
-                    .status(StatusCode::from_u16(result.status).unwrap_or(StatusCode::OK))
-                    .header("content-type", "application/json")
-                    .body(Body::from(result.body.to_string()))
-                    .unwrap();
-                if let Some(actual_amount) = result
-                    .actual_amount
-                    .filter(|actual_amount| *actual_amount >= 0 && *actual_amount <= context.reservation_amount)
-                {
-                    if let Ok(value) = HeaderValue::from_str(&actual_amount.to_string()) {
-                        response.headers_mut().insert("x-aiwork-core-actual-amount", value);
-                    }
-                }
-                let outcome = if is_success {
-                    ChatOutcome::Success(settlement_result)
-                } else if result.status >= 500 {
-                    ChatOutcome::Upstream(UpstreamError::Disconnected)
-                } else {
-                    ChatOutcome::Failure(UpstreamError::Rejected {
-                        status: result.status,
-                        code: None,
-                    })
-                };
-                settle_core_outcome(context, response, outcome)
-            }
-            Err(error) => {
-                let response = openai_error(StatusCode::BAD_GATEWAY, "upstream_error", &error.to_string());
-                settle_core_outcome(context, response, ChatOutcome::Upstream(error))
-            }
-        };
-        return response;
-    }
 
     // 统一调度分流点（§4.1 ③~⑥）：resolve_target 决定资源池/会话池粘性/跨池回退/
     // 错误矩阵，替代原 resolve_wb_target 单向判定；默认策略下行为与改造前一致（§9.1）。
@@ -775,10 +931,7 @@ pub async fn chat_completions(
             }
         },
     };
-    match core_context.as_ref() {
-        Some(context) => settle_core_response(context, response),
-        None => response,
-    }
+    response
 }
 
 /// Codex Responses API 端点（T4.1/F-40）：POST /v1/responses
@@ -798,6 +951,10 @@ pub async fn responses_api(
             "request_too_large",
             "request body exceeds 8MB limit",
         );
+    }
+
+    if core_enforcing(&state) {
+        return scheduler_endpoint_not_enabled_response();
     }
 
     state
@@ -910,6 +1067,10 @@ pub async fn messages(
         );
     }
 
+    if core_enforcing(&state) {
+        return scheduler_endpoint_not_enabled_response();
+    }
+
     state
         .total_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1005,6 +1166,10 @@ pub async fn completions(
             "request_too_large",
             "request body exceeds 8MB limit",
         );
+    }
+
+    if core_enforcing(&state) {
+        return scheduler_endpoint_not_enabled_response();
     }
 
     state
@@ -1502,6 +1667,9 @@ async fn images_entry(
     body: axum::body::Bytes,
     is_edit: bool,
 ) -> Response {
+    if core_enforcing(&state) {
+        return scheduler_endpoint_not_enabled_response();
+    }
     state
         .total_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2412,7 +2580,7 @@ mod tests {
     use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
 
     use super::*;
-    use aiwork_core::{CoreStore, CostPolicy, MockChatExecutor, NewUser, Principal, QuotaGrant, UserRole};
+    use aiwork_core::{CoreStore, CostPolicy, NewUser, Principal, QuotaGrant, UserRole};
     use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::HeaderMap;
@@ -2423,6 +2591,7 @@ mod tests {
         dir: PathBuf,
         state: Arc<ApiSharedState>,
         principal: Principal,
+        admin: Principal,
     }
 
     impl Drop for CoreFixture {
@@ -2432,7 +2601,9 @@ mod tests {
     }
 
     fn core_fixture(grant: i64, scopes: &[&str]) -> CoreFixture {
-        let dir = std::env::temp_dir().join(format!(
+        let root = PathBuf::from(r"D:\gpt");
+        fs::create_dir_all(&root).unwrap();
+        let dir = root.join(format!(
             "aiwork-routes-core-{}-{}",
             std::process::id(),
             rand::random::<u64>()
@@ -2440,6 +2611,24 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(CoreStore::open(&dir).unwrap());
         store.migrate().unwrap();
+        store
+            .create_bootstrap_admin(
+                NewUser {
+                    id: "admin".into(),
+                    name: "Admin".into(),
+                    role: UserRole::Admin,
+                },
+                "bootstrap",
+            )
+            .unwrap();
+        let admin_key = store
+            .issue_api_key("admin", "admin", BTreeSet::new(), "bootstrap")
+            .unwrap();
+        let admin = Principal {
+            user_id: "admin".into(),
+            key_id: admin_key.id,
+            scopes: BTreeSet::new(),
+        };
         store
             .create_user(
                 NewUser {
@@ -2512,11 +2701,191 @@ mod tests {
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
         });
-        CoreFixture { dir, state, principal }
+        CoreFixture { dir, state, principal, admin }
     }
 
     fn chat_body(stream: bool) -> Bytes {
         chat_body_for_model("mock-1", stream)
+    }
+
+    fn phase2_fixture(grant: i64) -> CoreFixture {
+        let mut fixture = core_fixture(grant, &["chat:invoke"]);
+        let store = fixture.state.core.as_ref().unwrap().store.clone();
+        let mut account = aiwork_core::RegisterUpstreamAccount::new("mock-account".into(), "mock".into(), "vault://mock/account".into());
+        account.capabilities.insert("chat".into());
+        store.upsert_upstream_account(account, &fixture.admin).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        store.append_upstream_observation(aiwork_core::UpstreamObservation::new(
+            "mock-observation".into(), "mock-account".into(), "chat_request".into(), Some(100), 1,
+            "reader".into(), aiwork_core::ObservationStatus::Fresh, now, now + 600_000, json!({}),
+        )).unwrap();
+        let runtime = super::super::scheduler::SchedulerRuntime::new(store.clone(), fixture.dir.clone(),
+            super::super::scheduler::SchedulerMode::Enforce, Default::default(), Default::default(), now).unwrap();
+        Arc::get_mut(&mut fixture.state).unwrap().core = Some(Arc::new(CoreBridge::new(store, CoreMode::Enforce)
+            .with_scheduler(Arc::new(runtime)).unwrap()));
+        fixture
+    }
+
+    #[tokio::test]
+    async fn core_enforce_chat_uses_core_lease_and_mock_executor_once() {
+        let fixture = phase2_fixture(2);
+        let executor = Arc::new(super::super::core_bridge::core_executor::MockUpstreamExecutor::ok());
+        install_core_test_executor(executor.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "phase2-success".parse().unwrap());
+        for _ in 0..2 {
+            let response = chat_completions(State(fixture.state.clone()),
+                Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+                Some(Extension(fixture.principal.clone())), headers.clone(), chat_body(false)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        clear_core_test_executor();
+        assert_eq!(executor.calls().len(), 1);
+        let db = rusqlite::Connection::open_with_flags(fixture.dir.join("data/core.sqlite3"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let (count, state, account): (i64, String, String) = db.query_row(
+            "SELECT count(*), state, account_ref FROM upstream_leases", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!((count, state.as_str(), account.as_str()), (1, "succeeded", "mock-account"));
+        let balance = fixture.state.core.as_ref().unwrap().balance("route-user", "chat_request").unwrap();
+        assert_eq!((balance.available, balance.held), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn core_replay_conflict_is_stable_and_does_not_dispatch_again() {
+        let fixture = phase2_fixture(2);
+        let executor = Arc::new(super::super::core_bridge::core_executor::MockUpstreamExecutor::ok());
+        install_core_test_executor(executor.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "phase2-conflict".parse().unwrap());
+        let first = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers.clone(),
+            chat_body(false),
+        )
+        .await;
+        let changed = Bytes::from(
+            json!({
+                "model": "mock-1",
+                "messages": [{"role": "user", "content": "changed"}],
+                "stream": false,
+            })
+            .to_string(),
+        );
+        let conflict = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            changed,
+        )
+        .await;
+        clear_core_test_executor();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(conflict.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "idempotency_conflict");
+        assert_eq!(executor.calls().len(), 1);
+        let balance = fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .balance("route-user", "chat_request")
+            .unwrap();
+        assert_eq!((balance.available, balance.held), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn core_request_body_account_and_user_fields_cannot_override_lease() {
+        let fixture = phase2_fixture(1);
+        let executor = Arc::new(super::super::core_bridge::core_executor::MockUpstreamExecutor::ok());
+        install_core_test_executor(executor.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "phase2-identity".parse().unwrap());
+        let body = json!({"model":"mock-1", "messages":[], "user_id":"victim", "account_ref":"attacker",
+            "credentials_ref":"vault://attacker", "provider":"attacker", "allowed_accounts":["attacker"], "dedicated_account":"attacker"});
+        let response = chat_completions(State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())), headers, Bytes::from(body.to_string())).await;
+        clear_core_test_executor();
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = executor.calls();
+        assert_eq!(calls.len(), 1);
+        for field in ["user_id", "account_ref", "credentials_ref", "provider", "allowed_accounts", "dedicated_account"] {
+            assert!(calls[0].body.get(field).is_none(), "untrusted field passed to adapter: {field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn core_no_fresh_observation_never_dispatches_or_holds_user_quota() {
+        let fixture = phase2_fixture(1);
+        let executor = Arc::new(super::super::core_bridge::core_executor::MockUpstreamExecutor::ok());
+        install_core_test_executor(executor.clone());
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        let now = chrono::Utc::now().timestamp_millis() + 1;
+        store.append_upstream_observation(aiwork_core::UpstreamObservation::new(
+            "stale-observation".into(), "mock-account".into(), "chat_request".into(), Some(100), 1,
+            "json_cache".into(), aiwork_core::ObservationStatus::Stale, now, now, json!({}),
+        )).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "stale".parse().unwrap());
+        let response = chat_completions(State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())), headers, chat_body(false)).await;
+        clear_core_test_executor();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(payload["error"]["code"], "no_fresh_observation");
+        assert_eq!(executor.calls().len(), 0);
+        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 0);
+        assert!(store.list_recoverable_leases().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn core_no_upstream_capacity_never_dispatches_or_holds_user_quota() {
+        let fixture = phase2_fixture(1);
+        let executor = Arc::new(super::super::core_bridge::core_executor::MockUpstreamExecutor::ok());
+        install_core_test_executor(executor.clone());
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        let now = chrono::Utc::now().timestamp_millis();
+        store
+            .append_upstream_observation(aiwork_core::UpstreamObservation::new(
+                "no-capacity-observation".into(),
+                "mock-account".into(),
+                "chat_request".into(),
+                Some(0),
+                1,
+                "reader".into(),
+                aiwork_core::ObservationStatus::Fresh,
+                now,
+                now + 600_000,
+                json!({}),
+            ))
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "no-capacity".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        )
+        .await;
+        clear_core_test_executor();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "no_upstream_capacity");
+        assert!(executor.calls().is_empty());
+        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 0);
+        assert!(store.list_recoverable_leases().unwrap().is_empty());
     }
 
     fn chat_body_for_model(model: &str, stream: bool) -> Bytes {
@@ -2525,6 +2894,145 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}],
             "stream": stream,
         }).to_string())
+    }
+
+    #[tokio::test]
+    async fn core_enforce_chat_does_not_fallback_to_legacy_pool_when_scheduler_rejects() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let executor = Arc::new(super::super::core_bridge::core_executor::MockUpstreamExecutor::ok());
+        install_core_test_executor(executor.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "no-runtime".parse().unwrap());
+        let response = chat_completions(State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())), headers, chat_body(false)).await;
+        clear_core_test_executor();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+        assert_eq!(executor.calls().len(), 0);
+        assert_eq!(fixture.state.core.as_ref().unwrap().balance("route-user", "chat_request").unwrap().held, 0);
+    }
+
+    #[tokio::test]
+    async fn core_missing_registered_executor_rejects_before_lease_acquire() {
+        let fixture = phase2_fixture(1);
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "missing-binding".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 0);
+        assert!(store.list_recoverable_leases().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn core_transport_unknown_settles_lease_without_held_or_active_residue() {
+        let fixture = phase2_fixture(1);
+        let executor = Arc::new(
+            super::super::core_bridge::core_executor::MockUpstreamExecutor::with_outcome(
+                UpstreamOutcome::TransportUnknown {
+                    reason: "transport_timeout".into(),
+                    upstream_request_ref: None,
+                },
+            ),
+        );
+        install_core_test_executor(executor.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "transport-unknown".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        )
+        .await;
+        clear_core_test_executor();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(executor.calls().len(), 1);
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 1);
+        let leases = store.list_recoverable_leases().unwrap();
+        assert_eq!(leases.len(), 1);
+        assert!(leases
+            .iter()
+            .all(|lease| lease.state == aiwork_core::LeaseState::Unknown));
+    }
+
+    #[tokio::test]
+    async fn core_unintegrated_stream_or_protocol_returns_scheduler_endpoint_not_enabled() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let response = chat_completions(State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())), HeaderMap::new(), chat_body(true)).await;
+        let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+        let response = responses_api(State(fixture.state.clone()), None, HeaderMap::new(), Bytes::from("{}")).await;
+        let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+        let response = messages(
+            State(fixture.state.clone()),
+            None,
+            HeaderMap::new(),
+            Bytes::from("{}"),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+        let response = completions(State(fixture.state.clone()), None, Bytes::from("{}")).await;
+        let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+    }
+
+    #[tokio::test]
+    async fn core_images_routes_return_scheduler_endpoint_not_enabled() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let response = images_generations(
+            State(fixture.state.clone()),
+            None,
+            Bytes::from("{}"),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+
+        let response = images_edits(
+            State(fixture.state.clone()),
+            None,
+            Bytes::from("{}"),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
     }
 
     #[tokio::test]
@@ -2558,6 +3066,11 @@ mod tests {
             chat_body(true),
         ).await;
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
         let balance = fixture
             .state
             .core
@@ -2585,7 +3098,7 @@ mod tests {
 
     #[tokio::test]
     async fn core_chat_reports_insufficient_quota_before_dispatch() {
-        let fixture = core_fixture(0, &["chat:invoke"]);
+        let fixture = phase2_fixture(0);
         let mut headers = HeaderMap::new();
         headers.insert("idempotency-key", "quota-1".parse().unwrap());
         let response = chat_completions(
@@ -2623,7 +3136,7 @@ mod tests {
 
     #[tokio::test]
     async fn core_chat_rejects_missing_budget_policy_before_reservation() {
-        let fixture = core_fixture(1, &["chat:invoke"]);
+        let fixture = phase2_fixture(1);
         let mut headers = HeaderMap::new();
         headers.insert("idempotency-key", "policy-1".parse().unwrap());
         let response = chat_completions(
@@ -2647,8 +3160,8 @@ mod tests {
 
     #[tokio::test]
     async fn core_chat_reserves_before_dispatch_and_replays_idempotency() {
-        let fixture = core_fixture(2, &["chat:invoke"]);
-        let executor = Arc::new(MockChatExecutor::ok());
+        let fixture = phase2_fixture(2);
+        let executor = Arc::new(super::super::core_bridge::core_executor::MockUpstreamExecutor::ok());
         install_core_test_executor(executor.clone());
         let mut headers = HeaderMap::new();
         headers.insert("idempotency-key", "idem-1".parse().unwrap());
@@ -2670,21 +3183,27 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(executor.calls().len(), 1);
+        let bound_accounts = vec!["mock-account".to_owned()];
         let persisted = fixture
             .state
             .core
             .as_ref()
             .unwrap()
-            .preflight_chat(
+            .preflight_chat_with_lease_for_accounts(
                 &fixture.principal,
                 &fixture.principal.key_id,
                 Some("idem-1"),
                 &serde_json::from_slice(&chat_body(false)).unwrap(),
+                &bound_accounts,
             )
             .unwrap();
         assert_ne!(persisted.request_id, "");
-        assert_eq!(persisted.result.as_ref().and_then(|result| result.status), Some(200));
-        assert_eq!(persisted.result.as_ref().and_then(|result| result.error_code.as_deref()), None);
+        assert_eq!(persisted.result, None);
+        assert_eq!(
+            persisted.replay_lease.as_ref().map(|lease| lease.state),
+            Some(LeaseState::Succeeded)
+        );
+        assert!(persisted.execution.is_none());
         let balance = fixture
             .state
             .core
@@ -2694,39 +3213,50 @@ mod tests {
             .unwrap();
         assert_eq!(balance.available, 1);
         assert_eq!(balance.held, 0);
+        let first_request_id = first.headers().get("x-request-id").cloned();
+        let second_request_id = second.headers().get("x-request-id").cloned();
         assert_eq!(
-            first.headers().get("x-request-id"),
-            second.headers().get("x-request-id")
+            first_request_id,
+            second_request_id
         );
+        let replay_payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(second.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay_payload["idempotent_replay"], true);
+        assert_eq!(replay_payload["choices"], json!([]));
     }
 
     #[tokio::test]
     async fn core_replay_of_failed_request_is_not_success() {
-        let fixture = core_fixture(1, &["chat:invoke"]);
+        let fixture = phase2_fixture(1);
         let bridge = fixture.state.core.as_ref().unwrap().clone();
         let body: Value = serde_json::from_slice(&chat_body(false)).unwrap();
+        let bound_accounts = vec!["mock-account".to_owned()];
         let first = bridge
-            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("replay-failed"), &body)
+            .preflight_chat_with_lease_for_accounts(&fixture.principal, &fixture.principal.key_id, Some("replay-failed"), &body, &bound_accounts)
             .unwrap();
-        let reservation = first.reservation.as_ref().unwrap();
+        let lease = first.lease.as_ref().unwrap();
         bridge
-            .settle_chat(
+            .settle_chat_lease(
                 &fixture.principal,
-                &reservation.id,
-                ChatOutcome::Failure(UpstreamError::Rejected {
+                &lease.lease_id,
+                UpstreamOutcome::Rejected {
                     status: 400,
-                    code: Some("bad_request".into()),
-                }),
+                    code: "bad_request".into(),
+                    accepted: false,
+                }
+                .lease_outcome(chrono::Utc::now().timestamp_millis()),
             )
             .unwrap();
         let persisted = bridge
-            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("replay-failed"), &body)
+            .preflight_chat_with_lease_for_accounts(&fixture.principal, &fixture.principal.key_id, Some("replay-failed"), &body, &bound_accounts)
             .unwrap();
         assert_ne!(persisted.request_id, "");
         assert_eq!(persisted.result.as_ref().and_then(|result| result.status), Some(400));
         assert!(persisted.result.as_ref().and_then(|result| result.error_code.as_deref()).is_some());
 
-        let executor = Arc::new(MockChatExecutor::ok());
+        let executor = Arc::new(super::super::core_bridge::core_executor::MockUpstreamExecutor::ok());
         install_core_test_executor(executor.clone());
         let mut headers = HeaderMap::new();
         headers.insert("idempotency-key", "replay-failed".parse().unwrap());
@@ -2751,28 +3281,33 @@ mod tests {
 
     #[tokio::test]
     async fn core_replay_of_unknown_request_is_not_success() {
-        let fixture = core_fixture(1, &["chat:invoke"]);
+        let fixture = phase2_fixture(1);
         let bridge = fixture.state.core.as_ref().unwrap().clone();
         let body: Value = serde_json::from_slice(&chat_body(false)).unwrap();
+        let bound_accounts = vec!["mock-account".to_owned()];
         let first = bridge
-            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("replay-unknown"), &body)
+            .preflight_chat_with_lease_for_accounts(&fixture.principal, &fixture.principal.key_id, Some("replay-unknown"), &body, &bound_accounts)
             .unwrap();
-        let reservation = first.reservation.as_ref().unwrap();
+        let lease = first.lease.as_ref().unwrap();
         bridge
-            .settle_chat(
+            .settle_chat_lease(
                 &fixture.principal,
-                &reservation.id,
-                ChatOutcome::Upstream(UpstreamError::Disconnected),
+                &lease.lease_id,
+                UpstreamOutcome::TransportUnknown {
+                    reason: "transport_unknown".into(),
+                    upstream_request_ref: None,
+                }
+                .lease_outcome(chrono::Utc::now().timestamp_millis()),
             )
             .unwrap();
         let persisted = bridge
-            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("replay-unknown"), &body)
+            .preflight_chat_with_lease_for_accounts(&fixture.principal, &fixture.principal.key_id, Some("replay-unknown"), &body, &bound_accounts)
             .unwrap();
         assert_ne!(persisted.request_id, "");
         assert_eq!(persisted.result.as_ref().and_then(|result| result.status), None);
-        assert_eq!(persisted.result.as_ref().and_then(|result| result.error_code.as_deref()), Some("upstream_uncertain"));
+        assert_eq!(persisted.result.as_ref().and_then(|result| result.error_code.as_deref()), Some("transport_unknown"));
 
-        let executor = Arc::new(MockChatExecutor::ok());
+        let executor = Arc::new(super::super::core_bridge::core_executor::MockUpstreamExecutor::ok());
         install_core_test_executor(executor.clone());
         let mut headers = HeaderMap::new();
         headers.insert("idempotency-key", "replay-unknown".parse().unwrap());
@@ -2815,6 +3350,7 @@ mod tests {
             principal: fixture.principal.clone(),
             request_id: preflight.request_id,
             reservation_id: reservation.id,
+            lease: None,
             reservation_amount: reservation.amount,
         };
         let response = settle_core_response(
@@ -2843,6 +3379,7 @@ mod tests {
             principal: fixture.principal.clone(),
             request_id: preflight.request_id,
             reservation_id: reservation.id,
+            lease: None,
             reservation_amount: reservation.amount,
         };
         let response = settle_core_outcome(
@@ -2869,6 +3406,7 @@ mod tests {
             principal: fixture.principal.clone(),
             request_id: preflight.request_id,
             reservation_id: reservation.id,
+            lease: None,
             reservation_amount: reservation.amount,
         };
         let response = Response::builder()

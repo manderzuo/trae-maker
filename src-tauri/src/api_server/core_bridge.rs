@@ -2,10 +2,17 @@ use std::{path::Path, sync::Arc};
 
 use aiwork_core::{
     require_scope, BeginRequestInput, ChatExecutionRequest, ChatExecutionResult, CoreError,
-    CoreStore, PreflightReserveInput, PreflightReserveResult, Principal, RequestResult,
-    RequestState, Reservation, Settlement, UpstreamError,
+    CoreStore, LeaseOutcome, PreflightReserveInput, PreflightReserveResult, Principal,
+    RequestResult, RequestState, Reservation, ScheduleError, SchedulerLeaseRequest,
+    SchedulerLeaseResult, SelectionStrategy, Settlement, UpstreamError, UpstreamLease,
+    UpstreamLeaseGrant,
 };
 use serde_json::Value;
+
+#[path = "core_executor.rs"]
+pub mod core_executor;
+
+pub use core_executor::{CoreUpstreamExecutor, LeaseUpstreamAdapter, UpstreamOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreMode {
@@ -48,6 +55,52 @@ pub enum ChatOutcome {
     Upstream(UpstreamError),
 }
 
+#[derive(Debug)]
+pub enum CoreLeaseError {
+    EndpointNotEnabled,
+    Core(CoreError),
+    Schedule(ScheduleError),
+}
+
+impl From<CoreError> for CoreLeaseError {
+    fn from(error: CoreError) -> Self {
+        Self::Core(error)
+    }
+}
+
+impl From<ScheduleError> for CoreLeaseError {
+    fn from(error: ScheduleError) -> Self {
+        match error {
+            ScheduleError::Core(error) => Self::Core(error),
+            other => Self::Schedule(other),
+        }
+    }
+}
+
+impl std::fmt::Display for CoreLeaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EndpointNotEnabled => formatter.write_str("scheduler_endpoint_not_enabled"),
+            Self::Core(error) => error.fmt(formatter),
+            Self::Schedule(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CoreLeaseError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeasePreflightResult {
+    pub request_id: String,
+    pub state: RequestState,
+    pub result: Option<RequestResult>,
+    pub reservation: Option<Reservation>,
+    /// Only `Acquired` carries this grant. Replay deliberately has no grant.
+    pub lease: Option<UpstreamLeaseGrant>,
+    pub replay_lease: Option<UpstreamLease>,
+    pub execution: Option<ChatExecutionRequest>,
+}
+
 pub struct CoreBridge {
     pub store: Arc<CoreStore>,
     pub mode: CoreMode,
@@ -72,6 +125,222 @@ impl CoreBridge {
     /// A missing runtime is an error, never permission to use a legacy pool.
     pub fn scheduler(&self) -> Result<&super::scheduler::SchedulerRuntime, super::scheduler::SchedulerError> {
         self.scheduler.as_deref().ok_or(super::scheduler::SchedulerError::NotReady)
+    }
+
+    /// Task 5's route-level bridge. The old `SchedulerRuntime::require_endpoint`
+    /// gate remains owned by the startup command and still reports
+    /// `scheduler_endpoint_not_enabled`; this method only makes the narrow
+    /// lease path available to direct route/runtime consumers. A missing
+    /// runtime or adapter fails closed and never selects a legacy pool.
+    pub fn upstream_executor(&self) -> Result<CoreUpstreamExecutor, CoreLeaseError> {
+        self.upstream_executor_with_bindings(std::iter::empty::<(String, String, String)>())
+    }
+
+    /// Build the executor registry only when the caller supplies the explicit
+    /// Core-account binding `(account_ref, provider, credentials_ref)`. Task 4
+    /// does not expose that directory from `SchedulerRuntime`; Task 6 startup
+    /// wiring must provide it. An empty binding set therefore remains closed.
+    pub fn upstream_executor_with_bindings<I>(
+        &self,
+        account_bindings: I,
+    ) -> Result<CoreUpstreamExecutor, CoreLeaseError>
+    where
+        I: IntoIterator<Item = (String, String, String)>,
+    {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        let scheduler = self.scheduler.as_ref().ok_or(CoreLeaseError::EndpointNotEnabled)?;
+        let executor = CoreUpstreamExecutor::from_chat_executors_with_accounts(
+            &scheduler.executors,
+            account_bindings,
+        );
+        if executor.is_empty() || !executor.can_dispatch_without_provider_binding() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        Ok(executor)
+    }
+
+    pub fn preflight_chat_with_lease(
+        &self,
+        principal: &Principal,
+        api_key_id: &str,
+        client_idempotency_key: Option<&str>,
+        body: &Value,
+    ) -> Result<LeasePreflightResult, CoreLeaseError> {
+        self.preflight_chat_with_lease_for_accounts(
+            principal,
+            api_key_id,
+            client_idempotency_key,
+            body,
+            &[],
+        )
+    }
+
+    /// Lease preflight constrained to accounts that have an explicit executor
+    /// binding. An empty list is fail-closed, never a wildcard.
+    pub fn preflight_chat_with_lease_for_accounts(
+        &self,
+        principal: &Principal,
+        api_key_id: &str,
+        client_idempotency_key: Option<&str>,
+        body: &Value,
+        bound_account_refs: &[String],
+    ) -> Result<LeasePreflightResult, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if self.scheduler.is_none() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        if bound_account_refs.is_empty() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        require_scope(principal, "chat:invoke").map_err(|_| CoreLeaseError::Core(CoreError::MissingScope {
+            scope: "chat:invoke".into(),
+        }))?;
+
+        let body = super::payload::sanitize_scheduler_chat_body(body);
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoreError::InvalidConfiguration {
+                key: "chat.model".into(),
+                value: "missing or non-string".into(),
+            })?;
+        let estimate = self.store.estimate_cost(CHAT_ENDPOINT, model, &body)?;
+        if principal.key_id != api_key_id {
+            return Err(CoreLeaseError::Core(CoreError::InvalidRequestIdentity {
+                user_id: principal.user_id.clone(),
+                api_key_id: api_key_id.into(),
+            }));
+        }
+        let idempotency_key = client_idempotency_key
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| CoreError::InvalidConfiguration {
+                key: "idempotency_key".into(),
+                value: "required in Core enforce mode".into(),
+            })?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let input = SchedulerLeaseRequest {
+            preflight: PreflightReserveInput {
+                request: BeginRequestInput {
+                    user_id: principal.user_id.clone(),
+                    api_key_id: api_key_id.into(),
+                    protocol: "openai".into(),
+                    endpoint: CHAT_ENDPOINT.into(),
+                    model: model.into(),
+                    idempotency_key: idempotency_key.into(),
+                    body: body.clone(),
+                },
+                resource_kind: estimate.resource_kind,
+                amount: estimate.reserve_amount,
+                ttl_ms: 15 * 60 * 1000,
+            },
+            provider_hint: None,
+            required_capabilities: vec!["chat".into()],
+            region: None,
+            predicted_units: estimate.reserve_amount,
+            safety_margin_units: 0,
+            observation_max_age_ms: 10 * 60 * 1000,
+            allowed_accounts: Some(bound_account_refs.to_vec()),
+            dedicated_account: None,
+            selection_strategy: SelectionStrategy::HighestNormalizedAvailable,
+            now_ms,
+            lease_ttl_ms: 15 * 60 * 1000,
+            reconcile_ttl_ms: 10 * 60 * 1000,
+        };
+        let result = self
+            .store
+            .preflight_reserve_with_lease(principal, input.clone())?;
+        match result {
+            SchedulerLeaseResult::Replay { request, lease } => {
+                let reservation = self.store.reservation_for_request(&request.id)?;
+                Ok(LeasePreflightResult {
+                    request_id: request.id,
+                    state: request.state,
+                    result: request.result,
+                    reservation,
+                    lease: None,
+                    replay_lease: Some(lease),
+                    execution: None,
+                })
+            }
+            SchedulerLeaseResult::Acquired(lease) => {
+                // The current Core grant deliberately contains only the
+                // execution locator. Re-reading the just-created idempotency
+                // row is a read-only way to recover request/reservation IDs
+                // without adding a second selector or settlement path.
+                let recovered = self.store.preflight_reserve(input.preflight.clone());
+                let (request, reservation) = match recovered {
+                    Ok(PreflightReserveResult::Existing {
+                        request,
+                        reservation: Some(reservation),
+                    }) => (request, reservation),
+                    Err(error) => {
+                        self.settle_acquired_lease_unknown(
+                            principal,
+                            &lease,
+                            "lease_context_recovery_failed",
+                        );
+                        return Err(CoreLeaseError::Core(error));
+                    }
+                    Ok(other) => {
+                        self.settle_acquired_lease_unknown(
+                            principal,
+                            &lease,
+                            "lease_context_recovery_failed",
+                        );
+                        return Err(CoreLeaseError::Core(CoreError::ReservationRequestConflict {
+                            request_id: format!("scheduler lease {}: {other:?}", lease.lease_id),
+                        }))
+                    }
+                };
+                let execution = ChatExecutionRequest {
+                    request_id: request.id.clone(),
+                    endpoint: CHAT_ENDPOINT.into(),
+                    model: request.model.clone(),
+                    body,
+                };
+                Ok(LeasePreflightResult {
+                    request_id: request.id,
+                    state: request.state,
+                    result: request.result,
+                    reservation: Some(reservation),
+                    lease: Some(lease),
+                    replay_lease: None,
+                    execution: Some(execution),
+                })
+            }
+        }
+    }
+
+    fn settle_acquired_lease_unknown(
+        &self,
+        principal: &Principal,
+        lease: &UpstreamLeaseGrant,
+        reason: &str,
+    ) {
+        let _ = self.store.settle_upstream_lease(
+            principal,
+            &lease.lease_id,
+            LeaseOutcome::TransportUnknown {
+                reason: reason.into(),
+                upstream_request_ref: None,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        );
+    }
+
+    pub fn settle_chat_lease(
+        &self,
+        principal: &Principal,
+        lease_id: &str,
+        outcome: LeaseOutcome,
+    ) -> Result<UpstreamLease, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if self.scheduler.is_none() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        self.store
+            .settle_upstream_lease(principal, lease_id, outcome)
+            .map_err(CoreLeaseError::from)
     }
 
     pub fn open_for_mode(mode: CoreMode, data_dir: &Path) -> Result<Option<Arc<Self>>, CoreError> {
@@ -248,7 +517,7 @@ fn generated_idempotency_key(endpoint: &str, model: &str, body: &Value) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
+    use std::{collections::BTreeSet, fs, path::{Path, PathBuf}, sync::Arc};
 
     use aiwork_core::{
         ChatExecutor, CoreError, CoreStore, CostPolicy, MockChatExecutor, NewUser, Principal,
@@ -258,21 +527,38 @@ mod tests {
 
     use super::*;
 
-    fn test_dir(prefix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aiwork-tauri-core-bridge-{prefix}-{}",
-            rand::random::<u64>()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            let root = PathBuf::from(r"D:\gpt");
+            fs::create_dir_all(&root).unwrap();
+            let dir = root.join(format!(
+                "aiwork-tauri-core-bridge-{prefix}-{}",
+                rand::random::<u64>()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
     }
 
-    fn bridge_with_grant(grant: i64) -> (CoreBridge, Principal) {
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn bridge_with_grant(grant: i64) -> (CoreBridge, Principal, TestDir) {
         bridge_with_grant_mode(grant, CoreMode::Enforce)
     }
 
-    fn bridge_with_grant_mode(grant: i64, mode: CoreMode) -> (CoreBridge, Principal) {
-        let store = Arc::new(CoreStore::open(&test_dir("bridge")).unwrap());
+    fn bridge_with_grant_mode(grant: i64, mode: CoreMode) -> (CoreBridge, Principal, TestDir) {
+        let dir = TestDir::new("bridge");
+        let store = Arc::new(CoreStore::open(dir.path()).unwrap());
         store.migrate().unwrap();
         store
             .create_user(
@@ -320,7 +606,7 @@ mod tests {
             key_id: key.id.clone(),
             scopes: key.scopes,
         };
-        (CoreBridge::new(store, mode), principal)
+        (CoreBridge::new(store, mode), principal, dir)
     }
 
     fn chat_body() -> serde_json::Value {
@@ -335,7 +621,7 @@ mod tests {
 
     #[test]
     fn preflight_checks_scope_before_identity_or_policy() {
-        let (bridge, mut principal) = bridge_with_grant(1);
+        let (bridge, mut principal, _dir) = bridge_with_grant(1);
         principal.scopes.clear();
         principal.key_id = "missing-key".into();
 
@@ -347,7 +633,7 @@ mod tests {
 
     #[test]
     fn preflight_reports_missing_policy_before_identity_mismatch() {
-        let (bridge, mut principal) = bridge_with_grant(1);
+        let (bridge, mut principal, _dir) = bridge_with_grant(1);
         principal.key_id = "different-key".into();
         let body = json!({"model": "not-priced", "messages": []});
 
@@ -359,7 +645,7 @@ mod tests {
 
     #[test]
     fn preflight_reserves_before_execution_and_success_commits() {
-        let (bridge, principal) = bridge_with_grant(1);
+        let (bridge, principal, _dir) = bridge_with_grant(1);
         let first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-success"), &chat_body())
             .unwrap();
@@ -381,7 +667,7 @@ mod tests {
 
     #[test]
     fn insufficient_budget_fails_preflight_without_reservation() {
-        let (bridge, principal) = bridge_with_grant(0);
+        let (bridge, principal, _dir) = bridge_with_grant(0);
         let error = bridge
             .preflight_chat(
                 &principal,
@@ -415,7 +701,7 @@ mod tests {
 
     #[test]
     fn same_idempotency_key_reuses_one_reservation() {
-        let (bridge, principal) = bridge_with_grant(2);
+        let (bridge, principal, _dir) = bridge_with_grant(2);
         let first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-repeat"), &chat_body())
             .unwrap();
@@ -431,7 +717,7 @@ mod tests {
 
     #[test]
     fn timeout_and_disconnect_settle_as_unknown() {
-        let (bridge, principal) = bridge_with_grant(1);
+        let (bridge, principal, _dir) = bridge_with_grant(1);
         let first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-timeout"), &chat_body())
             .unwrap();
@@ -450,7 +736,7 @@ mod tests {
     #[test]
     fn off_and_shadow_bridges_reject_without_store_side_effects() {
         for mode in [CoreMode::Off, CoreMode::Shadow] {
-            let (bridge, principal) = bridge_with_grant_mode(1, mode);
+            let (bridge, principal, _dir) = bridge_with_grant_mode(1, mode);
             let error = bridge
                 .preflight_chat(&principal, &principal.key_id, Some("idem-disabled"), &chat_body())
                 .unwrap_err();
@@ -466,7 +752,7 @@ mod tests {
 
     #[test]
     fn body_endpoint_cannot_select_a_different_cost_policy() {
-        let (bridge, principal) = bridge_with_grant(1);
+        let (bridge, principal, _dir) = bridge_with_grant(1);
         let body = json!({"endpoint": "cheap", "model": "mock-1", "messages": []});
         let result = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-endpoint"), &body)
@@ -476,7 +762,7 @@ mod tests {
 
     #[test]
     fn explicit_upstream_failure_releases_quota_and_settles_request() {
-        let (bridge, principal) = bridge_with_grant(1);
+        let (bridge, principal, _dir) = bridge_with_grant(1);
         let first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-failure"), &chat_body())
             .unwrap();
@@ -497,7 +783,7 @@ mod tests {
 
     #[test]
     fn terminal_replay_does_not_execute_mock_again() {
-        let (bridge, principal) = bridge_with_grant(2);
+        let (bridge, principal, _dir) = bridge_with_grant(2);
         let mut first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-terminal"), &chat_body())
             .unwrap();
@@ -521,7 +807,7 @@ mod tests {
 
     #[test]
     fn settlement_rejects_a_different_owner() {
-        let (bridge, principal) = bridge_with_grant(1);
+        let (bridge, principal, _dir) = bridge_with_grant(1);
         let first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-owner"), &chat_body())
             .unwrap();
