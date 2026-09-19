@@ -74,6 +74,7 @@ impl Drop for DoneSignal {
 /// 「Fatal 上游错误透传」（携带上游状态码与错误体摘要）
 enum AggregateFail {
     NoHealthy { message: String },
+    Incomplete { message: String },
     Upstream(u16, String),
 }
 
@@ -2020,6 +2021,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 return Ok(response);
                             }
                             (None, Some((code, msg))) => {
+                                if code == sse::INCOMPLETE_STREAM_ERROR_CODE {
+                                    return Err(AggregateFail::Incomplete { message: msg });
+                                }
                                 let kind = classify_solo_error(code, &msg);
                                 state.pool.note_error(&picked.uid, kind);
                                 *safe_lock(&state.last_error) =
@@ -2157,6 +2161,14 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             };
             response
         }
+        Ok(Err(AggregateFail::Incomplete { message: msg })) => match proto {
+            Protocol::Anthropic => anthropic_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "incomplete_upstream",
+                &msg,
+            ),
+            _ => openai_error(StatusCode::SERVICE_UNAVAILABLE, "incomplete_upstream", &msg),
+        },
         Ok(Err(AggregateFail::Upstream(status, msg))) => {
             // Fatal：上游错误体透传（不冷却），按协议格式化并保留上游状态码
             let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -2788,6 +2800,12 @@ mod tests {
         let fixture = core_fixture(1, &["chat:invoke"]);
         let bridge = fixture.state.core.as_ref().unwrap().clone();
         let body: Value = serde_json::from_slice(&chat_body(false)).unwrap();
+        let (completion, error) = sse::aggregate(
+            std::io::Cursor::new("event: output\ndata: {\"response\":\"partial\"}\n\n"),
+            "incomplete",
+        );
+        assert!(completion.is_none());
+        assert_eq!(error.as_ref().map(|(code, _)| *code), Some(sse::INCOMPLETE_STREAM_ERROR_CODE));
         let preflight = bridge
             .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("transport-503"), &body)
             .unwrap();

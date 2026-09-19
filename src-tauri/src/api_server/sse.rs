@@ -3,6 +3,9 @@ use std::io::{BufRead, BufReader, Read};
 use serde_json::{json, Map, Value};
 use super::usage::extract_tokens;
 
+/// 聚合器只能在收到明确完成事件后构造成功响应。
+pub const INCOMPLETE_STREAM_ERROR_CODE: i64 = -1;
+
 /// SOLO SSE 单事件
 struct SoloEvent {
     event: String,
@@ -453,6 +456,8 @@ struct PlainCollect {
     finish_reason: String,
     usage: Option<Value>,
     error_info: Option<(i64, String)>,
+    completed: bool,
+    reader_error: bool,
 }
 
 /// 读取完整 SOLO SSE，收集文本/结束原因/用量/错误
@@ -465,11 +470,16 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
         finish_reason: "stop".to_string(),
         usage: None,
         error_info: None,
+        completed: false,
+        reader_error: false,
     };
     for line in br.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break,
+            Err(_) => {
+                out.reader_error = true;
+                break;
+            }
         };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
@@ -481,6 +491,7 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
                     out.usage = Some(json!(ev.usage.unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
+                    out.completed = true;
                     if !ev.finish_reason.is_empty() {
                         out.finish_reason = ev.finish_reason;
                     }
@@ -503,6 +514,14 @@ pub fn aggregate<R: Read + Send>(
     let c = collect_plain(reader);
     if let Some((code, msg)) = &c.error_info {
         return (None, Some((*code, msg.clone())));
+    }
+    if !c.completed {
+        let message = if c.reader_error {
+            "upstream SSE reader failed before completion"
+        } else {
+            "upstream SSE ended before completion"
+        };
+        return (None, Some((INCOMPLETE_STREAM_ERROR_CODE, message.to_string())));
     }
 
     let mut message = json!({
@@ -540,6 +559,14 @@ pub fn aggregate_text<R: Read + Send>(
     let c = collect_plain(reader);
     if let Some((code, msg)) = &c.error_info {
         return (None, Some((*code, msg.clone())));
+    }
+    if !c.completed {
+        let message = if c.reader_error {
+            "upstream SSE reader failed before completion"
+        } else {
+            "upstream SSE ended before completion"
+        };
+        return (None, Some((INCOMPLETE_STREAM_ERROR_CODE, message.to_string())));
     }
 
     let mut resp = json!({
@@ -936,11 +963,16 @@ pub fn aggregate_anthropic<R: Read + Send>(
     let mut usage: Option<Value> = None;
     let mut tools: Vec<ToolBuf> = Vec::new();
     let mut error_info: Option<(i64, String)> = None;
+    let mut completed = false;
+    let mut reader_error = false;
 
     for line in br.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break,
+            Err(_) => {
+                reader_error = true;
+                break;
+            }
         };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
@@ -1009,6 +1041,7 @@ pub fn aggregate_anthropic<R: Read + Send>(
                     usage = Some(json!(ev.usage.unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
+                    completed = true;
                     if !ev.finish_reason.is_empty() {
                         finish_reason = ev.finish_reason;
                     }
@@ -1023,6 +1056,14 @@ pub fn aggregate_anthropic<R: Read + Send>(
 
     if let Some((code, msg)) = &error_info {
         return (None, Some((*code, msg.clone())));
+    }
+    if !completed {
+        let message = if reader_error {
+            "upstream SSE reader failed before completion"
+        } else {
+            "upstream SSE ended before completion"
+        };
+        return (None, Some((INCOMPLETE_STREAM_ERROR_CODE, message.to_string())));
     }
 
     let mut blocks: Vec<Value> = Vec::new();
@@ -1269,6 +1310,54 @@ mod tests {
         assert_eq!(without_created(&a), without_created(&b));
         assert!(a.contains("\"finish_reason\":\"stop\""));
         assert!(a.ends_with("data: [DONE]"));
+    }
+
+    #[test]
+    fn non_stream_aggregators_reject_eof_without_completion_event() {
+        let input = "event: output\ndata: {\"response\":\"partial\"}\n\n";
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c");
+        assert!(resp.is_none());
+        assert_eq!(err.as_ref().map(|(code, _)| *code), Some(-1));
+
+        let (resp, err) = aggregate_text(std::io::Cursor::new(input), "c", "m");
+        assert!(resp.is_none());
+        assert_eq!(err.as_ref().map(|(code, _)| *code), Some(-1));
+
+        let (resp, err) = aggregate_anthropic(std::io::Cursor::new(input), "m", "model");
+        assert!(resp.is_none());
+        assert_eq!(err.as_ref().map(|(code, _)| *code), Some(-1));
+    }
+
+    #[test]
+    fn non_stream_aggregator_rejects_reader_error_without_completion_event() {
+        struct ReadThenError {
+            sent: bool,
+        }
+
+        impl Read for ReadThenError {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent {
+                    return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"));
+                }
+                let bytes = b"event: output\ndata: {\"response\":\"partial\"}\n\n";
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                self.sent = true;
+                Ok(bytes.len())
+            }
+        }
+
+        let (resp, err) = aggregate(ReadThenError { sent: false }, "c");
+        assert!(resp.is_none());
+        assert_eq!(err.as_ref().map(|(code, _)| *code), Some(-1));
+    }
+
+    #[test]
+    fn non_stream_aggregators_accept_explicit_completion_event() {
+        let input = "event: output\ndata: {\"response\":\"complete\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        assert!(aggregate(std::io::Cursor::new(input), "c").0.is_some());
+        assert!(aggregate_text(std::io::Cursor::new(input), "c", "m").0.is_some());
+        assert!(aggregate_anthropic(std::io::Cursor::new(input), "m", "model").0.is_some());
     }
 
     #[test]

@@ -13,6 +13,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
+/// 非流式 WB 聚合必须收到明确的 `[DONE]` 帧后才能构造成功响应。
+pub const INCOMPLETE_STREAM_ERROR_CODE: i64 = -1;
+
 /// WB 上游单个 SSE 事件（已归一化）
 #[derive(Debug)]
 pub enum WbEvent {
@@ -87,6 +90,10 @@ impl<L: Iterator<Item = String>> WbSseParser<L> {
             }
             // 其余行（event:/id:/retry:/未知）忽略：WB 上游标准 OpenAI 流
         }
+    }
+
+    pub fn completed(&self) -> bool {
+        self.done
     }
 }
 
@@ -689,6 +696,16 @@ pub fn aggregate<L: Iterator<Item = String>>(
         }
     }
 
+    if !parser.completed() {
+        return (
+            None,
+            Some((
+                INCOMPLETE_STREAM_ERROR_CODE,
+                "upstream WB SSE ended before [DONE]".to_string(),
+            )),
+        );
+    }
+
     let mut message = json!({"role": "assistant", "content": content});
     if !reasoning.is_empty() {
         message["reasoning_content"] = json!(reasoning);
@@ -847,6 +864,7 @@ mod tests {
             _ => panic!("expect chunk"),
         }
         assert!(matches!(p.next_event(), Some(WbEvent::Done)));
+        assert!(p.completed());
         assert!(p.next_event().is_none());
     }
 
@@ -899,6 +917,16 @@ mod tests {
         );
         assert!(resp.is_none());
         assert_eq!(err.unwrap(), (9, "boom".to_string()));
+    }
+
+    #[test]
+    fn aggregate_rejects_eof_without_done_frame() {
+        let (resp, err) = aggregate(
+            lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}", ""]),
+            "c",
+        );
+        assert!(resp.is_none());
+        assert_eq!(err.as_ref().map(|(code, _)| *code), Some(-1));
     }
 
     #[test]
