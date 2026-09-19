@@ -1,8 +1,8 @@
-# Credit-Aware Scheduler 运维手册（Phase 2）
+# Credit-Aware Scheduler 运维手册（Phase 2–3B）
 
-本文说明 Core schema v6、`scheduler_mode`、账号健康、观测刷新、lease 恢复、管理员
-状态和回滚边界。它描述的是本地持久化与 Mock/fixture 验证结果，不等同于真实上游余额、
-真实扣费或生产账号可用性证明。
+本文说明 Core schema v8、`scheduler_mode`、账号健康、观测刷新、lease 恢复、用户素材、
+管理员状态和回滚边界。它描述的是本地持久化与 Mock/fixture 验证结果，不等同于真实上游
+余额、真实扣费或生产账号可用性证明。
 
 ## 1. 停机备份与数据边界
 
@@ -11,8 +11,9 @@ Core 数据库位于 `<AIWORK_DATA_DIR>\data\core.sqlite3`，默认根目录为
 `data` 目录，至少保留 `core.sqlite3`，以及存在时的 `core.sqlite3-wal` 和
 `core.sqlite3-shm`。不要在 SQLite 正在写入时只复制单个主库文件。
 
-schema v6 的 `upstream_accounts`、`upstream_observations`、`upstream_leases` 与用户
-`quota_*` 账本分离。`credentials_ref` 是不透明引用，不是 credential 内容。旧的
+schema v8 的 `upstream_accounts`、`upstream_observations`、`upstream_leases`、用户
+`quota_*` 账本和用户素材 `assets` 分离。`credentials_ref` 是不透明引用，不是 credential 内容。
+schema v7→v8 只建立活动素材表，不把旧 `assets.json` 导入 Core。旧的
 `remaining_credits.json`、WorkBuddy cache 和其他 JSON 只可作为迁移/诊断输入；同步时会
 标记为 `json_cache`/stale，不能成为 enforce 的 fresh reader 结果，也不能给用户发 grant。
 
@@ -141,3 +142,30 @@ Phase 3A 的流式路径继续由 Core 负责 quota、request、upstream lease �
 `core_mode`/`scheduler_mode` 回退到 `off`。回退恢复 legacy 业务路径，但不得删除
 unknown lease、quota hold 或审计记录；重新启用前需重新核对账号绑定、credentials locator、
 fresh observation、policy、grant 和 stream adapter readiness。
+
+## 10. Phase 3B 用户素材归属与回滚
+
+Phase 3B 在 `core_mode=enforce` 下把素材的用户归属、内容 token、过期状态和审计记录交给
+Core `assets` 表；`user_id` 来自已认证 Principal，不能由 multipart 字段覆盖。素材上传只在
+文件先以原子方式写入 `data/assets/<safe-storage-ref>`、再成功插入 Core 后返回；Core 插入
+失败必须删除刚写入的文件，不能留下无主文件。`storage_ref` 只允许安全单级相对引用，读回时
+还要校验 canonical path 位于素材根目录、文件大小和 SHA-256。
+
+enforce 素材端点没有 legacy fallback：
+
+1. `POST /v1/assets` 要求 Principal 和 `assets:write`，客户端提供的 `user_id` 只作为不可信
+   输入而被忽略；重复 token、重复 id 或校验失败不得产生部分 Core 行。
+2. `GET /v1/assets/{id}/content` 只接受匹配该素材、未过期的内容 token；错误 token、跨用户
+   访问、过期记录、路径逃逸、大小或摘要不匹配统一返回安全的 not-found 语义。
+3. 服务启动会把已过期的活动素材标记为 `expired` 并清理对应安全路径；清理失败不能删除
+   Core 审计事实，也不能把记录重新变成 active。
+
+`core_mode=off` 或 `shadow` 仍保留 legacy `assets.json` 兼容路径，但该路径不是 enforce 的
+用户归属或安全证明。回退到 off 前应停止服务并备份 Core 与素材目录；回退不会把 legacy
+索引导入 Core，也不会删除 Core 素材、审计或 quota 账本。
+
+Phase 3B 的验证只使用 D 盘 fixture：Core `assets_schema` 覆盖 v7→v8 迁移、用户隔离、token
+摘要、过期和原子约束；Tauri asset focused tests 覆盖安全文件存储/读回；route focused tests
+覆盖 enforce 上传、owner 绑定、错误 token 和不回退 legacy。测试 target、日志和临时文件必须
+放在 `D:\gpt`，Cargo 命令使用 `--offline --locked`，并在同一 PowerShell 进程清空并断言
+`AIWORK_*` 环境变量为空。这些证据仍不证明真实上游账号、余额或计费规则。

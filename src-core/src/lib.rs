@@ -13,7 +13,7 @@ pub use cost::{CostError, CostEstimate, CostPolicy};
 pub use error::CoreError;
 pub use identity::{require_scope, AuthError, Principal};
 pub use models::{
-    BeginRequest, BeginRequestInput, IssuedApiKey, NewUser, QuotaBalance, QuotaGrant,
+    AssetState, BeginRequest, BeginRequestInput, CoreAsset, CreateAssetInput, IssuedApiKey, NewUser, QuotaBalance, QuotaGrant,
     LegacyMigrationAsset, LegacyMigrationBatch, LegacyMigrationJob, LegacyMigrationKey,
     LegacyMigrationObservation, LegacyMigrationResult,
     PreflightReserveInput, PreflightReserveResult, QuotaReserve, RequestHandle, RequestResult,

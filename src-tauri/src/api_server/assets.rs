@@ -267,14 +267,31 @@ fn purge_expired_locked(data_dir: &Path, index: &mut AssetIndex, now: u64) {
     index.assets = kept;
 }
 
-/// 保存上传素材并返回不含文件路径的元数据。
-pub fn create(
-    data_dir: &Path,
-    owner_key_id: &str,
+fn write_record_file(data_dir: &Path, record: &AssetRecord, bytes: &[u8]) -> Result<PathBuf, String> {
+    let path = file_path(data_dir, record)?;
+    if path.exists() {
+        return Err("素材文件已存在，拒绝覆盖".into());
+    }
+    let dir = storage_dir(data_dir);
+    fs::create_dir_all(&dir).map_err(|e| format!("创建素材目录失败: {e}"))?;
+    let partial = path.with_extension(format!("{}.part", record.extension));
+    {
+        let mut file = File::create(&partial).map_err(|e| format!("创建素材临时文件失败: {e}"))?;
+        file.write_all(bytes).map_err(|e| format!("写入素材失败: {e}"))?;
+        file.sync_all().map_err(|e| format!("刷新素材失败: {e}"))?;
+    }
+    if let Err(error) = fs::rename(&partial, &path) {
+        let _ = fs::remove_file(&partial);
+        return Err(format!("提交素材失败: {error}"));
+    }
+    Ok(path)
+}
+
+fn validate_upload_bytes(
     filename: &str,
     declared_mime: Option<&str>,
     bytes: &[u8],
-) -> Result<AssetRecord, String> {
+) -> Result<(&'static str, &'static str), String> {
     if bytes.is_empty() {
         return Err("素材文件为空".into());
     }
@@ -284,12 +301,133 @@ pub fn create(
     let Some((detected_mime, extension)) = detect_format(bytes) else {
         return Err("不支持的素材格式，仅支持 PNG/JPEG/WebP/GIF/MP4/WebM".into());
     };
-    if let Some(mime) = declared_mime.map(str::trim).filter(|v| !v.is_empty()) {
-        let normalized = mime.to_ascii_lowercase();
-        if normalized != detected_mime {
+    if let Some(mime) = declared_mime.map(str::trim).filter(|value| !value.is_empty()) {
+        if mime.to_ascii_lowercase() != detected_mime {
             return Err(format!("素材类型与文件内容不匹配（声明 {mime}，实际 {detected_mime}）"));
         }
     }
+    if filename.trim().is_empty() || filename.len() > 128 {
+        return Err("filename 无效".into());
+    }
+    Ok((detected_mime, extension))
+}
+
+/// Core enforce 专用的文件写入：只落盘和返回元数据，不更新 legacy JSON 索引。
+pub fn write_core_asset(
+    data_dir: &Path,
+    user_id: &str,
+    filename: &str,
+    declared_mime: Option<&str>,
+    bytes: &[u8],
+) -> Result<(AssetRecord, String), String> {
+    if user_id.trim().is_empty() {
+        return Err("素材上传必须绑定 Core 用户".into());
+    }
+    let (detected_mime, extension) = validate_upload_bytes(filename, declared_mime, bytes)?;
+    let _guard = index_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let now = now_secs();
+    let record = AssetRecord {
+        id: format!("asset-{now}-{}", crate::commands::oauth::random_hex(12)),
+        owner_key_id: user_id.trim().to_string(),
+        filename: safe_filename(filename, extension),
+        mime_type: detected_mime.to_string(),
+        extension: extension.to_string(),
+        size: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+        created_at: now,
+        expires_at: now.saturating_add(asset_ttl_secs()),
+        public_token: crate::commands::oauth::random_hex(32),
+    };
+    let path = write_record_file(data_dir, &record, bytes)?;
+    let storage_ref = format!("assets/{}.{}", record.id, record.extension);
+    if path.file_name().and_then(|name| name.to_str()) != Some(storage_ref.trim_start_matches("assets/")) {
+        let _ = fs::remove_file(path);
+        return Err("生成素材存储引用失败".into());
+    }
+    Ok((record, storage_ref))
+}
+
+pub fn content_token_digest(token: &str) -> Vec<u8> {
+    Sha256::digest(token.as_bytes()).to_vec()
+}
+
+pub fn public_content_url(data_dir: &Path, asset_id: &str, token: &str) -> Result<String, String> {
+    let base = public_base_url(data_dir)?;
+    Ok(format!("{base}/assets/{asset_id}/content?token={token}"))
+}
+
+/// Core 资产读取不读取 JSON 索引；storage_ref、大小和摘要均在 SQLite 中受约束。
+pub fn read_core(
+    data_dir: &Path,
+    storage_ref: &str,
+    expected_size: i64,
+    expected_sha256: &str,
+) -> Result<Vec<u8>, String> {
+    let name = storage_ref.strip_prefix("assets/").unwrap_or("");
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.chars().any(char::is_whitespace)
+    {
+        return Err("素材存储引用无效".into());
+    }
+    if expected_size <= 0 || expected_sha256.len() != 64 {
+        return Err("素材元数据无效".into());
+    }
+    let root = storage_dir(data_dir)
+        .canonicalize()
+        .map_err(|e| format!("素材目录不可用: {e}"))?;
+    let path = root.join(name);
+    let canonical = fs::canonicalize(&path).map_err(|e| format!("素材文件不存在: {e}"))?;
+    if !canonical.starts_with(&root) {
+        return Err("素材路径越界".into());
+    }
+    let bytes = fs::read(&canonical).map_err(|e| format!("读取素材失败: {e}"))?;
+    if bytes.len() as i64 != expected_size
+        || format!("{:x}", Sha256::digest(&bytes)) != expected_sha256
+    {
+        return Err("素材文件摘要或大小不匹配".into());
+    }
+    Ok(bytes)
+}
+
+pub fn remove_core_asset(data_dir: &Path, storage_ref: &str) -> Result<(), String> {
+    let name = storage_ref.strip_prefix("assets/").unwrap_or("");
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.chars().any(char::is_whitespace)
+    {
+        return Err("素材存储引用无效".into());
+    }
+    let root = storage_dir(data_dir);
+    let path = root.join(name);
+    if path.exists() {
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|e| format!("素材目录不可用: {e}"))?;
+        let canonical_path = path
+            .canonicalize()
+            .map_err(|e| format!("素材文件不可用: {e}"))?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err("素材路径越界".into());
+        }
+        fs::remove_file(canonical_path).map_err(|e| format!("删除素材失败: {e}"))?;
+    }
+    Ok(())
+}
+
+/// 保存上传素材并返回不含文件路径的元数据。
+pub fn create(
+    data_dir: &Path,
+    owner_key_id: &str,
+    filename: &str,
+    declared_mime: Option<&str>,
+    bytes: &[u8],
+) -> Result<AssetRecord, String> {
+    let (detected_mime, extension) = validate_upload_bytes(filename, declared_mime, bytes)?;
 
     let owner = owner_key_id.trim();
     if owner.is_empty() {
@@ -313,19 +451,7 @@ pub fn create(
         expires_at: now.saturating_add(asset_ttl_secs()),
         public_token: crate::commands::oauth::random_hex(32),
     };
-    let path = file_path(data_dir, &record)?;
-    let dir = storage_dir(data_dir);
-    fs::create_dir_all(&dir).map_err(|e| format!("创建素材目录失败: {e}"))?;
-    let partial = path.with_extension(format!("{}.part", record.extension));
-    {
-        let mut file = File::create(&partial).map_err(|e| format!("创建素材临时文件失败: {e}"))?;
-        file.write_all(bytes).map_err(|e| format!("写入素材失败: {e}"))?;
-        file.sync_all().map_err(|e| format!("刷新素材失败: {e}"))?;
-    }
-    if let Err(error) = fs::rename(&partial, &path) {
-        let _ = fs::remove_file(&partial);
-        return Err(format!("提交素材失败: {error}"));
-    }
+    let path = write_record_file(data_dir, &record, bytes)?;
     index.assets.push(record.clone());
     if let Err(error) = save_index(data_dir, &index) {
         let _ = fs::remove_file(path);
@@ -488,6 +614,30 @@ mod tests {
         let (_, bytes) = read_owned(&root, "key-a", &record.id).unwrap();
         assert_eq!(bytes, png);
         assert!(read_owned(&root, "key-b", &record.id).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn core_asset_storage_does_not_touch_legacy_index_and_verifies_digest() {
+        let root = std::path::PathBuf::from(r"D:\gpt").join(format!(
+            "aiwork-assets-core-{}",
+            rand::random::<u64>()
+        ));
+        let png = b"\x89PNG\r\n\x1a\ncore-asset";
+        let (record, storage_ref) = write_core_asset(
+            &root,
+            "user-a",
+            "..\\reference.png",
+            Some("image/png"),
+            png,
+        )
+        .unwrap();
+        assert_eq!(record.owner_key_id, "user-a");
+        assert_eq!(storage_ref, format!("assets/{}.png", record.id));
+        assert!(!root.join("data").join("assets.json").exists());
+        assert_eq!(read_core(&root, &storage_ref, record.size as i64, &record.sha256).unwrap(), png);
+        assert!(read_core(&root, "assets/../secret", record.size as i64, &record.sha256).is_err());
+        assert!(read_core(&root, &storage_ref, record.size as i64 + 1, &record.sha256).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }

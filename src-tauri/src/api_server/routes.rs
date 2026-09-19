@@ -1532,10 +1532,15 @@ pub async fn images_edits(
 pub async fn assets_upload(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    principal: Option<Extension<Principal>>,
     body: axum::body::Bytes,
 ) -> Response {
     if core_enforcing(&state) {
-        return scheduler_endpoint_not_enabled_response();
+        let principal = match core_principal_or_unauthorized(principal.as_ref()) {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
+        return core_assets_upload(state, principal, body).await;
     }
     let _guard = state.inflight_guard();
     let owner = key_id
@@ -1548,70 +1553,13 @@ pub async fn assets_upload(
             "素材上传必须使用已启用的 API Key",
         );
     }
-    let input: Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(error) => {
-            return openai_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                &format!("素材上传 JSON 无效: {error}"),
-            )
-        }
+    let parsed = match parse_asset_upload(&body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
     };
-    let filename = input
-        .get("filename")
-        .and_then(Value::as_str)
-        .unwrap_or("upload")
-        .to_string();
-    if filename.len() > 128 {
-        return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "filename 过长");
-    }
-    let mut declared_mime = input
-        .get("mime_type")
-        .or_else(|| input.get("content_type"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let encoded = input
-        .get("data_base64")
-        .or_else(|| input.get("data"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let Some(encoded) = encoded else {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "缺少 data_base64 字段",
-        );
-    };
-    let encoded = if let Some((header, data)) = encoded.split_once(",") {
-        if header.starts_with("data:") {
-            if declared_mime.is_none() {
-                declared_mime = header
-                    .strip_prefix("data:")
-                    .and_then(|value| value.split(';').next())
-                    .map(str::to_string);
-            }
-            data
-        } else {
-            encoded
-        }
-    } else {
-        encoded
-    };
-    let bytes = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        encoded,
-    ) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return openai_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_asset",
-                &format!("data_base64 无效: {error}"),
-            )
-        }
-    };
+    let filename = parsed.filename;
+    let declared_mime = parsed.declared_mime;
+    let bytes = parsed.bytes;
     let _limit_permit = match state
         .limiter
         .acquire(&owner, LimitKind::AssetUpload, bytes.len() as u64)
@@ -1661,7 +1609,42 @@ pub async fn assets_content(
     Query(query): Query<PublicAssetQuery>,
 ) -> Response {
     if core_enforcing(&state) {
-        return scheduler_endpoint_not_enabled_response();
+        let Some(bridge) = state.core.as_ref() else {
+            return scheduler_endpoint_not_enabled_response();
+        };
+        let digest = assets::content_token_digest(&query.token);
+        let asset = match bridge.store.asset_by_content_token(
+            &asset_id,
+            &digest,
+            chrono::Utc::now().timestamp_millis(),
+        ) {
+            Ok(Some(asset)) => asset,
+            Ok(None) => {
+                return openai_error(StatusCode::NOT_FOUND, "asset_not_found", "素材不存在、已过期或链接无效")
+            }
+            Err(error) => return core_error_response(error),
+        };
+        let bytes = match assets::read_core(
+            &state.data_dir,
+            &asset.storage_ref,
+            asset.size,
+            &asset.sha256,
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return openai_error(StatusCode::NOT_FOUND, "asset_not_found", "素材不存在、已过期或链接无效")
+            }
+        };
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", asset.mime_type)
+            .header("content-length", bytes.len());
+        for (name, value) in asset_security_headers() {
+            builder = builder.header(name, value);
+        }
+        return builder
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| internal_error_response());
     }
     match assets::read_public(&state.data_dir, &asset_id, &query.token) {
         Ok((record, bytes)) => {
@@ -1686,6 +1669,156 @@ fn asset_security_headers() -> [(&'static str, &'static str); 3] {
         ("referrer-policy", "no-referrer"),
         ("x-content-type-options", "nosniff"),
     ]
+}
+
+struct ParsedAssetUpload {
+    filename: String,
+    declared_mime: Option<String>,
+    bytes: Vec<u8>,
+}
+
+fn parse_asset_upload(body: &[u8]) -> Result<ParsedAssetUpload, Response> {
+    let input: Value = serde_json::from_slice(body).map_err(|error| {
+        openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("素材上传 JSON 无效: {error}"),
+        )
+    })?;
+    let filename = input
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or("upload")
+        .to_string();
+    if filename.len() > 128 {
+        return Err(openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "filename 过长"));
+    }
+    let mut declared_mime = input
+        .get("mime_type")
+        .or_else(|| input.get("content_type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let encoded = input
+        .get("data_base64")
+        .or_else(|| input.get("data"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "缺少 data_base64 字段"))?;
+    let encoded = if let Some((header, data)) = encoded.split_once(',') {
+        if header.starts_with("data:") {
+            if declared_mime.is_none() {
+                declared_mime = header
+                    .strip_prefix("data:")
+                    .and_then(|value| value.split(';').next())
+                    .map(str::to_string);
+            }
+            data
+        } else {
+            encoded
+        }
+    } else {
+        encoded
+    };
+    let bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        encoded,
+    )
+    .map_err(|error| openai_error(StatusCode::BAD_REQUEST, "invalid_asset", &format!("data_base64 无效: {error}")))?;
+    Ok(ParsedAssetUpload {
+        filename,
+        declared_mime,
+        bytes,
+    })
+}
+
+async fn core_assets_upload(
+    state: Arc<ApiSharedState>,
+    principal: Principal,
+    body: axum::body::Bytes,
+) -> Response {
+    if require_scope(&principal, "assets:write").is_err() {
+        return core_scope_error("assets:write");
+    }
+    if body.len() > MAX_BODY_BYTES {
+        return openai_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", "request body exceeds 8MB limit");
+    }
+    let parsed = match parse_asset_upload(&body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let _guard = state.inflight_guard();
+    let _limit_permit = match state
+        .limiter
+        .acquire(&principal.user_id, LimitKind::AssetUpload, parsed.bytes.len() as u64)
+    {
+        Ok(permit) => permit,
+        Err(error) => return limit_error_response(error),
+    };
+    let (record, storage_ref) = match assets::write_core_asset(
+        &state.data_dir,
+        &principal.user_id,
+        &parsed.filename,
+        parsed.declared_mime.as_deref(),
+        &parsed.bytes,
+    ) {
+        Ok(value) => value,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, "invalid_asset", &error),
+    };
+    let created_at_ms = match i64::try_from(record.created_at.saturating_mul(1_000)) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = assets::remove_core_asset(&state.data_dir, &storage_ref);
+            return openai_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", "素材时间戳无效");
+        }
+    };
+    let expires_at_ms = match i64::try_from(record.expires_at.saturating_mul(1_000)) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = assets::remove_core_asset(&state.data_dir, &storage_ref);
+            return openai_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", "素材过期时间无效");
+        }
+    };
+    let storage_ref_for_cleanup = storage_ref.clone();
+    let input = aiwork_core::CreateAssetInput {
+        id: record.id.clone(),
+        filename: record.filename.clone(),
+        mime_type: record.mime_type.clone(),
+        extension: record.extension.clone(),
+        size: record.size as i64,
+        sha256: record.sha256.clone(),
+        storage_ref,
+        content_token_digest: assets::content_token_digest(&record.public_token),
+        created_at_ms,
+        expires_at_ms,
+    };
+    let core_asset = match state
+        .core
+        .as_ref()
+        .expect("Core asset route requires a Core bridge")
+        .store
+        .create_asset(&principal, input)
+    {
+        Ok(asset) => asset,
+        Err(error) => {
+            let _ = assets::remove_core_asset(&state.data_dir, &storage_ref_for_cleanup);
+            return core_error_response(error);
+        }
+    };
+    let mut response = json!({
+        "object": "asset",
+        "id": core_asset.id,
+        "filename": core_asset.filename,
+        "mime_type": core_asset.mime_type,
+        "bytes": core_asset.size,
+        "sha256": core_asset.sha256,
+        "created_at": core_asset.created_at_ms / 1_000,
+        "expires_at": core_asset.expires_at_ms / 1_000,
+    });
+    if let Ok(url) = assets::public_content_url(&state.data_dir, &record.id, &record.public_token) {
+        response["content_url"] = json!(url);
+    }
+    Json(response).into_response()
 }
 
 /// W-02 Seedance 文生视频入口。Work 积分账号异步转发到 Trae Work CN
@@ -3294,11 +3427,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_unintegrated_asset_and_video_routes_fail_closed_before_legacy_pool() {
+    async fn core_asset_route_requires_scope_while_video_routes_remain_fail_closed() {
         let fixture = core_fixture(1, &["chat:invoke"]);
         let response = assets_upload(
             State(fixture.state.clone()),
             None,
+            Some(Extension(fixture.principal.clone())),
             Bytes::from("{}"),
         )
         .await;
@@ -3306,7 +3440,7 @@ mod tests {
             &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
         )
         .unwrap();
-        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+        assert_eq!(payload["error"]["code"], "insufficient_scope");
 
         let response = assets_content(
             State(fixture.state.clone()),
@@ -3318,7 +3452,7 @@ mod tests {
             &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
         )
         .unwrap();
-        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+        assert_eq!(payload["error"]["code"], "asset_not_found");
 
         let response = videos_generations(
             State(fixture.state.clone()),
@@ -3356,6 +3490,83 @@ mod tests {
         )
         .unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+    }
+
+    #[tokio::test]
+    async fn core_asset_upload_persists_user_owner_and_token_protected_content() {
+        use base64::Engine as _;
+
+        let fixture = core_fixture(0, &["assets:write", "assets:read"]);
+        super::super::gateway_settings::save(
+            &fixture.dir,
+            super::super::gateway_settings::GatewaySettings {
+                port: 7864,
+                default_model: "mock-1".into(),
+                listen_host: "127.0.0.1".into(),
+                cors_origins: String::new(),
+                asset_public_base_url: "https://assets.example.test/v1".into(),
+                core_mode: "enforce".into(),
+                scheduler_mode: "enforce".into(),
+                updated_at: 0,
+            },
+        )
+        .unwrap();
+        let png = b"\x89PNG\r\n\x1a\ncore-route-asset";
+        let body = json!({
+            "filename": "..\\private.png",
+            "mime_type": "image/png",
+            "data_base64": base64::engine::general_purpose::STANDARD.encode(png),
+            "user_id": "attacker-controlled-value"
+        });
+        let response = assets_upload(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            Bytes::from(body.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        let asset_id = payload["id"].as_str().unwrap().to_owned();
+        let content_url = payload["content_url"].as_str().unwrap();
+        let token = content_url.rsplit_once("token=").unwrap().1.to_owned();
+        let db = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3")).unwrap();
+        let (owner, storage_ref): (String, String) = db
+            .query_row(
+                "SELECT user_id, storage_ref FROM assets WHERE id = ?1",
+                [&asset_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(owner, "route-user");
+        assert_eq!(storage_ref, format!("assets/{asset_id}.png"));
+        assert!(!fixture.dir.join("data/assets.json").exists());
+
+        let response = assets_content(
+            State(fixture.state.clone()),
+            Path(asset_id.clone()),
+            Query(PublicAssetQuery { token }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            png.as_slice()
+        );
+
+        let response = assets_content(
+            State(fixture.state.clone()),
+            Path(asset_id),
+            Query(PublicAssetQuery { token: "wrong".into() }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

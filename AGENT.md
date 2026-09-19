@@ -405,7 +405,7 @@ ai-work-assistant/
 
 ## 16. Phase 2 信用感知调度运维契约
 
-- Core 数据库为 `<AIWORK_DATA_DIR>\data\core.sqlite3`，schema v6 的 `upstream_accounts`、`upstream_observations`、`upstream_leases` 与用户 `quota_*` 账本分离；`credentials_ref` 永远是不透明引用，不能写入 JWT、Cookie、refresh token、prompt 或完整上游响应。
+- Core 数据库为 `<AIWORK_DATA_DIR>\data\core.sqlite3`，schema v8 的 `upstream_accounts`、`upstream_observations`、`upstream_leases`、用户 `quota_*` 账本和活动素材 `assets` 分离；`credentials_ref` 永远是不透明引用，不能写入 JWT、Cookie、refresh token、prompt 或完整上游响应。
 - `core_mode`/`scheduler_mode` 只按 `docs/credit-aware-scheduler-operations.md` 的兼容矩阵启用。`off` 保留 legacy `ApiPool`；`shadow` 只诊断、不扣额度；`enforce` 没有可信 reader/executor、fresh observation、policy、grant 或明确账号绑定时必须 fail-closed，禁止回退 `ApiPool`。
 - 过期 `held`/`active` upstream lease 只能进入 `unknown`；reservation/request 保持 unknown、hold 不释放、不写 release ledger、不自动重试。必须经过明确对账/人工处理。
 - 管理员 scheduler status 只返回聚合计数和固定错误码；HTTP enforce `/status` 与桌面管理辅助路径要求 admin Principal。普通用户不能读取管理员投影、账号凭据或其他用户的 quota/request。
@@ -433,3 +433,10 @@ Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' } |
 if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIWORK_* must be empty' }
 & 'C:\Users\StarLink\.cargo\bin\cargo.exe' test --manifest-path src-core/Cargo.toml --target-dir D:\gpt\aiwork-phase3-core --offline --locked --test full_phase3_streaming -- --nocapture
 ```
+
+## 18. Phase 3B 用户素材测试约定
+
+- schema v7→v8 只创建 Core `assets` 表，不导入 legacy `assets.json`；enforce 的素材 owner 必须来自认证 Principal 的 `user_id`，不能信任请求体里的 `user_id`。
+- enforce 上传先把文件原子写到 `data/assets/` 下的安全单级 `storage_ref`，再插入 Core；Core 失败必须清理孤立文件。内容读回必须验证路径、大小、SHA-256 和未过期的内容 token；错误 token、跨用户和过期记录不得回退到 legacy 索引。
+- `core_mode=off`/`shadow` 的 legacy `assets.json` 只用于兼容，不是 Core 用户归属证明。服务启动可将过期 Core 素材标为 `expired` 并清理文件，但不得删除审计事实。
+- Phase 3B 的 Core、Tauri 和 route focused tests 只使用 Mock/fixture；不得访问真实网络、真实账号或运行中的服务。`TEMP`、`TMP`、Cargo target、日志和 fixture 统一放在 `D:\gpt`，命令使用 `--offline --locked`，并先清空、断言 `AIWORK_*` 环境变量为空。

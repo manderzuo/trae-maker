@@ -339,3 +339,33 @@ DROP TABLE requests;
 ALTER TABLE requests_next RENAME TO requests;
 ALTER TABLE idempotency_keys_next RENAME TO idempotency_keys;
 "#;
+
+pub(crate) const SCHEMA_V8: &str = r#"
+CREATE TABLE assets (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  filename TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  extension TEXT NOT NULL,
+  size INTEGER NOT NULL CHECK(size > 0),
+  sha256 TEXT NOT NULL,
+  storage_ref TEXT NOT NULL CHECK(
+    storage_ref GLOB 'assets/*'
+    AND length(storage_ref) > length('assets/')
+    AND trim(storage_ref) = storage_ref
+    AND instr(storage_ref, '..') = 0
+    AND instr(storage_ref, char(92)) = 0
+    AND instr(storage_ref, '//') = 0
+    AND instr(storage_ref, char(9)) = 0
+    AND instr(storage_ref, char(10)) = 0
+    AND instr(storage_ref, char(13)) = 0
+  ),
+  content_token_digest BLOB NOT NULL CHECK(length(content_token_digest) = 32),
+  created_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms > created_at_ms),
+  state TEXT NOT NULL CHECK(state IN ('active','expired')),
+  UNIQUE(content_token_digest)
+);
+CREATE INDEX assets_by_user_state_created ON assets(user_id, state, created_at_ms DESC);
+CREATE INDEX assets_by_expiry ON assets(state, expires_at_ms);
+"#;

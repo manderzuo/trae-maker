@@ -294,6 +294,59 @@ pub struct User {
     pub role: UserRole,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetState {
+    Active,
+    Expired,
+}
+
+impl AssetState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub(crate) fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateAssetInput {
+    pub id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub extension: String,
+    pub size: i64,
+    pub sha256: String,
+    pub storage_ref: String,
+    pub content_token_digest: Vec<u8>,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreAsset {
+    pub id: String,
+    pub user_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub extension: String,
+    pub size: i64,
+    pub sha256: String,
+    pub storage_ref: String,
+    pub content_token_digest: Vec<u8>,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub state: AssetState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeginRequestInput {
     pub user_id: String,

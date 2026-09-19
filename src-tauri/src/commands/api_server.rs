@@ -157,6 +157,14 @@ async fn do_start_with_scheduler_key(
         }
         Err(_) => return Err(SchedulerError::StorageUnavailable.to_string()),
     };
+    if let Some(core_bridge) = core.as_ref() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Ok(expired_refs) = core_bridge.store.expire_assets(now_ms) {
+            for storage_ref in expired_refs {
+                let _ = crate::api_server::assets::remove_core_asset(&state.data_dir, &storage_ref);
+            }
+        }
+    }
 
     // LAN 监听不可在无 API Key 的情况下启动，避免把本机凭证池直接暴露给同网段设备。
     let lan_listener = !matches!(listen_host.as_str(), "127.0.0.1" | "localhost" | "::1");

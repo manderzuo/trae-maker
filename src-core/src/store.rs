@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 use crate::{
     schema::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
-        SCHEMA_V7,
+        SCHEMA_V7, SCHEMA_V8,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
@@ -19,13 +19,13 @@ use crate::{
         validate_required,
     },
     AuthError, CoreError, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
-    NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
+    AssetState, CoreAsset, CreateAssetInput, NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
     UpstreamAccountState,
     UpstreamLease, UpstreamObservation, User,
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 pub struct CoreStore {
     pub(crate) connection: Mutex<Connection>,
@@ -102,6 +102,7 @@ impl CoreStore {
                 Self::migrate_v4_to_v5(&transaction)?;
                 Self::migrate_v5_to_v6(&transaction)?;
                 Self::migrate_v6_to_v7(&transaction)?;
+                Self::migrate_v7_to_v8(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -116,6 +117,7 @@ impl CoreStore {
                 Self::migrate_v4_to_v5(&transaction)?;
                 Self::migrate_v5_to_v6(&transaction)?;
                 Self::migrate_v6_to_v7(&transaction)?;
+                Self::migrate_v7_to_v8(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -129,6 +131,7 @@ impl CoreStore {
                 Self::migrate_v4_to_v5(&transaction)?;
                 Self::migrate_v5_to_v6(&transaction)?;
                 Self::migrate_v6_to_v7(&transaction)?;
+                Self::migrate_v7_to_v8(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -141,6 +144,7 @@ impl CoreStore {
                 Self::migrate_v4_to_v5(&transaction)?;
                 Self::migrate_v5_to_v6(&transaction)?;
                 Self::migrate_v6_to_v7(&transaction)?;
+                Self::migrate_v7_to_v8(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -152,6 +156,7 @@ impl CoreStore {
                 Self::migrate_v4_to_v5(&transaction)?;
                 Self::migrate_v5_to_v6(&transaction)?;
                 Self::migrate_v6_to_v7(&transaction)?;
+                Self::migrate_v7_to_v8(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -162,6 +167,7 @@ impl CoreStore {
             5 => {
                 Self::migrate_v5_to_v6(&transaction)?;
                 Self::migrate_v6_to_v7(&transaction)?;
+                Self::migrate_v7_to_v8(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -171,6 +177,16 @@ impl CoreStore {
             }
             6 => {
                 Self::migrate_v6_to_v7(&transaction)?;
+                Self::migrate_v7_to_v8(&transaction)?;
+                transaction
+                    .execute(
+                        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![CURRENT_SCHEMA_VERSION.to_string()],
+                    )
+                    .map_err(CoreError::migration)?;
+            }
+            7 => {
+                Self::migrate_v7_to_v8(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -254,6 +270,145 @@ impl CoreStore {
             |row| row.get::<_, u64>(0),
         )?;
         Ok(count)
+    }
+
+    pub fn create_asset(
+        &self,
+        principal: &Principal,
+        input: CreateAssetInput,
+    ) -> Result<CoreAsset, CoreError> {
+        validate_asset_input(&input)?;
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::ensure_principal_in_transaction(&transaction, principal)?;
+        transaction.execute(
+            "INSERT INTO assets
+             (id, user_id, filename, mime_type, extension, size, sha256, storage_ref,
+              content_token_digest, created_at_ms, expires_at_ms, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active')",
+            params![
+                &input.id,
+                &principal.user_id,
+                &input.filename,
+                &input.mime_type,
+                &input.extension,
+                input.size,
+                &input.sha256,
+                &input.storage_ref,
+                &input.content_token_digest,
+                input.created_at_ms,
+                input.expires_at_ms,
+            ],
+        )?;
+        let now = Utc::now().timestamp_millis();
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "asset.create",
+            "asset",
+            &audit_hash(&input.id),
+            serde_json::json!({
+                "asset": audit_hash(&input.id),
+                "user": audit_hash(&principal.user_id),
+                "mime_type": audit_label(&input.mime_type),
+                "size": input.size,
+                "result": "created",
+            }),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(CoreAsset {
+            id: input.id,
+            user_id: principal.user_id.clone(),
+            filename: input.filename,
+            mime_type: input.mime_type,
+            extension: input.extension,
+            size: input.size,
+            sha256: input.sha256,
+            storage_ref: input.storage_ref,
+            content_token_digest: input.content_token_digest,
+            created_at_ms: input.created_at_ms,
+            expires_at_ms: input.expires_at_ms,
+            state: AssetState::Active,
+        })
+    }
+
+    pub fn asset_for_user(
+        &self,
+        principal: &Principal,
+        asset_id: &str,
+    ) -> Result<Option<CoreAsset>, CoreError> {
+        validate_asset_identifier(asset_id)?;
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        Self::ensure_principal_on_connection(&connection, principal)?;
+        connection
+            .query_row(
+                "SELECT id, user_id, filename, mime_type, extension, size, sha256,
+                        storage_ref, content_token_digest, created_at_ms, expires_at_ms, state
+                 FROM assets WHERE id = ?1 AND user_id = ?2",
+                params![asset_id.trim(), &principal.user_id],
+                Self::asset_from_row,
+            )
+            .optional()
+            .map_err(CoreError::from)
+    }
+
+    pub fn asset_by_content_token(
+        &self,
+        asset_id: &str,
+        token_digest: &[u8],
+        now_ms: i64,
+    ) -> Result<Option<CoreAsset>, CoreError> {
+        validate_asset_identifier(asset_id)?;
+        if token_digest.len() != 32 {
+            return Err(CoreError::Validation {
+                field: "content_token_digest".into(),
+                reason: "must be exactly 32 bytes".into(),
+            });
+        }
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let asset = connection
+            .query_row(
+                "SELECT id, user_id, filename, mime_type, extension, size, sha256,
+                        storage_ref, content_token_digest, created_at_ms, expires_at_ms, state
+                 FROM assets
+                 WHERE id = ?1 AND state = 'active' AND expires_at_ms > ?2",
+                params![asset_id.trim(), now_ms],
+                Self::asset_from_row,
+            )
+            .optional()?;
+        Ok(asset.filter(|asset| asset.content_token_digest.ct_eq(token_digest).into()))
+    }
+
+    pub fn expire_assets(&self, now_ms: i64) -> Result<Vec<String>, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let assets = {
+            let mut statement = transaction.prepare(
+                "SELECT id, storage_ref FROM assets WHERE state = 'active' AND expires_at_ms <= ?1",
+            )?;
+            let rows = statement
+                .query_map([now_ms], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (id, _) in &assets {
+            transaction.execute(
+                "UPDATE assets SET state = 'expired' WHERE id = ?1 AND state = 'active'",
+                [id],
+            )?;
+            Self::insert_audit_event(
+                &transaction,
+                "system",
+                "asset.expire",
+                "asset",
+                &audit_hash(id),
+                serde_json::json!({"asset": audit_hash(id), "result": "expired"}),
+                now_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(assets.into_iter().map(|(_, storage_ref)| storage_ref).collect())
     }
 
     pub fn upsert_upstream_account(
@@ -1086,6 +1241,54 @@ impl CoreStore {
         if active { Ok(()) } else { Err(CoreError::UserNotActive) }
     }
 
+    fn ensure_principal_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        principal: &Principal,
+    ) -> Result<(), CoreError> {
+        let valid = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM api_keys
+               INNER JOIN users ON users.id = api_keys.user_id
+               WHERE api_keys.id = ?1 AND api_keys.user_id = ?2
+                 AND api_keys.status = 'active' AND users.status = 'active'
+             )",
+            params![&principal.key_id, &principal.user_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if valid {
+            Ok(())
+        } else {
+            Err(CoreError::InvalidRequestIdentity {
+                user_id: principal.user_id.clone(),
+                api_key_id: principal.key_id.clone(),
+            })
+        }
+    }
+
+    fn ensure_principal_on_connection(
+        connection: &Connection,
+        principal: &Principal,
+    ) -> Result<(), CoreError> {
+        let valid = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM api_keys
+               INNER JOIN users ON users.id = api_keys.user_id
+               WHERE api_keys.id = ?1 AND api_keys.user_id = ?2
+                 AND api_keys.status = 'active' AND users.status = 'active'
+             )",
+            params![&principal.key_id, &principal.user_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if valid {
+            Ok(())
+        } else {
+            Err(CoreError::InvalidRequestIdentity {
+                user_id: principal.user_id.clone(),
+                api_key_id: principal.key_id.clone(),
+            })
+        }
+    }
+
     fn validate_migration_batch(
         transaction: &rusqlite::Transaction<'_>,
         batch: &LegacyMigrationBatch,
@@ -1271,6 +1474,31 @@ impl CoreStore {
             id: row.get(0)?, account_ref: row.get(1)?, resource_kind: row.get(2)?,
             observed_value: row.get(3)?, value_scale: row.get(4)?, source: row.get(5)?,
             status, observed_at_ms: row.get(7)?, stale_at_ms: row.get(8)?, summary,
+        })
+    }
+
+    fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CoreAsset> {
+        let state_value: String = row.get(11)?;
+        let state = AssetState::from_db(&state_value).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                "invalid asset state".into(),
+            )
+        })?;
+        Ok(CoreAsset {
+            id: row.get(0)?,
+            user_id: row.get(1)?,
+            filename: row.get(2)?,
+            mime_type: row.get(3)?,
+            extension: row.get(4)?,
+            size: row.get(5)?,
+            sha256: row.get(6)?,
+            storage_ref: row.get(7)?,
+            content_token_digest: row.get(8)?,
+            created_at_ms: row.get(9)?,
+            expires_at_ms: row.get(10)?,
+            state,
         })
     }
 
@@ -1469,6 +1697,10 @@ impl CoreStore {
             )
             .map_err(CoreError::migration)?;
         transaction.execute_batch(SCHEMA_V5).map_err(CoreError::migration)
+    }
+
+    fn migrate_v7_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        transaction.execute_batch(SCHEMA_V8).map_err(CoreError::migration)
     }
 
     fn migrate_v5_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
@@ -1747,6 +1979,90 @@ impl CoreStore {
         )?;
         Ok(())
     }
+}
+
+fn validate_asset_identifier(value: &str) -> Result<(), CoreError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, b'-' | b'_'))
+    {
+        return Err(CoreError::Validation {
+            field: "asset_id".into(),
+            reason: "must be a safe opaque identifier".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_asset_input(input: &CreateAssetInput) -> Result<(), CoreError> {
+    validate_asset_identifier(&input.id)?;
+    if input.filename.trim().is_empty()
+        || input.filename.len() > 128
+        || input.filename.chars().any(char::is_control)
+    {
+        return Err(CoreError::Validation {
+            field: "filename".into(),
+            reason: "must be a short non-control filename".into(),
+        });
+    }
+    if input.mime_type.trim().is_empty()
+        || input.mime_type.len() > 128
+        || input.mime_type.chars().any(char::is_whitespace)
+    {
+        return Err(CoreError::Validation {
+            field: "mime_type".into(),
+            reason: "must be a compact MIME type".into(),
+        });
+    }
+    if input.extension.is_empty()
+        || input.extension.len() > 8
+        || !input.extension.bytes().all(|character| character.is_ascii_alphanumeric())
+    {
+        return Err(CoreError::Validation {
+            field: "extension".into(),
+            reason: "must be an alphanumeric extension".into(),
+        });
+    }
+    if input.size <= 0 {
+        return Err(CoreError::Validation {
+            field: "size".into(),
+            reason: "must be positive".into(),
+        });
+    }
+    if input.sha256.len() != 64 || !input.sha256.bytes().all(|character| character.is_ascii_hexdigit()) {
+        return Err(CoreError::Validation {
+            field: "sha256".into(),
+            reason: "must be a SHA-256 hex digest".into(),
+        });
+    }
+    let storage_name = input.storage_ref.strip_prefix("assets/").unwrap_or("");
+    if storage_name.is_empty()
+        || storage_name.contains('/')
+        || storage_name.contains('\\')
+        || storage_name.contains("..")
+        || storage_name.chars().any(char::is_whitespace)
+    {
+        return Err(CoreError::Validation {
+            field: "storage_ref".into(),
+            reason: "must name one safe file below assets/".into(),
+        });
+    }
+    if input.content_token_digest.len() != 32 {
+        return Err(CoreError::Validation {
+            field: "content_token_digest".into(),
+            reason: "must be exactly 32 bytes".into(),
+        });
+    }
+    if input.created_at_ms < 0 || input.expires_at_ms <= input.created_at_ms {
+        return Err(CoreError::Validation {
+            field: "expires_at_ms".into(),
+            reason: "must be after created_at_ms".into(),
+        });
+    }
+    Ok(())
 }
 
 impl CoreError {
