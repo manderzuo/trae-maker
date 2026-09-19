@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     CostError, CostEstimate, CostPolicy, BeginRequest, BeginRequestInput, CoreError, CoreStore,
     LeaseOutcome, LeaseState, ObservationStatus, PreflightReserveInput, PreflightReserveResult,
-    QuotaReserve, RequestHandle, RequestResult, RequestState, ScheduleError,
+    QuotaReserve, RequestHandle, RequestResult, RequestState, ScheduleError, Settlement,
     SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, UpstreamLease, UpstreamLeaseGrant,
     upstream::{
         account_matches_constraints, sanitize_error_category, sanitize_upstream_request_ref,
@@ -234,6 +234,14 @@ impl CoreStore {
         let expired = statement.query_map([now_ms], Self::upstream_lease_from_row)?.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         for lease in &expired {
+            let reservation = Self::reservation_by_request(&transaction, &lease.request_id)?
+                .ok_or_else(|| CoreError::ReservationNotFound {
+                    reservation_id: lease.request_id.clone(),
+                })?;
+            // Recovery preserves the hold: an expired upstream call is not known
+            // to have succeeded or failed. Mark the user reservation unknown so
+            // it remains non-spendable without emitting a release ledger entry.
+            Self::apply_settlement(&transaction, &reservation, Settlement::Unknown, now_ms)?;
             transaction.execute(
                 "UPDATE upstream_leases SET state = 'unknown', reconcile_until_ms = ?1, error_kind = 'lease_expired', updated_at_ms = ?2 WHERE id = ?3 AND state IN ('held', 'active')",
                 params![now_ms.checked_add(crate::upstream::DEFAULT_RECONCILE_TTL_MS).ok_or(CoreError::InvalidQuotaAmount)?, now_ms, &lease.id],

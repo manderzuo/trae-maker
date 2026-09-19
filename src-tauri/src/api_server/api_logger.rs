@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Local};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 /// API 请求日志记录器：按日期分文件，直接存储在 logs/ 目录下（文件名 api_YYYY-MM-DD.log）
 pub struct ApiLogger {
@@ -90,6 +92,58 @@ impl ApiLogger {
         error: Option<&str>,
     ) {
         self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, ttfb_ms, error)
+    }
+
+    /// Write a scheduler JSONL event with a fixed, secret-free schema. This is
+    /// intentionally separate from the legacy request/debug log: scheduler
+    /// events must never contain prompts, upstream bodies, credentials or raw
+    /// account identifiers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_scheduler_event(
+        &self,
+        event: &str,
+        request_id: Option<&str>,
+        lease_id: Option<&str>,
+        account_ref: Option<&str>,
+        provider: Option<&str>,
+        resource_kind: Option<&str>,
+        observation_id: Option<&str>,
+        error_category: Option<&str>,
+    ) {
+        let mut payload = json!({
+            "event": safe_label(event),
+            "timestamp_ms": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        });
+        let Some(object) = payload.as_object_mut() else { return; };
+        if let Some(value) = request_id.and_then(safe_identifier) {
+            object.insert("request_id".into(), json!(value));
+        }
+        if let Some(value) = lease_id.and_then(safe_identifier) {
+            object.insert("lease_id".into(), json!(value));
+        }
+        if let Some(value) = account_ref {
+            object.insert("account_hash".into(), json!(hash_identifier(value)));
+        }
+        if let Some(value) = provider {
+            object.insert("provider".into(), json!(safe_label(value)));
+        }
+        if let Some(value) = resource_kind {
+            object.insert("resource_kind".into(), json!(safe_label(value)));
+        }
+        if let Some(value) = observation_id {
+            object.insert("observation_hash".into(), json!(hash_identifier(value)));
+        }
+        if let Some(value) = error_category {
+            object.insert("error_category".into(), json!(safe_label(value)));
+        }
+        let Ok(mut line) = serde_json::to_string(&payload) else { return; };
+        line.push('\n');
+        if let Some(mut file) = self.get_writer() {
+            let _ = file.write_all(line.as_bytes());
+        }
     }
 
     fn log_request_inner(
@@ -448,6 +502,40 @@ fn reverse_log_blocks(content: &str) -> String {
     blocks.join("\n")
 }
 
+fn hash_identifier(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn safe_identifier(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 128 {
+        return None;
+    }
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':'))
+    {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
+fn safe_label(value: &str) -> String {
+    if !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':'))
+    {
+        value.to_owned()
+    } else {
+        format!("hash:{}", hash_identifier(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,7 +546,7 @@ mod tests {
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
+        let dir = PathBuf::from(r"D:\gpt")
             .join(format!("api_logger_test_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
@@ -480,6 +568,31 @@ mod tests {
         assert!(content.contains("pool=buddy model=glm-5.3"), "buddy 行需含资源标识与模型: {content}");
         assert!(content.contains("pool=trae model=glm-5.2"), "trae 行需含资源标识与模型: {content}");
         assert!(content.contains("error=no healthy account"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scheduler_event_is_structured_and_redacted() {
+        let dir = tmp_dir("scheduler-event");
+        let logger = ApiLogger::new(dir.clone());
+        logger.log_scheduler_event(
+            "upstream.health_transition",
+            Some("request-safe"),
+            Some("lease-safe"),
+            Some("vault://raw-account-secret"),
+            Some("trae"),
+            Some("chat_request"),
+            Some("observation-safe"),
+            Some("transport_timeout"),
+        );
+        let content = logger.read_log(&today()).expect("scheduler event written");
+        assert!(content.contains("\"event\":\"upstream.health_transition\""));
+        assert!(content.contains("\"account_hash\""));
+        assert!(content.contains("\"error_category\":\"transport_timeout\""));
+        assert!(!content.contains("vault://raw-account-secret"));
+        assert!(!content.contains("prompt"));
+        assert!(!content.contains("jwt"));
+        assert!(!content.contains("cookie"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

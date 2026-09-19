@@ -1,8 +1,8 @@
-# Core 基础运维手册（Phase 0/1）
+# Core 基础运维手册（Phase 0/1/2）
 
-本文只描述统一网关的 Core 身份、幂等、逻辑额度和迁移基础。Phase 1 的闭环使用
+本文描述统一网关的 Core 身份、幂等、逻辑额度、迁移和信用感知调度基础。Phase 1 的闭环使用
 内存 Mock executor 验证，不代表真实上游余额、真实上游计费或真实视频/图片生成已经
-验证。
+验证；Phase 2 的调度证据同样只代表本地 Mock/fixture 路径。
 
 ## 1. 三种运行模式
 
@@ -89,5 +89,29 @@ cargo test --offline --manifest-path src-core/Cargo.toml
 
 不要把真实 upstream 测试、真实账号余额、真实计费响应或真实生成结果写进 Phase 1
 验收结论；尤其不要把 `src-python/tests/test_api_server.py` 的真实上游路径作为本计划
-smoke 证据。真实上游调度、credit-aware scheduler、媒体生命周期和生产部署必须在后续
-独立计划中单独设计、审阅和验证。
+smoke 证据。真实上游执行器、媒体生命周期和生产部署必须在后续独立计划中单独设计、
+审阅和验证。
+
+## 6. Phase 2 信用感知调度边界
+
+Phase 2 在 schema v6 中持久化上游账号、观测、lease 和健康状态。账号的
+`credentials_ref` 仍只是 opaque vault 引用；Core 不保存 JWT、Cookie、refresh token、
+完整上游响应或 prompt。上游观测是调度输入和诊断历史，**不是用户 grant**，也不能从
+`remaining_credits.json`、WorkBuddy cache 或任何上游余额自动生成用户额度。
+
+调度模式与 `core_mode` 必须按
+[credit-aware-scheduler-operations.md](credit-aware-scheduler-operations.md) 的兼容矩阵使用。
+`enforce` 没有可信 reader、executor、fresh observation、cost policy、用户 grant 或
+账号绑定时必须 fail-closed，返回稳定的 `scheduler_endpoint_not_enabled`/调度错误，不能
+回退到旧的 `ApiPool`。`off` 才保留原有池路径；`shadow` 只产生诊断，不拒绝请求、不扣
+用户额度。
+
+过期的 `held`/`active` upstream lease 只能转为 `unknown`，对应 reservation/request
+保持 unknown 并继续占用 hold；恢复过程不产生 release ledger，也不自动重试或释放。必须
+经过明确的对账/人工处理后才可结束该不确定状态。管理员状态接口只返回聚合计数（fresh、
+stale、active、unknown、reader failure、槽位饱和等），普通用户不得查询管理员投影，且
+不包含账号、凭据、用户额度或其他用户的 request 行。
+
+调度事件采用固定 JSONL 结构，使用 account/observation hash 和固定 error category；
+请求/响应 body、prompt、JWT、Cookie、credentials_ref 不得进入该结构化事件。遗留的 debug
+请求日志仍是显式诊断开关，启用前应按本机日志权限和敏感内容风险处理。

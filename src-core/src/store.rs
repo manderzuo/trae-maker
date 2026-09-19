@@ -5,13 +5,19 @@ use chrono::Utc;
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
+use serde_json::{Map, Value};
 use subtle::ConstantTimeEq;
 
 use crate::{
     schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH},
-    upstream::{validate_observation_summary, validate_opaque_credentials_ref, validate_required},
+    upstream::{
+        account_health_decision, audit_hash, audit_identifier, audit_label,
+        normalize_health_category, validate_observation_summary, validate_opaque_credentials_ref,
+        validate_required,
+    },
     AuthError, CoreError, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
     NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
+    UpstreamAccountState,
     UpstreamLease, UpstreamObservation, User,
 };
 
@@ -228,8 +234,12 @@ impl CoreStore {
             &principal.user_id,
             "upstream.account_upsert",
             "upstream_account",
-            &input.id,
-            serde_json::json!({"account_ref": input.id, "provider": input.provider, "result": "upserted"}),
+            &audit_hash(&input.id),
+            serde_json::json!({
+                "account_hash": audit_hash(&input.id),
+                "provider": audit_label(&input.provider),
+                "result": "upserted"
+            }),
             now,
         )?;
         transaction.commit()?;
@@ -250,11 +260,11 @@ impl CoreStore {
         let summary_json = validate_observation_summary(&observation.summary)?;
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let credentials_ref = transaction
+        let (provider, credentials_ref) = transaction
             .query_row(
-                "SELECT credentials_ref FROM upstream_accounts WHERE id = ?1",
+                "SELECT provider, credentials_ref FROM upstream_accounts WHERE id = ?1",
                 [&observation.account_ref],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
             .ok_or_else(|| CoreError::Validation {
@@ -306,6 +316,27 @@ impl CoreStore {
                 summary_json,
             ],
         )?;
+        let action = if observation.status == ObservationStatus::Failed {
+            "upstream.observation_failed"
+        } else {
+            "upstream.observation_recorded"
+        };
+        Self::insert_audit_event(
+            &transaction,
+            "system",
+            action,
+            "upstream_observation",
+            &audit_hash(&observation.id),
+            serde_json::json!({
+                "account_hash": audit_hash(&observation.account_ref),
+                "provider": audit_label(&provider),
+                "resource_kind": audit_label(&observation.resource_kind),
+                "observation": audit_hash(&observation.id),
+                "status": observation.status.as_str(),
+                "source": audit_label(&observation.source)
+            }),
+            observation.observed_at_ms,
+        )?;
         transaction.commit()?;
         Ok(observation)
     }
@@ -341,6 +372,180 @@ impl CoreStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(CoreError::from)?;
         Ok(leases)
+    }
+
+    /// Persist one adapter/reader health observation without storing the
+    /// upstream response or any credential. The account row is the durable
+    /// source of truth used by the next scheduler selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_upstream_health_transition(
+        &self,
+        account_ref: &str,
+        request_id: Option<&str>,
+        lease_id: Option<&str>,
+        resource_kind: &str,
+        observation_id: Option<&str>,
+        category: &str,
+        now_ms: i64,
+    ) -> Result<UpstreamAccount, CoreError> {
+        validate_required("account_ref", account_ref)?;
+        validate_required("resource_kind", resource_kind)?;
+        let category = normalize_health_category(category);
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT provider, enabled, state, cooldown_until_ms, cooldown_reason,
+                        consecutive_errors, created_at_ms, updated_at_ms, region,
+                        capabilities_json, max_concurrency
+                 FROM upstream_accounts WHERE id = ?1",
+                [account_ref],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::Validation {
+                field: "account_ref".into(),
+                reason: "must identify a registered upstream account".into(),
+            })?;
+        let previous_state = Self::upstream_account_state_from_db(&existing.2).ok_or_else(|| {
+            CoreError::InvalidConfiguration {
+                key: "upstream_accounts.state".into(),
+                value: existing.2.clone(),
+            }
+        })?;
+        let decision = account_health_decision(category, existing.5, now_ms);
+        let preserve_health = category == "reader_failure"
+            || (category == "success"
+                && matches!(previous_state, UpstreamAccountState::Disabled | UpstreamAccountState::Forbidden));
+        let (enabled, state, cooldown_until_ms, cooldown_reason, consecutive_errors) = if preserve_health {
+            (
+                existing.1,
+                previous_state,
+                existing.3,
+                existing.4.clone(),
+                existing.5,
+            )
+        } else {
+            (
+                decision.enabled,
+                decision.state,
+                decision.cooldown_until_ms,
+                decision.cooldown_reason.map(str::to_owned),
+                decision.consecutive_errors,
+            )
+        };
+        let updated_at_ms = now_ms;
+        transaction.execute(
+            "UPDATE upstream_accounts
+             SET enabled = ?1, state = ?2, cooldown_until_ms = ?3,
+                 cooldown_reason = ?4, consecutive_errors = ?5, updated_at_ms = ?6
+             WHERE id = ?7",
+            params![
+                if enabled { 1_i64 } else { 0_i64 },
+                state.as_str(),
+                cooldown_until_ms,
+                cooldown_reason,
+                consecutive_errors,
+                updated_at_ms,
+                account_ref,
+            ],
+        )?;
+        let observation = observation_id.map(audit_hash);
+        Self::insert_audit_event(
+            &transaction,
+            "system",
+            "upstream.health_transition",
+            "upstream_account",
+            &audit_hash(account_ref),
+            serde_json::json!({
+                "request_id": audit_identifier(request_id),
+                "lease_id": audit_identifier(lease_id),
+                "account_hash": audit_hash(account_ref),
+                "provider": audit_label(&existing.0),
+                "resource_kind": audit_label(resource_kind),
+                "observation": observation,
+                "error_category": decision.category,
+            }),
+            now_ms,
+        )?;
+        let account = Self::upstream_account_in_transaction(&transaction, account_ref)?;
+        transaction.commit()?;
+        Ok(account)
+    }
+
+    /// Return only aggregate scheduler diagnostics to an authorized
+    /// administrator. Account identifiers, credentials and user-owned quota
+    /// rows are intentionally absent from this projection.
+    pub fn scheduler_status_for_admin(
+        &self,
+        principal: &Principal,
+        now_ms: i64,
+    ) -> Result<serde_json::Value, CoreError> {
+        self.authorize_admin_principal(principal)?;
+        self.scheduler_status_counts(now_ms)
+    }
+
+    /// Internal/runtime status projection. Callers that expose it externally
+    /// must apply their own administrator authorization first.
+    pub fn scheduler_status_counts(&self, now_ms: i64) -> Result<serde_json::Value, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let count = |sql: &str| -> Result<u64, CoreError> {
+            Ok(connection.query_row(sql, [], |row| row.get::<_, u64>(0))?)
+        };
+        let count_now = |sql: &str| -> Result<u64, CoreError> {
+            Ok(connection.query_row(sql, [now_ms], |row| row.get::<_, u64>(0))?)
+        };
+        let accounts = count("SELECT COUNT(*) FROM upstream_accounts")?;
+        let enabled_accounts = count("SELECT COUNT(*) FROM upstream_accounts WHERE enabled = 1")?;
+        let fresh_observations = count_now(
+            "SELECT COUNT(*) FROM upstream_observations
+             WHERE status = 'fresh' AND observed_at_ms <= ?1 AND stale_at_ms > ?1",
+        )?;
+        let stale_observations = count_now(
+            "SELECT COUNT(*) FROM upstream_observations
+             WHERE status <> 'fresh' OR stale_at_ms <= ?1",
+        )?;
+        let reader_failures = count(
+            "SELECT COUNT(*) FROM upstream_observations WHERE status = 'failed'",
+        )?;
+        let active_leases = count(
+            "SELECT COUNT(*) FROM upstream_leases WHERE state IN ('held', 'active')",
+        )?;
+        let unknown_leases = count(
+            "SELECT COUNT(*) FROM upstream_leases WHERE state = 'unknown'",
+        )?;
+        let slot_saturated = count(
+            "SELECT COUNT(*) FROM upstream_accounts AS account
+             WHERE account.enabled = 1 AND account.state = 'available'
+               AND (SELECT COUNT(*) FROM upstream_leases AS lease
+                    WHERE lease.account_ref = account.id
+                      AND lease.state IN ('held', 'active')) >= account.max_concurrency",
+        )?;
+        Ok(serde_json::json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "accounts": accounts,
+            "enabled_accounts": enabled_accounts,
+            "fresh_observations": fresh_observations,
+            "stale_observations": stale_observations,
+            "active_leases": active_leases,
+            "unknown_leases": unknown_leases,
+            "slot_saturated": slot_saturated,
+            "reader_failures": reader_failures,
+        }))
     }
 
     pub fn create_user(&self, input: NewUser, actor: &str) -> Result<User, CoreError> {
@@ -897,6 +1102,71 @@ impl CoreStore {
         Ok(())
     }
 
+    fn upstream_account_state_from_db(value: &str) -> Option<UpstreamAccountState> {
+        match value {
+            "available" => Some(UpstreamAccountState::Available),
+            "cooling" => Some(UpstreamAccountState::Cooling),
+            "forbidden" => Some(UpstreamAccountState::Forbidden),
+            "disabled" => Some(UpstreamAccountState::Disabled),
+            _ => None,
+        }
+    }
+
+    fn upstream_account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpstreamAccount> {
+        let capabilities_json: String = row.get(4)?;
+        let capabilities = serde_json::from_str(&capabilities_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        let state_value: String = row.get(7)?;
+        let state = Self::upstream_account_state_from_db(&state_value).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                "invalid upstream account state".into(),
+            )
+        })?;
+        Ok(UpstreamAccount {
+            id: row.get(0)?,
+            provider: row.get(1)?,
+            credentials_ref: row.get(2)?,
+            region: row.get(3)?,
+            capabilities,
+            enabled: row.get::<_, i64>(5)? != 0,
+            max_concurrency: row.get(6)?,
+            state,
+            cooldown_until_ms: row.get(8)?,
+            cooldown_reason: row.get(9)?,
+            consecutive_errors: row.get(10)?,
+            created_at_ms: row.get(11)?,
+            updated_at_ms: row.get(12)?,
+        })
+    }
+
+    fn upstream_account_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        account_ref: &str,
+    ) -> Result<UpstreamAccount, CoreError> {
+        transaction
+            .query_row(
+                "SELECT id, provider, credentials_ref, region, capabilities_json,
+                        enabled, max_concurrency, state, cooldown_until_ms,
+                        cooldown_reason, consecutive_errors, created_at_ms,
+                        updated_at_ms
+                 FROM upstream_accounts WHERE id = ?1",
+                [account_ref],
+                Self::upstream_account_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::Validation {
+                field: "account_ref".into(),
+                reason: "must identify a registered upstream account".into(),
+            })
+    }
+
     fn upstream_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpstreamObservation> {
         let status: String = row.get(6)?;
         let status = ObservationStatus::from_db(&status).ok_or_else(|| rusqlite::Error::FromSqlConversionFailure(
@@ -946,6 +1216,7 @@ impl CoreStore {
         metadata: serde_json::Value,
         now: i64,
     ) -> Result<(), CoreError> {
+        let metadata = Self::sanitize_audit_metadata(metadata);
         transaction.execute(
             "INSERT INTO audit_events \
              (id, actor_user_id, action, target_type, target_id, metadata_json, created_at_ms) \
@@ -961,6 +1232,61 @@ impl CoreStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Keep the audit table useful for operations without making it a second
+    /// credential or account-identifier store. Older call sites still pass
+    /// legacy metadata keys, so sanitization belongs at this single write
+    /// boundary rather than relying on every caller to remember the policy.
+    fn sanitize_audit_metadata(value: Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut sanitized = Map::new();
+                for (key, value) in object {
+                    match key.as_str() {
+                        "account_ref" => {
+                            if let Some(raw) = value.as_str() {
+                                sanitized.insert("account_hash".into(), Value::String(audit_hash(raw)));
+                            }
+                        }
+                        "observation_id" => {
+                            if let Some(raw) = value.as_str() {
+                                sanitized.insert("observation".into(), Value::String(audit_hash(raw)));
+                            }
+                        }
+                        "credentials_ref" | "credential" | "jwt" | "token" | "cookie"
+                        | "authorization" | "prompt" | "body" | "request_body" | "response_body" => {}
+                        "provider" | "resource_kind" | "source" | "error_category" | "error_kind" => {
+                            if let Some(raw) = value.as_str() {
+                                sanitized.insert(key, Value::String(audit_label(raw)));
+                            } else {
+                                sanitized.insert(key, Self::sanitize_audit_metadata(value));
+                            }
+                        }
+                        "request_id" | "lease_id" | "reservation_id" => {
+                            if let Some(raw) = value.as_str() {
+                                if let Some(safe) = audit_identifier(Some(raw)) {
+                                    sanitized.insert(key, Value::String(safe));
+                                }
+                            } else {
+                                sanitized.insert(key, Self::sanitize_audit_metadata(value));
+                            }
+                        }
+                        _ => {
+                            sanitized.insert(key, Self::sanitize_audit_metadata(value));
+                        }
+                    }
+                }
+                Value::Object(sanitized)
+            }
+            Value::Array(values) => Value::Array(
+                values
+                    .into_iter()
+                    .map(Self::sanitize_audit_metadata)
+                    .collect(),
+            ),
+            other => other,
+        }
     }
 
     fn schema_version_in_transaction(

@@ -1,11 +1,18 @@
 use std::collections::BTreeSet;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use crate::{CoreError, PreflightReserveInput, RequestHandle, UpstreamLease};
+use crate::{CoreError, PreflightReserveInput, RequestHandle, UpstreamAccountState, UpstreamLease};
 
 pub(crate) const MAX_OBSERVATION_SUMMARY_BYTES: usize = 4 * 1024;
 pub(crate) const DEFAULT_RECONCILE_TTL_MS: i64 = 600_000;
+const HARD_CREDIT_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1_000;
+const PLAN_LIMIT_COOLDOWN_MS: i64 = 12 * 60 * 60 * 1_000;
+const SHORT_COOLDOWN_MS: i64 = 60 * 1_000;
+const CLIENT_COOLDOWN_MS: i64 = 10 * 60 * 1_000;
+const SERVER_COOLDOWN_MS: i64 = 30 * 60 * 1_000;
+const SERVER_MAX_COOLDOWN_MS: i64 = 6 * 60 * 60 * 1_000;
 
 /// Scheduler-specific input. `preflight` remains the source of request identity and user quota.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +174,171 @@ pub(crate) fn sanitize_error_category(value: &str, transport: bool) -> &'static 
             "insufficient_credits" => "insufficient_credits",
             _ => "upstream_rejected",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AccountHealthDecision {
+    pub category: &'static str,
+    pub state: UpstreamAccountState,
+    pub enabled: bool,
+    pub cooldown_until_ms: Option<i64>,
+    pub cooldown_reason: Option<&'static str>,
+    pub consecutive_errors: i64,
+}
+
+/// Maps adapter/legacy error labels to the small persistent health vocabulary.
+/// The returned value is safe to persist and safe to expose as an error category.
+pub(crate) fn normalize_health_category(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "success" | "ok" | "none" => "success",
+        "hardcredit" | "hard_credit" | "insufficient_credits" | "insufficient_credit" => "hard_credit",
+        "planlimit" | "plan_limit" => "plan_limit",
+        "softrate" | "soft_rate" | "rate_limited" | "ratelimited" => "soft_rate",
+        "notfound" | "not_found" => "not_found",
+        "sessiondead" | "session_dead" => "session_dead",
+        "forbidden" => "forbidden",
+        "server" | "upstream_execution_unknown" => "server",
+        "transport_timeout" | "timeout" => "transport_timeout",
+        "transport_unknown" | "disconnected" => "transport_unknown",
+        "reader_failure" | "reader_unavailable" => "reader_failure",
+        "client" | "invalid_request" | "upstream_rejected" => "client",
+        _ => "client",
+    }
+}
+
+pub(crate) fn account_health_decision(
+    category: &str,
+    previous_errors: i64,
+    now_ms: i64,
+) -> AccountHealthDecision {
+    let category = normalize_health_category(category);
+    let consecutive_errors = if category == "success" || category == "reader_failure" {
+        0
+    } else {
+        previous_errors.saturating_add(1)
+    };
+    let cooldown = |duration: i64| now_ms.checked_add(duration).or(Some(i64::MAX));
+    match category {
+        "success" => AccountHealthDecision {
+            category,
+            state: UpstreamAccountState::Available,
+            enabled: true,
+            cooldown_until_ms: None,
+            cooldown_reason: None,
+            consecutive_errors,
+        },
+        "hard_credit" => AccountHealthDecision {
+            category,
+            state: UpstreamAccountState::Cooling,
+            enabled: true,
+            cooldown_until_ms: None,
+            cooldown_reason: Some("hard_credit"),
+            consecutive_errors,
+        },
+        "plan_limit" => AccountHealthDecision {
+            category,
+            state: UpstreamAccountState::Cooling,
+            enabled: true,
+            cooldown_until_ms: cooldown(PLAN_LIMIT_COOLDOWN_MS),
+            cooldown_reason: Some("plan_limit"),
+            consecutive_errors,
+        },
+        "soft_rate" => AccountHealthDecision {
+            category,
+            state: UpstreamAccountState::Cooling,
+            enabled: true,
+            cooldown_until_ms: cooldown(SHORT_COOLDOWN_MS),
+            cooldown_reason: Some("soft_rate"),
+            consecutive_errors,
+        },
+        "not_found" => AccountHealthDecision {
+            category,
+            state: UpstreamAccountState::Cooling,
+            enabled: true,
+            cooldown_until_ms: cooldown(SHORT_COOLDOWN_MS),
+            cooldown_reason: Some("not_found"),
+            consecutive_errors,
+        },
+        "session_dead" => AccountHealthDecision {
+            category,
+            state: UpstreamAccountState::Disabled,
+            enabled: false,
+            cooldown_until_ms: cooldown(HARD_CREDIT_COOLDOWN_MS),
+            cooldown_reason: Some("session_dead"),
+            consecutive_errors,
+        },
+        "forbidden" => AccountHealthDecision {
+            category,
+            state: UpstreamAccountState::Forbidden,
+            enabled: false,
+            cooldown_until_ms: None,
+            cooldown_reason: Some("forbidden"),
+            consecutive_errors,
+        },
+        "transport_timeout" | "transport_unknown" | "server" => {
+            let exponent = (previous_errors.max(0) as u32).min(3);
+            let multiplier = 1_i64.checked_shl(exponent).unwrap_or(8);
+            let duration = SERVER_COOLDOWN_MS
+                .saturating_mul(multiplier)
+                .min(SERVER_MAX_COOLDOWN_MS);
+            AccountHealthDecision {
+                category,
+                state: UpstreamAccountState::Cooling,
+                enabled: true,
+                cooldown_until_ms: cooldown(duration),
+                cooldown_reason: Some(category),
+                consecutive_errors,
+            }
+        }
+        "reader_failure" => AccountHealthDecision {
+            category,
+            state: UpstreamAccountState::Available,
+            enabled: true,
+            cooldown_until_ms: None,
+            cooldown_reason: None,
+            consecutive_errors,
+        },
+        _ => AccountHealthDecision {
+            category,
+            state: UpstreamAccountState::Cooling,
+            enabled: true,
+            cooldown_until_ms: cooldown(CLIENT_COOLDOWN_MS),
+            cooldown_reason: Some("client"),
+            consecutive_errors,
+        },
+    }
+}
+
+pub(crate) fn audit_hash(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn audit_identifier(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+                })
+        })
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) fn audit_label(value: &str) -> String {
+    if !value.is_empty()
+        && value.len() <= 64
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+        })
+    {
+        value.to_owned()
+    } else {
+        format!("hash:{}", audit_hash(value))
     }
 }
 

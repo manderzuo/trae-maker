@@ -301,14 +301,79 @@ fn settle_core_lease_outcome(
     let Some(lease) = context.lease.as_ref() else {
         return scheduler_endpoint_not_enabled_response();
     };
+    let health_category = core_health_category(&outcome);
     match context.bridge.settle_chat_lease(
         &context.principal,
         &lease.lease_id,
         outcome.lease_outcome(now_ms),
     ) {
-        Ok(_) => with_core_request_id(response, &context.request_id),
+        Ok(_) => {
+            // The lease/quota transition is authoritative. Health persistence
+            // is a separate account projection and must never release a user
+            // hold if its best-effort diagnostic write fails.
+            let _ = context.bridge.store.record_upstream_health_transition(
+                &lease.account_ref,
+                Some(&context.request_id),
+                Some(&lease.lease_id),
+                "chat_request",
+                Some(&lease.observation_id),
+                health_category,
+                now_ms,
+            );
+            with_core_request_id(response, &context.request_id)
+        }
         Err(error) => core_lease_error_response(error),
     }
+}
+
+fn core_health_category(outcome: &UpstreamOutcome) -> &'static str {
+    match outcome {
+        UpstreamOutcome::Success { .. } => "success",
+        UpstreamOutcome::TransportUnknown { reason, .. } => {
+            let reason = reason.to_ascii_lowercase();
+            if reason.contains("timeout") {
+                "transport_timeout"
+            } else if reason.contains("disconnect") {
+                "transport_unknown"
+            } else {
+                "server"
+            }
+        }
+        UpstreamOutcome::Rejected { status, code, .. } => {
+            let code = code.to_ascii_lowercase();
+            if matches!(*status, 401) || code.contains("session") {
+                "session_dead"
+            } else if matches!(*status, 403) || code.contains("forbidden") {
+                "forbidden"
+            } else if matches!(*status, 404) || code.contains("not_found") || code.contains("notfound") {
+                "not_found"
+            } else if matches!(*status, 429) || code.contains("rate") {
+                "soft_rate"
+            } else if (500..600).contains(status) {
+                "server"
+            } else {
+                "client"
+            }
+        }
+    }
+}
+
+fn log_core_lease_event(
+    state: &ApiSharedState,
+    context: &CoreChatContext,
+    outcome: &UpstreamOutcome,
+) {
+    let Some(lease) = context.lease.as_ref() else { return; };
+    state.logger.log_scheduler_event(
+        "upstream.lease_settle",
+        Some(&context.request_id),
+        Some(&lease.lease_id),
+        Some(&lease.account_ref),
+        None,
+        Some("chat_request"),
+        Some(&lease.observation_id),
+        Some(core_health_category(outcome)),
+    );
 }
 
 fn settle_core_lease_response(
@@ -547,7 +612,47 @@ pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
     (status, axum::Json(payload)).into_response()
 }
 
-pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
+pub async fn status(
+    State(state): State<Arc<ApiSharedState>>,
+    principal: Option<Extension<Principal>>,
+) -> Response {
+    if core_enforcing(&state) {
+        let principal = match core_principal_or_unauthorized(principal.as_ref()) {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
+        let bridge = match state.core.as_ref() {
+            Some(bridge) => bridge,
+            None => return scheduler_endpoint_not_enabled_response(),
+        };
+        if bridge.store.authorize_admin_principal(&principal).is_err() {
+            return openai_error(
+                StatusCode::FORBIDDEN,
+                "scheduler_admin_required",
+                "scheduler status requires an administrator principal",
+            );
+        }
+        let scheduler = match bridge.scheduler() {
+            Ok(runtime) => runtime.scheduler_status_for_admin(
+                &principal,
+                chrono::Utc::now().timestamp_millis(),
+            ),
+            Err(error) => Err(error),
+        };
+        return match scheduler {
+            Ok(scheduler) => Json(json!({
+                "running": true,
+                "scheduler": scheduler,
+            }))
+            .into_response(),
+            Err(error) => openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                error.code(),
+                "scheduler status is unavailable",
+            ),
+        };
+    }
+
     let pool = state.pool.status_list();
     let now: i64 = now_ts() as i64;
     let total = state.total_requests.load(std::sync::atomic::Ordering::Relaxed);
@@ -647,6 +752,7 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "probe_ts_ms": state.wb_probe_ts_ms.load(std::sync::atomic::Ordering::Relaxed),
         },
     }))
+    .into_response()
 }
 
 pub async fn models(
@@ -867,13 +973,16 @@ pub async fn chat_completions(
                     lease: Some(lease.clone()),
                     reservation_amount: 0,
                 };
-                return settle_core_lease_response(
+                let outcome = UpstreamOutcome::TransportUnknown {
+                    reason: "lease_context_incomplete".into(),
+                    upstream_request_ref: None,
+                };
+                let response = settle_core_lease_response(
                     &context,
-                    UpstreamOutcome::TransportUnknown {
-                        reason: "lease_context_incomplete".into(),
-                        upstream_request_ref: None,
-                    },
+                    outcome.clone(),
                 );
+                log_core_lease_event(&state, &context, &outcome);
+                return response;
             }
         };
         let context = CoreChatContext {
@@ -885,7 +994,9 @@ pub async fn chat_completions(
             reservation_amount: reservation.amount,
         };
         let outcome = executor.execute_nonstream_chat(&lease, execution);
-        return settle_core_lease_response(&context, outcome);
+        let response = settle_core_lease_response(&context, outcome.clone());
+        log_core_lease_event(&state, &context, &outcome);
+        return response;
     }
 
     let body_vec = serde_json::to_vec(&peek).unwrap_or_else(|_| body.to_vec());

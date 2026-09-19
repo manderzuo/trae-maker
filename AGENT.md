@@ -402,3 +402,13 @@ ai-work-assistant/
 5. **孤儿提交勿清理**：`git gc` / `git prune` 一律不跑，dangling 提交（如 6c1fdca）是无害保险，误删不可逆。
 6. **慎用 `git pack-refs --all`**：它会把 loose ref 收编进 packed-refs，正是制造本坑的前提条件；本仓库避免执行。
 7. **关联环境故障**：同日 bash `rm` shim 损坏曾误删 docs/（已恢复）。删除文件一律用 Python `os.remove`，禁用裸 `rm`；修复类操作前先 `git status` 快照留证。
+
+## 16. Phase 2 信用感知调度运维契约
+
+- Core 数据库为 `<AIWORK_DATA_DIR>\data\core.sqlite3`，schema v6 的 `upstream_accounts`、`upstream_observations`、`upstream_leases` 与用户 `quota_*` 账本分离；`credentials_ref` 永远是不透明引用，不能写入 JWT、Cookie、refresh token、prompt 或完整上游响应。
+- `core_mode`/`scheduler_mode` 只按 `docs/credit-aware-scheduler-operations.md` 的兼容矩阵启用。`off` 保留 legacy `ApiPool`；`shadow` 只诊断、不扣额度；`enforce` 没有可信 reader/executor、fresh observation、policy、grant 或明确账号绑定时必须 fail-closed，禁止回退 `ApiPool`。
+- 过期 `held`/`active` upstream lease 只能进入 `unknown`；reservation/request 保持 unknown、hold 不释放、不写 release ledger、不自动重试。必须经过明确对账/人工处理。
+- 管理员 scheduler status 只返回聚合计数和固定错误码；HTTP enforce `/status` 与桌面管理辅助路径要求 admin Principal。普通用户不能读取管理员投影、账号凭据或其他用户的 quota/request。
+- scheduler 结构化 JSONL 事件只能使用 hash、受限 label 和固定 error category；旧 debug body 日志是显式敏感诊断开关，不能当作脱敏事件。
+- Task 6/Phase 2 测试只用 Mock/fixture，不访问真实网络、真实账号、`AGENT_HOST` 或正在运行的服务。Cargo 命令必须在同一 PowerShell 进程中清空并断言 `AIWORK_*` 为空，使用 `--offline --locked`，target/log/临时 fixture 放 `D:\gpt`，不运行 broad Tauri suite。
+- Task 6 交付时保留用户原有脏文件及 routes.rs 非 Task 6 的媒体/视频 hunks；不得修改或提交 `data/`、`credentials/`、`target-fix/`、生成的 `Cargo.lock`。

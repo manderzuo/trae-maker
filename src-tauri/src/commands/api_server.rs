@@ -49,6 +49,34 @@ pub fn core_store_for_admin(
     Ok(store)
 }
 
+/// Return the administrator-only aggregate scheduler projection used by
+/// desktop management surfaces. This path works both while the HTTP server is
+/// running and when it is stopped, and never exposes account credentials,
+/// account identifiers, or another user's quota rows.
+#[allow(dead_code)]
+pub fn scheduler_status_for_admin(
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
+    scheduler_admin_key: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let store = core_store_for_admin(state, runtime)?;
+    let principal = scheduler::authenticate_sync_admin(&store, scheduler_admin_key)
+        .map_err(|error| error.to_string())?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Some(api_runtime) = safe_lock(runtime).as_ref() {
+        if let Some(bridge) = api_runtime.shared.core.as_ref() {
+            if let Ok(scheduler) = bridge.scheduler() {
+                return scheduler
+                    .scheduler_status_for_admin(&principal, now_ms)
+                    .map_err(|error| error.to_string());
+            }
+        }
+    }
+    store
+        .scheduler_status_for_admin(&principal, now_ms)
+        .map_err(|error| error.to_string())
+}
+
 // ==================== 启停命令 ====================
 
 /// 启动 API 服务核心逻辑（页面命令 / 托盘菜单共用）。

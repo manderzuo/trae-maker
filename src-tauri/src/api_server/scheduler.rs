@@ -5,6 +5,7 @@ use aiwork_core::{ChatExecutor, CoreStore, LeaseState, ObservationReader, Observ
     ObservationSnapshot, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccountState,
     UpstreamObservation};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 
@@ -129,17 +130,46 @@ impl SchedulerRuntime {
     }
 
     pub fn scheduler_status(&self) -> SchedulerStatus {
+        self.scheduler_status_at(chrono::Utc::now().timestamp_millis())
+    }
+
+    fn scheduler_status_at(&self, now_ms: i64) -> SchedulerStatus {
         let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if self.mode != SchedulerMode::Off {
-            match self.store.list_recoverable_leases() {
-                Ok(leases) => {
-                    status.active_leases = leases.iter().filter(|l| matches!(l.state, LeaseState::Held | LeaseState::Active)).count() as u64;
-                    status.unknown_leases = leases.iter().filter(|l| l.state == LeaseState::Unknown).count() as u64;
+            match self.store.scheduler_status_counts(now_ms) {
+                Ok(counts) => merge_core_status_counts(&mut status, &counts),
+                Err(_) => {
+                    status.ready = false;
+                    status.last_error = Some(SchedulerError::StorageUnavailable.code().into());
                 }
-                Err(_) => { status.ready = false; status.last_error = Some(SchedulerError::StorageUnavailable.code().into()); }
             }
         }
         status
+    }
+
+    /// Administrator-only diagnostic projection. It contains aggregate Core
+    /// counts and runtime flags, never account credentials, user grants or
+    /// another user's request/quota rows.
+    pub fn scheduler_status_for_admin(
+        &self,
+        principal: &Principal,
+        now_ms: i64,
+    ) -> Result<Value, SchedulerError> {
+        let mut payload = self
+            .store
+            .scheduler_status_for_admin(principal, now_ms)
+            .map_err(|error| match error {
+                aiwork_core::CoreError::AdminRequired => SchedulerError::AdminRequired,
+                _ => SchedulerError::StorageUnavailable,
+            })?;
+        let runtime = serde_json::to_value(self.scheduler_status())
+            .map_err(|_| SchedulerError::StorageUnavailable)?;
+        if let (Some(target), Some(source)) = (payload.as_object_mut(), runtime.as_object()) {
+            for (key, value) in source {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(payload)
     }
 
     /// Administrator-facing inventory for a resource, with no ranking or eligibility decision.
@@ -189,7 +219,10 @@ impl SchedulerRuntime {
                 Err(error) => { status.ready = false; status.last_error = Some(error.code().into()); }
             }
         }
-        let status = self.scheduler_status();
+        // Use the same injected clock as the diagnostic query. Calling the
+        // public wall-clock status here would immediately relabel fixed-time
+        // fixture observations as stale and hide the shadow result.
+        let status = self.scheduler_status_at(now_ms);
         if let Ok(json) = serde_json::to_string(&status) {
             crate::fs_utils::app_log(&self.data_dir, &format!("scheduler.shadow_dry_run {json}"));
         }
@@ -199,6 +232,8 @@ impl SchedulerRuntime {
     /// Explicit refresh only; startup never invokes network readers or any executor.
     pub fn refresh_observation(&self, request: ObservationRequest, now_ms: i64) -> Result<(), SchedulerError> {
         if self.mode == SchedulerMode::Off { return Err(SchedulerError::NotReady); }
+        let account_ref = request.account_ref.clone();
+        let resource_kind = request.resource_kind.clone();
         let accounts = read_directory(&self.data_dir)?;
         let account = accounts.get(&request.account_ref).filter(|a| a.provider == request.provider)
             .ok_or(SchedulerError::ReaderUnavailable)?;
@@ -210,9 +245,26 @@ impl SchedulerRuntime {
                 }
                 self.store.record_observation_snapshot(snapshot).map(|_| ()).map_err(|_| SchedulerError::ReaderUnavailable)
             });
-        if result.is_err() {
+        if result.is_ok() {
+            let observation_id = self
+                .store
+                .get_latest_observation(&account_ref, &resource_kind)
+                .map_err(|_| SchedulerError::StorageUnavailable)?
+                .map(|observation| observation.id);
+            self.store
+                .record_upstream_health_transition(
+                    &account_ref,
+                    None,
+                    None,
+                    &resource_kind,
+                    observation_id.as_deref(),
+                    "success",
+                    now_ms,
+                )
+                .map_err(|_| SchedulerError::StorageUnavailable)?;
+        } else {
             self.status.lock().unwrap_or_else(|e| e.into_inner()).reader_failures += 1;
-            let previous = self.store.get_latest_observation(&request.account_ref, &request.resource_kind)
+            let previous = self.store.get_latest_observation(&account_ref, &resource_kind)
                 .map_err(|_| SchedulerError::StorageUnavailable)?;
             let scale = previous.as_ref().map(|o| o.value_scale).unwrap_or(1);
             // Core sorts equal timestamps by ID. A failed refresh must supersede the
@@ -222,13 +274,42 @@ impl SchedulerRuntime {
                 None => now_ms,
             };
             // Core preserves the last successful value on a Failed row; a failure is never zero credit.
+            let failed_id = format!("observation_{:032x}", rand::random::<u128>());
             self.store.append_upstream_observation(UpstreamObservation::new(
-                format!("observation_{:032x}", rand::random::<u128>()), request.account_ref, request.resource_kind,
+                failed_id.clone(), account_ref.clone(), resource_kind.clone(),
                 None, scale, "reader".into(), ObservationStatus::Failed, failed_at, failed_at,
                 serde_json::json!({"status":"failed", "reason":"reader_unavailable"}),
             )).map_err(|_| SchedulerError::StorageUnavailable)?;
+            self.store
+                .record_upstream_health_transition(
+                    &account_ref,
+                    None,
+                    None,
+                    &resource_kind,
+                    Some(&failed_id),
+                    "reader_failure",
+                    now_ms,
+                )
+                .map_err(|_| SchedulerError::StorageUnavailable)?;
         }
         result
+    }
+}
+
+fn merge_core_status_counts(status: &mut SchedulerStatus, counts: &Value) {
+    let count = |key: &str| counts.get(key).and_then(Value::as_u64);
+    if let Some(value) = count("accounts") { status.accounts = value; }
+    if let Some(value) = count("enabled_accounts") { status.enabled_accounts = value; }
+    if let Some(value) = count("fresh_observations") { status.fresh_observations = value; }
+    if let Some(value) = count("stale_observations") { status.stale_observations = value; }
+    if let Some(value) = count("active_leases") { status.active_leases = value; }
+    if let Some(value) = count("unknown_leases") { status.unknown_leases = value; }
+    if let Some(value) = count("reader_failures") {
+        // Keep failures observed in the current runtime even when the
+        // diagnostic row could not be persisted (for example, an unavailable
+        // reader before an observation can be appended). The durable count is
+        // still included once it is available.
+        status.reader_failures = status.reader_failures.max(value);
     }
 }
 
@@ -443,7 +524,9 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("aiwork-scheduler-task4-{}", rand::random::<u64>()));
+            let dir = std::path::PathBuf::from(r"D:\gpt")
+                .join(format!("aiwork-scheduler-task6-{}", rand::random::<u64>()));
+            let _ = std::fs::remove_dir_all(&dir);
             let store = Arc::new(CoreStore::open(&dir).unwrap());
             store.migrate().unwrap();
             store.create_bootstrap_admin(NewUser { id: "admin".into(), name: "Fixture".into(), role: UserRole::Admin }, "bootstrap").unwrap();
