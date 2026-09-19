@@ -12,7 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use aiwork_core::{
     require_scope, ChatExecutionResult, CoreError, CoreJob, CoreJobAttempt, JobState, LeaseState,
-    Principal, RequestState, UpstreamError, UpstreamLeaseGrant, VideoJobLeaseResult,
+    Principal, RequestState, UpstreamError, UpstreamLeaseGrant, VideoJobEnqueueResult,
 };
 
 use super::custom_route;
@@ -1835,7 +1835,7 @@ fn core_video_status(state: JobState) -> &'static str {
     }
 }
 
-fn core_video_projection(job: &CoreJob, attempt: &CoreJobAttempt, data_dir: &std::path::Path) -> Value {
+fn core_video_projection(job: &CoreJob, attempt: Option<&CoreJobAttempt>, data_dir: &std::path::Path) -> Value {
     let mut payload = json!({
         "id": job.id,
         "object": "video",
@@ -1843,8 +1843,10 @@ fn core_video_projection(job: &CoreJob, attempt: &CoreJobAttempt, data_dir: &std
         "status": core_video_status(job.state),
         "created_at": job.created_at_ms / 1_000,
         "updated_at": job.updated_at_ms / 1_000,
-        "attempt": attempt.attempt_no,
     });
+    if let Some(attempt) = attempt {
+        payload["attempt"] = json!(attempt.attempt_no);
+    }
     if let Some(error_code) = job.error_code.as_deref() {
         payload["error"] = json!({ "code": error_code });
     }
@@ -1868,17 +1870,11 @@ fn core_video_bundle(
     bridge: &super::CoreBridge,
     principal: &Principal,
     job_id: &str,
-) -> Result<Option<(CoreJob, CoreJobAttempt)>, CoreError> {
+) -> Result<Option<(CoreJob, Option<CoreJobAttempt>)>, CoreError> {
     let Some(job) = bridge.store.video_job_for_user(principal, job_id)? else {
         return Ok(None);
     };
-    let attempt = bridge
-        .store
-        .video_job_attempt_for_user(principal, job_id)?
-        .ok_or_else(|| CoreError::InvalidConfiguration {
-            key: "jobs.attempt".into(),
-            value: "video job has no attempt".into(),
-        })?;
+    let attempt = bridge.store.video_job_attempt_for_user(principal, job_id)?;
     Ok(Some((job, attempt)))
 }
 
@@ -1897,7 +1893,7 @@ fn core_video_response(
         Ok(None) => return openai_error(StatusCode::NOT_FOUND, "task_not_found", "video task not found"),
         Err(error) => return core_error_response(error),
     };
-    let task = core_video_projection(&bundle.0, &bundle.1, data_dir);
+    let task = core_video_projection(&bundle.0, bundle.1.as_ref(), data_dir);
     let body = if wrapped {
         json!({ "task": task, "idempotent_replay": replay })
     } else {
@@ -1971,18 +1967,18 @@ async fn core_videos_generations(
         chrono::Utc::now().timestamp_millis(),
         rand::random::<u64>()
     );
-    let preflight = match bridge.preflight_video_job(
+    let enqueued = match bridge.enqueue_video_job(
         &principal,
         &principal.key_id,
         idempotency_key,
         &input,
-        job_id,
+        job_id.clone(),
     ) {
         Ok(result) => result,
         Err(error) => return core_lease_error_response(error),
     };
-    let (job, lease) = match preflight {
-        VideoJobLeaseResult::Replay { job, .. } => {
+    let job = match enqueued {
+        VideoJobEnqueueResult::Replay { job, .. } => {
             return core_video_response(
                 &bridge,
                 &principal,
@@ -1994,21 +1990,25 @@ async fn core_videos_generations(
                 &state.data_dir,
             )
         }
-        VideoJobLeaseResult::Acquired { job, lease, .. } => (job, lease),
+        VideoJobEnqueueResult::Created { job, .. } => job,
     };
 
-    if let Err(error) = bridge.mark_video_job_running(&principal, &job.id) {
-        let _ = bridge.settle_video_job(
-            &principal,
-            &job.id,
-            &lease.lease_id,
-            VideoAdapterOutcome::TransportUnknown {
-                reason: "dispatch_state_failed".into(),
-                upstream_request_ref: None,
-            },
-        );
-        return core_lease_error_response(error);
-    }
+    let (job, lease) = match bridge.claim_video_job_for_worker("http-video-worker", &job.id) {
+        Ok(Some(claim)) => claim,
+        Ok(None) => {
+            return core_video_response(
+                &bridge,
+                &principal,
+                &job.id,
+                Some(&job.request_id),
+                StatusCode::ACCEPTED,
+                true,
+                false,
+                &state.data_dir,
+            )
+        }
+        Err(error) => return core_lease_error_response(error),
+    };
     let request = VideoExecutionRequest {
         job_id: job.id.clone(),
         request_id: job.request_id.clone(),

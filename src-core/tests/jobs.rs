@@ -270,6 +270,37 @@ fn durable_video_queue_claim_round_robins_users_and_claims_each_job_once() {
 }
 
 #[test]
+fn queued_video_cancel_releases_user_hold_before_any_upstream_lease_exists() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "queued-cancel", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "queued-cancel-job".into(),
+                input_hash: vec![7; 32],
+            },
+        )
+        .unwrap();
+    let job = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+    assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
+    let canceled = store
+        .request_video_cancel(&principal, &job.id, 1_800_000_000_100)
+        .unwrap();
+    assert_eq!(canceled.state, aiwork_core::JobState::Canceled);
+    assert_eq!(store.request_state(&job.request_id).unwrap(), aiwork_core::RequestState::Settled);
+    assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
+    let balance = store.balance("video-user", "video_job").unwrap();
+    assert_eq!((balance.available, balance.held), (10, 0));
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn bootstrap_creates_authoritative_video_job_tables() {
     let (store, _admin, _principal, dir) = fixture();
     assert_eq!(CURRENT_SCHEMA_VERSION, 11);
