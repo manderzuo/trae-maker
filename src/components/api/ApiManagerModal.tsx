@@ -17,13 +17,15 @@ import CustomModelsPanel from './CustomModelsPanel';
 import EcoAccess from './EcoAccess';
 import ResourceSummary from './ResourceSummary';
 import UsageStatsPanel from './UsageStatsPanel';
+import CoreAdminPanel from './CoreAdminPanel';
 
-type TabKey = 'overview' | 'config' | 'keys' | 'usage' | 'custom' | 'eco';
+type TabKey = 'overview' | 'config' | 'keys' | 'core' | 'usage' | 'custom' | 'eco';
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
   { key: 'config', label: '接口配置' },
   { key: 'keys', label: 'API Keys 管理' },
+  { key: 'core', label: 'Core 管理' },
   { key: 'usage', label: '用量统计' },
   { key: 'custom', label: '自定义模型' },
   { key: 'eco', label: '生态接入' },
@@ -86,6 +88,9 @@ export default function ApiManagerModal() {
         {tab === 'config' && <InterfaceConfig />}
         {tab === 'keys' && (
           <ApiKeysManager onSubModalChange={(v) => { subOpenRef.current = v; }} />
+        )}
+        {tab === 'core' && (
+          <CoreAdminPanel onSubModalChange={(v) => { subOpenRef.current = v; }} />
         )}
         {tab === 'usage' && <UsageStatsPanel />}
         {tab === 'custom' && (

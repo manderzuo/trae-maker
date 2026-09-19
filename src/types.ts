@@ -480,6 +480,56 @@ export interface GatewaySettings {
   updated_at: number;
 }
 
+/** Core 管理状态；与 legacy API Keys 管理分开，数据来自 core.sqlite3。 */
+export interface CoreStatus {
+  schema_version: number;
+  database_path: string;
+  foreign_keys_enabled: boolean;
+  core_mode: string;
+  running: boolean;
+}
+
+export interface CoreUserAdminView {
+  id: string;
+  name: string;
+  role: string;
+  status: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface CoreApiKeyAdminView {
+  id: string;
+  user_id: string;
+  name: string;
+  prefix: string;
+  scopes: string[];
+  status: string;
+  created_at_ms: number;
+  revoked_at_ms: number | null;
+}
+
+export interface CoreUserResponse {
+  id: string;
+  name: string;
+  role: string;
+}
+
+export interface CoreIssuedApiKeyResponse {
+  id: string;
+  plaintext: string;
+  prefix: string;
+  user_id: string;
+  scopes: string[];
+}
+
+export interface CoreQuotaBalanceResponse {
+  user_id: string;
+  resource_kind: string;
+  available: number;
+  held: number;
+}
+
 export interface ConversationSummary {
   conversation_id: string;
   model: string;

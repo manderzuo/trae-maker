@@ -81,6 +81,12 @@ import type {
   TraeRelayPackage,
   TraeShareResult,
   TraeInstanceView,
+  CoreApiKeyAdminView,
+  CoreIssuedApiKeyResponse,
+  CoreQuotaBalanceResponse,
+  CoreStatus,
+  CoreUserAdminView,
+  CoreUserResponse,
 } from '../types';
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
@@ -256,6 +262,49 @@ export const api = {
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
+  core: {
+    status: () => invoke<CoreStatus>('core_status'),
+    usersList: (adminApiKey: string) =>
+      invoke<CoreUserAdminView[]>('core_users_list', { adminApiKey }),
+    apiKeysList: (adminApiKey: string, userId?: string | null) =>
+      invoke<CoreApiKeyAdminView[]>('core_api_keys_list', {
+        adminApiKey,
+        userId: userId ?? null,
+      }),
+    quotaBalance: (adminApiKey: string, userId: string, resourceKind: string) =>
+      invoke<CoreQuotaBalanceResponse>('core_quota_balance', {
+        adminApiKey,
+        userId,
+        resourceKind,
+      }),
+    userSetStatus: (adminApiKey: string, userId: string, active: boolean) =>
+      invoke<CoreUserAdminView>('core_user_set_status', { adminApiKey, userId, active }),
+    apiKeyRevoke: (adminApiKey: string, keyId: string) =>
+      invoke<void>('core_api_key_revoke', { adminApiKey, keyId }),
+    userCreate: (adminApiKey: string, id: string, name: string, role: string) =>
+      invoke<CoreUserResponse>('core_user_create', { adminApiKey, id, name, role }),
+    apiKeyIssue: (adminApiKey: string, userId: string, name: string, scopes: string[]) =>
+      invoke<CoreIssuedApiKeyResponse>('core_api_key_issue', {
+        adminApiKey,
+        userId,
+        name,
+        scopes,
+      }),
+    quotaGrant: (
+      adminApiKey: string,
+      userId: string,
+      resourceKind: string,
+      amount: number,
+      reason: string,
+    ) =>
+      invoke<CoreQuotaBalanceResponse>('core_quota_grant', {
+        adminApiKey,
+        userId,
+        resourceKind,
+        amount,
+        reason,
+      }),
+  },
   profiles: {
     // Buddy 双应用：profile_list / profile_restore / profile_delete 支持 WorkBuddy / CodeBuddy 档案映射
     list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
