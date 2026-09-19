@@ -19,4 +19,11 @@ pub enum CoreError {
     InvalidSchemaVersion { value: String },
     #[error("core schema version {version} is newer than this binary supports")]
     UnsupportedSchemaVersion { version: u32 },
+    #[error("core serialization error: {source}")]
+    Serialization {
+        #[from]
+        source: serde_json::Error,
+    },
+    #[error("unsupported diagnostic table: {table}")]
+    UnsupportedDiagnosticTable { table: String },
 }
