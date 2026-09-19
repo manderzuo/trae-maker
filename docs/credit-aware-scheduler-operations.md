@@ -71,9 +71,10 @@ cooldown reason 和 consecutive error；未知输入会收敛到安全的 `clien
 
 结构化 scheduler JSONL 事件使用以下固定安全字段：`event`、时间、受限 request/lease
 标识、`account_hash`、安全 provider/resource label、`observation_hash` 和固定
-`error_category`。账号引用、观测 ID、凭据引用、JWT、Cookie、prompt、请求/响应 body
-均不得原样写入结构化事件或 Core 审计元数据。旧 debug 请求日志若由诊断开关启用，仍须按
-敏感日志对待。
+`error_category`。账号引用、凭据引用、JWT、Cookie、prompt、请求/响应 body 均不得原样
+写入结构化事件或 Core 审计元数据；通过 opaque 字符集和长度校验的 `observation_id` 可
+保留用于审计追踪，不安全的观测标识仍改写为 hash。旧 debug 请求日志若由诊断开关启用，
+仍须按敏感日志对待。
 
 ## 6. 回滚
 
@@ -98,3 +99,17 @@ cargo test --manifest-path src-core/Cargo.toml --target-dir D:/gpt/aiwork-task6-
 
 不要运行 broad Tauri suite、真实上游 API 测试或把 `target-fix/`、`data/`、`credentials/`
 和生成的 `Cargo.lock` 纳入提交。
+
+## 8. Phase 2 交付验证
+
+`src-core/tests/full_phase2.rs` 是固定时间、固定 Mock 的集成 smoke：它注册不同
+provider/region 的两个账号，验证 fresh/stale 观测、`max_concurrency=1` 的并发容量、
+success/replay/rejection/transport-unknown、重启恢复、审计脱敏和 quota 不透支。
+`src-tauri/src/api_server/phase2_smoke.rs` 只组合内存 Mock adapter；它不是生产上游
+连接器，也不读取账号凭据、legacy `ApiPool` 或网络配置。
+
+Task 5 的真实 `(account_ref, provider, credentials_ref)` 启动绑定仍未接通。因此当前
+`enforce` 只能在缺少可信绑定时稳定返回 `501/scheduler_endpoint_not_enabled`，不能把
+上述 Mock smoke 的成功结果表述为真实 upstream 成功。交付时应同时保留 Core 全套离线
+回归、Tauri `phase2_smoke`/focused 回归和其 D 盘日志；若 Python/frontend 测试会触达
+真实上游，则跳过并在报告中记录原因。

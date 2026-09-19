@@ -1277,7 +1277,11 @@ impl CoreStore {
                         }
                         "observation_id" => {
                             if let Some(raw) = value.as_str() {
-                                sanitized.insert("observation".into(), Value::String(audit_hash(raw)));
+                                if let Some(safe) = audit_identifier(Some(raw)) {
+                                    sanitized.insert("observation_id".into(), Value::String(safe));
+                                } else {
+                                    sanitized.insert("observation".into(), Value::String(audit_hash(raw)));
+                                }
                             }
                         }
                         "credentials_ref" | "credential" | "jwt" | "token" | "cookie"
