@@ -21,7 +21,8 @@ reservation 和 lease 组织成可恢复的持久队列边界：提交只产生�
 - 现有 Core scheduler 通过账号 observation、lease 和容量做安全选择；它不应被新的队列层
   绕过。队列只决定顺序，账号选择只发生在领取事务中。
 - 真实 adapter 的 accepted、success、rejection、cancel 和费用证据尚未有可核验契约；本阶段
-  只使用 `MockVideoAdapter`/fixture。
+  只使用 MockVideoAdapter/fixture。Tauri 已有一个显式 worker 边界，但生产启动仍不会
+  自动注册未知的真实 adapter。
 
 ## 设计边界
 
@@ -37,9 +38,10 @@ reservation 和 lease 组织成可恢复的持久队列边界：提交只产生�
    accepted 的 job 只记录取消意图，adapter 明确确认后才释放 hold。
 6. **敏感数据**：队列投影只返回 hash、受限 model/resource label、状态和时间；不持久化 prompt、
    完整 body、JWT、Cookie、credentials 或上游完整响应。
-7. **载荷边界**：当前 job 只持久化输入 hash，不足以在进程重启后重新构造 adapter 输入。因而
-   本阶段的 Tauri 路由只对当前请求的 transient body 立即执行；真正的后台 worker、受保护的
-   任务载荷引用/恢复读取必须作为后续独立设计，不能把“已入队”误报成“可自动完成”。
+7. **载荷边界**：Core job 仍只持久化输入 hash；Tauri 以 job id 为键把 adapter body 写入
+   Windows 当前用户 DPAPI 保护的独立载荷文件，文件不进入 Core、日志或管理投影。写入先于
+   Core enqueue，终态后删除，unknown 保留以支持对账。worker 读取失败或找不到载荷时只进入
+   unknown 并保留 hold；它不会把异常误报为成功，也不会自动换号重放。
 
 ## 计划接口
 
@@ -63,10 +65,12 @@ reservation、lease 或 job。
 - 进程重启、租约过期、心跳失败、accepted 无终态、取消未确认都保留 unknown hold，不能自动重试。
 - queued cancel 只释放一次；running/accepted cancel 只记录意图；确认取消才释放一次。
 - Core 全套离线 Mock 回归继续通过；不运行真实网络、真实账号或真实账单测试。
-- 新增的 job heartbeat/recovery 只证明 Core 状态边界，不证明后台 worker 已经能够从重启中
-  读取并执行视频输入。
+- 新增的 job heartbeat/recovery 加上 Tauri Mock worker 已证明：持久载荷可在独立 worker
+  中读取、领取、执行并结算；缺失载荷会保留 unknown hold。它仍不证明真实上游视频协议、
+  费用单位或重启后对真实上游状态的自动查询。
 
 ## 未解决边界
 
-Phase 4E 不证明真实上游队列、视频/图片协议、费用单位或退款规则。真实 adapter、异步轮询、
-结果下载、部署公网能力和 Skill/MCP Core job 契约需要在获得可核验上游接口后单独验收。
+Phase 4E 不证明真实上游队列、视频/图片协议、费用单位或退款规则。真实 adapter、启动时
+worker 生命周期接线、异步轮询、结果下载、部署公网能力和 Skill/MCP Core job 契约需要在
+获得可核验上游接口后单独验收。

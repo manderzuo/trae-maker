@@ -29,12 +29,13 @@
   cancel 仍由已有 lease 边界覆盖。
 - [x] 复用现有 lease recovery/settlement，确保 job/attempt/request/reservation 终态一致，并清除
   已失效的 queue claim owner。
-- [ ] 仅显式终态/受限证据允许 reconcile；重复 reconcile/release 幂等。
+- [x] 仅显式终态/受限证据允许 reconcile；重复 reconcile/release 幂等。
 
 ### Task 3：Tauri/worker 接入（Mock only）
 
-- [ ] 增加最小后台 worker helper 和管理员安全投影，生产 adapter 缺失仍返回 501。
-- [ ] 用 bounded Mock worker 验证领取、心跳、取消和重启，不启动真实服务或网络。
+- [x] 增加最小后台 worker helper 和 DPAPI 保护的任务载荷边界，生产 adapter 缺失仍返回 501；
+  管理员安全投影仍待补齐。
+- [x] 用 bounded Mock worker 验证领取、心跳、取消、缺失载荷和终态清理，不启动真实服务或网络。
 - [ ] 更新运维文档说明启动恢复、unknown hold 和回滚到 off。
 
 ### Task 4：验证与交付

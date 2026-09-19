@@ -301,6 +301,36 @@ fn queued_video_cancel_releases_user_hold_before_any_upstream_lease_exists() {
 }
 
 #[test]
+fn queued_video_job_can_resolve_its_internal_principal_without_exposing_key_material() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "worker-principal", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "worker-principal-job".into(),
+                input_hash: vec![11; 32],
+            },
+        )
+        .unwrap();
+    let job_id = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job.id,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+
+    let resolved = store.principal_for_video_job(&job_id).unwrap().unwrap();
+    assert_eq!(resolved.user_id, principal.user_id);
+    assert_eq!(resolved.key_id, principal.key_id);
+    assert!(resolved.scopes.contains("videos:submit"));
+    let serialized = format!("{resolved:?}");
+    assert!(!serialized.contains("sk-"));
+
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn claimed_video_job_heartbeat_is_owner_bound_and_keeps_all_runtime_rows_alive() {
     let (store, admin, principal, dir) = fixture();
     prepare_video_scheduler(&store, &admin);

@@ -398,6 +398,7 @@ async fn do_start_with_scheduler_key(
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
         data_dir: state.data_dir.clone(),
+        video_payloads: crate::api_server::video_payload::VideoPayloadStore::new(&state.data_dir),
         cors_origins,
         total_requests: std::sync::atomic::AtomicU64::new(0),
         inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),

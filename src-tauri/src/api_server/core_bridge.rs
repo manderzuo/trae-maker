@@ -639,6 +639,31 @@ impl CoreBridge {
         Ok(Some((claim.job, grant)))
     }
 
+    /// Claim the next durable video queue item.  Selection and lease creation
+    /// remain inside Core's Immediate transaction; this bridge only converts
+    /// the persisted lease to an explicitly bound adapter grant.
+    pub fn claim_next_video_job_for_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<(aiwork_core::CoreJob, UpstreamLeaseGrant)>, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if self.scheduler.is_none() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        let executor = self.video_executor()?;
+        let claim = self
+            .store
+            .claim_next_video_job(worker_id, chrono::Utc::now().timestamp_millis())
+            .map_err(CoreLeaseError::from)?;
+        let Some(claim) = claim else {
+            return Ok(None);
+        };
+        let grant = executor
+            .grant_for_lease(&claim.lease)
+            .ok_or(CoreLeaseError::EndpointNotEnabled)?;
+        Ok(Some((claim.job, grant)))
+    }
+
     pub fn heartbeat_video_job_for_worker(
         &self,
         worker_id: &str,

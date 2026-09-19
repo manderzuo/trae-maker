@@ -1967,6 +1967,23 @@ async fn core_videos_generations(
         chrono::Utc::now().timestamp_millis(),
         rand::random::<u64>()
     );
+    // Core stores only this digest.  The encrypted payload is written first so
+    // a crash between persistence and enqueue cannot leave a runnable Core job
+    // without the adapter input it needs after restart.
+    let sanitized_input = super::payload::sanitize_scheduler_chat_body(&input);
+    let input_hash = aiwork_core::canonical_json_hash(&sanitized_input);
+    if let Err(error) = state.video_payloads.put(
+        &job_id,
+        &principal.user_id,
+        &input_hash,
+        &input,
+    ) {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "video_payload_unavailable",
+            &error,
+        );
+    }
     let enqueued = match bridge.enqueue_video_job(
         &principal,
         &principal.key_id,
@@ -1975,10 +1992,14 @@ async fn core_videos_generations(
         job_id.clone(),
     ) {
         Ok(result) => result,
-        Err(error) => return core_lease_error_response(error),
+        Err(error) => {
+            let _ = state.video_payloads.remove(&job_id);
+            return core_lease_error_response(error);
+        }
     };
     let job = match enqueued {
         VideoJobEnqueueResult::Replay { job, .. } => {
+            let _ = state.video_payloads.remove(&job_id);
             return core_video_response(
                 &bridge,
                 &principal,
@@ -2071,6 +2092,9 @@ async fn core_videos_generations(
             ) {
                 return core_lease_error_response(error);
             }
+            if video_outcome_releases_payload(&outcome) {
+                let _ = state.video_payloads.remove(&job.id);
+            }
         }
     }
     if let VideoAdapterOutcome::Rejected {
@@ -2132,6 +2156,18 @@ fn video_outcome_request_ref(outcome: &VideoAdapterOutcome) -> Option<String> {
         | VideoAdapterOutcome::TransportUnknown { upstream_request_ref, .. } => upstream_request_ref.clone(),
         VideoAdapterOutcome::Rejected { .. } => None,
     }
+}
+
+fn video_outcome_releases_payload(outcome: &VideoAdapterOutcome) -> bool {
+    matches!(
+        outcome,
+        VideoAdapterOutcome::Succeeded { .. }
+            | VideoAdapterOutcome::Canceled { .. }
+            | VideoAdapterOutcome::Rejected {
+                accepted: false,
+                ..
+            }
+    )
 }
 
 /// W-02 Seedance 文生视频入口。Work 积分账号异步转发到 Trae Work CN
@@ -3577,6 +3613,7 @@ mod tests {
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             default_model: "mock-1".into(),
             data_dir: dir.clone(),
+            video_payloads: super::super::video_payload::VideoPayloadStore::new(&dir),
             cors_origins: String::new(),
             total_requests: std::sync::atomic::AtomicU64::new(0),
             inflight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5176,6 +5213,119 @@ mod tests {
         assert_eq!(store.balance("route-user", "video_job").unwrap().held, 1);
         assert_eq!(
             store.video_job_for_user(&fixture.principal, body["task"]["id"].as_str().unwrap()).unwrap().unwrap().state,
+            aiwork_core::JobState::Unknown
+        );
+    }
+
+    #[test]
+    fn durable_mock_worker_claims_persisted_payload_and_settles_once() {
+        let (fixture, adapter) = phase3_video_fixture(
+            1,
+            vec![VideoAdapterOutcome::Succeeded {
+                actual_units: Some(1),
+                upstream_request_ref: Some("worker-upstream".into()),
+                output_ref: Some("jobs/worker-output".into()),
+                artifact_ref: None,
+            }],
+            Vec::new(),
+        );
+        let body = json!({"model": "mock-video", "prompt": "worker payload"});
+        let job_id = "worker-persisted-job";
+        let bridge = fixture.state.core.as_ref().unwrap().clone();
+        let input_hash =
+            aiwork_core::canonical_json_hash(&super::super::payload::sanitize_scheduler_chat_body(&body));
+        fixture
+            .state
+            .video_payloads
+            .put(job_id, &fixture.principal.user_id, &input_hash, &body)
+            .unwrap();
+        bridge
+            .enqueue_video_job(
+                &fixture.principal,
+                &fixture.principal.key_id,
+                Some("worker-persisted-idempotency"),
+                &body,
+                job_id.into(),
+            )
+            .unwrap();
+
+        let worker = super::super::video_worker::VideoQueueWorker::new(
+            fixture.state.clone(),
+            "mock-worker",
+        );
+        let step = worker.run_once().unwrap();
+        assert_eq!(
+            step,
+            super::super::video_worker::VideoWorkerStep::Settled {
+                job_id: job_id.into(),
+                state: "succeeded",
+            }
+        );
+        assert_eq!(adapter.calls(), vec![job_id.to_string()]);
+        let store = &bridge.store;
+        assert_eq!(
+            store.video_job_for_user(&fixture.principal, job_id).unwrap().unwrap().state,
+            aiwork_core::JobState::Succeeded
+        );
+        assert_eq!(store.balance("route-user", "video_job").unwrap().held, 0);
+        assert_eq!(
+            fixture
+                .state
+                .video_payloads
+                .get(job_id, &fixture.principal.user_id, &input_hash)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn durable_worker_missing_payload_becomes_unknown_without_releasing_hold() {
+        let (fixture, adapter) = phase3_video_fixture(
+            1,
+            vec![VideoAdapterOutcome::Succeeded {
+                actual_units: Some(1),
+                upstream_request_ref: Some("should-not-run".into()),
+                output_ref: Some("jobs/should-not-run".into()),
+                artifact_ref: None,
+            }],
+            Vec::new(),
+        );
+        let body = json!({"model": "mock-video", "prompt": "not persisted"});
+        let bridge = fixture.state.core.as_ref().unwrap().clone();
+        let result = bridge
+            .enqueue_video_job(
+                &fixture.principal,
+                &fixture.principal.key_id,
+                Some("worker-missing-payload"),
+                &body,
+                "worker-missing-payload-job".into(),
+            )
+            .unwrap();
+        let job_id = match result {
+            VideoJobEnqueueResult::Created { job, .. } => job.id,
+            VideoJobEnqueueResult::Replay { .. } => panic!("unexpected replay"),
+        };
+
+        let worker = super::super::video_worker::VideoQueueWorker::new(
+            fixture.state.clone(),
+            "mock-worker-missing-payload",
+        );
+        assert_eq!(
+            worker.run_once().unwrap(),
+            super::super::video_worker::VideoWorkerStep::Unknown {
+                job_id: job_id.clone(),
+                reason: "video_payload_missing".into(),
+            }
+        );
+        assert!(adapter.calls().is_empty());
+        assert_eq!(bridge.store.balance("route-user", "video_job").unwrap().held, 1);
+        assert_eq!(
+            bridge
+                .store
+                .video_job_for_user(&fixture.principal, &job_id)
+                .unwrap()
+                .unwrap()
+                .state,
             aiwork_core::JobState::Unknown
         );
     }

@@ -27,7 +27,9 @@ pub mod unified_catalog;
 pub mod upstream_observation;
 pub mod usage;
 pub mod video;
+pub mod video_payload;
 pub mod video_store;
+pub mod video_worker;
 pub mod wb_catalog;
 pub mod wb_images;
 pub mod wb_model_route;
@@ -87,6 +89,8 @@ pub struct ApiSharedState {
     pub default_model: String,
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
+    /// 加密保存 Core 队列视频载荷；Core 数据库只保存输入摘要。
+    pub video_payloads: video_payload::VideoPayloadStore,
     /// 可选浏览器 CORS 允许来源（逗号分隔）；空值保持严格同源/非浏览器语义。
     pub cors_origins: String,
     pub total_requests: AtomicU64,
@@ -412,6 +416,7 @@ mod inflight_tests {
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),
             default_model: String::new(),
             data_dir: dir.clone(),
+            video_payloads: video_payload::VideoPayloadStore::new(&dir),
             cors_origins: String::new(),
             total_requests: AtomicU64::new(0),
             inflight: Arc::new(AtomicU64::new(0)),

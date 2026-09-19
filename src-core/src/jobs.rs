@@ -158,6 +158,42 @@ impl crate::CoreStore {
             .map_err(CoreError::from)
     }
 
+    /// Resolve the persisted owner identity needed by an internal worker.
+    /// This returns only the user/key identifiers and scopes; the API key
+    /// digest or plaintext is never selected into the worker projection.
+    pub fn principal_for_video_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<Principal>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let owner = connection
+            .query_row(
+                "SELECT r.user_id, r.api_key_id, k.scopes_json
+                 FROM jobs j
+                 INNER JOIN requests r ON r.id = j.request_id
+                 INNER JOIN api_keys k ON k.id = r.api_key_id
+                 WHERE j.id = ?1 AND j.kind = 'video'",
+                [job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((user_id, key_id, scopes_json)) = owner else {
+            return Ok(None);
+        };
+        let scopes = serde_json::from_str(&scopes_json).map_err(CoreError::from)?;
+        Ok(Some(Principal {
+            user_id,
+            key_id,
+            scopes,
+        }))
+    }
+
     pub fn video_job_attempt_for_user(
         &self,
         principal: &Principal,

@@ -106,6 +106,20 @@ mod dpapi {
     }
 }
 
+/// Protect an opaque application record with the current Windows user's
+/// DPAPI.  Callers must keep the plaintext in memory only; the returned blob
+/// is safe to persist as an application-owned record, but is not portable to
+/// another Windows user or machine.
+pub(crate) fn protect_blob(plain: &[u8]) -> Result<Vec<u8>, String> {
+    dpapi::protect(plain)
+}
+
+/// Reverse [`protect_blob`].  A failure is deliberately returned to the
+/// caller instead of falling back to plaintext or an unauthenticated decode.
+pub(crate) fn unprotect_blob(blob: &[u8]) -> Result<Vec<u8>, String> {
+    dpapi::unprotect(blob)
+}
+
 #[cfg(not(windows))]
 mod dpapi {
     pub fn protect(_plain: &[u8]) -> Result<Vec<u8>, String> {

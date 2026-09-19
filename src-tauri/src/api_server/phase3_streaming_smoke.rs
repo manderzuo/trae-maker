@@ -195,6 +195,7 @@ mod tests {
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             default_model: "mock-1".into(),
             data_dir: dir.clone(),
+            video_payloads: super::super::video_payload::VideoPayloadStore::new(&dir),
             cors_origins: String::new(),
             total_requests: std::sync::atomic::AtomicU64::new(0),
             inflight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
