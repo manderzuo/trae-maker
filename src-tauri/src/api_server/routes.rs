@@ -10,8 +10,11 @@ use axum::{Extension, Json};
 use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 
+use aiwork_core::{require_scope, ChatExecutionRequest, ChatExecutionResult, ChatExecutor, CoreError, Principal, RequestState, UpstreamError};
+
 use super::custom_route;
 use super::assets;
+use super::core_bridge::ChatOutcome;
 use super::dispatch::{self, DispatchError, TargetPool};
 use super::retry::{retry_plan, RetryAction};
 use super::sse;
@@ -70,8 +73,190 @@ impl Drop for DoneSignal {
 /// 聚合路径失败（P1 修复1）：区分「无健康账号」（维持原 503/格式）与
 /// 「Fatal 上游错误透传」（携带上游状态码与错误体摘要）
 enum AggregateFail {
-    NoHealthy(String),
+    NoHealthy { message: String, uncertain: bool },
     Upstream(u16, String),
+}
+
+struct CoreChatContext {
+    bridge: Arc<super::CoreBridge>,
+    principal: Principal,
+    request_id: String,
+    reservation_id: String,
+    reservation_amount: i64,
+}
+
+fn core_enforcing(state: &ApiSharedState) -> bool {
+    state
+        .core
+        .as_ref()
+        .map(|bridge| bridge.mode == super::CoreMode::Enforce)
+        .unwrap_or(false)
+}
+
+fn core_scope_error(scope: &str) -> Response {
+    openai_error(
+        StatusCode::FORBIDDEN,
+        "insufficient_scope",
+        &format!("missing required scope: {scope}"),
+    )
+}
+
+fn core_principal_or_unauthorized(principal: Option<&Extension<Principal>>) -> Result<Principal, Response> {
+    principal
+        .map(|extension| extension.0.clone())
+        .ok_or_else(|| openai_error(StatusCode::UNAUTHORIZED, "unauthorized", "Core Principal required"))
+}
+
+fn core_error_response(error: CoreError) -> Response {
+    match error {
+        CoreError::MissingScope { scope } => core_scope_error(&scope),
+        CoreError::BudgetPolicyMissing { .. } => openai_error(
+            StatusCode::BAD_REQUEST,
+            "budget_policy_missing",
+            "no Core cost policy matches this request",
+        ),
+        CoreError::QuotaInsufficient { .. } => openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "insufficient_quota",
+            "Core quota is insufficient",
+        ),
+        CoreError::IdempotencyConflict => openai_error(
+            StatusCode::CONFLICT,
+            "idempotency_conflict",
+            "Idempotency-Key was already used for a different request",
+        ),
+        CoreError::InvalidRequestIdentity { .. } => {
+            openai_error(StatusCode::UNAUTHORIZED, "unauthorized", "invalid Core request identity")
+        }
+        CoreError::CoreModeNotEnforcing { .. } => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "core_mode_error",
+            "Core enforce mode is unavailable",
+        ),
+        other => openai_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", &other.to_string()),
+    }
+}
+
+fn with_core_request_id(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+fn core_replay_response(preflight: &super::core_bridge::PreflightResult) -> Response {
+    let (status, code, message, body) = match preflight.state {
+        RequestState::Settled | RequestState::Succeeded => (
+            StatusCode::OK,
+            "idempotent_replay",
+            "request already completed; response replay is safe",
+            json!({
+                "id": preflight.request_id,
+                "object": "chat.completion",
+                "choices": [],
+                "idempotent_replay": true,
+            }),
+        ),
+        RequestState::Failed => (
+            StatusCode::CONFLICT,
+            "idempotent_replay_failed",
+            "request already failed; upstream was not called again",
+            json!({"request_id": preflight.request_id}),
+        ),
+        RequestState::Unknown => (
+            StatusCode::CONFLICT,
+            "idempotent_replay_unknown",
+            "request outcome is unknown; upstream was not called again",
+            json!({"request_id": preflight.request_id}),
+        ),
+        _ => (
+            StatusCode::CONFLICT,
+            "request_in_progress",
+            "request is already in progress; upstream was not called again",
+            json!({"request_id": preflight.request_id}),
+        ),
+    };
+    let mut response = openai_error(status, code, message);
+    if status == StatusCode::OK {
+        response = Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+    }
+    with_core_request_id(response, &preflight.request_id)
+}
+
+fn actual_amount_from_body(body: &Value, reserved_amount: i64) -> Option<i64> {
+    let usage = body.get("usage")?;
+    let actual = usage
+        .get("actual_amount")
+        .or_else(|| usage.get("total_tokens"))
+        .and_then(Value::as_i64)?;
+    (actual >= 0 && actual <= reserved_amount).then_some(actual)
+}
+
+fn settle_core_outcome(
+    context: &CoreChatContext,
+    mut response: Response,
+    outcome: ChatOutcome,
+) -> Response {
+    response.headers_mut().remove("x-aiwork-core-actual-amount");
+    response.headers_mut().remove("x-aiwork-core-outcome");
+    match context.bridge.settle_chat(&context.principal, &context.reservation_id, outcome) {
+        Ok(()) => with_core_request_id(response, &context.request_id),
+        Err(error) => core_error_response(error),
+    }
+}
+
+fn settle_core_response(context: &CoreChatContext, response: Response) -> Response {
+    let actual_amount = response
+        .headers()
+        .get("x-aiwork-core-actual-amount")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0 && *value <= context.reservation_amount);
+    let uncertain = response
+        .headers()
+        .get("x-aiwork-core-outcome")
+        .and_then(|value| value.to_str().ok())
+        == Some("unknown");
+    let outcome = if response.status().is_success() {
+        ChatOutcome::Success(ChatExecutionResult {
+            status: response.status().as_u16(),
+            body: json!({}),
+            actual_amount,
+        })
+    } else if uncertain || response.status().is_server_error() && response.status() != StatusCode::SERVICE_UNAVAILABLE {
+        ChatOutcome::Upstream(UpstreamError::Disconnected)
+    } else {
+        ChatOutcome::Failure(UpstreamError::Rejected {
+            status: response.status().as_u16(),
+            code: None,
+        })
+    };
+    settle_core_outcome(context, response, outcome)
+}
+
+#[cfg(test)]
+thread_local! {
+    static CORE_TEST_EXECUTOR: std::cell::RefCell<Option<Arc<dyn ChatExecutor>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_core_test_executor(executor: Arc<dyn ChatExecutor>) {
+    CORE_TEST_EXECUTOR.with(|slot| *slot.borrow_mut() = Some(executor));
+}
+
+#[cfg(test)]
+fn clear_core_test_executor() {
+    CORE_TEST_EXECUTOR.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn core_test_executor() -> Option<Arc<dyn ChatExecutor>> {
+    CORE_TEST_EXECUTOR.with(|slot| slot.borrow().clone())
 }
 
 // ==================== Handlers ====================
@@ -316,7 +501,19 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     }))
 }
 
-pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
+pub async fn models(
+    State(state): State<Arc<ApiSharedState>>,
+    principal: Option<Extension<Principal>>,
+) -> Response {
+    if core_enforcing(&state) {
+        let principal = match core_principal_or_unauthorized(principal.as_ref()) {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
+        if require_scope(&principal, "models:read").is_err() {
+            return core_scope_error("models:read");
+        }
+    }
     // 统一模型目录（§3.4）：实时聚合 data/api_models.json（Trae，元数据四层链）
     // 与 data/wb_model_catalog.json（Buddy），纯派生不落盘。官网/目录同步后
     // 无需重启 API 服务即可通过 /v1/models 看到最新列表
@@ -353,12 +550,13 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             })
         })
         .collect();
-    Json(json!({ "object": "list", "data": data }))
+    Json(json!({ "object": "list", "data": data })).into_response()
 }
 
 pub async fn chat_completions(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -400,7 +598,6 @@ pub async fn chat_completions(
     if let Some(id) = conversation_id.as_deref() {
         super::conversation::merge_history(&state.data_dir, id, &mut peek);
     }
-    let body_vec = serde_json::to_vec(&peek).unwrap_or_else(|_| body.to_vec());
     let stream = peek.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let model = peek
         .get("model")
@@ -412,11 +609,118 @@ pub async fn chat_completions(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
+    let mut core_context: Option<CoreChatContext> = None;
+    #[cfg(test)]
+    let mut core_execution: Option<ChatExecutionRequest> = None;
+    if core_enforcing(&state) {
+        let principal = match core_principal_or_unauthorized(principal.as_ref()) {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
+        if require_scope(&principal, "chat:invoke").is_err() {
+            return core_scope_error("chat:invoke");
+        }
+        if stream {
+            return openai_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "stream_not_enabled_in_phase1",
+                "streaming chat is not enabled in Core phase 1",
+            );
+        }
+        let idempotency_key = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let idempotency_key = match idempotency_key {
+            Some(key) => key,
+            None => {
+                return openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "idempotency_key_required",
+                    "Idempotency-Key is required in Core enforce mode",
+                )
+            }
+        };
+        if peek.get("model").is_none() {
+            peek["model"] = json!(model.clone());
+        }
+        let bridge = state.core.as_ref().expect("Core enforce mode requires a bridge");
+        let preflight = match bridge.preflight_chat(
+            &principal,
+            &key_str,
+            Some(idempotency_key),
+            &peek,
+        ) {
+            Ok(preflight) => preflight,
+            Err(error) => return core_error_response(error),
+        };
+        if preflight.execution.is_none() {
+            return core_replay_response(&preflight);
+        }
+        let reservation = match preflight.reservation.as_ref() {
+            Some(reservation) => reservation,
+            None => return core_error_response(CoreError::ReservationNotFound {
+                reservation_id: preflight.request_id,
+            }),
+        };
+        #[cfg(test)]
+        {
+            core_execution = preflight.execution;
+        }
+        core_context = Some(CoreChatContext {
+            bridge: state.core.as_ref().unwrap().clone(),
+            principal,
+            request_id: preflight.request_id,
+            reservation_id: reservation.id.clone(),
+            reservation_amount: reservation.amount,
+        });
+    }
+
+    let body_vec = serde_json::to_vec(&peek).unwrap_or_else(|_| body.to_vec());
+
+    #[cfg(test)]
+    if let (Some(context), Some(execution), Some(executor)) =
+        (core_context.as_ref(), core_execution.take(), core_test_executor())
+    {
+        let result = executor.execute(execution);
+        let response = match result {
+            Ok(result) => {
+                let settlement_result = ChatExecutionResult {
+                    status: result.status,
+                    body: result.body.clone(),
+                    actual_amount: result
+                        .actual_amount
+                        .filter(|actual_amount| *actual_amount >= 0 && *actual_amount <= context.reservation_amount),
+                };
+                let mut response = Response::builder()
+                    .status(StatusCode::from_u16(result.status).unwrap_or(StatusCode::OK))
+                    .header("content-type", "application/json")
+                    .body(Body::from(result.body.to_string()))
+                    .unwrap();
+                if let Some(actual_amount) = result
+                    .actual_amount
+                    .filter(|actual_amount| *actual_amount >= 0 && *actual_amount <= context.reservation_amount)
+                {
+                    if let Ok(value) = HeaderValue::from_str(&actual_amount.to_string()) {
+                        response.headers_mut().insert("x-aiwork-core-actual-amount", value);
+                    }
+                }
+                settle_core_outcome(context, response, ChatOutcome::Success(settlement_result))
+            }
+            Err(error) => {
+                let response = openai_error(StatusCode::BAD_GATEWAY, "upstream_error", &error.to_string());
+                settle_core_outcome(context, response, ChatOutcome::Upstream(error))
+            }
+        };
+        return response;
+    }
+
     // 统一调度分流点（§4.1 ③~⑥）：resolve_target 决定资源池/会话池粘性/跨池回退/
     // 错误矩阵，替代原 resolve_wb_target 单向判定；默认策略下行为与改造前一致（§9.1）。
     // inflight guard 随执行路径持有至请求结束（流式含整个后台任务）
     let guard = state.inflight_guard();
-    match dispatch::resolve_target(&state, &model, &peek) {
+    let response = match dispatch::resolve_target(&state, &model, &peek) {
         Err(e) => dispatch_error_response(e, Protocol::OpenAi, &model),
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
@@ -425,9 +729,10 @@ pub async fn chat_completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                    wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard)
+                } else {
+                    wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
             }
             TargetPool::Trae => {
                 if stream {
@@ -451,6 +756,10 @@ pub async fn chat_completions(
                 }
             }
         },
+    };
+    match core_context.as_ref() {
+        Some(context) => settle_core_response(context, response),
+        None => response,
     }
 }
 
@@ -1630,6 +1939,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // inflight guard 随后台任务存续至聚合完成（§4.5）
         let _inflight = guard;
         let mut tried = HashSet::new();
+        let mut uncertain_upstream = false;
 
         let max_rotate = state.pool.count().max(1);
         for _ in 0..max_rotate {
@@ -1729,6 +2039,13 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         }
                     }
                     Err((status, resp_body, retry_after)) => {
+                        if status == 502
+                            && ["连接超时", "传输错误", "DNS解析失败", "TLS证书验证失败"]
+                                .iter()
+                                .any(|marker| resp_body.contains(marker))
+                        {
+                            uncertain_upstream = true;
+                        }
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
@@ -1804,26 +2121,41 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 );
             }
         }
-        Err(AggregateFail::NoHealthy("no healthy account available".to_string()))
+        Err(AggregateFail::NoHealthy {
+            message: "no healthy account available".to_string(),
+            uncertain: uncertain_upstream,
+        })
     })
     .await;
 
     match result {
-        Ok(Ok(resp)) => Response::builder()
-            .header("content-type", "application/json")
-            .body(Body::from(resp.to_string()))
-            .unwrap_or_else(|_| {
+        Ok(Ok(resp)) => {
+            let mut builder = Response::builder().header("content-type", "application/json");
+            if let Some(actual_amount) = actual_amount_from_body(&resp, i64::MAX) {
+                builder = builder.header("x-aiwork-core-actual-amount", actual_amount.to_string());
+            }
+            builder.body(Body::from(resp.to_string())).unwrap_or_else(|_| {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::from("internal server error"))
                     .unwrap()
-            }),
-        Ok(Err(AggregateFail::NoHealthy(msg))) => match proto {
-            Protocol::OpenAi | Protocol::OpenAiText | Protocol::Responses => {
-                openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg)
+            })
+        }
+        Ok(Err(AggregateFail::NoHealthy { message: msg, uncertain })) => {
+            let mut response = match proto {
+                Protocol::OpenAi | Protocol::OpenAiText | Protocol::Responses => {
+                    openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg)
+                }
+                Protocol::Anthropic => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &msg),
+            };
+            if uncertain {
+                response.headers_mut().insert(
+                    "x-aiwork-core-outcome",
+                    HeaderValue::from_static("unknown"),
+                );
             }
-            Protocol::Anthropic => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &msg),
-        },
+            response
+        }
         Ok(Err(AggregateFail::Upstream(status, msg))) => {
             // Fatal：上游错误体透传（不冷却），按协议格式化并保留上游状态码
             let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -2064,7 +2396,281 @@ fn safe_slice(s: &str, n: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
+
     use super::*;
+    use aiwork_core::{CoreStore, CostPolicy, MockChatExecutor, NewUser, Principal, QuotaGrant, UserRole};
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+
+    use crate::api_server::{CoreBridge, CoreMode};
+
+    struct CoreFixture {
+        dir: PathBuf,
+        state: Arc<ApiSharedState>,
+        principal: Principal,
+    }
+
+    impl Drop for CoreFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn core_fixture(grant: i64, scopes: &[&str]) -> CoreFixture {
+        let dir = std::env::temp_dir().join(format!(
+            "aiwork-routes-core-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(CoreStore::open(&dir).unwrap());
+        store.migrate().unwrap();
+        store
+            .create_user(
+                NewUser {
+                    id: "route-user".into(),
+                    name: "Route test user".into(),
+                    role: UserRole::User,
+                },
+                "bootstrap",
+            )
+            .unwrap();
+        let key = store
+            .issue_api_key(
+                "route-user",
+                "route-test",
+                scopes.iter().map(|scope| (*scope).to_owned()).collect::<BTreeSet<_>>(),
+                "bootstrap",
+            )
+            .unwrap();
+        store
+            .upsert_cost_policy(CostPolicy {
+                id: "route-chat-policy".into(),
+                endpoint: "chat".into(),
+                model_pattern: "mock-*".into(),
+                resource_kind: "chat_request".into(),
+                reserve_amount: 1,
+                max_actual_amount: Some(1),
+                version: 1,
+                enabled: true,
+            })
+            .unwrap();
+        if grant > 0 {
+            store
+                .grant(QuotaGrant {
+                    user_id: "route-user".into(),
+                    resource_kind: "chat_request".into(),
+                    amount: grant,
+                    actor_user_id: "route-user".into(),
+                    reason: "route test grant".into(),
+                })
+                .unwrap();
+        }
+        let principal = Principal {
+            user_id: "route-user".into(),
+            key_id: key.id,
+            scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+        };
+        let state = Arc::new(ApiSharedState {
+            core: Some(Arc::new(CoreBridge::new(store, CoreMode::Enforce))),
+            pool: super::super::pool::ApiPool::new(),
+            wb_pool: super::super::pool::ApiPool::new(),
+            wb_enabled: std::sync::atomic::AtomicBool::new(false),
+            wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+            wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+            wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+            wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_sticky: super::super::wb_sticky::StickyStore::default(),
+            pool_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
+            model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            default_model: "mock-1".into(),
+            data_dir: dir.clone(),
+            cors_origins: String::new(),
+            total_requests: std::sync::atomic::AtomicU64::new(0),
+            inflight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            limiter: super::super::limits::RateLimiter::from_env(),
+            active_uid: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+            logger: super::super::ApiLogger::new(dir.join("logs")),
+            debug_enabled: std::sync::atomic::AtomicBool::new(false),
+            usage: std::sync::Mutex::new(super::super::usage::UsageFile::default()),
+            wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        });
+        CoreFixture { dir, state, principal }
+    }
+
+    fn chat_body(stream: bool) -> Bytes {
+        chat_body_for_model("mock-1", stream)
+    }
+
+    fn chat_body_for_model(model: &str, stream: bool) -> Bytes {
+        Bytes::from(json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": stream,
+        }).to_string())
+    }
+
+    #[tokio::test]
+    async fn core_models_keep_existing_catalog_shape_with_scope() {
+        let fixture = core_fixture(1, &["models:read", "chat:invoke"]);
+        let response = models(
+            State(fixture.state.clone()),
+            Some(Extension(fixture.principal.clone())),
+        ).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn core_models_reject_missing_scope() {
+        let fixture = core_fixture(1, &[]);
+        let response = models(
+            State(fixture.state.clone()),
+            Some(Extension(fixture.principal.clone())),
+        ).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn core_chat_stream_returns_phase1_not_implemented() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            HeaderMap::new(),
+            chat_body(true),
+        ).await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let balance = fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .balance("route-user", "chat_request")
+            .unwrap();
+        assert_eq!(balance.held, 0);
+    }
+
+    #[tokio::test]
+    async fn core_chat_requires_idempotency_key_even_with_request_id() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "trace-only".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        ).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn core_chat_reports_insufficient_quota_before_dispatch() {
+        let fixture = core_fixture(0, &["chat:invoke"]);
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "quota-1".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        ).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn core_chat_rejects_missing_scope_before_preflight() {
+        let fixture = core_fixture(1, &[]);
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "scope-1".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        ).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let balance = fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .balance("route-user", "chat_request")
+            .unwrap();
+        assert_eq!(balance.held, 0);
+    }
+
+    #[tokio::test]
+    async fn core_chat_rejects_missing_budget_policy_before_reservation() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "policy-1".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body_for_model("unpriced-model", false),
+        ).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let balance = fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .balance("route-user", "chat_request")
+            .unwrap();
+        assert_eq!(balance.available, 1);
+        assert_eq!(balance.held, 0);
+    }
+
+    #[tokio::test]
+    async fn core_chat_reserves_before_dispatch_and_replays_idempotency() {
+        let fixture = core_fixture(2, &["chat:invoke"]);
+        let executor = Arc::new(MockChatExecutor::ok());
+        install_core_test_executor(executor.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "idem-1".parse().unwrap());
+        let first = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers.clone(),
+            chat_body(false),
+        ).await;
+        let second = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        ).await;
+        clear_core_test_executor();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(executor.calls().len(), 1);
+        let balance = fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .balance("route-user", "chat_request")
+            .unwrap();
+        assert_eq!(balance.available, 1);
+        assert_eq!(balance.held, 0);
+        assert_eq!(
+            first.headers().get("x-request-id"),
+            second.headers().get("x-request-id")
+        );
+    }
 
     #[test]
     fn public_health_payload_contains_liveness_only() {
