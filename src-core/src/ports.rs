@@ -62,6 +62,7 @@ pub trait ChatExecutor: Send + Sync {
 pub struct MockChatExecutor {
     pub calls: Arc<Mutex<Vec<ChatExecutionRequest>>>,
     pub response: ChatExecutionResult,
+    error: Option<UpstreamError>,
 }
 
 impl MockChatExecutor {
@@ -69,6 +70,7 @@ impl MockChatExecutor {
         Self {
             calls: Arc::new(Mutex::new(Vec::new())),
             response: ChatExecutionResult::ok(),
+            error: None,
         }
     }
 
@@ -76,6 +78,17 @@ impl MockChatExecutor {
         Self {
             calls: Arc::new(Mutex::new(Vec::new())),
             response,
+            error: None,
+        }
+    }
+
+    /// Deterministic transport-timeout outcome for Core integration tests.
+    /// Runtime adapters never construct this test-only executor.
+    pub fn timeout() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            response: ChatExecutionResult::ok(),
+            error: Some(UpstreamError::Timeout),
         }
     }
 
@@ -93,6 +106,9 @@ impl ChatExecutor for MockChatExecutor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(request);
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
         Ok(self.response.clone())
     }
 }
