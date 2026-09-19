@@ -8,13 +8,15 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::{
-    schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5},
-    AuthError, CoreError, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, NewUser,
-    Principal, User,
+    schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH},
+    upstream::{validate_observation_summary, validate_required},
+    AuthError, CoreError, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
+    NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
+    UpstreamLease, UpstreamObservation, User,
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 pub struct CoreStore {
     pub(crate) connection: Mutex<Connection>,
@@ -55,6 +57,7 @@ impl CoreStore {
                 Self::migrate_v2_to_v3(&transaction)?;
                 Self::migrate_v3_to_v4(&transaction)?;
                 Self::migrate_v4_to_v5(&transaction)?;
+                Self::migrate_v5_to_v6(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -67,6 +70,7 @@ impl CoreStore {
                 Self::migrate_v2_to_v3(&transaction)?;
                 Self::migrate_v3_to_v4(&transaction)?;
                 Self::migrate_v4_to_v5(&transaction)?;
+                Self::migrate_v5_to_v6(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -78,6 +82,7 @@ impl CoreStore {
                 Self::migrate_v2_to_v3(&transaction)?;
                 Self::migrate_v3_to_v4(&transaction)?;
                 Self::migrate_v4_to_v5(&transaction)?;
+                Self::migrate_v5_to_v6(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -88,6 +93,7 @@ impl CoreStore {
             3 => {
                 Self::migrate_v3_to_v4(&transaction)?;
                 Self::migrate_v4_to_v5(&transaction)?;
+                Self::migrate_v5_to_v6(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -97,6 +103,16 @@ impl CoreStore {
             }
             4 => {
                 Self::migrate_v4_to_v5(&transaction)?;
+                Self::migrate_v5_to_v6(&transaction)?;
+                transaction
+                    .execute(
+                        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![CURRENT_SCHEMA_VERSION.to_string()],
+                    )
+                    .map_err(CoreError::migration)?;
+            }
+            5 => {
+                Self::migrate_v5_to_v6(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -143,6 +159,161 @@ impl CoreStore {
             |row| row.get::<_, u32>(0),
         )?;
         Ok(count)
+    }
+
+    pub fn table_exists(&self, table_name: &str) -> Result<bool, CoreError> {
+        Ok(self.table_count(table_name)? == 1)
+    }
+
+    pub fn count_rows(&self, table_name: &str) -> Result<u64, CoreError> {
+        if table_name.is_empty()
+            || !table_name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(CoreError::Validation {
+                field: "table_name".into(),
+                reason: "must be an SQLite identifier".into(),
+            });
+        }
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let count = connection.query_row(
+            &format!("SELECT COUNT(*) FROM {table_name}"),
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn upsert_upstream_account(
+        &self,
+        input: RegisterUpstreamAccount,
+        principal: &Principal,
+    ) -> Result<UpstreamAccount, CoreError> {
+        Self::validate_upstream_account(&input)?;
+        let capabilities_json = serde_json::to_string(&input.capabilities)?;
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let created_at_ms = transaction
+            .query_row(
+                "SELECT created_at_ms FROM upstream_accounts WHERE id = ?1",
+                [&input.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(now);
+        transaction.execute(
+            "INSERT INTO upstream_accounts
+             (id, provider, credentials_ref, region, capabilities_json, enabled, max_concurrency,
+              state, cooldown_until_ms, cooldown_reason, consecutive_errors, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(id) DO UPDATE SET
+               provider = excluded.provider, credentials_ref = excluded.credentials_ref,
+               region = excluded.region, capabilities_json = excluded.capabilities_json,
+               enabled = excluded.enabled, max_concurrency = excluded.max_concurrency,
+               state = excluded.state, cooldown_until_ms = excluded.cooldown_until_ms,
+               cooldown_reason = excluded.cooldown_reason,
+               consecutive_errors = excluded.consecutive_errors, updated_at_ms = excluded.updated_at_ms",
+            params![
+                &input.id, &input.provider, &input.credentials_ref, &input.region, capabilities_json,
+                if input.enabled { 1_i64 } else { 0_i64 }, input.max_concurrency,
+                input.state.as_str(), input.cooldown_until_ms, &input.cooldown_reason,
+                input.consecutive_errors, created_at_ms, now,
+            ],
+        )?;
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "upstream.account_upsert",
+            "upstream_account",
+            &input.id,
+            serde_json::json!({"account_ref": input.id, "provider": input.provider, "result": "upserted"}),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(UpstreamAccount {
+            id: input.id, provider: input.provider, credentials_ref: input.credentials_ref,
+            region: input.region, capabilities: input.capabilities, enabled: input.enabled,
+            max_concurrency: input.max_concurrency, state: input.state,
+            cooldown_until_ms: input.cooldown_until_ms, cooldown_reason: input.cooldown_reason,
+            consecutive_errors: input.consecutive_errors, created_at_ms, updated_at_ms: now,
+        })
+    }
+
+    pub fn append_upstream_observation(
+        &self,
+        observation: UpstreamObservation,
+    ) -> Result<UpstreamObservation, CoreError> {
+        Self::validate_upstream_observation(&observation)?;
+        let summary_json = validate_observation_summary(&observation.summary)?;
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let credentials_ref = transaction
+            .query_row(
+                "SELECT credentials_ref FROM upstream_accounts WHERE id = ?1",
+                [&observation.account_ref],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::Validation {
+                field: "account_ref".into(),
+                reason: "must identify a registered upstream account".into(),
+            })?;
+        if summary_json.contains(&credentials_ref) {
+            return Err(CoreError::Validation {
+                field: "summary".into(),
+                reason: "must not contain credentials_ref".into(),
+            });
+        }
+        transaction.execute(
+            "INSERT INTO upstream_observations
+             (id, account_ref, resource_kind, observed_value, value_scale, source, status,
+              observed_at_ms, stale_at_ms, summary_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                &observation.id, &observation.account_ref, &observation.resource_kind,
+                observation.observed_value, observation.value_scale, &observation.source,
+                observation.status.as_str(), observation.observed_at_ms, observation.stale_at_ms,
+                summary_json,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(observation)
+    }
+
+    pub fn get_latest_observation(
+        &self,
+        account_ref: &str,
+        resource_kind: &str,
+    ) -> Result<Option<UpstreamObservation>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        connection.query_row(
+            "SELECT id, account_ref, resource_kind, observed_value, value_scale, source, status,
+                    observed_at_ms, stale_at_ms, summary_json
+             FROM upstream_observations
+             WHERE account_ref = ?1 AND resource_kind = ?2
+             ORDER BY observed_at_ms DESC, id DESC LIMIT 1",
+            params![account_ref, resource_kind],
+            Self::upstream_observation_from_row,
+        ).optional().map_err(CoreError::from)
+    }
+
+    pub fn list_recoverable_leases(&self) -> Result<Vec<UpstreamLease>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, request_id, account_ref, resource_kind, predicted_units, observation_id,
+                    state, lease_expires_at_ms, reconcile_until_ms, upstream_request_ref, error_kind,
+                    created_at_ms, updated_at_ms, settled_at_ms
+             FROM upstream_leases WHERE state IN ('held', 'active', 'unknown')
+             ORDER BY created_at_ms, id",
+        )?;
+        let leases = statement
+            .query_map([], Self::upstream_lease_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CoreError::from)?;
+        Ok(leases)
     }
 
     pub fn create_user(&self, input: NewUser, actor: &str) -> Result<User, CoreError> {
@@ -672,6 +843,63 @@ impl CoreStore {
             && !storage_ref.chars().any(|character| character.is_control())
     }
 
+    fn validate_upstream_account(input: &RegisterUpstreamAccount) -> Result<(), CoreError> {
+        validate_required("upstream account id", &input.id)?;
+        validate_required("upstream account provider", &input.provider)?;
+        validate_required("credentials_ref", &input.credentials_ref)?;
+        if input.max_concurrency <= 0 {
+            return Err(CoreError::Validation { field: "max_concurrency".into(), reason: "must be positive".into() });
+        }
+        if input.consecutive_errors < 0 {
+            return Err(CoreError::Validation { field: "consecutive_errors".into(), reason: "must not be negative".into() });
+        }
+        Ok(())
+    }
+
+    fn validate_upstream_observation(observation: &UpstreamObservation) -> Result<(), CoreError> {
+        validate_required("upstream observation id", &observation.id)?;
+        validate_required("account_ref", &observation.account_ref)?;
+        validate_required("resource_kind", &observation.resource_kind)?;
+        validate_required("source", &observation.source)?;
+        if observation.value_scale <= 0 {
+            return Err(CoreError::Validation { field: "value_scale".into(), reason: "must be positive".into() });
+        }
+        if observation.stale_at_ms < observation.observed_at_ms {
+            return Err(CoreError::Validation { field: "stale_at_ms".into(), reason: "must not precede observed_at_ms".into() });
+        }
+        Ok(())
+    }
+
+    fn upstream_observation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpstreamObservation> {
+        let status: String = row.get(6)?;
+        let status = ObservationStatus::from_db(&status).ok_or_else(|| rusqlite::Error::FromSqlConversionFailure(
+            6, rusqlite::types::Type::Text, "invalid upstream observation status".into(),
+        ))?;
+        let summary_json: String = row.get(9)?;
+        let summary = serde_json::from_str(&summary_json).map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+            9, rusqlite::types::Type::Text, Box::new(error),
+        ))?;
+        Ok(UpstreamObservation {
+            id: row.get(0)?, account_ref: row.get(1)?, resource_kind: row.get(2)?,
+            observed_value: row.get(3)?, value_scale: row.get(4)?, source: row.get(5)?,
+            status, observed_at_ms: row.get(7)?, stale_at_ms: row.get(8)?, summary,
+        })
+    }
+
+    fn upstream_lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpstreamLease> {
+        let state: String = row.get(6)?;
+        let state = LeaseState::from_db(&state).ok_or_else(|| rusqlite::Error::FromSqlConversionFailure(
+            6, rusqlite::types::Type::Text, "invalid upstream lease state".into(),
+        ))?;
+        Ok(UpstreamLease {
+            id: row.get(0)?, request_id: row.get(1)?, account_ref: row.get(2)?, resource_kind: row.get(3)?,
+            predicted_units: row.get(4)?, observation_id: row.get(5)?, state,
+            lease_expires_at_ms: row.get(7)?, reconcile_until_ms: row.get(8)?,
+            upstream_request_ref: row.get(9)?, error_kind: row.get(10)?,
+            created_at_ms: row.get(11)?, updated_at_ms: row.get(12)?, settled_at_ms: row.get(13)?,
+        })
+    }
+
     pub(crate) fn new_id(kind: &str) -> String {
         let mut material = [0_u8; 16];
         OsRng.fill_bytes(&mut material);
@@ -793,6 +1021,65 @@ impl CoreStore {
             )
             .map_err(CoreError::migration)?;
         transaction.execute_batch(SCHEMA_V5).map_err(CoreError::migration)
+    }
+
+    fn migrate_v5_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        let observations_table_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'upstream_observations')",
+            [],
+            |row| row.get(0),
+        ).map_err(CoreError::migration)?;
+        if !observations_table_exists {
+            transaction.execute_batch(
+                "CREATE TABLE upstream_observations (
+                   id TEXT PRIMARY KEY,
+                   account_ref TEXT NOT NULL,
+                   resource_kind TEXT NOT NULL,
+                   observed_value INTEGER,
+                   source TEXT NOT NULL,
+                   observed_at_ms INTEGER NOT NULL,
+                   stale_at_ms INTEGER,
+                   summary_json TEXT NOT NULL
+                 );",
+            ).map_err(CoreError::migration)?;
+        }
+        transaction.execute_batch(SCHEMA_V6).map_err(CoreError::migration)?;
+        let legacy_accounts = {
+            let mut statement = transaction
+                .prepare("SELECT account_ref, MIN(observed_at_ms) FROM upstream_observations GROUP BY account_ref")
+                .map_err(CoreError::migration)?;
+            let accounts = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                .map_err(CoreError::migration)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CoreError::migration)?;
+            accounts
+        };
+        for (account_ref, observed_at_ms) in legacy_accounts {
+            transaction.execute(
+                "INSERT INTO upstream_accounts
+                 (id, provider, credentials_ref, region, capabilities_json, enabled,
+                  max_concurrency, state, cooldown_until_ms, cooldown_reason,
+                  consecutive_errors, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'legacy', ?2, NULL, '[]', 0, 1, 'disabled', NULL,
+                         'legacy observation requires reconciliation', 0, ?3, ?3)
+                 ON CONFLICT(id) DO NOTHING",
+                params![&account_ref, format!("legacy://{account_ref}"), observed_at_ms],
+            ).map_err(CoreError::migration)?;
+        }
+        transaction.execute(
+            "INSERT INTO upstream_observations_next
+             (id, account_ref, resource_kind, observed_value, value_scale, source, status,
+              observed_at_ms, stale_at_ms, summary_json)
+             SELECT id, account_ref, resource_kind, observed_value, 1, source, 'stale',
+                    observed_at_ms, COALESCE(stale_at_ms, observed_at_ms), summary_json
+             FROM upstream_observations",
+            [],
+        ).map_err(CoreError::migration)?;
+        transaction.execute_batch(
+            "DROP TABLE upstream_observations;
+             ALTER TABLE upstream_observations_next RENAME TO upstream_observations;",
+        ).map_err(CoreError::migration)?;
+        transaction.execute_batch(SCHEMA_V6_FINISH).map_err(CoreError::migration)
     }
 }
 

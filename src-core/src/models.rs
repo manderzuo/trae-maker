@@ -7,6 +7,199 @@ use crate::{CoreStore, Principal};
 pub type SharedCoreStore = Arc<CoreStore>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamAccountState {
+    Available,
+    Cooling,
+    Forbidden,
+    Disabled,
+}
+
+impl UpstreamAccountState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Cooling => "cooling",
+            Self::Forbidden => "forbidden",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationStatus {
+    Fresh,
+    Stale,
+    Failed,
+}
+
+impl ObservationStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "fresh" => Some(Self::Fresh),
+            "stale" => Some(Self::Stale),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseState {
+    Held,
+    Active,
+    Succeeded,
+    Failed,
+    Unknown,
+    Released,
+}
+
+impl LeaseState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::Active => "active",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+            Self::Released => "released",
+        }
+    }
+
+    pub(crate) fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "held" => Some(Self::Held),
+            "active" => Some(Self::Active),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "unknown" => Some(Self::Unknown),
+            "released" => Some(Self::Released),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterUpstreamAccount {
+    pub id: String,
+    pub provider: String,
+    /// Opaque vault/keychain locator only; never a raw credential.
+    pub credentials_ref: String,
+    pub region: Option<String>,
+    pub capabilities: BTreeSet<String>,
+    pub enabled: bool,
+    pub max_concurrency: i64,
+    pub state: UpstreamAccountState,
+    pub cooldown_until_ms: Option<i64>,
+    pub cooldown_reason: Option<String>,
+    pub consecutive_errors: i64,
+}
+
+impl RegisterUpstreamAccount {
+    pub fn new(id: String, provider: String, credentials_ref: String) -> Self {
+        Self {
+            id,
+            provider,
+            credentials_ref,
+            region: None,
+            capabilities: BTreeSet::new(),
+            enabled: true,
+            max_concurrency: 1,
+            state: UpstreamAccountState::Available,
+            cooldown_until_ms: None,
+            cooldown_reason: None,
+            consecutive_errors: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamAccount {
+    pub id: String,
+    pub provider: String,
+    /// Opaque vault/keychain locator only; never a raw credential.
+    pub credentials_ref: String,
+    pub region: Option<String>,
+    pub capabilities: BTreeSet<String>,
+    pub enabled: bool,
+    pub max_concurrency: i64,
+    pub state: UpstreamAccountState,
+    pub cooldown_until_ms: Option<i64>,
+    pub cooldown_reason: Option<String>,
+    pub consecutive_errors: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamObservation {
+    pub id: String,
+    pub account_ref: String,
+    pub resource_kind: String,
+    pub observed_value: Option<i64>,
+    pub value_scale: i64,
+    pub source: String,
+    pub status: ObservationStatus,
+    pub observed_at_ms: i64,
+    pub stale_at_ms: i64,
+    pub summary: Value,
+}
+
+impl UpstreamObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: String,
+        account_ref: String,
+        resource_kind: String,
+        observed_value: Option<i64>,
+        value_scale: i64,
+        source: String,
+        status: ObservationStatus,
+        observed_at_ms: i64,
+        stale_at_ms: i64,
+        summary: Value,
+    ) -> Self {
+        Self {
+            id,
+            account_ref,
+            resource_kind,
+            observed_value,
+            value_scale,
+            source,
+            status,
+            observed_at_ms,
+            stale_at_ms,
+            summary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamLease {
+    pub id: String,
+    pub request_id: String,
+    pub account_ref: String,
+    pub resource_kind: String,
+    pub predicted_units: i64,
+    pub observation_id: Option<String>,
+    pub state: LeaseState,
+    pub lease_expires_at_ms: i64,
+    pub reconcile_until_ms: Option<i64>,
+    pub upstream_request_ref: Option<String>,
+    pub error_kind: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub settled_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserRole {
     Admin,
     Operator,

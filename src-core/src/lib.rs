@@ -7,6 +7,7 @@ mod quota;
 mod requests;
 mod schema;
 mod store;
+mod upstream;
 
 pub use cost::{CostError, CostEstimate, CostPolicy};
 pub use error::CoreError;
@@ -16,8 +17,9 @@ pub use models::{
     LegacyMigrationAsset, LegacyMigrationBatch, LegacyMigrationJob, LegacyMigrationKey,
     LegacyMigrationObservation, LegacyMigrationResult,
     PreflightReserveInput, PreflightReserveResult, QuotaReserve, RequestHandle, RequestResult,
-    RequestState, Reservation, ReservationState, ReserveResult, Settlement, SharedCoreStore, User,
-    UserRole,
+    LeaseState, ObservationStatus, RegisterUpstreamAccount, RequestState, Reservation,
+    ReservationState, ReserveResult, Settlement, SharedCoreStore, UpstreamAccount,
+    UpstreamAccountState, UpstreamLease, UpstreamObservation, User, UserRole,
 };
 pub use ports::{ChatExecutionRequest, ChatExecutionResult, ChatExecutor, MockChatExecutor, UpstreamError};
 pub use requests::canonical_json_hash;

@@ -31,7 +31,9 @@ fn bootstrap_creates_authoritative_schema() {
         "quota_reservations",
         "requests",
         "idempotency_keys",
+        "upstream_accounts",
         "upstream_observations",
+        "upstream_leases",
         "audit_events",
     ] {
         assert_eq!(store.table_count(table).unwrap(), 1, "missing table {table}");
@@ -58,7 +60,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     connection
         .execute_batch(
             "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
-             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '6');",
+             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '7');",
         )
         .unwrap();
     drop(connection);
@@ -66,7 +68,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     let store = CoreStore::open(&future_dir).unwrap();
     assert!(matches!(
         store.migrate(),
-        Err(CoreError::UnsupportedSchemaVersion { version: 6 })
+        Err(CoreError::UnsupportedSchemaVersion { version: 7 })
     ));
     drop(store);
     fs::remove_dir_all(future_dir).unwrap();

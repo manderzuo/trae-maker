@@ -24,6 +24,8 @@ pub enum CoreError {
         #[from]
         source: serde_json::Error,
     },
+    #[error("invalid {field}: {reason}")]
+    Validation { field: String, reason: String },
     #[error("quota amount must be positive")]
     InvalidQuotaAmount,
     #[error("actual quota amount cannot exceed the reserved amount")]

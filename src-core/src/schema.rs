@@ -265,3 +265,42 @@ BEGIN
   SELECT RAISE(ABORT, 'invalid legacy asset storage_ref');
 END;
 "#;
+
+pub(crate) const SCHEMA_V6: &str = r#"
+CREATE TABLE upstream_accounts (
+  id TEXT PRIMARY KEY, provider TEXT NOT NULL, credentials_ref TEXT NOT NULL, region TEXT,
+  capabilities_json TEXT NOT NULL CHECK(json_valid(capabilities_json)),
+  enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+  max_concurrency INTEGER NOT NULL CHECK(max_concurrency > 0),
+  state TEXT NOT NULL CHECK(state IN ('available','cooling','forbidden','disabled')),
+  cooldown_until_ms INTEGER, cooldown_reason TEXT,
+  consecutive_errors INTEGER NOT NULL CHECK(consecutive_errors >= 0),
+  created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE upstream_observations_next (
+  id TEXT PRIMARY KEY, account_ref TEXT NOT NULL REFERENCES upstream_accounts(id),
+  resource_kind TEXT NOT NULL, observed_value INTEGER, value_scale INTEGER NOT NULL CHECK(value_scale > 0),
+  source TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('fresh','stale','failed')),
+  observed_at_ms INTEGER NOT NULL, stale_at_ms INTEGER NOT NULL,
+  summary_json TEXT NOT NULL CHECK(json_valid(summary_json))
+);
+"#;
+
+pub(crate) const SCHEMA_V6_FINISH: &str = r#"
+CREATE TABLE upstream_leases (
+  id TEXT PRIMARY KEY, request_id TEXT NOT NULL REFERENCES requests(id),
+  account_ref TEXT NOT NULL REFERENCES upstream_accounts(id), resource_kind TEXT NOT NULL,
+  predicted_units INTEGER NOT NULL CHECK(predicted_units > 0),
+  observation_id TEXT REFERENCES upstream_observations(id),
+  state TEXT NOT NULL CHECK(state IN ('held','active','succeeded','failed','unknown','released')),
+  lease_expires_at_ms INTEGER NOT NULL, reconcile_until_ms INTEGER,
+  upstream_request_ref TEXT, error_kind TEXT, created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL, settled_at_ms INTEGER,
+  UNIQUE(request_id, resource_kind)
+);
+CREATE INDEX upstream_accounts_by_provider_state ON upstream_accounts(provider, state);
+CREATE INDEX upstream_observations_by_account_resource_time ON upstream_observations(account_ref, resource_kind, observed_at_ms DESC);
+CREATE INDEX upstream_leases_by_account_state ON upstream_leases(account_ref, state);
+CREATE INDEX upstream_leases_by_request_resource ON upstream_leases(request_id, resource_kind);
+CREATE INDEX upstream_leases_recoverable ON upstream_leases(state, lease_expires_at_ms) WHERE state IN ('held','active','unknown');
+"#;
