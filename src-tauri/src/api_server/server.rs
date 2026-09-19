@@ -9,6 +9,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::auth;
+#[path = "core_account.rs"]
+mod core_account;
 use super::routes;
 use super::wb_catalog;
 use super::ApiSharedState;
@@ -94,6 +96,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/healthz", get(routes::healthz))
         .route("/status", get(routes::status))
         .route("/v1/models", get(routes::models))
+        .route("/v1/usage", get(core_account::usage))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/completions", post(routes::completions))
         .route("/v1/embeddings", post(routes::embeddings))
@@ -144,6 +147,12 @@ mod tests {
         assert!(!wait_task_finished(&slow, std::time::Duration::from_millis(150)));
         assert!(started.elapsed() >= std::time::Duration::from_millis(150));
         slow.abort();
+    }
+
+    #[test]
+    fn router_registers_the_authenticated_user_usage_route() {
+        let source = include_str!("server.rs");
+        assert!(source.contains(".route(\"/v1/usage\", get(core_account::usage))"));
     }
 }
 
