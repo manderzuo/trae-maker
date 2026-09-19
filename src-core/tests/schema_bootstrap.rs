@@ -100,6 +100,31 @@ fn failed_migration_rolls_back_schema_bootstrap() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn rejects_a_partial_v6_requests_table_instead_of_marking_it_v7() {
+    let dir = test_dir("partial-v6-requests");
+    let database_dir = dir.join("data");
+    fs::create_dir_all(&database_dir).unwrap();
+    let connection = Connection::open(database_dir.join(CORE_DB_FILE)).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '6');
+             CREATE TABLE requests (id TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = CoreStore::open(&dir).unwrap();
+    assert!(matches!(
+        store.migrate(),
+        Err(CoreError::MigrationValidation { .. })
+    ));
+    assert_eq!(store.schema_version().unwrap(), 6);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 fn create_v1_database(dir: &PathBuf, state: &str) {
     let database_dir = dir.join("data");
     fs::create_dir_all(&database_dir).unwrap();

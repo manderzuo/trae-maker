@@ -1,7 +1,7 @@
 use std::{path::Path, sync::Arc};
 
 use aiwork_core::{
-    require_scope, BeginRequestInput, ChatExecutionRequest, ChatExecutionResult, CoreError,
+    require_scope, BeginRequest, BeginRequestInput, ChatExecutionRequest, ChatExecutionResult, CoreError,
     CoreStore, LeaseOutcome, LeaseSettlement, PreflightReserveInput, PreflightReserveResult, Principal,
     RequestResult, RequestState, Reservation, ScheduleError, SchedulerLeaseRequest,
     SchedulerLeaseResult, SelectionStrategy, Settlement, UpstreamError, UpstreamLease,
@@ -190,6 +190,71 @@ impl CoreBridge {
             body,
             &[],
         )
+    }
+
+    /// Check idempotency without touching scheduler capacity. Stream routes
+    /// use this before adapter readiness so a completed request remains a
+    /// stable replay even while its upstream adapter is temporarily missing.
+    pub fn lookup_chat_replay(
+        &self,
+        principal: &Principal,
+        api_key_id: &str,
+        client_idempotency_key: &str,
+        body: &Value,
+    ) -> Result<Option<LeasePreflightResult>, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        require_scope(principal, "chat:invoke").map_err(|_| {
+            CoreLeaseError::Core(CoreError::MissingScope {
+                scope: "chat:invoke".into(),
+            })
+        })?;
+        if principal.key_id != api_key_id {
+            return Err(CoreLeaseError::Core(CoreError::InvalidRequestIdentity {
+                user_id: principal.user_id.clone(),
+                api_key_id: api_key_id.into(),
+            }));
+        }
+        let body = super::payload::sanitize_scheduler_chat_body(body);
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoreError::InvalidConfiguration {
+                key: "chat.model".into(),
+                value: "missing or non-string".into(),
+            })?;
+        let Some(request) = self.store.lookup_idempotent_request(
+            &principal.user_id,
+            api_key_id,
+            CHAT_ENDPOINT,
+            model,
+            &body,
+            client_idempotency_key,
+        )? else {
+            return Ok(None);
+        };
+        let request = match request {
+            BeginRequest::Existing(request) => request,
+            BeginRequest::Conflict => return Err(CoreLeaseError::Schedule(ScheduleError::IdempotencyConflict)),
+            BeginRequest::Created(_) => {
+                return Err(CoreLeaseError::Core(CoreError::InvalidConfiguration {
+                    key: "core.idempotency.lookup".into(),
+                    value: "read-only lookup returned a created request".into(),
+                }))
+            }
+        };
+        let reservation = self.store.reservation_for_request(&request.id)?;
+        let replay_lease = self
+            .store
+            .upstream_lease_for_request(&request.id, "chat_request")?;
+        Ok(Some(LeasePreflightResult {
+            request_id: request.id,
+            state: request.state,
+            result: request.result,
+            reservation,
+            lease: None,
+            replay_lease,
+            execution: None,
+        }))
     }
 
     /// Lease preflight constrained to accounts that have an explicit executor

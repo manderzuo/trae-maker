@@ -24,6 +24,52 @@ pub fn canonical_json_hash(value: &Value) -> [u8; 32] {
 }
 
 impl CoreStore {
+    /// Read-only idempotency lookup used by stream routes before checking
+    /// upstream adapter readiness. It must never create a request or reserve
+    /// quota when the adapter is unavailable.
+    pub fn lookup_idempotent_request(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        endpoint: &str,
+        model: &str,
+        body: &Value,
+        idempotency_key: &str,
+    ) -> Result<Option<BeginRequest>, CoreError> {
+        let request_hash = request_hash(endpoint, model, body);
+        let scope = format!("{user_id}:{endpoint}");
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let active_key = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = ?1 AND user_id = ?2 AND status = 'active')",
+                params![api_key_id, user_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if !active_key {
+            return Err(CoreError::InvalidRequestIdentity {
+                user_id: user_id.into(),
+                api_key_id: api_key_id.into(),
+            });
+        }
+        let Some((stored_hash, request_id)) = connection
+            .query_row(
+                "SELECT request_hash, request_id FROM idempotency_keys WHERE scope = ?1 AND client_key = ?2",
+                params![scope, idempotency_key],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if stored_hash != request_hash {
+            return Ok(Some(BeginRequest::Conflict));
+        }
+        Ok(Some(BeginRequest::Existing(Self::request_handle_in_connection(
+            &connection,
+            &request_id,
+        )?)))
+    }
+
     pub fn preflight_reserve_with_lease(
         &self,
         principal: &crate::Principal,
@@ -74,7 +120,7 @@ impl CoreStore {
                 return Err(ScheduleError::IdempotencyConflict);
             }
             let request = Self::request_handle_in_transaction(&transaction, &request_id)?;
-            let lease = Self::upstream_lease_for_request(&transaction, &request_id, &input.preflight.resource_kind)?
+            let lease = Self::upstream_lease_for_request_in_transaction(&transaction, &request_id, &input.preflight.resource_kind)?
                 .ok_or_else(|| ScheduleError::Core(CoreError::ReservationRequestConflict { request_id }))?;
             transaction.commit()?;
             return Ok(SchedulerLeaseResult::Replay { request, lease });
@@ -135,7 +181,8 @@ impl CoreStore {
                 "provider": candidate.provider, "resource_kind": lease.resource_kind, "observation_id": candidate.observation_id,
                 "selection_reason": selection_reason(&input), "reservation_id": reservation.id}), now)?;
         let grant = UpstreamLeaseGrant {
-            lease_id: lease.id, account_ref: candidate.id, credentials_ref: candidate.credentials_ref,
+            lease_id: lease.id, account_ref: candidate.id, provider: candidate.provider,
+            credentials_ref: candidate.credentials_ref,
             observation_id: candidate.observation_id, predicted_units: lease.predicted_units,
             lease_expires_at_ms: lease.lease_expires_at_ms,
         };
@@ -442,6 +489,23 @@ impl CoreStore {
         Ok(BeginRequest::Created(handle))
     }
 
+    pub fn upstream_lease_for_request(
+        &self,
+        request_id: &str,
+        resource_kind: &str,
+    ) -> Result<Option<UpstreamLease>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        connection
+            .query_row(
+                "SELECT id, request_id, account_ref, resource_kind, predicted_units, observation_id, state, lease_expires_at_ms, reconcile_until_ms, upstream_request_ref, error_kind, created_at_ms, updated_at_ms, settled_at_ms \
+                 FROM upstream_leases WHERE request_id = ?1 AND resource_kind = ?2",
+                params![request_id, resource_kind],
+                Self::upstream_lease_from_row,
+            )
+            .optional()
+            .map_err(CoreError::from)
+    }
+
     pub fn preflight_reserve(
         &self,
         input: PreflightReserveInput,
@@ -724,6 +788,46 @@ impl CoreStore {
         ).map_err(CoreError::from)
     }
 
+    fn request_handle_in_connection(
+        connection: &rusqlite::Connection,
+        request_id: &str,
+    ) -> Result<RequestHandle, CoreError> {
+        connection
+            .query_row(
+                "SELECT id, user_id, api_key_id, protocol, endpoint, model, state, result_status, error_code FROM requests WHERE id = ?1",
+                [request_id],
+                |row| {
+                    let state = row.get::<_, String>(6)?;
+                    let state = RequestState::from_db(&state).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid request state")),
+                        )
+                    })?;
+                    Ok(RequestHandle {
+                        id: row.get(0)?,
+                        user_id: row.get(1)?,
+                        api_key_id: row.get(2)?,
+                        protocol: row.get(3)?,
+                        endpoint: row.get(4)?,
+                        model: row.get(5)?,
+                        state,
+                        result: {
+                            let status: Option<i64> = row.get(7)?;
+                            let error_code: Option<String> = row.get(8)?;
+                            if status.is_some() || error_code.is_some() {
+                                Some(RequestResult { status, error_code })
+                            } else {
+                                None
+                            }
+                        },
+                    })
+                },
+            )
+            .map_err(CoreError::from)
+    }
+
     fn upstream_lease_by_id(
         transaction: &Transaction<'_>, lease_id: &str,
     ) -> Result<Option<UpstreamLease>, CoreError> {
@@ -733,7 +837,7 @@ impl CoreStore {
         ).optional().map_err(CoreError::from)
     }
 
-    fn upstream_lease_for_request(
+    fn upstream_lease_for_request_in_transaction(
         transaction: &Transaction<'_>, request_id: &str, resource_kind: &str,
     ) -> Result<Option<UpstreamLease>, CoreError> {
         transaction.query_row(

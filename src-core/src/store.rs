@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 use crate::{
     schema::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
-        SCHEMA_V7, SCHEMA_V7_REQUESTS_ONLY,
+        SCHEMA_V7,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
@@ -1530,6 +1530,78 @@ impl CoreStore {
         transaction
             .execute_batch(SCHEMA_V6_FINISH)
             .map_err(CoreError::migration)?;
+
+        // A few pre-v6 databases carried an intentionally inert requests
+        // table containing only an id. It has no data that can be mapped into
+        // the Core state machine. Quarantine that shape during the known
+        // v5->v6 path, but refuse to do the same for a database that already
+        // claims to be v6 (migrate_v6_to_v7 below fails closed there).
+        let requests_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'requests')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(CoreError::migration)?;
+        let requests_have_state = requests_exists && {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(requests)")
+                .map_err(CoreError::migration)?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(CoreError::migration)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CoreError::migration)?;
+            columns.iter().any(|column| column == "state")
+        };
+        if requests_exists && !requests_have_state {
+            let request_count: i64 = transaction
+                .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+                .map_err(CoreError::migration)?;
+            if request_count != 0 {
+                return Err(CoreError::MigrationValidation {
+                    reason: "legacy inert requests table contains rows that cannot be imported".into(),
+                });
+            }
+            transaction
+                .execute_batch(
+                    "DROP TABLE requests;
+                     CREATE TABLE requests (
+                       id TEXT PRIMARY KEY,
+                       user_id TEXT NOT NULL,
+                       api_key_id TEXT NOT NULL,
+                       protocol TEXT NOT NULL,
+                       endpoint TEXT NOT NULL,
+                       model TEXT NOT NULL,
+                       request_hash BLOB NOT NULL,
+                       state TEXT NOT NULL,
+                       result_status INTEGER,
+                       error_code TEXT,
+                       created_at_ms INTEGER NOT NULL,
+                       updated_at_ms INTEGER NOT NULL
+                     );",
+                )
+                .map_err(CoreError::migration)?;
+        } else if !requests_exists {
+            transaction
+                .execute_batch(
+                    "CREATE TABLE requests (
+                       id TEXT PRIMARY KEY,
+                       user_id TEXT NOT NULL,
+                       api_key_id TEXT NOT NULL,
+                       protocol TEXT NOT NULL,
+                       endpoint TEXT NOT NULL,
+                       model TEXT NOT NULL,
+                       request_hash BLOB NOT NULL,
+                       state TEXT NOT NULL,
+                       result_status INTEGER,
+                       error_code TEXT,
+                       created_at_ms INTEGER NOT NULL,
+                       updated_at_ms INTEGER NOT NULL
+                     );",
+                )
+                .map_err(CoreError::migration)?;
+        }
         Self::harden_v6_records(transaction)
     }
 
@@ -1554,12 +1626,15 @@ impl CoreStore {
                 .map_err(CoreError::migration)?;
             columns.iter().any(|column| column == "state")
         };
-        // Some pre-v6 migration fixtures contain only a request id because no
-        // request data was imported. There is no state constraint to upgrade
-        // in that shape; leave the inert table untouched and let the next
-        // authoritative bootstrap create the v7 schema.
+        // A requests table without the v7 state machine is not an inert table
+        // that can safely be marked as migrated: the rest of Core would read
+        // state/result columns and idempotency rows from it. Fail the
+        // transaction instead of silently recording schema version 7 over a
+        // partial database.
         if !requests_have_state {
-            return Ok(());
+            return Err(CoreError::MigrationValidation {
+                reason: "requests table is missing the v7 state column".into(),
+            });
         }
 
         let idempotency_exists: bool = transaction.query_row(
@@ -1582,13 +1657,24 @@ impl CoreStore {
             indexes
         };
 
-        if idempotency_exists {
-            transaction.execute_batch(SCHEMA_V7).map_err(CoreError::migration)?;
-        } else {
+        if !idempotency_exists {
+            // Older fixtures may have request rows but no idempotency table.
+            // Create an empty legacy-shaped table so the canonical v7 rebuild
+            // still creates the authoritative idempotency table.
             transaction
-                .execute_batch(SCHEMA_V7_REQUESTS_ONLY)
+                .execute_batch(
+                    "CREATE TABLE idempotency_keys (\
+                       scope TEXT NOT NULL,\
+                       client_key TEXT NOT NULL,\
+                       request_hash BLOB NOT NULL,\
+                       request_id TEXT NOT NULL REFERENCES requests(id),\
+                       created_at_ms INTEGER NOT NULL,\
+                       PRIMARY KEY(scope, client_key)\
+                     );",
+                )
                 .map_err(CoreError::migration)?;
         }
+        transaction.execute_batch(SCHEMA_V7).map_err(CoreError::migration)?;
         for index_sql in request_indexes {
             transaction.execute_batch(&index_sql).map_err(CoreError::migration)?;
         }

@@ -15,6 +15,8 @@ pub mod models_sync;
 pub mod pool;
 pub mod payload;
 pub mod phase2_smoke;
+#[cfg(test)]
+pub mod phase3_streaming_smoke;
 pub mod retry;
 pub mod routes;
 pub mod server;

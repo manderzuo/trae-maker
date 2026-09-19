@@ -108,7 +108,12 @@ fn parse_data(data: &str) -> Option<WbEvent> {
     }
     let v: Value = match serde_json::from_str(t) {
         Ok(v) => v,
-        Err(_) => return None,
+        Err(_) => {
+            return Some(WbEvent::Error {
+                code: INCOMPLETE_STREAM_ERROR_CODE,
+                msg: "malformed_upstream_frame".into(),
+            });
+        }
     };
     // 错误帧：{"error": {...}}（与 OpenAI 一致；兼容顶层 code/message）
     if let Some(err) = v.get("error") {
@@ -881,6 +886,20 @@ mod tests {
             }
             _ => panic!("expect error"),
         }
+    }
+
+    #[test]
+    fn parser_surfaces_malformed_frame_instead_of_skipping_to_done() {
+        let mut p = WbSseParser::new(lines(&[
+            "data: {not-json}",
+            "",
+            "data: [DONE]",
+            "",
+        ]));
+        assert!(matches!(
+            p.next_event(),
+            Some(WbEvent::Error { code: INCOMPLETE_STREAM_ERROR_CODE, .. })
+        ));
     }
 
     #[test]

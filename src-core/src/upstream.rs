@@ -43,6 +43,9 @@ pub enum SelectionStrategy {
 pub struct UpstreamLeaseGrant {
     pub lease_id: String,
     pub account_ref: String,
+    /// The provider selected by Core for this exact lease. Executors must
+    /// reject a lease whose provider does not match the bound adapter.
+    pub provider: String,
     /// An opaque locator only; callers must never persist or log a resolved secret.
     pub credentials_ref: String,
     pub observation_id: String,

@@ -412,3 +412,24 @@ ai-work-assistant/
 - scheduler 结构化 JSONL 事件只能使用 hash、受限 label 和固定 error category；旧 debug body 日志是显式敏感诊断开关，不能当作脱敏事件。
 - Task 6/Phase 2 测试只用 Mock/fixture，不访问真实网络、真实账号、`AGENT_HOST` 或正在运行的服务。Cargo 命令必须在同一 PowerShell 进程中清空并断言 `AIWORK_*` 为空，使用 `--offline --locked`，target/log/临时 fixture 放 `D:\gpt`，不运行 broad Tauri suite。
 - Task 6 交付时保留用户原有脏文件及 routes.rs 非 Task 6 的媒体/视频 hunks；不得修改或提交 `data/`、`credentials/`、`target-fix/`、生成的 `Cargo.lock`。
+
+## 17. Phase 3A 流式测试约定
+
+- Core stream 只有在 `core_mode=enforce`、scheduler ready、fresh observation、policy/grant
+  以及精确的 `(account_ref, provider, credentials_ref)` + provider stream adapter 都就绪时才
+  可用；缺少任一可信绑定必须在 preflight 前返回 `501/scheduler_endpoint_not_enabled`，不回退
+  legacy `ApiPool`。
+- 取消确认或明确未接受的 rejection 才能释放 quota hold；客户端断开、取消不支持、心跳失败或
+  其他传输不确定结果一律进入 `unknown` 并保留 hold，等待对账。幂等重放不能再次调用上游。
+- Phase 3A 测试不得写 C 盘。PowerShell 中先设置 `$env:TEMP`/`$env:TMP` 为 `D:\gpt`，清除并
+  断言 `AIWORK_*` 为空，再使用 `--offline --locked`，把 Cargo target、日志和临时 fixture
+  放到 `D:\gpt`。示例：
+
+```powershell
+$env:TEMP = 'D:\gpt'
+$env:TMP = 'D:\gpt'
+Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' } |
+  ForEach-Object { Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue }
+if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIWORK_* must be empty' }
+& 'C:\Users\StarLink\.cargo\bin\cargo.exe' test --manifest-path src-core/Cargo.toml --target-dir D:\gpt\aiwork-phase3-core --offline --locked --test full_phase3_streaming -- --nocapture
+```

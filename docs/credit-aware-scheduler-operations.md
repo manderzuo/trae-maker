@@ -108,8 +108,36 @@ success/replay/rejection/transport-unknown、重启恢复、审计脱敏和 quot
 `src-tauri/src/api_server/phase2_smoke.rs` 只组合内存 Mock adapter；它不是生产上游
 连接器，也不读取账号凭据、legacy `ApiPool` 或网络配置。
 
-Task 5 的真实 `(account_ref, provider, credentials_ref)` 启动绑定仍未接通。因此当前
-`enforce` 只能在缺少可信绑定时稳定返回 `501/scheduler_endpoint_not_enabled`，不能把
-上述 Mock smoke 的成功结果表述为真实 upstream 成功。交付时应同时保留 Core 全套离线
-回归、Tauri `phase2_smoke`/focused 回归和其 D 盘日志；若 Python/frontend 测试会触达
-真实上游，则跳过并在报告中记录原因。
+Phase 2 的 Mock smoke 仍不能证明真实 upstream 余额或账号可用性。Phase 3A 已在启动路径
+注册显式的 `(account_ref, provider, credentials_ref)` Trae/WorkBuddy legacy adapter 绑定，
+并要求对应 stream adapter readiness；缺少可信绑定时仍稳定返回
+`501/scheduler_endpoint_not_enabled`，不会把 Mock smoke 的成功结果表述为真实 upstream
+成功。交付时应同时保留 Core 全套离线回归、Tauri `phase2_smoke`/focused 回归和其 D 盘日志；
+若 Python/frontend 测试会触达真实上游，则跳过并在报告中记录原因。
+
+## 9. Phase 3A 流式启用与回滚
+
+Phase 3A 的流式路径继续由 Core 负责 quota、request、upstream lease 和最终结算。
+只有同时满足以下条件时，`core_mode=enforce` 的流式端点才可启用：
+
+1. Core 已有 fresh observation、cost policy、user grant 和可用并发槽位。
+2. 启动注册表为每个可选账号提供精确的
+   `(account_ref, provider, credentials_ref)` 绑定，并注册对应 provider 的 stream adapter。
+3. stream adapter 能给出终态 `success`、未接受的 `rejection`、确认 `canceled` 或
+   `transport_unknown`；没有终态的流不得被当作成功。
+
+缺少 stream adapter、账号绑定或 credentials locator 时，路由必须在 preflight 前返回
+`501/scheduler_endpoint_not_enabled`，不创建 request、lease 或 quota hold，也绝不能
+回退到 legacy `ApiPool`。OpenAI、Anthropic 和 Responses 流都必须发送各自的终止事件；
+客户端断开、上游取消不支持或心跳失败时，结果保持 `unknown`，hold 不释放，等待对账。
+确认取消或明确未接受的拒绝才释放 hold；重放同一幂等键不能再次调用上游。
+
+交付证据全部是离线 Mock：`src-core/tests/full_phase3_streaming.rs` 覆盖账本和 lease
+生命周期，`src-tauri/src/api_server/phase3_streaming_smoke.rs` 覆盖有界 SSE、幂等重放和
+缺适配器 501，路由 focused tests 覆盖三种协议终止事件及客户端断开。测试 target、日志
+和 fixture 固定放在 `D:\gpt`；这证明本地生命周期和边界，不证明真实上游账号可用性。
+
+若绑定、reader 或健康数据不可信，先停止服务并备份 Core 数据库，再把
+`core_mode`/`scheduler_mode` 回退到 `off`。回退恢复 legacy 业务路径，但不得删除
+unknown lease、quota hold 或审计记录；重新启用前需重新核对账号绑定、credentials locator、
+fresh observation、policy、grant 和 stream adapter readiness。

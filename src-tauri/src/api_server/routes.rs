@@ -500,8 +500,9 @@ fn core_route_executor(
 ) -> Result<CoreUpstreamExecutor, CoreLeaseError> {
     #[cfg(test)]
     if let Some(adapter) = core_test_executor() {
-        return Ok(CoreUpstreamExecutor::from_adapter_for_account(
+        return Ok(CoreUpstreamExecutor::from_adapter_for_account_with_provider(
             adapter,
+            "mock",
             "mock-account",
             "vault://mock/account",
         ));
@@ -1308,6 +1309,30 @@ pub async fn messages(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+
+    if core_enforcing(&state) {
+        if !stream {
+            return scheduler_endpoint_not_enabled_response();
+        }
+        let principal = match core_principal_or_unauthorized(principal.as_ref()) {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
+        let idempotency_key = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        return core_stream_chat(
+            state.clone(),
+            principal,
+            key_str,
+            internal,
+            Protocol::Anthropic,
+            idempotency_key,
+        );
+    }
 
     // 统一调度分流点（§4.1）：resolve_target 决定资源池/回退/错误矩阵；
     // guard 随执行路径持有至请求结束（流式含整个后台任务）

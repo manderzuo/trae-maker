@@ -292,6 +292,18 @@ impl CoreUpstreamExecutor {
         Self::from_adapter(adapter).for_account(account_ref, "single", credentials_ref)
     }
 
+    pub fn from_adapter_for_account_with_provider(
+        adapter: Arc<dyn LeaseUpstreamAdapter>,
+        provider: impl Into<String>,
+        account_ref: impl Into<String>,
+        credentials_ref: impl Into<String>,
+    ) -> Self {
+        let provider = provider.into();
+        Self::new()
+            .with_provider(provider.clone(), adapter)
+            .for_account(account_ref, provider, credentials_ref)
+    }
+
     pub fn from_chat_executors(
         executors: &BTreeMap<String, Arc<dyn ChatExecutor>>,
     ) -> Self {
@@ -356,6 +368,12 @@ impl CoreUpstreamExecutor {
                 upstream_request_ref: None,
             };
         };
+        if binding.provider != lease.provider {
+            return UpstreamOutcome::TransportUnknown {
+                reason: "lease_provider_mismatch".into(),
+                upstream_request_ref: None,
+            };
+        }
         if binding.credentials_ref != lease.credentials_ref {
             return UpstreamOutcome::TransportUnknown {
                 reason: "lease_credentials_mismatch".into(),
@@ -391,6 +409,12 @@ impl CoreUpstreamExecutor {
                 upstream_request_ref: None,
             };
         };
+        if binding.provider != lease.provider {
+            return StreamTerminalOutcome::TransportUnknown {
+                reason: "lease_provider_mismatch".into(),
+                upstream_request_ref: None,
+            };
+        }
         if binding.credentials_ref != lease.credentials_ref {
             return StreamTerminalOutcome::TransportUnknown {
                 reason: "lease_credentials_mismatch".into(),
@@ -413,6 +437,9 @@ impl CoreUpstreamExecutor {
         let Some(binding) = self.account_bindings.get(&lease.account_ref) else {
             return CancelSupport::Unknown;
         };
+        if binding.provider != lease.provider {
+            return CancelSupport::Unknown;
+        }
         if binding.credentials_ref != lease.credentials_ref {
             return CancelSupport::Unknown;
         }
@@ -529,6 +556,12 @@ impl LeaseUpstreamAdapter for LegacyPoolLeaseAdapter {
         lease: &UpstreamLeaseGrant,
         request: ChatExecutionRequest,
     ) -> UpstreamOutcome {
+        if self.provider != lease.provider {
+            return UpstreamOutcome::TransportUnknown {
+                reason: "lease_provider_mismatch".into(),
+                upstream_request_ref: None,
+            };
+        }
         let Some(uid) = self.account_uids.get(&lease.account_ref) else {
             return UpstreamOutcome::TransportUnknown {
                 reason: "account_binding_missing".into(),
@@ -605,6 +638,12 @@ impl LegacyPoolStreamAdapter {
     }
 
     fn resolve(&self, lease: &UpstreamLeaseGrant) -> Result<PickedAccount, StreamTerminalOutcome> {
+        if self.provider != lease.provider {
+            return Err(StreamTerminalOutcome::TransportUnknown {
+                reason: "lease_provider_mismatch".into(),
+                upstream_request_ref: None,
+            });
+        }
         let Some(uid) = self.account_uids.get(&lease.account_ref) else {
             return Err(StreamTerminalOutcome::TransportUnknown {
                 reason: "account_binding_missing".into(),
@@ -777,6 +816,7 @@ fn consume_workbuddy_stream(
     sink: &mut dyn StreamSink,
 ) -> StreamTerminalOutcome {
     let mut parser = wb_sse::WbSseParser::new(lines);
+    let mut sent_any = false;
     while let Some(event) = parser.next_event() {
         if sink.cancel_requested() {
             return StreamTerminalOutcome::TransportUnknown {
@@ -802,20 +842,24 @@ fn consume_workbuddy_stream(
                         upstream_request_ref: None,
                     };
                 }
+                sent_any = true;
             }
             wb_sse::WbEvent::Error { code, msg } => {
+                if sent_any || code == wb_sse::INCOMPLETE_STREAM_ERROR_CODE {
+                    return StreamTerminalOutcome::TransportUnknown {
+                        reason: "malformed_or_partial_upstream_stream".into(),
+                        upstream_request_ref: None,
+                    };
+                }
                 let status = code.clamp(0, i64::from(u16::MAX)) as u16;
                 return if (400..500).contains(&status) {
                     StreamTerminalOutcome::Rejected {
                         status,
-                        code: if msg.is_empty() {
-                            "upstream_rejected".into()
-                        } else {
-                            msg
-                        },
+                        code: "upstream_rejected".into(),
                         accepted: false,
                     }
                 } else {
+                    let _ = msg;
                     StreamTerminalOutcome::TransportUnknown {
                         reason: "upstream_stream_error".into(),
                         upstream_request_ref: None,
@@ -859,8 +903,15 @@ fn consume_trae_stream(
                 upstream_request_ref: None,
             };
         }
-        let Some(event) = scan_trae_stream_line(&mut state, &line) else {
-            continue;
+        let event = match scan_trae_stream_line(&mut state, &line) {
+            Ok(Some(event)) => event,
+            Ok(None) => continue,
+            Err(()) => {
+                return StreamTerminalOutcome::TransportUnknown {
+                    reason: "malformed_upstream_frame".into(),
+                    upstream_request_ref: None,
+                };
+            }
         };
         match event.kind.as_str() {
             "output" | "thought" => {
@@ -923,24 +974,27 @@ fn consume_trae_stream(
     }
 }
 
-fn scan_trae_stream_line(state: &mut TraeSseState, line: &str) -> Option<TraeStreamEvent> {
+fn scan_trae_stream_line(
+    state: &mut TraeSseState,
+    line: &str,
+) -> Result<Option<TraeStreamEvent>, ()> {
     let line = line.trim_end();
     if line.is_empty() {
         if state.event.is_empty() {
             state.data.clear();
-            return None;
+            return Ok(None);
         }
         let kind = std::mem::take(&mut state.event);
         let data = std::mem::take(&mut state.data);
-        let data = serde_json::from_str(&data).ok()?;
-        return Some(TraeStreamEvent { kind, data });
+        let data = serde_json::from_str(&data).map_err(|_| ())?;
+        return Ok(Some(TraeStreamEvent { kind, data }));
     }
     if let Some(rest) = line.strip_prefix("event:") {
         state.event = rest.trim().to_owned();
     } else if let Some(rest) = line.strip_prefix("data:") {
         state.data.push_str(rest);
     }
-    None
+    Ok(None)
 }
 
 fn stream_usage_from_value(value: &Value) -> Option<StreamUsage> {
@@ -1624,9 +1678,18 @@ mod tests {
     }
 
     fn lease(account_ref: &str, credentials_ref: &str) -> UpstreamLeaseGrant {
+        lease_with_provider("mock", account_ref, credentials_ref)
+    }
+
+    fn lease_with_provider(
+        provider: &str,
+        account_ref: &str,
+        credentials_ref: &str,
+    ) -> UpstreamLeaseGrant {
         UpstreamLeaseGrant {
             lease_id: "lease-test".into(),
             account_ref: account_ref.into(),
+            provider: provider.into(),
             credentials_ref: credentials_ref.into(),
             observation_id: "observation-test".into(),
             predicted_units: 1,
@@ -1715,6 +1778,27 @@ mod tests {
     }
 
     #[test]
+    fn lease_provider_mismatch_is_unknown_and_never_dispatches() {
+        let mock = Arc::new(MockStreamAdapter::success_without_usage());
+        let executor = CoreUpstreamExecutor::new()
+            .with_stream_provider("mock", mock.clone())
+            .for_account("account-a", "mock", "vault://a");
+        let mut lease = lease("account-a", "vault://a");
+        lease.provider = "workbuddy".into();
+        let mut sink = RecordingStreamSink::accepting();
+
+        let outcome = executor.execute_stream(&lease, request(), &mut sink);
+
+        assert!(matches!(
+            outcome,
+            StreamTerminalOutcome::TransportUnknown { reason, .. }
+                if reason == "lease_provider_mismatch"
+        ));
+        assert!(sink.events.is_empty());
+        assert!(mock.calls().is_empty());
+    }
+
+    #[test]
     fn stream_sink_emit_false_is_not_a_successful_terminal_outcome() {
         let mock = Arc::new(MockStreamAdapter::success_without_usage());
         let executor = CoreUpstreamExecutor::new()
@@ -1775,7 +1859,10 @@ mod tests {
     fn unbound_account_fails_closed_even_with_one_provider() {
         let mock = Arc::new(MockUpstreamExecutor::ok());
         let executor = CoreUpstreamExecutor::from_adapter(mock.clone());
-        let outcome = executor.execute_nonstream_chat(&lease("account-a", "vault://a"), request());
+        let outcome = executor.execute_nonstream_chat(
+            &lease_with_provider("single", "account-a", "vault://a"),
+            request(),
+        );
         assert!(matches!(
             outcome,
             UpstreamOutcome::TransportUnknown { reason, .. } if reason == "account_binding_missing"
@@ -1791,9 +1878,15 @@ mod tests {
             "account-a",
             "vault://a",
         );
-        let exact = executor.execute_nonstream_chat(&lease("account-a", "vault://a"), request());
+        let exact = executor.execute_nonstream_chat(
+            &lease_with_provider("single", "account-a", "vault://a"),
+            request(),
+        );
         assert!(matches!(exact, UpstreamOutcome::Success { .. }));
-        let mismatch = executor.execute_nonstream_chat(&lease("account-a", "vault://other"), request());
+        let mismatch = executor.execute_nonstream_chat(
+            &lease_with_provider("single", "account-a", "vault://other"),
+            request(),
+        );
         assert!(matches!(
             mismatch,
             UpstreamOutcome::TransportUnknown { reason, .. } if reason == "lease_credentials_mismatch"
@@ -1877,13 +1970,13 @@ mod tests {
         );
 
         let exact = adapter.execute_nonstream_chat(
-            &lease("account-a", "vault://a"),
+            &lease_with_provider("trae", "account-a", "vault://a"),
             request(),
         );
         assert!(matches!(exact, UpstreamOutcome::Success { .. }));
 
         let unbound = adapter.execute_nonstream_chat(
-            &lease("account-b", "vault://b"),
+            &lease_with_provider("trae", "account-b", "vault://b"),
             request(),
         );
         assert!(matches!(
@@ -1955,13 +2048,17 @@ mod tests {
             transport.clone(),
         );
         let mut sink = RecordingStreamSink::accepting();
-        let exact = adapter.execute_stream(&lease("account-a", "vault://a"), request(), &mut sink);
+        let exact = adapter.execute_stream(
+            &lease_with_provider("trae", "account-a", "vault://a"),
+            request(),
+            &mut sink,
+        );
         assert!(matches!(exact, StreamTerminalOutcome::Success { actual_units: None, .. }));
         assert_eq!(sink.events.len(), 1);
 
         let mut unbound_sink = RecordingStreamSink::accepting();
         let unbound = adapter.execute_stream(
-            &lease("account-b", "vault://b"),
+            &lease_with_provider("trae", "account-b", "vault://b"),
             request(),
             &mut unbound_sink,
         );
@@ -1990,7 +2087,11 @@ mod tests {
             transport.clone(),
         );
         let mut sink = RecordingStreamSink::accepting();
-        let unavailable = adapter.execute_stream(&lease("account-a", "vault://a"), request(), &mut sink);
+        let unavailable = adapter.execute_stream(
+            &lease_with_provider("workbuddy", "account-a", "vault://a"),
+            request(),
+            &mut sink,
+        );
         assert!(matches!(
             unavailable,
             StreamTerminalOutcome::TransportUnknown { reason, .. }
@@ -2033,6 +2134,47 @@ mod tests {
             incomplete,
             StreamTerminalOutcome::TransportUnknown { reason, .. }
                 if reason == "upstream_stream_incomplete"
+        ));
+    }
+
+    #[test]
+    fn legacy_stream_errors_after_content_and_malformed_frames_are_unknown_and_redacted() {
+        let mut wb_sink = RecordingStreamSink::accepting();
+        let wb = consume_workbuddy_stream(
+            Box::new(
+                vec![
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}".to_string(),
+                    "data: {\"error\":{\"code\":429,\"message\":\"secret upstream detail\"}}".to_string(),
+                ]
+                .into_iter(),
+            ),
+            &mut wb_sink,
+        );
+        assert!(matches!(
+            wb,
+            StreamTerminalOutcome::TransportUnknown { reason, .. }
+                if reason == "malformed_or_partial_upstream_stream"
+        ));
+
+        let mut trae_sink = RecordingStreamSink::accepting();
+        let trae = consume_trae_stream(
+            Box::new(
+                vec![
+                    "event: output".to_string(),
+                    "data: {not-json}".to_string(),
+                    "".to_string(),
+                    "event: done".to_string(),
+                    "data: {}".to_string(),
+                    "".to_string(),
+                ]
+                .into_iter(),
+            ),
+            &mut trae_sink,
+        );
+        assert!(matches!(
+            trae,
+            StreamTerminalOutcome::TransportUnknown { reason, .. }
+                if reason == "malformed_upstream_frame"
         ));
     }
 
