@@ -24,3 +24,4 @@ pub use models::{
 pub use ports::{ChatExecutionRequest, ChatExecutionResult, ChatExecutor, MockChatExecutor, UpstreamError};
 pub use requests::canonical_json_hash;
 pub use store::{CoreStore, CORE_DB_FILE, CURRENT_SCHEMA_VERSION};
+pub use upstream::{LeaseOutcome, ScheduleError, SchedulerLeaseRequest, UpstreamLeaseGrant};

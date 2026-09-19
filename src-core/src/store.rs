@@ -904,7 +904,7 @@ impl CoreStore {
         })
     }
 
-    fn upstream_lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpstreamLease> {
+    pub(crate) fn upstream_lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpstreamLease> {
         let state: String = row.get(6)?;
         let state = LeaseState::from_db(&state).ok_or_else(|| rusqlite::Error::FromSqlConversionFailure(
             6, rusqlite::types::Type::Text, "invalid upstream lease state".into(),

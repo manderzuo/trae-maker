@@ -371,7 +371,7 @@ impl CoreStore {
         Ok(ReserveResult::Created(reservation))
     }
 
-    fn apply_settlement(
+    pub(crate) fn apply_settlement(
         transaction: &Transaction<'_>,
         reservation: &Reservation,
         settlement: Settlement,
@@ -423,7 +423,7 @@ impl CoreStore {
         Ok(())
     }
 
-    fn validate_reservation_owner(
+    pub(crate) fn validate_reservation_owner(
         transaction: &Transaction<'_>,
         reservation: &Reservation,
         principal: &Principal,
@@ -450,7 +450,7 @@ impl CoreStore {
         Ok(())
     }
 
-    fn settle_request_state(
+    pub(crate) fn settle_request_state(
         transaction: &Transaction<'_>,
         request_id: &str,
         current: RequestState,
@@ -551,7 +551,7 @@ impl CoreStore {
             .map_err(CoreError::from)
     }
 
-    fn reservation_by_id(
+    pub(crate) fn reservation_by_id(
         transaction: &Transaction<'_>,
         reservation_id: &str,
     ) -> Result<Option<Reservation>, CoreError> {
