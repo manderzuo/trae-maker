@@ -95,7 +95,8 @@ Add pure response tests for missing scope, non-enforce Core, invalid limit and s
 Run:
 
 ```powershell
-$env:TEMP='D:\gpt'; $env:TMP='D:\gpt'; & 'C:\Users\StarLink\.cargo\bin\cargo.exe' test --manifest-path src-tauri/Cargo.toml --target-dir D:\gpt\aiwork-user-usage-task2-red --offline --locked core_account server -- --nocapture
+$env:TEMP='D:\gpt'; $env:TMP='D:\gpt'; & 'C:\Users\StarLink\.cargo\bin\cargo.exe' test --manifest-path src-tauri/Cargo.toml --target-dir D:\gpt\aiwork-user-usage-task2-red --offline --locked usage_ -- --nocapture
+$env:TEMP='D:\gpt'; $env:TMP='D:\gpt'; & 'C:\Users\StarLink\.cargo\bin\cargo.exe' test --manifest-path src-tauri/Cargo.toml --target-dir D:\gpt\aiwork-user-usage-task2-red --offline --locked router_registers_the_authenticated_user_usage_route -- --nocapture
 ```
 
 Expected: FAIL because the module, handler, and route are not registered.
@@ -106,7 +107,7 @@ Create `core_account::usage` with `State<Arc<ApiSharedState>>`, `Extension<Princ
 
 - [ ] **Step 4: Run focused tests and the full Tauri suite**
 
-Run the focused command again, then:
+Run both focused commands above again, then:
 
 ```powershell
 $env:TEMP='D:\gpt'; $env:TMP='D:\gpt'; & 'C:\Users\StarLink\.cargo\bin\cargo.exe' test --manifest-path src-tauri/Cargo.toml --target-dir D:\gpt\aiwork-user-usage-tauri-green --offline --locked -- --nocapture
