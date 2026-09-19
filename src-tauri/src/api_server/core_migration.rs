@@ -103,16 +103,22 @@ struct LegacyRemainingCredits {
     #[serde(default)]
     credits: std::collections::HashMap<String, f64>,
     #[serde(default)]
+    #[serde(rename = "expire_times")]
     _expire_times: std::collections::HashMap<String, i64>,
     #[serde(default)]
+    #[serde(rename = "general")]
     _general: std::collections::HashMap<String, f64>,
     #[serde(default)]
+    #[serde(rename = "work")]
     _work: std::collections::HashMap<String, f64>,
     #[serde(default)]
+    #[serde(rename = "membership_expire")]
     _membership_expire: std::collections::HashMap<String, i64>,
     #[serde(default)]
+    #[serde(rename = "membership_next_billing")]
     _membership_next_billing: std::collections::HashMap<String, i64>,
     #[serde(default)]
+    #[serde(rename = "updated_at")]
     _updated_at: Option<String>,
 }
 
@@ -697,9 +703,9 @@ mod tests {
                     "credits": {"account-1": 12.5, "account-2": 3.0},
                     "general": {"account-1": 10.0},
                     "work": {"account-1": 2.5},
-                    "expire_times": {},
-                    "membership_expire": {},
-                    "membership_next_billing": {},
+                    "expire_times": {"account-1": 1700000000},
+                    "membership_expire": {"account-1": 1800000000},
+                    "membership_next_billing": {"account-1": 1710000000},
                     "updated_at": "2026-09-19T00:00:00Z"
                 }),
             ),
@@ -989,11 +995,14 @@ mod tests {
         assert!(report.errors.is_empty(), "{report:?}");
         let connection = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3")).unwrap();
         let summary: String = connection.query_row("SELECT summary_json FROM legacy_observations WHERE account_ref = 'account-1'", [], |row| row.get(0)).unwrap();
-        assert!(summary.contains("general"));
-        assert!(summary.contains("work"));
-        assert!(summary.contains("membership_expire"));
-        assert!(summary.contains("membership_next_billing"));
-        assert!(summary.contains("updated_at"));
+        let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(summary["credits"]["account-1"], 12.5);
+        assert_eq!(summary["expire_times"]["account-1"], 1700000000);
+        assert_eq!(summary["general"]["account-1"], 10.0);
+        assert_eq!(summary["work"]["account-1"], 2.5);
+        assert_eq!(summary["membership_expire"]["account-1"], 1800000000);
+        assert_eq!(summary["membership_next_billing"]["account-1"], 1710000000);
+        assert_eq!(summary["updated_at"], "2026-09-19T00:00:00Z");
         assert_eq!(connection.query_row("SELECT COUNT(*) FROM quota_ledger", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     }
 
