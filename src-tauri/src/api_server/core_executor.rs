@@ -93,6 +93,107 @@ impl UpstreamOutcome {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamUsage {
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEvent {
+    pub data: Value,
+    pub usage: Option<StreamUsage>,
+    pub upstream_request_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelSupport {
+    Confirmed,
+    Unsupported,
+    Unknown,
+}
+
+pub trait StreamSink {
+    /// Returns false when the client channel has closed. A false return is
+    /// never a successful upstream terminal outcome.
+    fn emit(&mut self, event: StreamEvent) -> bool;
+
+    fn cancel_requested(&self) -> bool;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamTerminalOutcome {
+    Success {
+        actual_units: Option<i64>,
+        upstream_request_ref: Option<String>,
+    },
+    Rejected {
+        status: u16,
+        code: String,
+        accepted: bool,
+    },
+    Canceled {
+        upstream_request_ref: Option<String>,
+    },
+    TransportUnknown {
+        reason: String,
+        upstream_request_ref: Option<String>,
+    },
+}
+
+impl StreamTerminalOutcome {
+    pub fn lease_outcome(&self, now_ms: i64) -> LeaseOutcome {
+        match self {
+            Self::Success {
+                actual_units,
+                upstream_request_ref,
+            } => LeaseOutcome::Success {
+                actual_units: *actual_units,
+                upstream_request_ref: upstream_request_ref.clone(),
+                now_ms,
+            },
+            Self::Rejected {
+                status,
+                code,
+                accepted,
+            } => LeaseOutcome::Rejected {
+                status: i64::from(*status),
+                code: Some(code.clone()),
+                accepted: *accepted,
+                now_ms,
+            },
+            Self::Canceled {
+                upstream_request_ref,
+            } => LeaseOutcome::Canceled {
+                upstream_request_ref: upstream_request_ref.clone(),
+                now_ms,
+            },
+            Self::TransportUnknown {
+                reason,
+                upstream_request_ref,
+            } => LeaseOutcome::TransportUnknown {
+                reason: reason.clone(),
+                upstream_request_ref: upstream_request_ref.clone(),
+                now_ms,
+            },
+        }
+    }
+}
+
+pub trait LeaseStreamAdapter: Send + Sync {
+    fn execute_stream(
+        &self,
+        lease: &UpstreamLeaseGrant,
+        request: ChatExecutionRequest,
+        sink: &mut dyn StreamSink,
+    ) -> StreamTerminalOutcome;
+
+    fn cancel_stream(&self, _lease: &UpstreamLeaseGrant) -> CancelSupport {
+        CancelSupport::Unsupported
+    }
+}
+
 /// The only adapter boundary that can receive an upstream lease.
 pub trait LeaseUpstreamAdapter: Send + Sync {
     fn execute_nonstream_chat(
@@ -115,6 +216,7 @@ enum RegisteredAdapter {
 #[derive(Clone, Default)]
 pub struct CoreUpstreamExecutor {
     adapters: BTreeMap<String, RegisteredAdapter>,
+    stream_adapters: BTreeMap<String, Arc<dyn LeaseStreamAdapter>>,
     account_bindings: BTreeMap<String, AccountBinding>,
 }
 
@@ -137,6 +239,15 @@ impl CoreUpstreamExecutor {
     ) -> Self {
         self.adapters
             .insert(provider.into(), RegisteredAdapter::Lease(adapter));
+        self
+    }
+
+    pub fn with_stream_provider(
+        mut self,
+        provider: impl Into<String>,
+        adapter: Arc<dyn LeaseStreamAdapter>,
+    ) -> Self {
+        self.stream_adapters.insert(provider.into(), adapter);
         self
     }
 
@@ -209,7 +320,7 @@ impl CoreUpstreamExecutor {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.adapters.is_empty()
+        self.adapters.is_empty() && self.stream_adapters.is_empty()
     }
 
     pub fn can_dispatch_without_provider_binding(&self) -> bool {
@@ -224,6 +335,14 @@ impl CoreUpstreamExecutor {
     /// Returning an empty list is intentionally distinct from a wildcard.
     pub fn bound_account_refs(&self) -> Vec<String> {
         self.account_bindings.keys().cloned().collect()
+    }
+
+    pub fn can_dispatch_stream(&self) -> bool {
+        !self.account_bindings.is_empty()
+            && self
+                .account_bindings
+                .values()
+                .all(|binding| self.stream_adapters.contains_key(&binding.provider))
     }
 
     pub fn execute_nonstream_chat(
@@ -258,6 +377,33 @@ impl CoreUpstreamExecutor {
             }
             .execute_nonstream_chat(lease, request),
         }
+    }
+
+    pub fn execute_stream(
+        &self,
+        lease: &UpstreamLeaseGrant,
+        request: ChatExecutionRequest,
+        sink: &mut dyn StreamSink,
+    ) -> StreamTerminalOutcome {
+        let Some(binding) = self.account_bindings.get(&lease.account_ref) else {
+            return StreamTerminalOutcome::TransportUnknown {
+                reason: "account_binding_missing".into(),
+                upstream_request_ref: None,
+            };
+        };
+        if binding.credentials_ref != lease.credentials_ref {
+            return StreamTerminalOutcome::TransportUnknown {
+                reason: "lease_credentials_mismatch".into(),
+                upstream_request_ref: None,
+            };
+        }
+        let Some(adapter) = self.stream_adapters.get(&binding.provider) else {
+            return StreamTerminalOutcome::TransportUnknown {
+                reason: "stream_adapter_unavailable".into(),
+                upstream_request_ref: None,
+            };
+        };
+        adapter.execute_stream(lease, request, sink)
     }
 }
 
@@ -594,6 +740,136 @@ impl LeaseUpstreamAdapter for MockUpstreamExecutor {
                 body: request.body,
             });
         self.outcome.clone()
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockStreamCall {
+    pub lease_id: String,
+    pub account_ref: String,
+    pub request_id: String,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub struct MockStreamAdapter {
+    calls: Arc<Mutex<Vec<MockStreamCall>>>,
+    outcome: StreamTerminalOutcome,
+    usage: Option<StreamUsage>,
+    cancel_support: CancelSupport,
+}
+
+#[cfg(test)]
+impl MockStreamAdapter {
+    pub fn success_without_usage() -> Self {
+        Self::with_outcome(StreamTerminalOutcome::Success {
+            actual_units: None,
+            upstream_request_ref: None,
+        })
+    }
+
+    pub fn with_outcome(outcome: StreamTerminalOutcome) -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            outcome,
+            usage: None,
+            cancel_support: CancelSupport::Unsupported,
+        }
+    }
+
+    pub fn with_usage(mut self, usage: StreamUsage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    pub fn with_cancel_support(mut self, cancel_support: CancelSupport) -> Self {
+        self.cancel_support = cancel_support;
+        self
+    }
+
+    pub fn calls(&self) -> Vec<MockStreamCall> {
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn upstream_request_ref(&self) -> Option<String> {
+        match &self.outcome {
+            StreamTerminalOutcome::Success {
+                upstream_request_ref,
+                ..
+            }
+            | StreamTerminalOutcome::Canceled {
+                upstream_request_ref,
+            }
+            | StreamTerminalOutcome::TransportUnknown {
+                upstream_request_ref,
+                ..
+            } => upstream_request_ref.clone(),
+            StreamTerminalOutcome::Rejected { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LeaseStreamAdapter for MockStreamAdapter {
+    fn execute_stream(
+        &self,
+        lease: &UpstreamLeaseGrant,
+        request: ChatExecutionRequest,
+        sink: &mut dyn StreamSink,
+    ) -> StreamTerminalOutcome {
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(MockStreamCall {
+                lease_id: lease.lease_id.clone(),
+                account_ref: lease.account_ref.clone(),
+                request_id: request.request_id,
+            });
+
+        if !sink.emit(StreamEvent {
+            data: json!({"type": "mock_text", "content": "hello"}),
+            usage: None,
+            upstream_request_ref: None,
+        }) {
+            return StreamTerminalOutcome::TransportUnknown {
+                reason: "stream_sink_closed".into(),
+                upstream_request_ref: self.upstream_request_ref(),
+            };
+        }
+        if let Some(usage) = self.usage.clone() {
+            if !sink.emit(StreamEvent {
+                data: json!({"type": "mock_usage"}),
+                usage: Some(usage),
+                upstream_request_ref: None,
+            }) {
+                return StreamTerminalOutcome::TransportUnknown {
+                    reason: "stream_sink_closed".into(),
+                    upstream_request_ref: self.upstream_request_ref(),
+                };
+            }
+        }
+        if sink.cancel_requested() {
+            return match self.cancel_support {
+                CancelSupport::Confirmed => StreamTerminalOutcome::Canceled {
+                    upstream_request_ref: self.upstream_request_ref(),
+                },
+                CancelSupport::Unsupported | CancelSupport::Unknown => {
+                    StreamTerminalOutcome::TransportUnknown {
+                        reason: "stream_cancel_unconfirmed".into(),
+                        upstream_request_ref: self.upstream_request_ref(),
+                    }
+                }
+            };
+        }
+        self.outcome.clone()
+    }
+
+    fn cancel_stream(&self, _lease: &UpstreamLeaseGrant) -> CancelSupport {
+        self.cancel_support
     }
 }
 
@@ -937,6 +1213,134 @@ mod tests {
             model: "mock-1".into(),
             body: serde_json::json!({"model": "mock-1", "messages": []}),
         }
+    }
+
+    struct RecordingStreamSink {
+        events: Vec<StreamEvent>,
+        emit_result: bool,
+        cancel_requested: bool,
+    }
+
+    impl RecordingStreamSink {
+        fn accepting() -> Self {
+            Self {
+                events: Vec::new(),
+                emit_result: true,
+                cancel_requested: false,
+            }
+        }
+
+        fn closed() -> Self {
+            Self {
+                events: Vec::new(),
+                emit_result: false,
+                cancel_requested: false,
+            }
+        }
+    }
+
+    impl StreamSink for RecordingStreamSink {
+        fn emit(&mut self, event: StreamEvent) -> bool {
+            self.events.push(event);
+            self.emit_result
+        }
+
+        fn cancel_requested(&self) -> bool {
+            self.cancel_requested
+        }
+    }
+
+    #[test]
+    fn stream_executor_requires_exact_account_binding_and_rejects_unbound_accounts() {
+        let mock = Arc::new(MockStreamAdapter::success_without_usage());
+        let executor = CoreUpstreamExecutor::new()
+            .with_stream_provider("mock", mock.clone())
+            .for_account("account-a", "mock", "vault://a");
+        assert!(executor.can_dispatch_stream());
+
+        let mut sink = RecordingStreamSink::accepting();
+        let exact = executor.execute_stream(
+            &lease("account-a", "vault://a"),
+            request(),
+            &mut sink,
+        );
+        assert!(matches!(
+            exact,
+            StreamTerminalOutcome::Success { actual_units: None, .. }
+        ));
+        assert_eq!(sink.events.len(), 1);
+
+        let mut unbound_sink = RecordingStreamSink::accepting();
+        let unbound = executor.execute_stream(
+            &lease("account-b", "vault://b"),
+            request(),
+            &mut unbound_sink,
+        );
+        assert!(matches!(
+            unbound,
+            StreamTerminalOutcome::TransportUnknown { reason, .. }
+                if reason == "account_binding_missing"
+        ));
+        assert!(unbound_sink.events.is_empty());
+        assert_eq!(mock.calls().len(), 1);
+        assert_eq!(mock.calls()[0].request_id, "request-test");
+    }
+
+    #[test]
+    fn stream_sink_emit_false_is_not_a_successful_terminal_outcome() {
+        let mock = Arc::new(MockStreamAdapter::success_without_usage());
+        let executor = CoreUpstreamExecutor::new()
+            .with_stream_provider("mock", mock)
+            .for_account("account-a", "mock", "vault://a");
+        let mut sink = RecordingStreamSink::closed();
+
+        let outcome = executor.execute_stream(
+            &lease("account-a", "vault://a"),
+            request(),
+            &mut sink,
+        );
+        assert!(matches!(
+            outcome,
+            StreamTerminalOutcome::TransportUnknown { reason, .. }
+                if reason == "stream_sink_closed"
+        ));
+        assert_eq!(sink.events.len(), 1);
+    }
+
+    #[test]
+    fn mock_stream_without_usage_keeps_actual_units_unknown_and_records_identity() {
+        let mock = Arc::new(MockStreamAdapter::success_without_usage());
+        let executor = CoreUpstreamExecutor::new()
+            .with_stream_provider("mock", mock.clone())
+            .for_account("account-a", "mock", "vault://a");
+        let mut sink = RecordingStreamSink::accepting();
+
+        let outcome = executor.execute_stream(
+            &lease("account-a", "vault://a"),
+            request(),
+            &mut sink,
+        );
+        assert!(matches!(
+            outcome,
+            StreamTerminalOutcome::Success {
+                actual_units: None,
+                upstream_request_ref: None,
+            }
+        ));
+        assert_eq!(sink.events[0].usage, None);
+        assert_eq!(mock.calls()[0].lease_id, "lease-test");
+        assert_eq!(mock.calls()[0].account_ref, "account-a");
+        assert_eq!(mock.calls()[0].request_id, "request-test");
+    }
+
+    #[test]
+    fn stream_provider_registration_is_separate_from_nonstream_capability() {
+        let mock = Arc::new(MockStreamAdapter::success_without_usage());
+        let stream_only = CoreUpstreamExecutor::new()
+            .with_stream_provider("mock", mock)
+            .for_account("account-a", "mock", "vault://a");
+        assert!(stream_only.can_dispatch_stream());
+        assert!(!stream_only.can_dispatch_without_provider_binding());
     }
 
     #[test]

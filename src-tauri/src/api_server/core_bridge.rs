@@ -13,8 +13,9 @@ use serde_json::Value;
 pub mod core_executor;
 
 pub use core_executor::{
-    CoreUpstreamExecutor, LegacyChatTransport, LegacyPoolLeaseAdapter, LeaseUpstreamAdapter,
-    UpstreamOutcome,
+    CancelSupport, CoreUpstreamExecutor, LegacyChatTransport, LegacyPoolLeaseAdapter,
+    LeaseStreamAdapter, LeaseUpstreamAdapter, StreamEvent, StreamSink, StreamTerminalOutcome,
+    StreamUsage, UpstreamOutcome,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
