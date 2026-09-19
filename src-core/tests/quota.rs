@@ -386,3 +386,74 @@ fn scheduler_recovery_after_request_progression_preserves_the_quota_hold() {
     let state: String = connection.query_row("SELECT state FROM upstream_leases WHERE id = ?1", [&lease_id], |row| row.get(0)).unwrap();
     assert_eq!(state, LeaseState::Unknown.as_str());
 }
+
+#[test]
+fn user_quota_usage_projection_is_owner_scoped_bounded_and_redacted() {
+    let (store, dir) = test_store_with_grant(100);
+    store.create_user(user("u2", UserRole::User), "admin-1").unwrap();
+    store
+        .grant(QuotaGrant {
+            user_id: "u2".into(),
+            resource_kind: "chat_request".into(),
+            amount: 999,
+            actor_user_id: "admin-1".into(),
+            reason: "other-user-secret-grant".into(),
+        })
+        .unwrap();
+    let key = store
+        .issue_api_key(
+            "u1",
+            "usage",
+            std::collections::BTreeSet::from(["usage:read".to_owned()]),
+            "admin-1",
+        )
+        .unwrap();
+    let owner = Principal {
+        user_id: "u1".into(),
+        key_id: key.id,
+        scopes: std::collections::BTreeSet::from(["usage:read".to_owned()]),
+    };
+
+    let _held_id = created(&store, "usage-held", 5);
+    let unknown_id = created(&store, "usage-unknown", 7);
+    let committed_id = created(&store, "usage-committed", 9);
+    store
+        .settle(&owner, &unknown_id, Settlement::Unknown)
+        .unwrap();
+    store
+        .settle(
+            &owner,
+            &committed_id,
+            Settlement::Commit {
+                actual_amount: Some(4),
+            },
+        )
+        .unwrap();
+
+    let view = store.quota_usage_for_principal(&owner, 100).unwrap();
+    assert_eq!(view.balances.len(), 1);
+    assert_eq!(view.balances[0].resource_kind, "chat_request");
+    assert_eq!(view.balances[0].available, 84);
+    assert_eq!(view.balances[0].held, 12);
+    assert_eq!(view.balances[0].settled, 4);
+    assert_eq!(view.ledger.len(), 5);
+    assert!(view.ledger.iter().all(|entry| entry.request_id.as_deref() != Some("u2")));
+    assert!(view.ledger.iter().any(|entry| entry.request_id.as_deref() == Some("usage-committed")));
+
+    let serialized = serde_json::to_string(&view).unwrap();
+    for forbidden in ["actor_user_id", "other-user-secret-grant", "prompt", "u2"] {
+        assert!(!serialized.contains(forbidden), "projection leaked {forbidden}");
+    }
+    assert_eq!(store.quota_usage_for_principal(&owner, 1).unwrap().ledger.len(), 1);
+    assert!(matches!(
+        store.quota_usage_for_principal(&owner, 0),
+        Err(aiwork_core::CoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        store.quota_usage_for_principal(&owner, 101),
+        Err(aiwork_core::CoreError::Validation { .. })
+    ));
+
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}

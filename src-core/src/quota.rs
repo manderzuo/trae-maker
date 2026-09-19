@@ -2,11 +2,90 @@ use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
-    CoreError, CoreStore, Principal, QuotaBalance, QuotaGrant, QuotaReserve, RequestResult,
-    RequestState, Reservation, ReservationState, ReserveResult, Settlement,
+    CoreError, CoreQuotaBalanceView, CoreQuotaLedgerView, CoreQuotaUsageView, CoreStore, Principal,
+    QuotaBalance, QuotaGrant, QuotaReserve, RequestResult, RequestState, Reservation,
+    ReservationState, ReserveResult, Settlement,
 };
 
 impl CoreStore {
+    /// Return a bounded, owner-checked quota projection for a user.
+    ///
+    /// The read transaction intentionally selects only public ledger fields;
+    /// actor/reason metadata remains an administrator-only audit concern.
+    pub fn quota_usage_for_principal(
+        &self,
+        principal: &Principal,
+        limit: usize,
+    ) -> Result<CoreQuotaUsageView, CoreError> {
+        if !(1..=100).contains(&limit) {
+            return Err(CoreError::Validation {
+                field: "usage.limit".into(),
+                reason: "must be between 1 and 100".into(),
+            });
+        }
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        Self::ensure_principal_in_transaction(&transaction, principal)?;
+
+        let resource_kinds = {
+            let mut statement = transaction.prepare(
+                "SELECT resource_kind FROM quota_ledger WHERE user_id = ?1
+                 UNION
+                 SELECT resource_kind FROM quota_reservations WHERE user_id = ?1
+                 ORDER BY resource_kind",
+            )?;
+            let rows = statement.query_map([&principal.user_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut balances = Vec::with_capacity(resource_kinds.len());
+        for resource_kind in resource_kinds {
+            let (available, held, settled) = transaction.query_row(
+                "SELECT
+                   COALESCE((SELECT SUM(delta) FROM quota_ledger
+                             WHERE user_id = ?1 AND resource_kind = ?2), 0),
+                   COALESCE((SELECT SUM(amount) FROM quota_reservations
+                             WHERE user_id = ?1 AND resource_kind = ?2
+                               AND state IN ('held', 'unknown')), 0),
+                   COALESCE((SELECT SUM(amount) FROM quota_ledger
+                             WHERE user_id = ?1 AND resource_kind = ?2
+                               AND event_kind = 'commit'), 0)",
+                rusqlite::params![&principal.user_id, &resource_kind],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            balances.push(CoreQuotaBalanceView {
+                resource_kind,
+                available,
+                held,
+                settled,
+            });
+        }
+
+        let ledger = {
+            let mut statement = transaction.prepare(
+                "SELECT resource_kind, event_kind, amount, delta, request_id, created_at_ms
+                 FROM quota_ledger
+                 WHERE user_id = ?1
+                 ORDER BY created_at_ms DESC, entry_id DESC
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(rusqlite::params![&principal.user_id, limit as i64], |row| {
+                Ok(CoreQuotaLedgerView {
+                    resource_kind: row.get(0)?,
+                    event_kind: row.get(1)?,
+                    amount: row.get(2)?,
+                    delta: row.get(3)?,
+                    request_id: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        transaction.commit()?;
+        Ok(CoreQuotaUsageView { balances, ledger })
+    }
+
     pub fn quota_balance_as_admin(
         &self,
         principal: &Principal,

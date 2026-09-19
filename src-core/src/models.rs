@@ -711,6 +711,34 @@ pub struct QuotaBalance {
     pub held: i64,
 }
 
+/// User-scoped quota projection for the public `usage:read` endpoint.
+///
+/// This intentionally contains no actor, reason, ledger entry id, prompt,
+/// digest, credential or upstream-account fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreQuotaUsageView {
+    pub balances: Vec<CoreQuotaBalanceView>,
+    pub ledger: Vec<CoreQuotaLedgerView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreQuotaBalanceView {
+    pub resource_kind: String,
+    pub available: i64,
+    pub held: i64,
+    pub settled: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreQuotaLedgerView {
+    pub resource_kind: String,
+    pub event_kind: String,
+    pub amount: i64,
+    pub delta: i64,
+    pub request_id: Option<String>,
+    pub created_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReservationState {
     Held,
