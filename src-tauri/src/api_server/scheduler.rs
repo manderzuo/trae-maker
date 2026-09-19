@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tauri::Manager;
 
 use super::{
-    core_bridge::{CoreMode, CoreUpstreamExecutor, LegacyPoolLeaseAdapter},
+    core_bridge::{CoreMode, CoreUpstreamExecutor, LegacyPoolLeaseAdapter, LegacyPoolStreamAdapter},
     pool::{ApiPool, WbSyncAccount},
     upstream_observation::TauriObservationReader,
 };
@@ -413,21 +413,39 @@ pub fn build_legacy_executor(
     trae_pool: ApiPool,
     wb_pool: ApiPool,
 ) -> CoreUpstreamExecutor {
+    let trae_account_ids = directory.legacy_account_ids("trae");
+    let wb_account_ids = directory.legacy_account_ids("workbuddy");
     let mut executor = CoreUpstreamExecutor::new()
         .with_provider(
             "trae",
             Arc::new(LegacyPoolLeaseAdapter::from_pool(
                 "trae",
-                trae_pool,
-                directory.legacy_account_ids("trae"),
+                trae_pool.clone(),
+                trae_account_ids.clone(),
             )),
         )
         .with_provider(
             "workbuddy",
             Arc::new(LegacyPoolLeaseAdapter::from_pool(
                 "workbuddy",
+                wb_pool.clone(),
+                wb_account_ids.clone(),
+            )),
+        )
+        .with_stream_provider(
+            "trae",
+            Arc::new(LegacyPoolStreamAdapter::from_pool(
+                "trae",
+                trae_pool,
+                trae_account_ids,
+            )),
+        )
+        .with_stream_provider(
+            "workbuddy",
+            Arc::new(LegacyPoolStreamAdapter::from_pool(
+                "workbuddy",
                 wb_pool,
-                directory.legacy_account_ids("workbuddy"),
+                wb_account_ids,
             )),
         );
     for (account_ref, provider, credentials_ref) in directory.executor_bindings() {
@@ -623,6 +641,7 @@ mod tests {
         let executor = build_legacy_executor(&directory, ApiPool::new(), ApiPool::new());
 
         assert!(executor.can_dispatch_without_provider_binding());
+        assert!(executor.can_dispatch_stream());
         assert_eq!(executor.bound_account_refs().len(), directory.accounts.len());
         assert_eq!(directory.legacy_account_ids("trae").len(), 1);
         assert_eq!(directory.legacy_account_ids("workbuddy").len(), 1);

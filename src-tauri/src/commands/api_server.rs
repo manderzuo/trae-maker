@@ -338,7 +338,10 @@ async fn do_start_with_scheduler_key(
             let bridge = if core_mode == crate::api_server::CoreMode::Enforce {
                 let directory = directory.as_ref().ok_or_else(|| SchedulerError::SyncFailed.to_string())?;
                 let executor = scheduler::build_legacy_executor(directory, pool.clone(), wb_pool.clone());
-                if executor.is_empty() || !executor.can_dispatch_without_provider_binding() {
+                if executor.is_empty()
+                    || !executor.can_dispatch_without_provider_binding()
+                    || !executor.can_dispatch_stream()
+                {
                     return Err(SchedulerError::EndpointNotEnabled.to_string());
                 }
                 bridge.with_upstream_executor(executor)

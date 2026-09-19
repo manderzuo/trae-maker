@@ -545,6 +545,418 @@ impl LeaseUpstreamAdapter for LegacyPoolLeaseAdapter {
     }
 }
 
+/// Transport boundary for legacy provider streaming. It receives only the
+/// exact account resolved from Core's binding and a credential-free request
+/// envelope; account rotation remains outside this adapter.
+pub trait LegacyStreamTransport: Send + Sync {
+    fn execute(
+        &self,
+        provider: &str,
+        account: &PickedAccount,
+        request: ChatExecutionRequest,
+        sink: &mut dyn StreamSink,
+    ) -> StreamTerminalOutcome;
+
+    fn cancel(
+        &self,
+        _provider: &str,
+        _account: &PickedAccount,
+        _lease: &UpstreamLeaseGrant,
+    ) -> CancelSupport {
+        CancelSupport::Unsupported
+    }
+}
+
+#[derive(Clone)]
+pub struct LegacyPoolStreamAdapter {
+    provider: String,
+    account_uids: BTreeMap<String, String>,
+    resolve_account: Arc<dyn Fn(&str) -> Option<PickedAccount> + Send + Sync>,
+    transport: Arc<dyn LegacyStreamTransport>,
+}
+
+impl LegacyPoolStreamAdapter {
+    pub fn with_transport(
+        provider: impl Into<String>,
+        account_uids: BTreeMap<String, String>,
+        resolve_account: Arc<dyn Fn(&str) -> Option<PickedAccount> + Send + Sync>,
+        transport: Arc<dyn LegacyStreamTransport>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            account_uids,
+            resolve_account,
+            transport,
+        }
+    }
+
+    pub fn from_pool(
+        provider: impl Into<String>,
+        pool: ApiPool,
+        account_uids: BTreeMap<String, String>,
+    ) -> Self {
+        let resolve_account = Arc::new(move |uid: &str| pool.pick_by_uid(uid));
+        Self::with_transport(
+            provider,
+            account_uids,
+            resolve_account,
+            Arc::new(LegacyNetworkStreamTransport),
+        )
+    }
+
+    fn resolve(&self, lease: &UpstreamLeaseGrant) -> Result<PickedAccount, StreamTerminalOutcome> {
+        let Some(uid) = self.account_uids.get(&lease.account_ref) else {
+            return Err(StreamTerminalOutcome::TransportUnknown {
+                reason: "account_binding_missing".into(),
+                upstream_request_ref: None,
+            });
+        };
+        (self.resolve_account)(uid).ok_or_else(|| StreamTerminalOutcome::TransportUnknown {
+            reason: "account_unavailable".into(),
+            upstream_request_ref: None,
+        })
+    }
+}
+
+impl LeaseStreamAdapter for LegacyPoolStreamAdapter {
+    fn execute_stream(
+        &self,
+        lease: &UpstreamLeaseGrant,
+        request: ChatExecutionRequest,
+        sink: &mut dyn StreamSink,
+    ) -> StreamTerminalOutcome {
+        let account = match self.resolve(lease) {
+            Ok(account) => account,
+            Err(outcome) => return outcome,
+        };
+        self.transport
+            .execute(&self.provider, &account, request, sink)
+    }
+
+    fn cancel_stream(&self, lease: &UpstreamLeaseGrant) -> CancelSupport {
+        let account = match self.resolve(lease) {
+            Ok(account) => account,
+            Err(_) => return CancelSupport::Unknown,
+        };
+        self.transport.cancel(&self.provider, &account, lease)
+    }
+}
+
+struct LegacyNetworkStreamTransport;
+
+impl LegacyStreamTransport for LegacyNetworkStreamTransport {
+    fn execute(
+        &self,
+        provider: &str,
+        account: &PickedAccount,
+        request: ChatExecutionRequest,
+        sink: &mut dyn StreamSink,
+    ) -> StreamTerminalOutcome {
+        match provider {
+            "trae" => execute_trae_stream(account, request, sink),
+            "workbuddy" => execute_workbuddy_stream(account, request, sink),
+            _ => StreamTerminalOutcome::TransportUnknown {
+                reason: "adapter_unavailable".into(),
+                upstream_request_ref: None,
+            },
+        }
+    }
+}
+
+fn execute_trae_stream(
+    account: &PickedAccount,
+    request: ChatExecutionRequest,
+    sink: &mut dyn StreamSink,
+) -> StreamTerminalOutcome {
+    let body = match serde_json::to_vec(&request.body) {
+        Ok(body) => body,
+        Err(_) => {
+            return StreamTerminalOutcome::Rejected {
+                status: 400,
+                code: "invalid_request".into(),
+                accepted: false,
+            }
+        }
+    };
+    let converted = payload::prepare_llm_chat_body(
+        &body,
+        &request.model,
+        &account.uid,
+        &account.device_id,
+        &account.machine_id,
+    );
+    let reader = match routes::make_upstream_request(
+        &account.jwt,
+        &account.uid,
+        &account.device_id,
+        &account.machine_id,
+        &converted,
+    ) {
+        Ok(reader) => reader,
+        Err((status, _, _)) => return map_legacy_stream_http_error(status),
+    };
+    let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
+        Ok(lines) => lines,
+        Err(()) => {
+            return StreamTerminalOutcome::TransportUnknown {
+                reason: "transport_timeout".into(),
+                upstream_request_ref: None,
+            }
+        }
+    };
+    consume_trae_stream(lines, sink)
+}
+
+fn execute_workbuddy_stream(
+    account: &PickedAccount,
+    request: ChatExecutionRequest,
+    sink: &mut dyn StreamSink,
+) -> StreamTerminalOutcome {
+    let body = match serde_json::to_vec(&request.body) {
+        Ok(body) => body,
+        Err(_) => {
+            return StreamTerminalOutcome::Rejected {
+                status: 400,
+                code: "invalid_request".into(),
+                accepted: false,
+            }
+        }
+    };
+    let converted = wb_payload::prepare_wb_chat_body(
+        &body,
+        &request.model,
+        &request.request_id,
+        None,
+        true,
+        &wb_payload::default_template_map(),
+    );
+    let reader = match wb_upstream::make_wb_request(
+        &wb_upstream::WbCreds {
+            id: account.uid.clone(),
+            uid: account.uid.clone(),
+            name: String::new(),
+            token: account.jwt.clone(),
+            domain: account.domain.clone(),
+            enterprise_id: account.enterprise_id.clone(),
+            global_region: account.global_region,
+        },
+        &converted,
+    ) {
+        Ok(reader) => reader,
+        Err((status, _, _)) => return map_legacy_stream_http_error(status),
+    };
+    let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
+        Ok(lines) => lines,
+        Err(()) => {
+            return StreamTerminalOutcome::TransportUnknown {
+                reason: "transport_timeout".into(),
+                upstream_request_ref: None,
+            }
+        }
+    };
+    consume_workbuddy_stream(lines, sink)
+}
+
+fn map_legacy_stream_http_error(status: u16) -> StreamTerminalOutcome {
+    if (400..500).contains(&status) {
+        StreamTerminalOutcome::Rejected {
+            status,
+            code: rejected_code(status).into(),
+            accepted: false,
+        }
+    } else {
+        StreamTerminalOutcome::TransportUnknown {
+            reason: "transport_unknown".into(),
+            upstream_request_ref: None,
+        }
+    }
+}
+
+fn consume_workbuddy_stream(
+    lines: Box<dyn Iterator<Item = String> + Send>,
+    sink: &mut dyn StreamSink,
+) -> StreamTerminalOutcome {
+    let mut parser = wb_sse::WbSseParser::new(lines);
+    while let Some(event) = parser.next_event() {
+        if sink.cancel_requested() {
+            return StreamTerminalOutcome::TransportUnknown {
+                reason: "stream_cancel_requested".into(),
+                upstream_request_ref: None,
+            };
+        }
+        match event {
+            wb_sse::WbEvent::Chunk { delta, finish, usage, .. } => {
+                let mut data = delta;
+                if !finish.is_empty() {
+                    if let Some(object) = data.as_object_mut() {
+                        object.insert("finish_reason".into(), json!(finish));
+                    }
+                }
+                if !sink.emit(StreamEvent {
+                    data,
+                    usage: usage.as_ref().and_then(stream_usage_from_value),
+                    upstream_request_ref: None,
+                }) {
+                    return StreamTerminalOutcome::TransportUnknown {
+                        reason: "stream_sink_closed".into(),
+                        upstream_request_ref: None,
+                    };
+                }
+            }
+            wb_sse::WbEvent::Error { code, msg } => {
+                let status = code.clamp(0, i64::from(u16::MAX)) as u16;
+                return if (400..500).contains(&status) {
+                    StreamTerminalOutcome::Rejected {
+                        status,
+                        code: if msg.is_empty() {
+                            "upstream_rejected".into()
+                        } else {
+                            msg
+                        },
+                        accepted: false,
+                    }
+                } else {
+                    StreamTerminalOutcome::TransportUnknown {
+                        reason: "upstream_stream_error".into(),
+                        upstream_request_ref: None,
+                    }
+                };
+            }
+            wb_sse::WbEvent::Done => {
+                return StreamTerminalOutcome::Success {
+                    actual_units: None,
+                    upstream_request_ref: None,
+                };
+            }
+        }
+    }
+    StreamTerminalOutcome::TransportUnknown {
+        reason: "upstream_stream_incomplete".into(),
+        upstream_request_ref: None,
+    }
+}
+
+#[derive(Default)]
+struct TraeSseState {
+    event: String,
+    data: String,
+}
+
+struct TraeStreamEvent {
+    kind: String,
+    data: Value,
+}
+
+fn consume_trae_stream(
+    lines: Box<dyn Iterator<Item = String> + Send>,
+    sink: &mut dyn StreamSink,
+) -> StreamTerminalOutcome {
+    let mut state = TraeSseState::default();
+    for line in lines {
+        if sink.cancel_requested() {
+            return StreamTerminalOutcome::TransportUnknown {
+                reason: "stream_cancel_requested".into(),
+                upstream_request_ref: None,
+            };
+        }
+        let Some(event) = scan_trae_stream_line(&mut state, &line) else {
+            continue;
+        };
+        match event.kind.as_str() {
+            "output" | "thought" => {
+                let mut data = json!({});
+                if let Some(text) = event
+                    .data
+                    .get("response")
+                    .or_else(|| event.data.get("thought"))
+                    .and_then(Value::as_str)
+                {
+                    data["content"] = json!(text);
+                }
+                if let Some(reasoning) = event.data.get("reasoning_content") {
+                    data["reasoning_content"] = reasoning.clone();
+                }
+                if let Some(tool_calls) = event.data.get("tool_calls") {
+                    data["tool_calls"] = tool_calls.clone();
+                }
+                if !sink.emit(StreamEvent {
+                    data,
+                    usage: None,
+                    upstream_request_ref: None,
+                }) {
+                    return StreamTerminalOutcome::TransportUnknown {
+                        reason: "stream_sink_closed".into(),
+                        upstream_request_ref: None,
+                    };
+                }
+            }
+            "token_usage" => {
+                if !sink.emit(StreamEvent {
+                    data: json!({}),
+                    usage: stream_usage_from_value(&event.data),
+                    upstream_request_ref: None,
+                }) {
+                    return StreamTerminalOutcome::TransportUnknown {
+                        reason: "stream_sink_closed".into(),
+                        upstream_request_ref: None,
+                    };
+                }
+            }
+            "done" | "turn_completion" => {
+                return StreamTerminalOutcome::Success {
+                    actual_units: None,
+                    upstream_request_ref: None,
+                };
+            }
+            "error" => {
+                return StreamTerminalOutcome::TransportUnknown {
+                    reason: "upstream_stream_error".into(),
+                    upstream_request_ref: None,
+                };
+            }
+            _ => {}
+        }
+    }
+    StreamTerminalOutcome::TransportUnknown {
+        reason: "upstream_stream_incomplete".into(),
+        upstream_request_ref: None,
+    }
+}
+
+fn scan_trae_stream_line(state: &mut TraeSseState, line: &str) -> Option<TraeStreamEvent> {
+    let line = line.trim_end();
+    if line.is_empty() {
+        if state.event.is_empty() {
+            state.data.clear();
+            return None;
+        }
+        let kind = std::mem::take(&mut state.event);
+        let data = std::mem::take(&mut state.data);
+        let data = serde_json::from_str(&data).ok()?;
+        return Some(TraeStreamEvent { kind, data });
+    }
+    if let Some(rest) = line.strip_prefix("event:") {
+        state.event = rest.trim().to_owned();
+    } else if let Some(rest) = line.strip_prefix("data:") {
+        state.data.push_str(rest);
+    }
+    None
+}
+
+fn stream_usage_from_value(value: &Value) -> Option<StreamUsage> {
+    let value = value.get("usage").unwrap_or(value);
+    let get = |key: &str| value.get(key).and_then(Value::as_i64);
+    let usage = StreamUsage {
+        prompt_tokens: get("prompt_tokens").or_else(|| get("input_tokens")),
+        completion_tokens: get("completion_tokens").or_else(|| get("output_tokens")),
+        total_tokens: get("total_tokens"),
+    };
+    (usage.prompt_tokens.is_some()
+        || usage.completion_tokens.is_some()
+        || usage.total_tokens.is_some())
+    .then_some(usage)
+}
+
 struct LegacyNetworkChatTransport;
 
 impl LegacyChatTransport for LegacyNetworkChatTransport {
@@ -1487,5 +1899,153 @@ mod tests {
                 .as_slice(),
             &["trae:uid-a:request-test".to_string()]
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingLegacyStreamTransport {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl LegacyStreamTransport for RecordingLegacyStreamTransport {
+        fn execute(
+            &self,
+            provider: &str,
+            account: &crate::api_server::pool::PickedAccount,
+            request: ChatExecutionRequest,
+            sink: &mut dyn StreamSink,
+        ) -> StreamTerminalOutcome {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(format!("{provider}:{}:{}", account.uid, request.request_id));
+            if !sink.emit(StreamEvent {
+                data: serde_json::json!({"content": "legacy"}),
+                usage: None,
+                upstream_request_ref: None,
+            }) {
+                return StreamTerminalOutcome::TransportUnknown {
+                    reason: "stream_sink_closed".into(),
+                    upstream_request_ref: None,
+                };
+            }
+            StreamTerminalOutcome::Success {
+                actual_units: None,
+                upstream_request_ref: Some(request.request_id),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_stream_adapter_dispatches_only_the_core_bound_account() {
+        let account = crate::api_server::pool::PickedAccount {
+            uid: "uid-a".into(),
+            jwt: "jwt-a".into(),
+            device_id: "device-a".into(),
+            machine_id: "machine-a".into(),
+            domain: String::new(),
+            enterprise_id: String::new(),
+            global_region: false,
+        };
+        let resolver_account = account.clone();
+        let transport = Arc::new(RecordingLegacyStreamTransport::default());
+        let adapter = LegacyPoolStreamAdapter::with_transport(
+            "trae",
+            BTreeMap::from([(String::from("account-a"), String::from("uid-a"))]),
+            Arc::new(move |uid| (uid == "uid-a").then_some(resolver_account.clone())),
+            transport.clone(),
+        );
+        let mut sink = RecordingStreamSink::accepting();
+        let exact = adapter.execute_stream(&lease("account-a", "vault://a"), request(), &mut sink);
+        assert!(matches!(exact, StreamTerminalOutcome::Success { actual_units: None, .. }));
+        assert_eq!(sink.events.len(), 1);
+
+        let mut unbound_sink = RecordingStreamSink::accepting();
+        let unbound = adapter.execute_stream(
+            &lease("account-b", "vault://b"),
+            request(),
+            &mut unbound_sink,
+        );
+        assert!(matches!(
+            unbound,
+            StreamTerminalOutcome::TransportUnknown { reason, .. }
+                if reason == "account_binding_missing"
+        ));
+        assert_eq!(
+            transport
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &["trae:uid-a:request-test".to_string()]
+        );
+    }
+
+    #[test]
+    fn legacy_stream_adapter_returns_unknown_for_missing_or_closed_account() {
+        let transport = Arc::new(RecordingLegacyStreamTransport::default());
+        let adapter = LegacyPoolStreamAdapter::with_transport(
+            "workbuddy",
+            BTreeMap::from([(String::from("account-a"), String::from("uid-a"))]),
+            Arc::new(|_| None),
+            transport.clone(),
+        );
+        let mut sink = RecordingStreamSink::accepting();
+        let unavailable = adapter.execute_stream(&lease("account-a", "vault://a"), request(), &mut sink);
+        assert!(matches!(
+            unavailable,
+            StreamTerminalOutcome::TransportUnknown { reason, .. }
+                if reason == "account_unavailable"
+        ));
+        assert!(transport.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_stream_parsers_require_terminal_and_preserve_unknown_usage() {
+        let mut trae_sink = RecordingStreamSink::accepting();
+        let trae_lines = vec![
+            "event: output".to_string(),
+            "data: {\"response\":\"hello\"}".to_string(),
+            "".to_string(),
+            "event: done".to_string(),
+            "data: {\"finish_reason\":\"stop\"}".to_string(),
+            "".to_string(),
+        ];
+        let trae = consume_trae_stream(Box::new(trae_lines.into_iter()), &mut trae_sink);
+        assert!(matches!(trae, StreamTerminalOutcome::Success { actual_units: None, .. }));
+        assert_eq!(trae_sink.events[0].data["content"], "hello");
+        assert_eq!(trae_sink.events[0].usage, None);
+
+        let mut wb_sink = RecordingStreamSink::accepting();
+        let wb_lines = vec![
+            "data: {\"id\":\"wb\",\"choices\":[{\"delta\":{\"content\":\"world\"}}]}".to_string(),
+            "data: [DONE]".to_string(),
+        ];
+        let wb = consume_workbuddy_stream(Box::new(wb_lines.into_iter()), &mut wb_sink);
+        assert!(matches!(wb, StreamTerminalOutcome::Success { actual_units: None, .. }));
+        assert_eq!(wb_sink.events[0].data["content"], "world");
+
+        let mut incomplete_sink = RecordingStreamSink::accepting();
+        let incomplete = consume_workbuddy_stream(
+            Box::new(vec!["data: {\"choices\":[]}".to_string()].into_iter()),
+            &mut incomplete_sink,
+        );
+        assert!(matches!(
+            incomplete,
+            StreamTerminalOutcome::TransportUnknown { reason, .. }
+                if reason == "upstream_stream_incomplete"
+        ));
+    }
+
+    #[test]
+    fn legacy_stream_http_rejection_is_unaccepted_but_transport_is_unknown() {
+        assert!(matches!(
+            map_legacy_stream_http_error(429),
+            StreamTerminalOutcome::Rejected { status: 429, accepted: false, .. }
+        ));
+        assert!(matches!(
+            map_legacy_stream_http_error(502),
+            StreamTerminalOutcome::TransportUnknown { reason, .. }
+                if reason == "transport_unknown"
+        ));
     }
 }

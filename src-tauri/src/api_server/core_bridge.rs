@@ -12,10 +12,11 @@ use serde_json::Value;
 #[path = "core_executor.rs"]
 pub mod core_executor;
 
+#[allow(unused_imports)]
 pub use core_executor::{
     CancelSupport, CoreUpstreamExecutor, LegacyChatTransport, LegacyPoolLeaseAdapter,
-    LeaseStreamAdapter, LeaseUpstreamAdapter, StreamEvent, StreamSink, StreamTerminalOutcome,
-    StreamUsage, UpstreamOutcome,
+    LegacyPoolStreamAdapter, LegacyStreamTransport, LeaseStreamAdapter, LeaseUpstreamAdapter,
+    StreamEvent, StreamSink, StreamTerminalOutcome, StreamUsage, UpstreamOutcome,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
