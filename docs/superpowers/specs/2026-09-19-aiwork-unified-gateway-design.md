@@ -27,6 +27,7 @@
 | 图像 | `POST /v1/images/generations`、`/edits` | 已有 JSON 变体；不接受当前 multipart 变体 | 保留能力声明，错误时返回明确 415/501 |
 | 素材 | `POST /v1/assets`、受控 content 路径 | 当前按 API Key 所有 | 改为用户所有，Key 只作为授权入口 |
 | 视频 | `POST /v1/videos/generations`、状态/content | 已有异步任务和 Key 级幂等；重启不会恢复 processing worker | 迁移到持久化任务状态机与 Agent lease |
+| 用户额度查询 | `GET /v1/usage?limit=<n>` | Core enforce + `usage:read`；只返回当前 Principal 的额度投影 | 仅返回脱敏 balances/ledger，不回退 legacy 或上游余额 |
 | 健康检查 | `/health`、`/healthz` | 免鉴权；业务路由要求 Key | 保留，但不泄露账号/额度详情 |
 
 现状中的重要限制：API Key 文件含明文 key；API Key 只有每日请求计数，没有用户永久额度账本；`remaining_credits.json` 是缓存而非事务性余额；账号池没有持久化预占；`inflight` 是进程内计数；视频和素材以 `owner_key_id` 隔离；公网多个子域名最终进入同一核心网关，不能视为能力隔离。
@@ -88,6 +89,14 @@
 | `admin:*` | 用户、额度、账号、策略、审计和迁移管理 |
 
 任何管理端点都要求管理员用户或管理员 Key；业务响应只返回当前用户可见资源。日志和错误中禁止出现明文 Key、JWT、Cookie、完整 URL token、原始请求体和完整上游响应。
+
+### 4.3 用户自助额度查询
+
+`GET /v1/usage?limit=<n>` 是 Core-only 的用户自助查询接口。它只在 `core_mode=enforce` 且请求 Principal 持有 `usage:read` 时工作；`limit` 缺省为 100，允许范围为 1–100。接口始终以鉴权得到的 `user_id` 做 owner 过滤，不接受查询参数或请求体覆盖用户身份。
+
+成功响应固定为 `object=user_usage`，包括 `balances`、`ledger` 和实际采用的 `limit`。每个 balance 只暴露 `resource_kind`、`available`、`held`、`settled`；每条 ledger 只暴露 `resource_kind`、`event_kind`、`amount`、`delta`、可选 `request_id` 和 `created_at_ms`。不返回用户/actor 标识、管理员原因、entry id、prompt、摘要、Key、凭据、上游账号或完整上游引用。有效 reserve 和结果为 `unknown` 的保守占用都继续计入 `held`；明确结算的 commit 才计入 `settled`。
+
+Core 未启用（`off`/`shadow` 或 bridge 缺失）返回 501；缺少 Principal 返回 401；缺少 `usage:read` 返回 403；limit 越界返回 400；Core 存储失败返回通用 500。该查询不创建 reserve、不结算、不触碰 legacy usage 文件。上游 observation 仅供调度和审计，**上游余额不转换为用户额度**，也不对外宣称真实费用或现金余额。
 
 ## 5. 数据模型
 

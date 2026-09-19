@@ -16,6 +16,13 @@
 
 当前版本的 `VideoQueueWorker` 是可测试的 worker 边界，生产启动生命周期和真实上游 adapter 尚未自动注册；没有可信 adapter 时，enforce 路径继续 fail-closed，返回 `501/scheduler_endpoint_not_enabled`。
 
+## 用户自助额度查询边界
+
+- `GET /v1/usage?limit=<n>` 只由 Core enforce 路径提供，并要求当前 API Key 的 Principal 具有 `usage:read`；默认 `limit=100`，范围为 1–100。用户只能看到自己的 `resource_kind` 余额投影和最近账本事件，不能通过参数读取其他用户。
+- 响应的 `balances` 只包含 `available`、`held`、`settled`；有效 reserve 和 `unknown` 任务的保守占用继续留在 `held`，明确 commit 才进入 `settled`。`ledger` 仅保留资源、事件、金额、变化、可选 request id 和时间，不返回 prompt、凭据、上游账号或管理员内部信息。
+- `core_mode=off/shadow`、未认证、缺 scope、limit 越界和 Core 存储错误分别保持 501/401/403/400/500 边界；查询是只读投影，不创建或释放额度，也不绕过 durable queue 的 recovery/reconcile 规则。
+- 上游积分/余额仍是带来源和时间戳的 observation；上游余额不转换为用户额度，不把 legacy JSON 或真实上游 billing 当作用户账本事实。
+
 ## 回滚到 `core_mode=off`
 
 1. 停止 API 服务和桌面管理操作，先备份整个 `<AIWORK_DATA_DIR>\data` 目录及 WAL/SHM 文件。
