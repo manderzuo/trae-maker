@@ -59,9 +59,10 @@ Core grant 是逻辑额度账本操作，不是向上游查询余额。管理员
 推荐顺序如下：
 
 1. 停机并完成上文的文件级备份，保留旧 JSON 原件。
-2. 在 `off` 或 `shadow` 下运行 `core_migration_inspect`，仅检查 JSON 是否可解析、数量、
-   哈希、候选 owner 映射和待核对项；inspect 不验证 owner 是否真实存在，也不检查物理素材
-   文件、大小或 SHA-256。缺失或不确定项必须保留为待核对，不能猜测 owner。
+2. 在 `off` 或 `shadow` 下运行 `core_migration_inspect`，读取并保留待核对的 owner 字段
+   （不做 owner 映射校验，也不返回候选映射；真正的 owner 校验在 apply 阶段执行）；inspect
+   仅检查 JSON 是否可解析、数量和哈希，不检查物理素材文件、大小或 SHA-256。缺失或不确定项
+   必须保留为待核对，不能猜测 owner。
 3. 使用管理员 Key 执行 `core_migration_apply`。apply 才会对 owner、物理素材文件存在性、
    大小和 SHA-256 做 fail-closed 校验；通过后才在单个事务内写入记录。旧明文 Key 不写入
    Core，旧 Key 的 legacy 使用状态按迁移结果禁用/标记。
