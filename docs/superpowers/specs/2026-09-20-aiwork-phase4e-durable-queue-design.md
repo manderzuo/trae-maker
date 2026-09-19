@@ -23,6 +23,8 @@ reservation 和 lease 组织成可恢复的持久队列边界：提交只产生�
 - 真实 adapter 的 accepted、success、rejection、cancel 和费用证据尚未有可核验契约；本阶段
   只使用 MockVideoAdapter/fixture。Tauri 已有一个显式 worker 边界，但生产启动仍不会
   自动注册未知的真实 adapter。
+- 管理员可通过 Core 安全投影查看视频任务的归属、状态、时间、尝试/租约和额度摘要；投影
+  不返回 prompt、输入摘要、request/lease ID、上游账号标识、凭据、结果路径或完整上游引用。
 
 ## 设计边界
 

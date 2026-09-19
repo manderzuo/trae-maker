@@ -34,12 +34,12 @@
 ### Task 3：Tauri/worker 接入（Mock only）
 
 - [x] 增加最小后台 worker helper 和 DPAPI 保护的任务载荷边界，生产 adapter 缺失仍返回 501；
-  管理员安全投影仍待补齐。
+  管理员安全投影已通过 Core、Tauri 命令和桌面 Core 管理 Tab 接入。
 - [x] 用 bounded Mock worker 验证领取、心跳、取消、缺失载荷和终态清理，不启动真实服务或网络。
-- [ ] 更新运维文档说明启动恢复、unknown hold 和回滚到 off。
+- [x] 更新运维文档说明启动恢复、unknown hold 和回滚到 off。
 
 ### Task 4：验证与交付
 
-- [ ] Core focused/full、Tauri focused/full、Vitest/build、diff check，全程 D 盘。
-- [ ] 检查 no plaintext/digest/prompt/credential 泄露、用户隔离、资源隔离、幂等和无回退。
-- [ ] 复核目标文件，报告 Phase 4E 证据与仍待真实上游契约的 Phase 4/5 项；不宣称总目标完成。
+- [x] Core focused/full、Tauri focused/full、Vitest/build、diff check，全程 D 盘。
+- [x] 检查 no plaintext/digest/prompt/credential 泄露、用户隔离、资源隔离、幂等和无回退。
+- [x] 复核目标文件，报告 Phase 4E 证据与仍待真实上游契约的 Phase 4/5 项；不宣称总目标完成。

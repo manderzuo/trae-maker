@@ -87,6 +87,7 @@ import type {
   CoreSchedulerStatus,
   CoreStatus,
   CoreUserAdminView,
+  CoreVideoJobAdminView,
   CoreUserResponse,
 } from '../types';
 
@@ -273,6 +274,12 @@ export const api = {
       invoke<CoreApiKeyAdminView[]>('core_api_keys_list', {
         adminApiKey,
         userId: userId ?? null,
+      }),
+    videoJobsList: (adminApiKey: string, jobState?: string | null, limit = 100) =>
+      invoke<CoreVideoJobAdminView[]>('core_video_jobs_list', {
+        adminApiKey,
+        jobState: jobState ?? null,
+        limit,
       }),
     quotaBalance: (adminApiKey: string, userId: string, resourceKind: string) =>
       invoke<CoreQuotaBalanceResponse>('core_quota_balance', {

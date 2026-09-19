@@ -154,6 +154,18 @@ pub(crate) fn core_api_keys_list_for_store(
         .map_err(|error| error.to_string())
 }
 
+pub(crate) fn core_video_jobs_list_for_store(
+    store: &CoreStore,
+    admin_api_key: &str,
+    job_state: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<aiwork_core::CoreVideoJobAdminView>, String> {
+    let principal = authenticate_admin(store, admin_api_key)?;
+    store
+        .list_video_jobs_as_admin(&principal, job_state.as_deref(), limit.unwrap_or(100) as usize)
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) fn core_quota_balance_for_store(
     store: &CoreStore,
     admin_api_key: &str,
@@ -366,6 +378,18 @@ pub fn core_api_keys_list(
 }
 
 #[tauri::command]
+pub fn core_video_jobs_list(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    admin_api_key: String,
+    job_state: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<aiwork_core::CoreVideoJobAdminView>, String> {
+    let store = core_store_for_admin(&state, &runtime)?;
+    core_video_jobs_list_for_store(&store, &admin_api_key, job_state, limit)
+}
+
+#[tauri::command]
 pub fn core_quota_balance(
     state: State<'_, AppState>,
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
@@ -409,6 +433,7 @@ mod tests {
     use super::{
         authenticate_admin, core_api_key_revoke_for_store, core_api_keys_list_for_store,
         core_quota_balance_for_store, core_user_set_status_for_store, core_users_list_for_store,
+        core_video_jobs_list_for_store,
     };
 
     #[test]
@@ -503,11 +528,44 @@ mod tests {
         for name in [
             "commands::core::core_users_list",
             "commands::core::core_api_keys_list",
+            "commands::core::core_video_jobs_list",
             "commands::core::core_quota_balance",
             "commands::core::core_user_set_status",
             "commands::core::core_api_key_revoke",
         ] {
             assert!(source.contains(name), "missing command registration: {name}");
         }
+    }
+
+    #[test]
+    fn video_job_admin_command_requires_real_admin_and_bounded_limit() {
+        let dir = std::env::temp_dir().join(format!("aiwork-command-video-jobs-{}", rand::random::<u64>()));
+        let store = CoreStore::open(&dir).unwrap();
+        store.migrate().unwrap();
+        store
+            .create_user(
+                NewUser { id: "admin".into(), name: "Admin".into(), role: UserRole::Admin },
+                "bootstrap",
+            )
+            .unwrap();
+        store
+            .create_user(
+                NewUser { id: "user".into(), name: "User".into(), role: UserRole::User },
+                "admin",
+            )
+            .unwrap();
+        let admin_key = store
+            .issue_api_key("admin", "admin", BTreeSet::from(["admin:*".into()]), "bootstrap")
+            .unwrap();
+        let user_key = store
+            .issue_api_key("user", "user", BTreeSet::new(), "admin")
+            .unwrap();
+
+        let jobs = core_video_jobs_list_for_store(&store, &admin_key.plaintext, Some("queued".into()), Some(10)).unwrap();
+        assert!(jobs.is_empty());
+        assert!(core_video_jobs_list_for_store(&store, &user_key.plaintext, None, Some(10)).is_err());
+        assert!(core_video_jobs_list_for_store(&store, &admin_key.plaintext, None, Some(501)).is_err());
+        assert!(core_video_jobs_list_for_store(&store, &admin_key.plaintext, Some("invalid".into()), Some(10)).is_err());
+        let _ = fs::remove_dir_all(dir);
     }
 }

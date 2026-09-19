@@ -138,6 +138,86 @@ pub(crate) fn insert_video_job_without_attempt(
 }
 
 impl crate::CoreStore {
+    /// List a bounded, redacted view of durable video jobs for administrators.
+    /// The query deliberately excludes payload hashes, request/lease IDs,
+    /// account references, result paths and credentials.
+    pub fn list_video_jobs_as_admin(
+        &self,
+        principal: &Principal,
+        state: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::CoreVideoJobAdminView>, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        if !(1..=500).contains(&limit) {
+            return Err(CoreError::Validation {
+                field: "jobs.limit".into(),
+                reason: "must be between 1 and 500".into(),
+            });
+        }
+        if let Some(state) = state {
+            if JobState::from_db(state).is_none() {
+                return Err(CoreError::Validation {
+                    field: "jobs.state".into(),
+                    reason: "must be a valid job state".into(),
+                });
+            }
+        }
+        let sql = if state.is_some() {
+            "SELECT j.id, j.user_id, j.model, j.state, j.reconcile_required,
+                    j.created_at_ms, j.updated_at_ms, j.last_heartbeat_ms,
+                    j.cancel_requested_at_ms, j.queue_claim_owner,
+                    j.queue_claim_expires_at_ms, a.attempt_no, a.state,
+                    a.error_code, a.upstream_request_ref, l.state,
+                    l.predicted_units, l.lease_expires_at_ms,
+                    l.reconcile_until_ms, l.error_kind, q.amount, q.state
+             FROM jobs j
+             LEFT JOIN job_attempts a
+               ON a.job_id = j.id
+              AND a.attempt_no = (SELECT MAX(latest.attempt_no)
+                                  FROM job_attempts latest
+                                  WHERE latest.job_id = j.id)
+             LEFT JOIN upstream_leases l ON l.id = a.lease_id
+             LEFT JOIN quota_reservations q
+               ON q.request_id = j.request_id AND q.resource_kind = 'video_job'
+             WHERE j.kind = 'video' AND j.state = ?1
+             ORDER BY j.created_at_ms, j.id
+             LIMIT ?2"
+        } else {
+            "SELECT j.id, j.user_id, j.model, j.state, j.reconcile_required,
+                    j.created_at_ms, j.updated_at_ms, j.last_heartbeat_ms,
+                    j.cancel_requested_at_ms, j.queue_claim_owner,
+                    j.queue_claim_expires_at_ms, a.attempt_no, a.state,
+                    a.error_code, a.upstream_request_ref, l.state,
+                    l.predicted_units, l.lease_expires_at_ms,
+                    l.reconcile_until_ms, l.error_kind, q.amount, q.state
+             FROM jobs j
+             LEFT JOIN job_attempts a
+               ON a.job_id = j.id
+              AND a.attempt_no = (SELECT MAX(latest.attempt_no)
+                                  FROM job_attempts latest
+                                  WHERE latest.job_id = j.id)
+             LEFT JOIN upstream_leases l ON l.id = a.lease_id
+             LEFT JOIN quota_reservations q
+               ON q.request_id = j.request_id AND q.resource_kind = 'video_job'
+             WHERE j.kind = 'video'
+             ORDER BY j.created_at_ms, j.id
+             LIMIT ?1"
+        };
+        let jobs = {
+            let mut statement = transaction.prepare(sql)?;
+            let rows = if let Some(state) = state {
+                statement.query_map(rusqlite::params![state, limit as i64], admin_video_job_from_row)?
+            } else {
+                statement.query_map(rusqlite::params![limit as i64], admin_video_job_from_row)?
+            };
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.commit()?;
+        Ok(jobs)
+    }
+
     pub fn video_job_for_user(
         &self,
         principal: &Principal,
@@ -1533,6 +1613,33 @@ fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<CoreJobAttempt> {
         updated_at_ms: row.get(10)?,
         last_heartbeat_ms: row.get(11)?,
         finished_at_ms: row.get(12)?,
+    })
+}
+
+fn admin_video_job_from_row(row: &Row<'_>) -> rusqlite::Result<crate::CoreVideoJobAdminView> {
+    Ok(crate::CoreVideoJobAdminView {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        model: row.get(2)?,
+        state: row.get(3)?,
+        reconcile_required: row.get::<_, i64>(4)? != 0,
+        created_at_ms: row.get(5)?,
+        updated_at_ms: row.get(6)?,
+        last_heartbeat_ms: row.get(7)?,
+        cancel_requested_at_ms: row.get(8)?,
+        queue_claimed: row.get::<_, Option<String>>(9)?.is_some(),
+        queue_claim_expires_at_ms: row.get(10)?,
+        attempt_no: row.get(11)?,
+        attempt_state: row.get(12)?,
+        attempt_error_code: row.get(13)?,
+        upstream_request_ref_present: row.get::<_, Option<String>>(14)?.is_some(),
+        lease_state: row.get(15)?,
+        predicted_units: row.get(16)?,
+        lease_expires_at_ms: row.get(17)?,
+        reconcile_until_ms: row.get(18)?,
+        lease_error_kind: row.get(19)?,
+        quota_amount: row.get(20)?,
+        quota_state: row.get(21)?,
     })
 }
 

@@ -317,6 +317,37 @@ pub struct CoreApiKeyAdminView {
     pub revoked_at_ms: Option<i64>,
 }
 
+/// Redacted administrator view of the durable video queue.
+///
+/// This intentionally omits request/lease identifiers, input digests and
+/// result paths.  It exposes enough state for queue operations and audit
+/// triage without making the admin UI a second payload or credential store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreVideoJobAdminView {
+    pub id: String,
+    pub user_id: String,
+    pub model: String,
+    pub state: String,
+    pub reconcile_required: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub last_heartbeat_ms: Option<i64>,
+    pub cancel_requested_at_ms: Option<i64>,
+    pub queue_claimed: bool,
+    pub queue_claim_expires_at_ms: Option<i64>,
+    pub attempt_no: Option<i64>,
+    pub attempt_state: Option<String>,
+    pub attempt_error_code: Option<String>,
+    pub upstream_request_ref_present: bool,
+    pub lease_state: Option<String>,
+    pub predicted_units: Option<i64>,
+    pub lease_expires_at_ms: Option<i64>,
+    pub reconcile_until_ms: Option<i64>,
+    pub lease_error_kind: Option<String>,
+    pub quota_amount: Option<i64>,
+    pub quota_state: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetState {
     Active,

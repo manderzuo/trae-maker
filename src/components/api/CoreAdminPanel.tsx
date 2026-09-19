@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   Copy,
   Database,
+  ListChecks,
   KeyRound,
   LockKeyhole,
   Plus,
@@ -18,6 +19,7 @@ import type {
   CoreQuotaBalanceResponse,
   CoreStatus,
   CoreUserAdminView,
+  CoreVideoJobAdminView,
 } from '../../types';
 
 type CoreAdminAction =
@@ -27,6 +29,14 @@ type CoreAdminAction =
 
 export function normalizeCoreScopes(value: string): string[] {
   return [...new Set(value.split(',').map((scope) => scope.trim()).filter(Boolean))];
+}
+
+export function coreJobTone(state: string): 'green' | 'amber' | 'slate' | 'red' | 'blue' {
+  if (state === 'succeeded' || state === 'canceled') return 'green';
+  if (state === 'unknown' || state === 'cancel_requested') return 'amber';
+  if (state === 'failed') return 'red';
+  if (state === 'running') return 'blue';
+  return 'slate';
 }
 
 function errorMessage(error: unknown): string {
@@ -65,6 +75,8 @@ export default function CoreAdminPanel({
   } | null>(null);
   const [users, setUsers] = useState<CoreUserAdminView[]>([]);
   const [keys, setKeys] = useState<CoreApiKeyAdminView[]>([]);
+  const [videoJobs, setVideoJobs] = useState<CoreVideoJobAdminView[]>([]);
+  const [jobStateFilter, setJobStateFilter] = useState('');
   const [selectedUserId, setSelectedUserId] = useState('');
   const [keyFilterUserId, setKeyFilterUserId] = useState('');
   const [busy, setBusy] = useState(false);
@@ -107,10 +119,14 @@ export default function CoreAdminPanel({
         api.core.usersList(normalized),
         api.core.apiKeysList(normalized, keyFilterUserId || null),
       ]);
-      const nextScheduler = await api.core.schedulerStatus(normalized);
+      const [nextScheduler, nextVideoJobs] = await Promise.all([
+        api.core.schedulerStatus(normalized),
+        api.core.videoJobsList(normalized, jobStateFilter || null, 100),
+      ]);
       setUsers(nextUsers);
       setKeys(nextKeys);
       setScheduler(nextScheduler);
+      setVideoJobs(nextVideoJobs);
       if (!selectedUserId && nextUsers.length > 0) setSelectedUserId(nextUsers[0].id);
       toast('success', `Core 管理数据已刷新（${nextUsers.length} 个用户 / ${nextKeys.length} 个 Key）`);
     } catch (error) {
@@ -119,7 +135,7 @@ export default function CoreAdminPanel({
     } finally {
       setLoading(false);
     }
-  }, [adminApiKey, keyFilterUserId, selectedUserId, toast]);
+  }, [adminApiKey, jobStateFilter, keyFilterUserId, selectedUserId, toast]);
 
   useEffect(() => {
     void refreshStatus();
@@ -135,7 +151,7 @@ export default function CoreAdminPanel({
       void loadLists(adminApiKey);
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [keyFilterUserId]); // 过滤器改变后刷新，不把输入框每次按键都提交到后端
+  }, [keyFilterUserId, jobStateFilter]); // 过滤器改变后刷新，不把输入框每次按键都提交到后端
 
   const runMutation = async (action: () => Promise<unknown>, successMessage: string) => {
     setBusy(true);
@@ -334,6 +350,18 @@ export default function CoreAdminPanel({
               </div>
               <p className="mt-1 text-[11px] text-slate-400">Scopes 可用逗号分隔；留空表示不附加 scope。</p>
             </div>
+          </div>
+
+          <div className="card p-4">
+            <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
+              <div>
+                <div className="flex items-center gap-2"><ListChecks size={16} className="text-brand-500" /><h4 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">视频持久队列</h4><Badge tone="slate">脱敏投影</Badge></div>
+                <p className="mt-1 text-xs text-slate-400">只显示归属、状态、租约和额度摘要；不显示 prompt、输入摘要、账号标识或结果路径。</p>
+              </div>
+              <label className="text-xs text-slate-500">状态<select className="input mt-1 !w-36" value={jobStateFilter} onChange={(event) => setJobStateFilter(event.target.value)}><option value="">全部</option><option value="queued">queued</option><option value="running">running</option><option value="unknown">unknown</option><option value="succeeded">succeeded</option><option value="failed">failed</option><option value="canceled">canceled</option></select></label>
+            </div>
+            <div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400"><th className="pb-2 pr-3">任务</th><th className="pb-2 pr-3">用户</th><th className="pb-2 pr-3">模型</th><th className="pb-2 pr-3">状态</th><th className="pb-2 pr-3">额度</th><th className="pb-2 pr-3">尝试 / lease</th><th className="pb-2">更新时间</th></tr></thead><tbody>{videoJobs.map((job) => <tr key={job.id} className="row-hover border-b border-slate-100 last:border-0 dark:border-zinc-800"><td className="max-w-48 truncate py-2 pr-3 font-mono text-xs" title={job.id}>{job.id}</td><td className="py-2 pr-3 font-mono text-xs">{job.user_id}</td><td className="py-2 pr-3 text-xs">{job.model}</td><td className="py-2 pr-3"><div className="flex flex-wrap items-center gap-1"><Badge tone={coreJobTone(job.state)}>{job.state}</Badge>{job.reconcile_required && <Badge tone="amber">待对账</Badge>}{job.queue_claimed && <Badge tone="blue">已领取</Badge>}</div></td><td className="py-2 pr-3 text-xs">{job.quota_amount ?? '—'} / {job.quota_state ?? '—'}</td><td className="py-2 pr-3 text-xs text-slate-500">{job.attempt_state ?? '—'} / {job.lease_state ?? '—'}</td><td className="py-2 text-xs text-slate-400">{formatTime(job.updated_at_ms)}</td></tr>)}</tbody></table>{videoJobs.length === 0 && <p className="py-4 text-center text-xs text-slate-400">暂无匹配的视频任务。</p>}</div>
+            {videoJobs.some((job) => job.state === 'unknown' || job.reconcile_required) && <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">unknown / 待对账任务保留额度，不会由管理界面自动换号重放。</p>}
           </div>
 
           <div className="card p-4">

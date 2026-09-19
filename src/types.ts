@@ -521,6 +521,32 @@ export interface CoreApiKeyAdminView {
   revoked_at_ms: number | null;
 }
 
+/** Core 管理员可见的脱敏持久视频队列投影；不包含 prompt、摘要、凭据或结果路径。 */
+export interface CoreVideoJobAdminView {
+  id: string;
+  user_id: string;
+  model: string;
+  state: string;
+  reconcile_required: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+  last_heartbeat_ms: number | null;
+  cancel_requested_at_ms: number | null;
+  queue_claimed: boolean;
+  queue_claim_expires_at_ms: number | null;
+  attempt_no: number | null;
+  attempt_state: string | null;
+  attempt_error_code: string | null;
+  upstream_request_ref_present: boolean;
+  lease_state: string | null;
+  predicted_units: number | null;
+  lease_expires_at_ms: number | null;
+  reconcile_until_ms: number | null;
+  lease_error_kind: string | null;
+  quota_amount: number | null;
+  quota_state: string | null;
+}
+
 export interface CoreUserResponse {
   id: string;
   name: string;

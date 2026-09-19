@@ -171,6 +171,7 @@ fn main() {
             commands::core::core_quota_grant,
             commands::core::core_users_list,
             commands::core::core_api_keys_list,
+            commands::core::core_video_jobs_list,
             commands::core::core_quota_balance,
             commands::core::core_user_set_status,
             commands::core::core_api_key_revoke,

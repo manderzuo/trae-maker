@@ -331,6 +331,70 @@ fn queued_video_job_can_resolve_its_internal_principal_without_exposing_key_mate
 }
 
 #[test]
+fn admin_video_job_projection_is_bounded_and_redacted() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "admin-job-projection", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "admin-job-projection".into(),
+                input_hash: vec![42; 32],
+            },
+        )
+        .unwrap();
+    let job_id = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job.id,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+
+    let queued = store
+        .list_video_jobs_as_admin(&admin, None, 10)
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, job_id);
+    assert_eq!(queued[0].user_id, "video-user");
+    assert_eq!(queued[0].state, "queued");
+    assert!(!queued[0].queue_claimed);
+    assert_eq!(queued[0].quota_amount, Some(4));
+    assert_eq!(queued[0].quota_state.as_deref(), Some("held"));
+    let serialized = serde_json::to_string(&queued[0]).unwrap();
+    assert!(!serialized.contains("input_hash"));
+    assert!(!serialized.contains("request_id"));
+    assert!(!serialized.contains("video-account"));
+    assert!(!serialized.contains("vault://"));
+    assert!(!serialized.contains("prompt"));
+
+    store
+        .claim_video_job_by_id("admin-projection-worker", &job_id, 1_800_000_010_000)
+        .unwrap()
+        .unwrap();
+    let claimed = store
+        .list_video_jobs_as_admin(&admin, Some("running"), 10)
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert!(claimed[0].queue_claimed);
+    assert_eq!(claimed[0].attempt_state.as_deref(), Some("running"));
+    assert_eq!(claimed[0].lease_state.as_deref(), Some("active"));
+    assert!(!claimed[0].upstream_request_ref_present);
+
+    assert!(matches!(
+        store.list_video_jobs_as_admin(&principal, None, 10),
+        Err(aiwork_core::CoreError::AdminRequired)
+    ));
+    assert!(matches!(
+        store.list_video_jobs_as_admin(&principal, None, 0),
+        Err(aiwork_core::CoreError::AdminRequired)
+    ));
+    assert!(store.list_video_jobs_as_admin(&admin, None, 0).is_err());
+    assert!(store.list_video_jobs_as_admin(&admin, Some("not-a-state"), 10).is_err());
+
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn claimed_video_job_heartbeat_is_owner_bound_and_keeps_all_runtime_rows_alive() {
     let (store, admin, principal, dir) = fixture();
     prepare_video_scheduler(&store, &admin);
