@@ -328,7 +328,6 @@ git commit -m "feat: add scheduler modes and account synchronization"
 - Modify: src-tauri/src/api_server/pool.rs
 - Test: src-tauri/src/api_server/core_executor.rs (unit tests)
 - Test: src-tauri/src/api_server/routes.rs (Core enforce tests)
-- Test: src-core/tests/full_phase2.rs
 
 **Interfaces:**
 - Consumes: Task 2 atomic preflight/lease, Task 3 ports, Task 4 SchedulerRuntime, existing non-stream Chat protocol projection and legacy ApiPool path.
@@ -350,11 +349,16 @@ async fn request_body_account_and_user_fields_cannot_override_lease() { /* Core 
 async fn unintegrated_stream_or_protocol_returns_scheduler_endpoint_not_enabled() { /* no budget bypass */ }
 ~~~
 
-- [ ] Step 2: Run the Phase 2 tests to verify failure
+- [ ] Step 2: Run the focused route tests to verify failure
 
-Run: cargo test --manifest-path src-core/Cargo.toml --offline --test full_phase2 -- --nocapture
+Run:
 
-Expected: FAIL because the phase2 harness and lease-aware executor are not wired.
+~~~powershell
+cargo test --manifest-path src-tauri/Cargo.toml --target-dir src-tauri/target-fix --offline core_executor
+cargo test --manifest-path src-tauri/Cargo.toml --target-dir src-tauri/target-fix --offline core_
+~~~
+
+Expected: FAIL because the lease-aware executor and enforce route are not wired.
 
 - [ ] Step 3: Implement the lease-aware executor seam
 
@@ -376,7 +380,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --target-dir src-tauri/target-fi
 ~~~
 
 ~~~powershell
-git add src-tauri/src/api_server/core_executor.rs src-tauri/src/api_server/routes.rs src-tauri/src/api_server/core_bridge.rs src-tauri/src/api_server/payload.rs src-tauri/src/api_server/pool.rs src-core/tests/full_phase2.rs
+git add src-tauri/src/api_server/core_executor.rs src-tauri/src/api_server/routes.rs src-tauri/src/api_server/core_bridge.rs src-tauri/src/api_server/payload.rs src-tauri/src/api_server/pool.rs
 git commit -m "feat: route non-stream chat through upstream leases"
 ~~~
 
