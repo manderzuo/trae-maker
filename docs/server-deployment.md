@@ -23,6 +23,30 @@ AIWORK_CORS_ORIGINS=https://console.example.com
 桌面端未设置这些变量时，仍使用 `%APPDATA%\\AIWorkAssistant` 和配置页中的值。
 变量只覆盖运行时配置，不改写用户的登录文件或 SSH 私钥。
 
+## Core 基础模式与数据库运维（Phase 0/1）
+
+网关设置 `core_mode` 默认为 `off`，可切换为 `shadow` 或 `enforce`。`off` 保持现有
+legacy 鉴权/请求路径；`shadow` 只做 Core 身份和迁移观察，不用 Core 结果拒绝请求；
+`enforce` 才以 Core Key、scope、cost policy、逻辑额度和幂等结果为权威。Phase 1 的
+`enforce` 仅支持非流式 Chat，`stream=true` 返回 501；视频、素材、真实账号调度和
+重启对账不属于本阶段。
+
+Core SQLite 位于 `<AIWORK_DATA_DIR>\\data\\core.sqlite3`，未设置变量时为
+`%APPDATA%\\AIWorkAssistant\\data\\core.sqlite3`。备份必须先停止 API 服务和桌面应用，
+再复制整个 `data` 目录（包含存在的 `core.sqlite3-wal`/`core.sqlite3-shm`），并保留旧
+JSON 和迁移报告；禁止对正在运行的 SQLite 做热文件复制。
+
+迁移前必须先做可恢复备份。使用 `core_migration_inspect` 生成报告，确认 user/Key/policy/
+grant 映射、素材文件存在性和 parity；缺失或不确定项必须 fail closed。使用
+`core_migration_apply`、`core_user_create`、`core_api_key_issue` 和 `core_quota_grant`
+时都必须提供真实 admin API Key，不能由客户端传入 actor 身份。Key 明文只在签发响应中
+显示一次，Core 只保存 digest/prefix。
+
+切换 `enforce` 前必须完成：迁移前备份、user、Key、scope、cost policy、grant 和 parity
+report。旧 JSON 继续保留，不会被当作 Core grant 或真实上游余额。Phase 1 smoke 只使用
+Mock executor；不得以真实 upstream、真实余额、真实计费或真实生成结果作为本阶段部署
+验证证据。
+
 ## 局域网
 
 1. 网关监听 `0.0.0.0` 或指定内网网卡地址。

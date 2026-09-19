@@ -292,6 +292,30 @@ AI Work 助手 是一款 Windows 桌面端多账号管理一站式工作台，**
 
 > 生态接入只注册一个统一网关条目「AI Work 助手网关」，同时覆盖 Trae 与 Buddy 全部模型；历史双条目可在 CC Switch 中手动清理。
 
+#### Core 基础模式与逻辑额度（Phase 0/1）
+
+API 管理中的 `core_mode` 有三种值：
+
+- `off`（默认）：保持现有 legacy 鉴权和账号池行为，Core 不作为权威额度判断。
+- `shadow`：打开 Core 做身份/迁移观察，legacy 继续负责放行；观察结果不会直接拒绝
+  请求或扣除 Core 额度。
+- `enforce`：Core Key 解析出的用户是唯一权威身份；scope、cost policy、幂等和逻辑
+  grant 缺失时 fail closed。Phase 1 只允许非流式 Chat，`stream=true` 返回 501。
+
+管理员操作 Core 时必须使用真实 admin API Key。Key 签发后明文只显示一次，Core 只保存
+digest/prefix；请立即保存到安全位置，遗失后撤销并重新签发。`core_quota_grant` 是按
+用户和资源写入 Core 逻辑额度账本的管理操作，常用 `resource_kind=chat_request`；它
+不是上游账户余额查询，也不代表真实上游计费。
+
+迁移前先停机备份 `%APPDATA%\\AIWorkAssistant\\data`（或 `AIWORK_DATA_DIR\\data`）中的
+Core SQLite、WAL sidecar、旧 JSON 和报告。旧 JSON 会保留，不会把
+`remaining_credits.json` 直接导入为 Core grant。切换 `enforce` 前必须有 user、Key、
+scope、cost policy、grant 和 parity report，并先在 `shadow` 完成核对。
+
+本阶段的 `full_phase1` smoke 只注入内存 Mock executor；禁止使用真实 API Key、运行中的
+服务、真实 upstream 或真实余额作为测试数据。通过该 smoke 只能说明本地身份、幂等、
+预占/结算、unknown 恢复和审计闭环成立，不能宣称真实上游余额、计费或生成已验证。
+
 ### 7.2 Trae · 资源调度
 
 - **资源类目**：页面分为「文字处理」「视频生成」「图片生成」三类；文字处理沿用现有 Trae 模型目录，视频生成展示 Trae Work CN 内置 Seedance 接入状态，图片生成预留 GPT Image 2.5 本地转发配置位
@@ -333,7 +357,7 @@ response = client.chat.completions.create(
 
 **支持接口**：
 
-- `POST /v1/chat/completions` — 对话（流式 + 非流式）
+- `POST /v1/chat/completions` — 对话（legacy 可流式；`core_mode=enforce` 的 Phase 1 仅非流式，流式返回 501）
 - `POST /v1/completions` — legacy 文本补全（prompt 转 user message 复用对话链路）
 - `POST /v1/messages` — Anthropic 兼容端点（Claude Code 等工具直连）
 - `GET /v1/models` — 统一模型目录（Trae + Buddy 合并去重）
