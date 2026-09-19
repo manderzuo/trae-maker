@@ -36,11 +36,13 @@ Core SQLite 位于 `<AIWORK_DATA_DIR>\\data\\core.sqlite3`，未设置变量时�
 再复制整个 `data` 目录（包含存在的 `core.sqlite3-wal`/`core.sqlite3-shm`），并保留旧
 JSON 和迁移报告；禁止对正在运行的 SQLite 做热文件复制。
 
-迁移前必须先做可恢复备份。使用 `core_migration_inspect` 生成报告，确认 user/Key/policy/
-grant 映射、素材文件存在性和 parity；缺失或不确定项必须 fail closed。使用
+迁移前必须先做可恢复备份。使用 `core_migration_inspect` 生成报告，仅检查 JSON 可解析性、
+数量、哈希、候选 owner 映射和待核对项；owner 是否存在以及素材文件存在性、大小和 SHA
+由 `core_migration_apply` 做 fail-closed 校验。写入/变更类命令
 `core_migration_apply`、`core_user_create`、`core_api_key_issue` 和 `core_quota_grant`
-时都必须提供真实 admin API Key，不能由客户端传入 actor 身份。Key 明文只在签发响应中
-显示一次，Core 只保存 digest/prefix。
+必须提供真实 admin API Key；只读的 `core_status`、`core_migration_inspect` 是例外，具体
+鉴权以当前实现为准。不能由客户端传入 actor 身份。Key 明文只在签发响应中显示一次，
+Core 只保存 digest/prefix。
 
 切换 `enforce` 前必须完成：迁移前备份、user、Key、scope、cost policy、grant 和 parity
 report。旧 JSON 继续保留，不会被当作 Core grant 或真实上游余额。Phase 1 smoke 只使用

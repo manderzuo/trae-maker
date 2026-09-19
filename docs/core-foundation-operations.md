@@ -40,9 +40,10 @@ WAL、外键和事务迁移。备份采用停机文件级方式：
 
 ## 3. 管理员、Key 与逻辑额度
 
-所有管理命令都要求传入真实的 `admin_api_key`，服务端从 Key 记录解析 Principal 并再次
-校验 admin 角色；不能用 `actor_user_id` 或用户 ID 代替 Key。首个 admin 的 bootstrap
-必须在受控初始化环境完成，后续使用正常管理 Key。
+写入/变更类管理命令要求传入真实的 `admin_api_key`，服务端从 Key 记录解析 Principal 并再次
+校验 admin 角色；`core_status`、`core_migration_inspect` 是只读例外，不要求管理 Key。
+不能用 `actor_user_id` 或用户 ID 代替 Key；其他命令的鉴权以当前实现为准。首个 admin 的
+bootstrap 必须在受控初始化环境完成，后续使用正常管理 Key。
 
 Key 的明文只在 `core_api_key_issue` 成功响应中显示一次。Core 只保存 digest 和 prefix，
 不会把明文 Key 写入 SQLite、审计元数据或日志；应立即放入外部安全存储，遗失只能撤销后
@@ -50,19 +51,20 @@ Key 的明文只在 `core_api_key_issue` 成功响应中显示一次。Core 只�
 
 Core grant 是逻辑额度账本操作，不是向上游查询余额。管理员通过 `core_quota_grant`
 指定 `user_id`、`resource_kind`、整数 `amount` 和非空 `reason`；常用 Chat 资源名为
-`chat_request`。每次调整都记录 actor、原因、delta 和余额，不能把该余额解释为上游
-账户剩余积分或已向上游支付的费用。
+`chat_request`。每次调整都持久化 actor、原因和 delta；余额由账本聚合，并通过命令响应
+返回，不能把该余额解释为上游账户剩余积分或已向上游支付的费用。
 
 ## 4. 迁移和启用顺序
 
 推荐顺序如下：
 
 1. 停机并完成上文的文件级备份，保留旧 JSON 原件。
-2. 在 `off` 或 `shadow` 下运行 `core_migration_inspect`，检查用户、Key、素材、任务、
-   observation 的 owner 映射、文件存在性、大小和 SHA-256；缺失或不确定项必须停在
-   `legacy_unverified`/`reconcile_required`，不能猜测 owner。
-3. 使用管理员 Key 执行 `core_migration_apply`。迁移在单个事务内写入记录；旧明文 Key
-   不写入 Core，旧 Key 的 legacy 使用状态按迁移结果禁用/标记。
+2. 在 `off` 或 `shadow` 下运行 `core_migration_inspect`，仅检查 JSON 是否可解析、数量、
+   哈希、候选 owner 映射和待核对项；inspect 不验证 owner 是否真实存在，也不检查物理素材
+   文件、大小或 SHA-256。缺失或不确定项必须保留为待核对，不能猜测 owner。
+3. 使用管理员 Key 执行 `core_migration_apply`。apply 才会对 owner、物理素材文件存在性、
+   大小和 SHA-256 做 fail-closed 校验；通过后才在单个事务内写入记录。旧明文 Key 不写入
+   Core，旧 Key 的 legacy 使用状态按迁移结果禁用/标记。
 4. 保存 inspect/apply 输出和 parity report，逐项核对 legacy 数量、owner、资源状态和
    账本边界。迁移不会把旧 JSON 的 remaining credits 变成 Core grant。
 5. 先在 `shadow` 观察鉴权和映射，再确认 **user、Key、scope、cost policy、grant、
