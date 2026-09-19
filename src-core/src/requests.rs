@@ -9,8 +9,11 @@ use crate::{
     CostError, CostEstimate, CostPolicy, BeginRequest, BeginRequestInput, CoreError, CoreStore,
     LeaseOutcome, LeaseState, ObservationStatus, PreflightReserveInput, PreflightReserveResult,
     QuotaReserve, RequestHandle, RequestResult, RequestState, ScheduleError,
-    SchedulerLeaseRequest, UpstreamLease, UpstreamLeaseGrant,
-    upstream::{account_matches_constraints, selection_reason, validate_scheduler_request, CandidateAccount},
+    SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, UpstreamLease, UpstreamLeaseGrant,
+    upstream::{
+        account_matches_constraints, sanitize_error_category, sanitize_upstream_request_ref,
+        selection_reason, validate_scheduler_request, CandidateAccount,
+    },
 };
 
 pub fn canonical_json_hash(value: &Value) -> [u8; 32] {
@@ -24,7 +27,7 @@ impl CoreStore {
         &self,
         principal: &crate::Principal,
         input: SchedulerLeaseRequest,
-    ) -> Result<UpstreamLeaseGrant, ScheduleError> {
+    ) -> Result<SchedulerLeaseResult, ScheduleError> {
         validate_scheduler_request(&input)?;
         if principal.user_id != input.preflight.request.user_id || principal.key_id != input.preflight.request.api_key_id {
             return Err(ScheduleError::InvalidRequestIdentity);
@@ -69,11 +72,11 @@ impl CoreStore {
             if stored_hash != request_hash {
                 return Err(ScheduleError::IdempotencyConflict);
             }
+            let request = Self::request_handle_in_transaction(&transaction, &request_id)?;
             let lease = Self::upstream_lease_for_request(&transaction, &request_id, &input.preflight.resource_kind)?
                 .ok_or_else(|| ScheduleError::Core(CoreError::ReservationRequestConflict { request_id }))?;
-            let grant = Self::grant_from_lease(&transaction, &lease)?;
             transaction.commit()?;
-            return Ok(grant);
+            return Ok(SchedulerLeaseResult::Replay { request, lease });
         }
 
         let candidate = Self::select_upstream_candidate(&transaction, &input)?;
@@ -136,7 +139,7 @@ impl CoreStore {
             lease_expires_at_ms: lease.lease_expires_at_ms,
         };
         transaction.commit()?;
-        Ok(grant)
+        Ok(SchedulerLeaseResult::Acquired(grant))
     }
 
     pub fn heartbeat_upstream_lease(
@@ -176,30 +179,38 @@ impl CoreStore {
         let reservation = Self::reservation_by_request(&transaction, &lease.request_id)?
             .ok_or_else(|| ScheduleError::Core(CoreError::ReservationNotFound { reservation_id: lease.request_id.clone() }))?;
         Self::validate_reservation_owner(&transaction, &reservation, principal)?;
+        let current_request_state = Self::request_state_in_transaction(&transaction, &lease.request_id)?;
         let (lease_state, settlement, request_state, result, error_kind, upstream_request_ref, reconcile_until_ms) = match outcome {
             LeaseOutcome::Success { actual_units, upstream_request_ref, .. } => (
                 LeaseState::Succeeded, crate::Settlement::Commit { actual_amount: actual_units }, RequestState::Succeeded,
-                None, None, upstream_request_ref, None,
+                None, None::<String>, sanitize_upstream_request_ref(upstream_request_ref), None,
             ),
             LeaseOutcome::Rejected { status, code, accepted: false, .. } => (
                 LeaseState::Failed, crate::Settlement::Release, RequestState::Failed,
-                Some(RequestResult { status: Some(status), error_code: code.clone() }), code, None, None,
+                Some(RequestResult { status: Some(status), error_code: Some(sanitize_error_category(code.as_deref().unwrap_or_default(), false).into()) }),
+                Some(sanitize_error_category(code.as_deref().unwrap_or_default(), false).into()), None, None,
             ),
             LeaseOutcome::Rejected { code, accepted: true, .. } => (
                 LeaseState::Unknown, crate::Settlement::Unknown, RequestState::Unknown,
-                Some(RequestResult { status: None, error_code: code.clone() }), code, None,
+                Some(RequestResult { status: None, error_code: Some(sanitize_error_category(code.as_deref().unwrap_or_default(), false).into()) }),
+                Some(sanitize_error_category(code.as_deref().unwrap_or_default(), false).into()), None,
                 lease.reconcile_until_ms.or(Some(now.checked_add(crate::upstream::DEFAULT_RECONCILE_TTL_MS).ok_or(CoreError::InvalidQuotaAmount)?)),
             ),
             LeaseOutcome::TransportUnknown { reason, upstream_request_ref, .. } => (
                 LeaseState::Unknown, crate::Settlement::Unknown, RequestState::Unknown,
-                Some(RequestResult { status: None, error_code: Some(reason.clone()) }), Some(reason), upstream_request_ref,
+                Some(RequestResult { status: None, error_code: Some(sanitize_error_category(&reason, true).into()) }),
+                Some(sanitize_error_category(&reason, true).into()), sanitize_upstream_request_ref(upstream_request_ref),
                 lease.reconcile_until_ms.or(Some(now.checked_add(crate::upstream::DEFAULT_RECONCILE_TTL_MS).ok_or(CoreError::InvalidQuotaAmount)?)),
             ),
         };
         if request_state == RequestState::Unknown {
-            Self::transition_request_on_connection(&transaction, &lease.request_id, RequestState::Reserved, RequestState::Unknown, result, now)?;
+            if current_request_state != RequestState::Unknown {
+                Self::transition_request_on_connection(
+                    &transaction, &lease.request_id, current_request_state, RequestState::Unknown, result, now,
+                )?;
+            }
         } else {
-            Self::settle_request_state(&transaction, &lease.request_id, RequestState::Reserved, request_state, result, now)?;
+            Self::settle_request_state(&transaction, &lease.request_id, current_request_state, request_state, result, now)?;
         }
         Self::apply_settlement(&transaction, &reservation, settlement, now)?;
         transaction.execute(
@@ -227,8 +238,11 @@ impl CoreStore {
                 "UPDATE upstream_leases SET state = 'unknown', reconcile_until_ms = ?1, error_kind = 'lease_expired', updated_at_ms = ?2 WHERE id = ?3 AND state IN ('held', 'active')",
                 params![now_ms.checked_add(crate::upstream::DEFAULT_RECONCILE_TTL_MS).ok_or(CoreError::InvalidQuotaAmount)?, now_ms, &lease.id],
             )?;
-            Self::transition_request_on_connection(&transaction, &lease.request_id, RequestState::Reserved, RequestState::Unknown,
-                Some(RequestResult { status: None, error_code: Some("lease_expired".into()) }), now_ms)?;
+            let current_request_state = Self::request_state_in_transaction(&transaction, &lease.request_id)?;
+            if current_request_state != RequestState::Unknown {
+                Self::transition_request_on_connection(&transaction, &lease.request_id, current_request_state, RequestState::Unknown,
+                    Some(RequestResult { status: None, error_code: Some("lease_expired".into()) }), now_ms)?;
+            }
             Self::insert_audit_event(&transaction, "system", "upstream.lease_recovered", "upstream_lease", &lease.id,
                 serde_json::json!({"request_id": lease.request_id, "lease_id": lease.id, "reason": "lease_expired"}), now_ms)?;
         }
@@ -658,21 +672,6 @@ impl CoreStore {
         ).optional().map_err(CoreError::from)
     }
 
-    fn grant_from_lease(
-        transaction: &Transaction<'_>, lease: &UpstreamLease,
-    ) -> Result<UpstreamLeaseGrant, ScheduleError> {
-        let credentials_ref = transaction.query_row(
-            "SELECT credentials_ref FROM upstream_accounts WHERE id = ?1", [&lease.account_ref], |row| row.get(0),
-        )?;
-        let observation_id = lease.observation_id.clone().ok_or_else(|| ScheduleError::Core(CoreError::InvalidConfiguration {
-            key: "upstream_leases.observation_id".into(), value: lease.id.clone(),
-        }))?;
-        Ok(UpstreamLeaseGrant {
-            lease_id: lease.id.clone(), account_ref: lease.account_ref.clone(), credentials_ref, observation_id,
-            predicted_units: lease.predicted_units, lease_expires_at_ms: lease.lease_expires_at_ms,
-        })
-    }
-
     fn validate_lease_owner(
         transaction: &Transaction<'_>, lease: &UpstreamLease, principal: &crate::Principal,
     ) -> Result<(), ScheduleError> {
@@ -684,6 +683,17 @@ impl CoreStore {
             Some((user_id, key_id)) if user_id == principal.user_id && key_id == principal.key_id => Ok(()),
             _ => Err(ScheduleError::InvalidRequestIdentity),
         }
+    }
+
+    fn request_state_in_transaction(
+        transaction: &Transaction<'_>, request_id: &str,
+    ) -> Result<RequestState, CoreError> {
+        let state = transaction.query_row(
+            "SELECT state FROM requests WHERE id = ?1", [request_id], |row| row.get::<_, String>(0),
+        ).optional()?.ok_or_else(|| CoreError::RequestNotFound { request_id: request_id.into() })?;
+        RequestState::from_db(&state).ok_or_else(|| CoreError::InvalidConfiguration {
+            key: "requests.state".into(), value: state,
+        })
     }
 
     fn select_upstream_candidate(
@@ -722,7 +732,7 @@ impl CoreStore {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?, row.get::<_, i64>(6)?)),
             ).optional()?;
             let Some((observation_id, observed_value, value_scale, source, status, observed_at_ms, stale_at_ms)) = observation else { continue };
-            if source != "reader" || status != ObservationStatus::Fresh.as_str() || stale_at_ms <= input.now_ms
+            if source != "reader" || status != ObservationStatus::Fresh.as_str() || observed_at_ms > input.now_ms || stale_at_ms <= input.now_ms
                 || observed_at_ms < input.now_ms.saturating_sub(input.observation_max_age_ms) || value_scale <= 0 {
                 continue;
             }
@@ -743,7 +753,10 @@ impl CoreStore {
                 max_concurrency, active_slots,
             });
         }
-        candidates.sort_by(|left, right| right.normalized_available_units.cmp(&left.normalized_available_units).then_with(|| left.id.cmp(&right.id)));
+        candidates.sort_by(|left, right| match input.selection_strategy {
+            SelectionStrategy::HighestNormalizedAvailable => right.normalized_available_units.cmp(&left.normalized_available_units),
+            SelectionStrategy::LeastActiveSlots => left.active_slots.cmp(&right.active_slots),
+        }.then_with(|| left.id.cmp(&right.id)));
         candidates.into_iter().next().ok_or_else(|| {
             if !matched_constraints { ScheduleError::CapabilityMismatch }
             else if !usable_state { ScheduleError::AccountCooling }

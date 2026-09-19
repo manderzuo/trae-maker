@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-use crate::{CoreError, PreflightReserveInput};
+use crate::{CoreError, PreflightReserveInput, RequestHandle, UpstreamLease};
 
 pub(crate) const MAX_OBSERVATION_SUMMARY_BYTES: usize = 4 * 1024;
 pub(crate) const DEFAULT_RECONCILE_TTL_MS: i64 = 600_000;
@@ -19,10 +19,17 @@ pub struct SchedulerLeaseRequest {
     pub observation_max_age_ms: i64,
     pub allowed_accounts: Option<Vec<String>>,
     pub dedicated_account: Option<String>,
+    pub selection_strategy: SelectionStrategy,
     /// Injected time keeps Core scheduler decisions deterministic and testable.
     pub now_ms: i64,
     pub lease_ttl_ms: i64,
     pub reconcile_ttl_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionStrategy {
+    HighestNormalizedAvailable,
+    LeastActiveSlots,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +41,14 @@ pub struct UpstreamLeaseGrant {
     pub observation_id: String,
     pub predicted_units: i64,
     pub lease_expires_at_ms: i64,
+}
+
+/// Only a newly created result grants permission to dispatch upstream work.
+/// A replay intentionally exposes persisted state rather than credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerLeaseResult {
+    Acquired(UpstreamLeaseGrant),
+    Replay { request: RequestHandle, lease: UpstreamLease },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,8 +144,40 @@ pub(crate) fn selection_reason(input: &SchedulerLeaseRequest) -> &'static str {
     } else if input.allowed_accounts.is_some() {
         "allowed_account_ranked"
     } else {
-        "highest_normalized_available_units"
+        match input.selection_strategy {
+            SelectionStrategy::HighestNormalizedAvailable => "highest_normalized_available_units",
+            SelectionStrategy::LeastActiveSlots => "least_active_slots",
+        }
     }
+}
+
+pub(crate) fn sanitize_error_category(value: &str, transport: bool) -> &'static str {
+    if transport {
+        if value.to_ascii_lowercase().contains("timeout") || value.to_ascii_lowercase().contains("deadline") {
+            "transport_timeout"
+        } else {
+            "transport_unknown"
+        }
+    } else {
+        match value {
+            "invalid_request" => "invalid_request",
+            "rate_limited" => "rate_limited",
+            "forbidden" => "forbidden",
+            "not_found" => "not_found",
+            "insufficient_credits" => "insufficient_credits",
+            _ => "upstream_rejected",
+        }
+    }
+}
+
+pub(crate) fn sanitize_upstream_request_ref(value: Option<String>) -> Option<String> {
+    value.filter(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+            })
+    })
 }
 
 pub(crate) fn validate_required(field: &str, value: &str) -> Result<(), CoreError> {

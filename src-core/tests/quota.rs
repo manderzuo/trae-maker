@@ -6,10 +6,15 @@ use std::{
 };
 
 use aiwork_core::{
-    CoreStore, NewUser, Principal, QuotaGrant, QuotaReserve, ReserveResult, Settlement, UserRole,
-    CORE_DB_FILE,
+    BeginRequestInput, CoreStore, CostPolicy, LeaseState, NewUser, ObservationStatus, Principal,
+    PreflightReserveInput, QuotaGrant, QuotaReserve, RegisterUpstreamAccount, ReserveResult,
+    SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, Settlement, UpstreamAccountState,
+    UpstreamObservation, UserRole, CORE_DB_FILE,
 };
 use rusqlite::Connection;
+use serde_json::json;
+
+const SCHEDULER_NOW_MS: i64 = 1_725_000_100_000;
 
 fn test_dir(prefix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -325,4 +330,59 @@ fn administrator_adjustment_persists_its_actor_and_reason() {
         )
         .unwrap();
     assert_eq!(row, ("adjust".to_owned(), "admin-1".to_owned(), "manual correction".to_owned(), -5));
+}
+
+#[test]
+fn scheduler_recovery_after_request_progression_preserves_the_quota_hold() {
+    let dir = test_dir("scheduler-recovery");
+    let store = CoreStore::open(&dir).unwrap();
+    store.migrate().unwrap();
+    store.create_user(user("admin-1", UserRole::Admin), "bootstrap").unwrap();
+    store.create_user(user("u1", UserRole::User), "admin-1").unwrap();
+    let key = store.issue_api_key(
+        "u1", "scheduler", std::collections::BTreeSet::from(["chat:invoke".to_owned()]), "admin-1",
+    ).unwrap();
+    let admin_key = store.issue_api_key("admin-1", "scheduler-admin", Default::default(), "admin-1").unwrap();
+    store.upsert_cost_policy(CostPolicy {
+        id: "scheduler-policy".into(), endpoint: "chat".into(), model_pattern: "mock-*".into(),
+        resource_kind: "chat_request".into(), reserve_amount: 3, max_actual_amount: Some(3), version: 1, enabled: true,
+    }).unwrap();
+    store.grant(QuotaGrant {
+        user_id: "u1".into(), resource_kind: "chat_request".into(), amount: 3,
+        actor_user_id: "admin-1".into(), reason: "fixed scheduler grant".into(),
+    }).unwrap();
+    let admin = Principal { user_id: "admin-1".into(), key_id: admin_key.id, scopes: Default::default() };
+    let mut account = RegisterUpstreamAccount::new("scheduler-account".into(), "fixture".into(), "vault://quota-fixture".into());
+    account.capabilities = std::collections::BTreeSet::from(["chat".to_owned()]);
+    account.state = UpstreamAccountState::Available;
+    store.upsert_upstream_account(account, &admin).unwrap();
+    store.append_upstream_observation(UpstreamObservation::new(
+        "scheduler-observation".into(), "scheduler-account".into(), "chat_request".into(), Some(10), 1,
+        "reader".into(), ObservationStatus::Fresh, SCHEDULER_NOW_MS, SCHEDULER_NOW_MS + 60_000,
+        json!({"available": 10, "value_scale": 1, "source": "reader", "status": "fresh"}),
+    )).unwrap();
+    let principal = Principal {
+        user_id: "u1".into(), key_id: key.id, scopes: std::collections::BTreeSet::from(["chat:invoke".to_owned()]),
+    };
+    let acquired = store.preflight_reserve_with_lease(&principal, SchedulerLeaseRequest {
+        preflight: PreflightReserveInput {
+            request: BeginRequestInput {
+                user_id: "u1".into(), api_key_id: principal.key_id.clone(), protocol: "openai".into(), endpoint: "chat".into(),
+                model: "mock-1".into(), idempotency_key: "quota-progressed-recovery".into(), body: json!({"model": "mock-1"}),
+            }, resource_kind: "chat_request".into(), amount: 3, ttl_ms: 300_000,
+        }, provider_hint: None, required_capabilities: vec!["chat".into()], region: None, predicted_units: 3,
+        safety_margin_units: 0, observation_max_age_ms: 30_000, allowed_accounts: None, dedicated_account: None,
+        selection_strategy: SelectionStrategy::HighestNormalizedAvailable,
+        now_ms: SCHEDULER_NOW_MS, lease_ttl_ms: 1, reconcile_ttl_ms: 600_000,
+    }).unwrap();
+    let lease_id = match acquired { SchedulerLeaseResult::Acquired(grant) => grant.lease_id, other => panic!("expected acquisition, got {other:?}") };
+    let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
+    let request_id: String = connection.query_row("SELECT request_id FROM upstream_leases WHERE id = ?1", [&lease_id], |row| row.get(0)).unwrap();
+    store.transition_request(&request_id, aiwork_core::RequestState::Reserved, aiwork_core::RequestState::Queued, None).unwrap();
+    store.transition_request(&request_id, aiwork_core::RequestState::Queued, aiwork_core::RequestState::Dispatched, None).unwrap();
+    store.recover_expired_upstream_leases(SCHEDULER_NOW_MS + 2).unwrap();
+    assert_eq!(store.request_state(&request_id).unwrap(), aiwork_core::RequestState::Unknown);
+    assert_eq!(store.balance("u1", "chat_request").unwrap().held, 3);
+    let state: String = connection.query_row("SELECT state FROM upstream_leases WHERE id = ?1", [&lease_id], |row| row.get(0)).unwrap();
+    assert_eq!(state, LeaseState::Unknown.as_str());
 }

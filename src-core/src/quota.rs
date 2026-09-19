@@ -459,12 +459,21 @@ impl CoreStore {
         now: i64,
     ) -> Result<(), CoreError> {
         let intermediate: Vec<RequestState> = match final_state {
-            RequestState::Succeeded => vec![
-                RequestState::Queued,
-                RequestState::Dispatched,
-                RequestState::Completing,
-                RequestState::Succeeded,
-            ],
+            RequestState::Succeeded => {
+                let progression = [
+                    RequestState::Reserved,
+                    RequestState::Queued,
+                    RequestState::Dispatched,
+                    RequestState::Completing,
+                    RequestState::Succeeded,
+                ];
+                let Some(position) = progression.iter().position(|state| *state == current) else {
+                    return Err(CoreError::InvalidTransition {
+                        request_id: request_id.to_owned(), expected: current, next: final_state,
+                    });
+                };
+                progression[position + 1..].to_vec()
+            }
             RequestState::Failed | RequestState::Unknown => vec![final_state],
             RequestState::Settled => return Ok(()),
             _ => {
@@ -488,14 +497,16 @@ impl CoreStore {
             )?;
             expected = next;
         }
-        Self::transition_request_on_connection(
-            transaction,
-            request_id,
-            expected,
-            RequestState::Settled,
-            None,
-            now,
-        )
+        if expected == RequestState::Settled { Ok(()) } else {
+            Self::transition_request_on_connection(
+                transaction,
+                request_id,
+                expected,
+                RequestState::Settled,
+                None,
+                now,
+            )
+        }
     }
 
     pub fn balance(&self, user_id: &str, resource_kind: &str) -> Result<QuotaBalance, CoreError> {

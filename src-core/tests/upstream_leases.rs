@@ -9,7 +9,8 @@ use std::{
 use aiwork_core::{
     BeginRequestInput, CoreStore, CostPolicy, LeaseOutcome, LeaseState, NewUser,
     ObservationStatus, PreflightReserveInput, Principal, QuotaGrant,
-    RegisterUpstreamAccount, SchedulerLeaseRequest, ScheduleError, UpstreamLeaseGrant,
+    RegisterUpstreamAccount, SchedulerLeaseRequest, SchedulerLeaseResult, ScheduleError,
+    SelectionStrategy, UpstreamLeaseGrant,
     UpstreamAccountState, UpstreamObservation, UserRole, CORE_DB_FILE,
 };
 use rusqlite::Connection;
@@ -127,6 +128,7 @@ fn lease_request(key_id: &str, idempotency_key: &str) -> SchedulerLeaseRequest {
         observation_max_age_ms: 30_000,
         allowed_accounts: Some(vec!["trae-cn".into(), "work-us".into()]),
         dedicated_account: Some("trae-cn".into()),
+        selection_strategy: SelectionStrategy::HighestNormalizedAvailable,
         now_ms: NOW_MS,
         lease_ttl_ms: 120_000,
         reconcile_ttl_ms: 600_000,
@@ -139,6 +141,19 @@ fn assert_grant(grant: &UpstreamLeaseGrant) {
     assert_eq!(grant.predicted_units, 6);
     assert_eq!(grant.lease_expires_at_ms, NOW_MS + 120_000);
     assert_eq!(grant.credentials_ref, "vault://trae-cn-opaque-ref");
+}
+
+fn acquired(result: Result<SchedulerLeaseResult, ScheduleError>) -> UpstreamLeaseGrant {
+    match result.expect("scheduler acquire") {
+        SchedulerLeaseResult::Acquired(grant) => grant,
+        SchedulerLeaseResult::Replay { request, .. } => panic!("expected a newly acquired lease, got replay for {}", request.id),
+    }
+}
+
+fn request_id_for_lease(dir: &PathBuf, lease_id: &str) -> String {
+    Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap()
+        .query_row("SELECT request_id FROM upstream_leases WHERE id = ?1", [lease_id], |row| row.get(0))
+        .unwrap()
 }
 
 #[test]
@@ -193,10 +208,10 @@ fn stale_or_json_cache_observation_fails_closed_without_user_hold() {
 fn same_request_replays_one_lease_and_hash_conflict_is_rejected() {
     let (store, key_id, admin_key_id, dir) = test_store();
     configure_accounts(&store, &admin_key_id);
-    let first = store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "same-key")).unwrap();
+    let first = acquired(store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "same-key")));
     assert_grant(&first);
     let replay = store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "same-key")).unwrap();
-    assert_eq!(replay.lease_id, first.lease_id);
+    assert!(matches!(replay, SchedulerLeaseResult::Replay { ref lease, .. } if lease.id == first.lease_id));
     let mut conflict = lease_request(&key_id, "same-key");
     conflict.preflight.request.body = json!({"model": "mock-1", "messages": [{"role": "user", "content": "changed"}]});
     assert!(matches!(store.preflight_reserve_with_lease(&principal(&key_id), conflict), Err(ScheduleError::IdempotencyConflict)));
@@ -211,7 +226,7 @@ fn same_request_replays_one_lease_and_hash_conflict_is_rejected() {
 fn timeout_unknown_survives_restart_and_is_not_ttl_released() {
     let (store, key_id, admin_key_id, dir) = test_store();
     configure_accounts(&store, &admin_key_id);
-    let grant = store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "timeout-key")).unwrap();
+    let grant = acquired(store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "timeout-key")));
     let unknown = store.settle_upstream_lease(
         &principal(&key_id), &grant.lease_id,
         LeaseOutcome::TransportUnknown { reason: "fixed-timeout".into(), upstream_request_ref: Some("upstream-fixed-ref".into()), now_ms: NOW_MS + 1 },
@@ -230,7 +245,7 @@ fn timeout_unknown_survives_restart_and_is_not_ttl_released() {
 fn settlement_is_idempotent_and_expired_held_lease_becomes_unknown() {
     let (store, key_id, admin_key_id, _) = test_store();
     configure_accounts(&store, &admin_key_id);
-    let grant = store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "success-key")).unwrap();
+    let grant = acquired(store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "success-key")));
     let succeeded = store.settle_upstream_lease(
         &principal(&key_id), &grant.lease_id,
         LeaseOutcome::Success { actual_units: Some(2), upstream_request_ref: Some("fixed-success-ref".into()), now_ms: NOW_MS + 2 },
@@ -243,7 +258,7 @@ fn settlement_is_idempotent_and_expired_held_lease_becomes_unknown() {
     assert_eq!(replay.state, LeaseState::Succeeded);
     assert_eq!(store.balance("u1", RESOURCE_KIND).unwrap().available, 28);
 
-    let held = store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "expired-key")).unwrap();
+    let held = acquired(store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "expired-key")));
     let recovered = store.recover_expired_upstream_leases(NOW_MS + 120_001).unwrap();
     assert!(recovered.iter().any(|lease| lease.id == held.lease_id && lease.state == LeaseState::Unknown));
     assert_eq!(store.balance("u1", RESOURCE_KIND).unwrap().held, 3);
@@ -253,11 +268,125 @@ fn settlement_is_idempotent_and_expired_held_lease_becomes_unknown() {
     rejected_request.region = Some("us".into());
     rejected_request.allowed_accounts = Some(vec!["work-us".into()]);
     rejected_request.dedicated_account = Some("work-us".into());
-    let rejected = store.preflight_reserve_with_lease(&principal(&key_id), rejected_request).unwrap();
+    let rejected = acquired(store.preflight_reserve_with_lease(&principal(&key_id), rejected_request));
     let rejected = store.settle_upstream_lease(
         &principal(&key_id), &rejected.lease_id,
         LeaseOutcome::Rejected { status: 400, code: Some("fixed-reject".into()), accepted: false, now_ms: NOW_MS + 4 },
     ).unwrap();
     assert_eq!(rejected.state, LeaseState::Failed);
     assert_eq!(store.balance("u1", RESOURCE_KIND).unwrap().held, 3, "only the unknown lease remains held");
+}
+
+#[test]
+fn terminal_or_unknown_replay_never_returns_an_execution_grant() {
+    let (store, key_id, admin_key_id, _) = test_store();
+    configure_accounts(&store, &admin_key_id);
+    let grant = acquired(store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "terminal-replay")));
+    store.settle_upstream_lease(
+        &principal(&key_id), &grant.lease_id,
+        LeaseOutcome::Success { actual_units: Some(2), upstream_request_ref: None, now_ms: NOW_MS + 1 },
+    ).unwrap();
+    let terminal_replay = store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "terminal-replay")).unwrap();
+    assert!(matches!(terminal_replay, SchedulerLeaseResult::Replay { ref request, ref lease }
+        if request.state == aiwork_core::RequestState::Settled && lease.state == LeaseState::Succeeded));
+
+    let mut unknown_request = lease_request(&key_id, "unknown-replay");
+    unknown_request.provider_hint = Some("workbuddy".into());
+    unknown_request.region = Some("us".into());
+    unknown_request.allowed_accounts = Some(vec!["work-us".into()]);
+    unknown_request.dedicated_account = Some("work-us".into());
+    let grant = acquired(store.preflight_reserve_with_lease(&principal(&key_id), unknown_request.clone()));
+    store.settle_upstream_lease(
+        &principal(&key_id), &grant.lease_id,
+        LeaseOutcome::TransportUnknown { reason: "fixed-timeout".into(), upstream_request_ref: None, now_ms: NOW_MS + 1 },
+    ).unwrap();
+    let replay = store.preflight_reserve_with_lease(&principal(&key_id), unknown_request).unwrap();
+    assert!(matches!(replay, SchedulerLeaseResult::Replay { ref request, ref lease }
+        if request.state == aiwork_core::RequestState::Unknown && lease.state == LeaseState::Unknown));
+}
+
+#[test]
+fn future_observation_fails_closed_without_a_hold() {
+    let (store, key_id, admin_key_id, dir) = test_store();
+    let admin = admin_principal(&admin_key_id);
+    store.upsert_upstream_account(account("trae-cn", "trae", "cn", 1), &admin).unwrap();
+    let mut future = observation("obs-future", "trae-cn", "reader", ObservationStatus::Fresh, Some(12), 1, NOW_MS + 60_000);
+    future.observed_at_ms = NOW_MS + 1;
+    store.append_upstream_observation(future).unwrap();
+    assert!(matches!(
+        store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "future-observation")),
+        Err(ScheduleError::NoFreshObservation)
+    ));
+    let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM quota_reservations", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
+fn sensitive_upstream_diagnostics_are_reduced_to_safe_categories() {
+    let (store, key_id, admin_key_id, dir) = test_store();
+    configure_accounts(&store, &admin_key_id);
+    let grant = acquired(store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "sensitive-diagnostics")));
+    let secret_like = "Bearer eyJhbGciOiJIUzI1NiJ9.prompt-body-cookie=abc";
+    store.settle_upstream_lease(
+        &principal(&key_id), &grant.lease_id,
+        LeaseOutcome::TransportUnknown { reason: secret_like.into(), upstream_request_ref: Some(secret_like.into()), now_ms: NOW_MS + 1 },
+    ).unwrap();
+    let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
+    for table_and_column in [
+        ("requests", "error_code"),
+        ("upstream_leases", "error_kind"),
+        ("upstream_leases", "upstream_request_ref"),
+        ("audit_events", "metadata_json"),
+    ] {
+        let value: Option<String> = connection.query_row(
+            &format!("SELECT {column} FROM {table} ORDER BY rowid DESC LIMIT 1", column = table_and_column.1, table = table_and_column.0),
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!value.unwrap_or_default().contains(secret_like), "sensitive diagnostic leaked into {}.{}", table_and_column.0, table_and_column.1);
+    }
+}
+
+#[test]
+fn selection_strategy_changes_ranked_candidate_with_account_ref_tiebreak() {
+    let (store, key_id, admin_key_id, dir) = test_store();
+    configure_accounts(&store, &admin_key_id);
+    let admin = admin_principal(&admin_key_id);
+    store.upsert_upstream_account(account("trae-cn", "trae", "cn", 2), &admin).unwrap();
+    let mut first = lease_request(&key_id, "strategy-first");
+    first.allowed_accounts = None;
+    first.dedicated_account = None;
+    first.provider_hint = None;
+    first.region = None;
+    let first = acquired(store.preflight_reserve_with_lease(&principal(&key_id), first));
+    assert_eq!(first.account_ref, "trae-cn");
+
+    let mut least_loaded = lease_request(&key_id, "strategy-least-loaded");
+    least_loaded.allowed_accounts = None;
+    least_loaded.dedicated_account = None;
+    least_loaded.provider_hint = None;
+    least_loaded.region = None;
+    least_loaded.selection_strategy = SelectionStrategy::LeastActiveSlots;
+    let least_loaded = acquired(store.preflight_reserve_with_lease(&principal(&key_id), least_loaded));
+    assert_eq!(least_loaded.account_ref, "work-us");
+    let audit: String = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap().query_row(
+        "SELECT metadata_json FROM audit_events WHERE target_id = ?1", [&least_loaded.lease_id], |row| row.get(0),
+    ).unwrap();
+    assert!(audit.contains("least_active_slots"));
+}
+
+#[test]
+fn settlement_after_request_progression_uses_remaining_valid_transitions() {
+    let (store, key_id, admin_key_id, dir) = test_store();
+    configure_accounts(&store, &admin_key_id);
+    let grant = acquired(store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "progressed-settlement")));
+    let request_id = request_id_for_lease(&dir, &grant.lease_id);
+    store.transition_request(&request_id, aiwork_core::RequestState::Reserved, aiwork_core::RequestState::Queued, None).unwrap();
+    store.transition_request(&request_id, aiwork_core::RequestState::Queued, aiwork_core::RequestState::Dispatched, None).unwrap();
+    store.transition_request(&request_id, aiwork_core::RequestState::Dispatched, aiwork_core::RequestState::Completing, None).unwrap();
+    let lease = store.settle_upstream_lease(
+        &principal(&key_id), &grant.lease_id,
+        LeaseOutcome::Success { actual_units: Some(2), upstream_request_ref: None, now_ms: NOW_MS + 2 },
+    ).unwrap();
+    assert_eq!(lease.state, LeaseState::Succeeded);
+    assert_eq!(store.request_state(&request_id).unwrap(), aiwork_core::RequestState::Settled);
 }
