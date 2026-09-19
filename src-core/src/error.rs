@@ -24,6 +24,4 @@ pub enum CoreError {
         #[from]
         source: serde_json::Error,
     },
-    #[error("unsupported diagnostic table: {table}")]
-    UnsupportedDiagnosticTable { table: String },
 }

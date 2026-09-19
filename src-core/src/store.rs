@@ -186,7 +186,9 @@ impl CoreStore {
         let digest = Self::digest_api_key(presented);
         let connection = self.connection.lock().expect("core store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, user_id, key_digest, scopes_json FROM api_keys WHERE status = 'active'",
+            "SELECT api_keys.id, api_keys.user_id, api_keys.key_digest, api_keys.scopes_json \
+             FROM api_keys INNER JOIN users ON users.id = api_keys.user_id \
+             WHERE api_keys.status = 'active' AND users.status = 'active'",
         ).map_err(CoreError::from)?;
         let candidates = statement.query_map([], |row| {
             Ok((
@@ -209,36 +211,6 @@ impl CoreStore {
             }
         }
         Err(AuthError::InvalidApiKey)
-    }
-
-    #[doc(hidden)]
-    pub fn raw_text_search(&self, table_name: &str, needle: &str) -> Result<Vec<String>, CoreError> {
-        let query = match table_name {
-            "api_keys" => {
-                "SELECT id FROM api_keys WHERE \
-                 instr(id, ?1) > 0 OR instr(user_id, ?1) > 0 OR instr(name, ?1) > 0 OR \
-                 instr(prefix, ?1) > 0 OR instr(CAST(key_digest AS TEXT), ?1) > 0 OR \
-                 instr(scopes_json, ?1) > 0 OR instr(status, ?1) > 0"
-            }
-            "audit_events" => {
-                "SELECT id FROM audit_events WHERE \
-                 instr(id, ?1) > 0 OR instr(actor_user_id, ?1) > 0 OR instr(action, ?1) > 0 OR \
-                 instr(target_type, ?1) > 0 OR instr(target_id, ?1) > 0 OR \
-                 instr(request_id, ?1) > 0 OR instr(metadata_json, ?1) > 0"
-            }
-            _ => {
-                return Err(CoreError::UnsupportedDiagnosticTable {
-                    table: table_name.to_owned(),
-                })
-            }
-        };
-        let connection = self.connection.lock().expect("core store mutex poisoned");
-        let mut statement = connection.prepare(query)?;
-        let matches = statement
-            .query_map([needle], |row| row.get(0))?
-            .collect::<Result<Vec<String>, _>>()
-            .map_err(CoreError::from)?;
-        Ok(matches)
     }
 
     fn new_api_key() -> String {

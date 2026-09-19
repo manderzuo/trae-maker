@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use crate::CoreStore;
 
@@ -35,11 +35,23 @@ pub struct User {
     pub role: UserRole,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IssuedApiKey {
     pub id: String,
     pub plaintext: String,
     pub prefix: String,
     pub user_id: String,
-    pub scopes: std::collections::BTreeSet<String>,
+    pub scopes: BTreeSet<String>,
+}
+
+impl fmt::Debug for IssuedApiKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IssuedApiKey")
+            .field("id", &self.id)
+            .field("prefix", &self.prefix)
+            .field("user_id", &self.user_id)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
 }
