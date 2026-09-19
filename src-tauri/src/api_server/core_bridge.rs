@@ -36,6 +36,7 @@ impl TryFrom<&str> for CoreMode {
 pub struct PreflightResult {
     pub request_id: String,
     pub state: RequestState,
+    pub result: Option<RequestResult>,
     pub reservation: Option<Reservation>,
     pub execution: Option<ChatExecutionRequest>,
 }
@@ -136,6 +137,7 @@ impl CoreBridge {
         Ok(PreflightResult {
             request_id: request.id,
             state: request.state,
+            result: request.result,
             reservation,
             execution,
         })

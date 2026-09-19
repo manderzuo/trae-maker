@@ -73,7 +73,7 @@ impl Drop for DoneSignal {
 /// 聚合路径失败（P1 修复1）：区分「无健康账号」（维持原 503/格式）与
 /// 「Fatal 上游错误透传」（携带上游状态码与错误体摘要）
 enum AggregateFail {
-    NoHealthy { message: String, uncertain: bool },
+    NoHealthy { message: String },
     Upstream(u16, String),
 }
 
@@ -145,8 +145,12 @@ fn with_core_request_id(mut response: Response, request_id: &str) -> Response {
 }
 
 fn core_replay_response(preflight: &super::core_bridge::PreflightResult) -> Response {
-    let (status, code, message, body) = match preflight.state {
-        RequestState::Settled | RequestState::Succeeded => (
+    let successful_result = preflight.result.as_ref().filter(|result| {
+        matches!(result.status, Some(status) if (200..300).contains(&status))
+            && result.error_code.is_none()
+    });
+    let (status, code, message, body) = if successful_result.is_some() {
+        (
             StatusCode::OK,
             "idempotent_replay",
             "request already completed; response replay is safe",
@@ -156,44 +160,46 @@ fn core_replay_response(preflight: &super::core_bridge::PreflightResult) -> Resp
                 "choices": [],
                 "idempotent_replay": true,
             }),
-        ),
-        RequestState::Failed => (
-            StatusCode::CONFLICT,
-            "idempotent_replay_failed",
-            "request already failed; upstream was not called again",
-            json!({"request_id": preflight.request_id}),
-        ),
-        RequestState::Unknown => (
-            StatusCode::CONFLICT,
-            "idempotent_replay_unknown",
-            "request outcome is unknown; upstream was not called again",
-            json!({"request_id": preflight.request_id}),
-        ),
-        _ => (
+        )
+    } else if preflight.result.is_none()
+        && !matches!(
+            preflight.state,
+            RequestState::Settled | RequestState::Succeeded | RequestState::Failed | RequestState::Unknown
+        ) {
+        (
             StatusCode::CONFLICT,
             "request_in_progress",
             "request is already in progress; upstream was not called again",
             json!({"request_id": preflight.request_id}),
-        ),
+        )
+    } else if matches!(
+        preflight.result.as_ref().and_then(|result| result.error_code.as_deref()),
+        Some("upstream_uncertain")
+    ) || preflight.result.is_none() {
+        (
+            StatusCode::CONFLICT,
+            "idempotent_replay_unknown",
+            "request outcome is unknown; upstream was not called again",
+            json!({"request_id": preflight.request_id}),
+        )
+    } else {
+        (
+            StatusCode::CONFLICT,
+            "idempotent_replay_failed",
+            "request already failed; upstream was not called again",
+            json!({"request_id": preflight.request_id}),
+        )
     };
-    let mut response = openai_error(status, code, message);
-    if status == StatusCode::OK {
-        response = Response::builder()
+    let response = if status == StatusCode::OK {
+        Response::builder()
             .status(status)
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
-            .unwrap();
-    }
+            .unwrap()
+    } else {
+        openai_error(status, code, message)
+    };
     with_core_request_id(response, &preflight.request_id)
-}
-
-fn actual_amount_from_body(body: &Value, reserved_amount: i64) -> Option<i64> {
-    let usage = body.get("usage")?;
-    let actual = usage
-        .get("actual_amount")
-        .or_else(|| usage.get("total_tokens"))
-        .and_then(Value::as_i64)?;
-    (actual >= 0 && actual <= reserved_amount).then_some(actual)
 }
 
 fn settle_core_outcome(
@@ -227,7 +233,7 @@ fn settle_core_response(context: &CoreChatContext, response: Response) -> Respon
             body: json!({}),
             actual_amount,
         })
-    } else if uncertain || response.status().is_server_error() && response.status() != StatusCode::SERVICE_UNAVAILABLE {
+    } else if uncertain || response.status().is_server_error() {
         ChatOutcome::Upstream(UpstreamError::Disconnected)
     } else {
         ChatOutcome::Failure(UpstreamError::Rejected {
@@ -686,6 +692,7 @@ pub async fn chat_completions(
         let result = executor.execute(execution);
         let response = match result {
             Ok(result) => {
+                let is_success = (200..300).contains(&result.status);
                 let settlement_result = ChatExecutionResult {
                     status: result.status,
                     body: result.body.clone(),
@@ -706,7 +713,17 @@ pub async fn chat_completions(
                         response.headers_mut().insert("x-aiwork-core-actual-amount", value);
                     }
                 }
-                settle_core_outcome(context, response, ChatOutcome::Success(settlement_result))
+                let outcome = if is_success {
+                    ChatOutcome::Success(settlement_result)
+                } else if result.status >= 500 {
+                    ChatOutcome::Upstream(UpstreamError::Disconnected)
+                } else {
+                    ChatOutcome::Failure(UpstreamError::Rejected {
+                        status: result.status,
+                        code: None,
+                    })
+                };
+                settle_core_outcome(context, response, outcome)
             }
             Err(error) => {
                 let response = openai_error(StatusCode::BAD_GATEWAY, "upstream_error", &error.to_string());
@@ -1939,7 +1956,6 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // inflight guard 随后台任务存续至聚合完成（§4.5）
         let _inflight = guard;
         let mut tried = HashSet::new();
-        let mut uncertain_upstream = false;
 
         let max_rotate = state.pool.count().max(1);
         for _ in 0..max_rotate {
@@ -2039,13 +2055,6 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         }
                     }
                     Err((status, resp_body, retry_after)) => {
-                        if status == 502
-                            && ["连接超时", "传输错误", "DNS解析失败", "TLS证书验证失败"]
-                                .iter()
-                                .any(|marker| resp_body.contains(marker))
-                        {
-                            uncertain_upstream = true;
-                        }
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
@@ -2123,37 +2132,29 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         }
         Err(AggregateFail::NoHealthy {
             message: "no healthy account available".to_string(),
-            uncertain: uncertain_upstream,
         })
     })
     .await;
 
     match result {
         Ok(Ok(resp)) => {
-            let mut builder = Response::builder().header("content-type", "application/json");
-            if let Some(actual_amount) = actual_amount_from_body(&resp, i64::MAX) {
-                builder = builder.header("x-aiwork-core-actual-amount", actual_amount.to_string());
-            }
-            builder.body(Body::from(resp.to_string())).unwrap_or_else(|_| {
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(resp.to_string()))
+                .unwrap_or_else(|_| {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::from("internal server error"))
                     .unwrap()
-            })
+                })
         }
-        Ok(Err(AggregateFail::NoHealthy { message: msg, uncertain })) => {
-            let mut response = match proto {
+        Ok(Err(AggregateFail::NoHealthy { message: msg })) => {
+            let response = match proto {
                 Protocol::OpenAi | Protocol::OpenAiText | Protocol::Responses => {
                     openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg)
                 }
                 Protocol::Anthropic => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &msg),
             };
-            if uncertain {
-                response.headers_mut().insert(
-                    "x-aiwork-core-outcome",
-                    HeaderValue::from_static("unknown"),
-                );
-            }
             response
         }
         Ok(Err(AggregateFail::Upstream(status, msg))) => {
@@ -2657,6 +2658,21 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(executor.calls().len(), 1);
+        let persisted = fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .preflight_chat(
+                &fixture.principal,
+                &fixture.principal.key_id,
+                Some("idem-1"),
+                &serde_json::from_slice(&chat_body(false)).unwrap(),
+            )
+            .unwrap();
+        assert_ne!(persisted.request_id, "");
+        assert_eq!(persisted.result.as_ref().and_then(|result| result.status), Some(200));
+        assert_eq!(persisted.result.as_ref().and_then(|result| result.error_code.as_deref()), None);
         let balance = fixture
             .state
             .core
@@ -2670,6 +2686,182 @@ mod tests {
             first.headers().get("x-request-id"),
             second.headers().get("x-request-id")
         );
+    }
+
+    #[tokio::test]
+    async fn core_replay_of_failed_request_is_not_success() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let bridge = fixture.state.core.as_ref().unwrap().clone();
+        let body: Value = serde_json::from_slice(&chat_body(false)).unwrap();
+        let first = bridge
+            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("replay-failed"), &body)
+            .unwrap();
+        let reservation = first.reservation.as_ref().unwrap();
+        bridge
+            .settle_chat(
+                &fixture.principal,
+                &reservation.id,
+                ChatOutcome::Failure(UpstreamError::Rejected {
+                    status: 400,
+                    code: Some("bad_request".into()),
+                }),
+            )
+            .unwrap();
+        let persisted = bridge
+            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("replay-failed"), &body)
+            .unwrap();
+        assert_ne!(persisted.request_id, "");
+        assert_eq!(persisted.result.as_ref().and_then(|result| result.status), Some(400));
+        assert!(persisted.result.as_ref().and_then(|result| result.error_code.as_deref()).is_some());
+
+        let executor = Arc::new(MockChatExecutor::ok());
+        install_core_test_executor(executor.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "replay-failed".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        )
+        .await;
+        clear_core_test_executor();
+        assert_ne!(response.status(), StatusCode::OK);
+        assert!(executor.calls().is_empty());
+        assert_eq!(response.headers().get("x-request-id").is_some(), true);
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "idempotent_replay_failed");
+    }
+
+    #[tokio::test]
+    async fn core_replay_of_unknown_request_is_not_success() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let bridge = fixture.state.core.as_ref().unwrap().clone();
+        let body: Value = serde_json::from_slice(&chat_body(false)).unwrap();
+        let first = bridge
+            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("replay-unknown"), &body)
+            .unwrap();
+        let reservation = first.reservation.as_ref().unwrap();
+        bridge
+            .settle_chat(
+                &fixture.principal,
+                &reservation.id,
+                ChatOutcome::Upstream(UpstreamError::Disconnected),
+            )
+            .unwrap();
+        let persisted = bridge
+            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("replay-unknown"), &body)
+            .unwrap();
+        assert_ne!(persisted.request_id, "");
+        assert_eq!(persisted.result.as_ref().and_then(|result| result.status), None);
+        assert_eq!(persisted.result.as_ref().and_then(|result| result.error_code.as_deref()), Some("upstream_uncertain"));
+
+        let executor = Arc::new(MockChatExecutor::ok());
+        install_core_test_executor(executor.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "replay-unknown".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        )
+        .await;
+        clear_core_test_executor();
+        assert_ne!(response.status(), StatusCode::OK);
+        assert!(executor.calls().is_empty());
+        assert_eq!(response.headers().get("x-request-id").is_some(), true);
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "idempotent_replay_unknown");
+    }
+
+    #[test]
+    fn core_503_response_settles_unknown() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let bridge = fixture.state.core.as_ref().unwrap().clone();
+        let body: Value = serde_json::from_slice(&chat_body(false)).unwrap();
+        let preflight = bridge
+            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("transport-503"), &body)
+            .unwrap();
+        let reservation = preflight.reservation.as_ref().unwrap().clone();
+        let context = CoreChatContext {
+            bridge: bridge.clone(),
+            principal: fixture.principal.clone(),
+            request_id: preflight.request_id,
+            reservation_id: reservation.id,
+            reservation_amount: reservation.amount,
+        };
+        let response = settle_core_response(
+            &context,
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from("upstream unavailable"))
+                .unwrap(),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let stored = bridge.store.reservation_for_request(&context.request_id).unwrap().unwrap();
+        assert_eq!(stored.state, aiwork_core::ReservationState::Unknown);
+    }
+
+    #[test]
+    fn core_disconnect_settles_unknown() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let bridge = fixture.state.core.as_ref().unwrap().clone();
+        let body: Value = serde_json::from_slice(&chat_body(false)).unwrap();
+        let preflight = bridge
+            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("transport-disconnect"), &body)
+            .unwrap();
+        let reservation = preflight.reservation.as_ref().unwrap().clone();
+        let context = CoreChatContext {
+            bridge: bridge.clone(),
+            principal: fixture.principal.clone(),
+            request_id: preflight.request_id,
+            reservation_id: reservation.id,
+            reservation_amount: reservation.amount,
+        };
+        let response = settle_core_outcome(
+            &context,
+            openai_error(StatusCode::BAD_GATEWAY, "upstream_error", "disconnected"),
+            ChatOutcome::Upstream(UpstreamError::Disconnected),
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let stored = bridge.store.reservation_for_request(&context.request_id).unwrap().unwrap();
+        assert_eq!(stored.state, aiwork_core::ReservationState::Unknown);
+    }
+
+    #[test]
+    fn upstream_usage_does_not_set_core_actual_amount() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let bridge = fixture.state.core.as_ref().unwrap().clone();
+        let body: Value = serde_json::from_slice(&chat_body(false)).unwrap();
+        let preflight = bridge
+            .preflight_chat(&fixture.principal, &fixture.principal.key_id, Some("usage-untrusted"), &body)
+            .unwrap();
+        let reservation = preflight.reservation.as_ref().unwrap().clone();
+        let context = CoreChatContext {
+            bridge: bridge.clone(),
+            principal: fixture.principal.clone(),
+            request_id: preflight.request_id,
+            reservation_id: reservation.id,
+            reservation_amount: reservation.amount,
+        };
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"usage": {"total_tokens": 0}}).to_string()))
+            .unwrap();
+        settle_core_response(&context, response);
+        let balance = bridge.balance("route-user", "chat_request").unwrap();
+        assert_eq!(balance.available, 0);
+        assert_eq!(balance.held, 0);
     }
 
     #[test]

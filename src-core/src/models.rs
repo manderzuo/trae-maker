@@ -65,6 +65,7 @@ pub struct RequestHandle {
     pub endpoint: String,
     pub model: String,
     pub state: RequestState,
+    pub result: Option<RequestResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

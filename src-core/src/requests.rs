@@ -382,7 +382,7 @@ impl CoreStore {
         request_id: &str,
     ) -> Result<RequestHandle, CoreError> {
         transaction.query_row(
-            "SELECT id, user_id, api_key_id, protocol, endpoint, model, state FROM requests WHERE id = ?1",
+            "SELECT id, user_id, api_key_id, protocol, endpoint, model, state, result_status, error_code FROM requests WHERE id = ?1",
             [request_id],
             |row| {
                 let state = row.get::<_, String>(6)?;
@@ -401,6 +401,15 @@ impl CoreStore {
                     endpoint: row.get(4)?,
                     model: row.get(5)?,
                     state,
+                    result: {
+                        let status: Option<i64> = row.get(7)?;
+                        let error_code: Option<String> = row.get(8)?;
+                        if status.is_some() || error_code.is_some() {
+                            Some(RequestResult { status, error_code })
+                        } else {
+                            None
+                        }
+                    },
                 })
             },
         ).map_err(CoreError::from)
