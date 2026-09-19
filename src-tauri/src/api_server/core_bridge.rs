@@ -2,7 +2,7 @@ use std::{path::Path, sync::Arc};
 
 use aiwork_core::{
     require_scope, BeginRequestInput, ChatExecutionRequest, ChatExecutionResult, CoreError,
-    CoreStore, LeaseOutcome, PreflightReserveInput, PreflightReserveResult, Principal,
+    CoreStore, LeaseOutcome, LeaseSettlement, PreflightReserveInput, PreflightReserveResult, Principal,
     RequestResult, RequestState, Reservation, ScheduleError, SchedulerLeaseRequest,
     SchedulerLeaseResult, SelectionStrategy, Settlement, UpstreamError, UpstreamLease,
     UpstreamLeaseGrant,
@@ -333,13 +333,13 @@ impl CoreBridge {
         principal: &Principal,
         lease_id: &str,
         outcome: LeaseOutcome,
-    ) -> Result<UpstreamLease, CoreLeaseError> {
+    ) -> Result<LeaseSettlement, CoreLeaseError> {
         self.require_enforce().map_err(CoreLeaseError::Core)?;
         if self.scheduler.is_none() {
             return Err(CoreLeaseError::EndpointNotEnabled);
         }
         self.store
-            .settle_upstream_lease(principal, lease_id, outcome)
+            .settle_upstream_lease_with_status(principal, lease_id, outcome)
             .map_err(CoreLeaseError::from)
     }
 

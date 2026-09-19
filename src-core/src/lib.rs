@@ -29,8 +29,8 @@ pub use ports::{
 pub use requests::canonical_json_hash;
 pub use store::{CoreStore, CORE_DB_FILE, CURRENT_SCHEMA_VERSION};
 pub use upstream::{
-    LeaseOutcome, ScheduleError, SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy,
-    UpstreamLeaseGrant,
+    LeaseOutcome, LeaseSettlement, ScheduleError, SchedulerLeaseRequest, SchedulerLeaseResult,
+    SelectionStrategy, UpstreamLeaseGrant,
 };
 
 impl CoreStore {

@@ -512,11 +512,37 @@ impl CoreStore {
         let accounts = count("SELECT COUNT(*) FROM upstream_accounts")?;
         let enabled_accounts = count("SELECT COUNT(*) FROM upstream_accounts WHERE enabled = 1")?;
         let fresh_observations = count_now(
-            "SELECT COUNT(*) FROM upstream_observations
+            "WITH latest AS (
+                 SELECT observation.account_ref, observation.resource_kind,
+                        observation.status, observation.observed_at_ms, observation.stale_at_ms
+                 FROM upstream_observations AS observation
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM upstream_observations AS newer
+                     WHERE newer.account_ref = observation.account_ref
+                       AND newer.resource_kind = observation.resource_kind
+                       AND (newer.observed_at_ms > observation.observed_at_ms
+                            OR (newer.observed_at_ms = observation.observed_at_ms
+                                AND newer.id > observation.id))
+                 )
+             )
+             SELECT COUNT(*) FROM latest
              WHERE status = 'fresh' AND observed_at_ms <= ?1 AND stale_at_ms > ?1",
         )?;
         let stale_observations = count_now(
-            "SELECT COUNT(*) FROM upstream_observations
+            "WITH latest AS (
+                 SELECT observation.account_ref, observation.resource_kind,
+                        observation.status, observation.observed_at_ms, observation.stale_at_ms
+                 FROM upstream_observations AS observation
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM upstream_observations AS newer
+                     WHERE newer.account_ref = observation.account_ref
+                       AND newer.resource_kind = observation.resource_kind
+                       AND (newer.observed_at_ms > observation.observed_at_ms
+                            OR (newer.observed_at_ms = observation.observed_at_ms
+                                AND newer.id > observation.id))
+                 )
+             )
+             SELECT COUNT(*) FROM latest
              WHERE status <> 'fresh' OR stale_at_ms <= ?1",
         )?;
         let reader_failures = count(
@@ -533,7 +559,7 @@ impl CoreStore {
              WHERE account.enabled = 1 AND account.state = 'available'
                AND (SELECT COUNT(*) FROM upstream_leases AS lease
                     WHERE lease.account_ref = account.id
-                      AND lease.state IN ('held', 'active')) >= account.max_concurrency",
+                       AND lease.state IN ('held', 'active', 'unknown')) >= account.max_concurrency",
         )?;
         Ok(serde_json::json!({
             "schema_version": CURRENT_SCHEMA_VERSION,

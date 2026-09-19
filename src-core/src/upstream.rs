@@ -50,6 +50,15 @@ pub struct UpstreamLeaseGrant {
     pub lease_expires_at_ms: i64,
 }
 
+/// Result of attempting to settle a lease. `applied` is false when the lease
+/// was already terminal; callers must not repeat health or audit projections
+/// for that idempotent replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseSettlement {
+    pub lease: UpstreamLease,
+    pub applied: bool,
+}
+
 /// Only a newly created result grants permission to dispatch upstream work.
 /// A replay intentionally exposes persisted state rather than credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]

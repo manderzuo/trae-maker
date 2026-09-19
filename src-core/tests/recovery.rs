@@ -6,7 +6,7 @@ use std::{
 };
 
 use aiwork_core::{
-    BeginRequestInput, CoreStore, CostPolicy, LeaseState, NewUser, ObservationStatus,
+    BeginRequestInput, CoreStore, CostPolicy, LeaseOutcome, LeaseState, NewUser, ObservationStatus,
     PreflightReserveInput, Principal, QuotaGrant, RegisterUpstreamAccount,
     SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, UpstreamAccountState,
     UpstreamObservation, UserRole,
@@ -296,4 +296,49 @@ fn scheduler_status_exposes_counts_but_not_credentials_or_other_users() {
         .scheduler_status_for_admin(&fixture.user, NOW_MS)
         .is_err());
     drop(fixture);
+}
+
+#[test]
+fn scheduler_status_uses_latest_observation_and_counts_unknown_slots() {
+    let fixture = Fixture::new();
+    fixture.account();
+    let lease_id = fixture.acquire("status-unknown");
+    fixture
+        .store
+        .append_upstream_observation(UpstreamObservation::new(
+            "task6-latest-failed".into(),
+            "task6-account".into(),
+            RESOURCE_KIND.into(),
+            Some(100),
+            1,
+            "reader".into(),
+            ObservationStatus::Failed,
+            NOW_MS + 1,
+            NOW_MS + 60_000,
+            json!({"status": "failed"}),
+        ))
+        .unwrap();
+    fixture
+        .store
+        .settle_upstream_lease(
+            &fixture.user,
+            &lease_id,
+            LeaseOutcome::TransportUnknown {
+                reason: "transport_timeout".into(),
+                upstream_request_ref: None,
+                now_ms: NOW_MS + 2,
+            },
+        )
+        .unwrap();
+
+    let status = fixture
+        .store
+        .scheduler_status_for_admin(&fixture.admin, NOW_MS + 3)
+        .unwrap();
+    assert_eq!(status["fresh_observations"], 0);
+    assert_eq!(status["stale_observations"], 1);
+    assert_eq!(status["reader_failures"], 1);
+    assert_eq!(status["active_leases"], 0);
+    assert_eq!(status["unknown_leases"], 1);
+    assert_eq!(status["slot_saturated"], 1);
 }

@@ -153,6 +153,7 @@ fn main() {
             commands::api_server::api_server_start,
             commands::api_server::api_server_stop,
             commands::api_server::api_server_status,
+            commands::api_server::scheduler_status_for_admin,
             commands::api_server::api_server_wait_idle,
             commands::api_server::pool_list,
             commands::api_server::pool_set,

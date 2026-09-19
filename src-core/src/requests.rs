@@ -10,6 +10,7 @@ use crate::{
     LeaseOutcome, LeaseState, ObservationStatus, PreflightReserveInput, PreflightReserveResult,
     QuotaReserve, RequestHandle, RequestResult, RequestState, ScheduleError, Settlement,
     SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, UpstreamLease, UpstreamLeaseGrant,
+    upstream::LeaseSettlement,
     upstream::{
         account_matches_constraints, sanitize_error_category, sanitize_upstream_request_ref,
         selection_reason, validate_scheduler_request, CandidateAccount,
@@ -165,6 +166,13 @@ impl CoreStore {
     pub fn settle_upstream_lease(
         &self, principal: &crate::Principal, lease_id: &str, outcome: LeaseOutcome,
     ) -> Result<UpstreamLease, ScheduleError> {
+        self.settle_upstream_lease_with_status(principal, lease_id, outcome)
+            .map(|settlement| settlement.lease)
+    }
+
+    pub fn settle_upstream_lease_with_status(
+        &self, principal: &crate::Principal, lease_id: &str, outcome: LeaseOutcome,
+    ) -> Result<LeaseSettlement, ScheduleError> {
         let now = match &outcome {
             LeaseOutcome::Success { now_ms, .. } | LeaseOutcome::Rejected { now_ms, .. } | LeaseOutcome::TransportUnknown { now_ms, .. } => *now_ms,
         };
@@ -174,7 +182,7 @@ impl CoreStore {
         Self::validate_lease_owner(&transaction, &lease, principal)?;
         if !matches!(lease.state, LeaseState::Held | LeaseState::Active) {
             transaction.commit()?;
-            return Ok(lease);
+            return Ok(LeaseSettlement { lease, applied: false });
         }
         let reservation = Self::reservation_by_request(&transaction, &lease.request_id)?
             .ok_or_else(|| ScheduleError::Core(CoreError::ReservationNotFound { reservation_id: lease.request_id.clone() }))?;
@@ -222,7 +230,7 @@ impl CoreStore {
             serde_json::json!({"request_id": lease.request_id, "lease_id": lease_id, "outcome": lease_state.as_str(), "error_kind": error_kind}), now)?;
         let settled = Self::upstream_lease_by_id(&transaction, lease_id)?.expect("lease exists inside transaction");
         transaction.commit()?;
-        Ok(settled)
+        Ok(LeaseSettlement { lease: settled, applied: true })
     }
 
     pub fn recover_expired_upstream_leases(&self, now_ms: i64) -> Result<Vec<UpstreamLease>, ScheduleError> {

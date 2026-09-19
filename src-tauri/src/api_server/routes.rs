@@ -294,12 +294,12 @@ fn settle_core_lease_outcome(
     context: &CoreChatContext,
     mut response: Response,
     outcome: UpstreamOutcome,
-) -> Response {
+) -> (Response, bool) {
     response.headers_mut().remove("x-aiwork-core-actual-amount");
     response.headers_mut().remove("x-aiwork-core-outcome");
     let now_ms = chrono::Utc::now().timestamp_millis();
     let Some(lease) = context.lease.as_ref() else {
-        return scheduler_endpoint_not_enabled_response();
+        return (scheduler_endpoint_not_enabled_response(), false);
     };
     let health_category = core_health_category(&outcome);
     match context.bridge.settle_chat_lease(
@@ -307,22 +307,24 @@ fn settle_core_lease_outcome(
         &lease.lease_id,
         outcome.lease_outcome(now_ms),
     ) {
-        Ok(_) => {
+        Ok(settlement) => {
             // The lease/quota transition is authoritative. Health persistence
             // is a separate account projection and must never release a user
             // hold if its best-effort diagnostic write fails.
-            let _ = context.bridge.store.record_upstream_health_transition(
-                &lease.account_ref,
-                Some(&context.request_id),
-                Some(&lease.lease_id),
-                "chat_request",
-                Some(&lease.observation_id),
-                health_category,
-                now_ms,
-            );
-            with_core_request_id(response, &context.request_id)
+            if settlement.applied {
+                let _ = context.bridge.store.record_upstream_health_transition(
+                    &lease.account_ref,
+                    Some(&context.request_id),
+                    Some(&lease.lease_id),
+                    "chat_request",
+                    Some(&lease.observation_id),
+                    health_category,
+                    now_ms,
+                );
+            }
+            (with_core_request_id(response, &context.request_id), settlement.applied)
         }
-        Err(error) => core_lease_error_response(error),
+        Err(error) => (core_lease_error_response(error), false),
     }
 }
 
@@ -340,13 +342,19 @@ fn core_health_category(outcome: &UpstreamOutcome) -> &'static str {
             }
         }
         UpstreamOutcome::Rejected { status, code, .. } => {
-            let code = code.to_ascii_lowercase();
+            let code = normalize_health_code(code);
             if matches!(*status, 401) || code.contains("session") {
                 "session_dead"
             } else if matches!(*status, 403) || code.contains("forbidden") {
                 "forbidden"
             } else if matches!(*status, 404) || code.contains("not_found") || code.contains("notfound") {
                 "not_found"
+            } else if code == "hard_credit" || code.contains("hard_credit") {
+                "hard_credit"
+            } else if code == "plan_limit" || code.contains("plan_limit") {
+                "plan_limit"
+            } else if code == "soft_rate" || code.contains("soft_rate") {
+                "soft_rate"
             } else if matches!(*status, 429) || code.contains("rate") {
                 "soft_rate"
             } else if (500..600).contains(status) {
@@ -356,6 +364,34 @@ fn core_health_category(outcome: &UpstreamOutcome) -> &'static str {
             }
         }
     }
+}
+
+fn normalize_health_code(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len() + 4);
+    let mut previous_is_lower_or_digit = false;
+    for character in value.chars() {
+        if character == '-' || character == ' ' {
+            if !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            previous_is_lower_or_digit = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() {
+            if !normalized.is_empty()
+                && previous_is_lower_or_digit
+                && !normalized.ends_with('_')
+            {
+                normalized.push('_');
+            }
+            normalized.push(character.to_ascii_lowercase());
+            previous_is_lower_or_digit = false;
+        } else {
+            normalized.push(character.to_ascii_lowercase());
+            previous_is_lower_or_digit = character.is_ascii_lowercase() || character.is_ascii_digit();
+        }
+    }
+    normalized
 }
 
 fn log_core_lease_event(
@@ -379,7 +415,7 @@ fn log_core_lease_event(
 fn settle_core_lease_response(
     context: &CoreChatContext,
     outcome: UpstreamOutcome,
-) -> Response {
+) -> (Response, bool) {
     match outcome.response() {
         Some(result) if (200..300).contains(&result.status) => {
             let response = Response::builder()
@@ -387,7 +423,7 @@ fn settle_core_lease_response(
                 .header("content-type", "application/json")
                 .body(Body::from(result.body.to_string()))
                 .unwrap_or_else(|_| internal_error_response());
-            settle_core_lease_outcome(context, response, outcome)
+                settle_core_lease_outcome(context, response, outcome)
         }
         Some(result) => {
             let response = openai_error(
@@ -977,11 +1013,13 @@ pub async fn chat_completions(
                     reason: "lease_context_incomplete".into(),
                     upstream_request_ref: None,
                 };
-                let response = settle_core_lease_response(
+                let (response, applied) = settle_core_lease_response(
                     &context,
                     outcome.clone(),
                 );
-                log_core_lease_event(&state, &context, &outcome);
+                if applied {
+                    log_core_lease_event(&state, &context, &outcome);
+                }
                 return response;
             }
         };
@@ -994,8 +1032,10 @@ pub async fn chat_completions(
             reservation_amount: reservation.amount,
         };
         let outcome = executor.execute_nonstream_chat(&lease, execution);
-        let response = settle_core_lease_response(&context, outcome.clone());
-        log_core_lease_event(&state, &context, &outcome);
+        let (response, applied) = settle_core_lease_response(&context, outcome.clone());
+        if applied {
+            log_core_lease_event(&state, &context, &outcome);
+        }
         return response;
     }
 
@@ -1424,6 +1464,9 @@ pub async fn assets_upload(
     key_id: Option<Extension<KeyId>>,
     body: axum::body::Bytes,
 ) -> Response {
+    if core_enforcing(&state) {
+        return scheduler_endpoint_not_enabled_response();
+    }
     let _guard = state.inflight_guard();
     let owner = key_id
         .map(|Extension(k)| k.0)
@@ -1547,6 +1590,9 @@ pub async fn assets_content(
     Path(asset_id): Path<String>,
     Query(query): Query<PublicAssetQuery>,
 ) -> Response {
+    if core_enforcing(&state) {
+        return scheduler_endpoint_not_enabled_response();
+    }
     match assets::read_public(&state.data_dir, &asset_id, &query.token) {
         Ok((record, bytes)) => {
             let mut builder = Response::builder()
@@ -1580,6 +1626,9 @@ pub async fn videos_generations(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    if core_enforcing(&state) {
+        return scheduler_endpoint_not_enabled_response();
+    }
     state
         .total_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1680,6 +1729,9 @@ pub async fn video_task(
     key_id: Option<Extension<KeyId>>,
     Path(task_id): Path<String>,
 ) -> Response {
+    if core_enforcing(&state) {
+        return scheduler_endpoint_not_enabled_response();
+    }
     let owner_key_id = key_id
         .map(|Extension(k)| k.0)
         .unwrap_or_else(|| "anonymous".to_string());
@@ -1710,6 +1762,9 @@ pub async fn video_content(
     key_id: Option<Extension<KeyId>>,
     Path(task_id): Path<String>,
 ) -> Response {
+    if core_enforcing(&state) {
+        return scheduler_endpoint_not_enabled_response();
+    }
     let owner_key_id = key_id
         .map(|Extension(k)| k.0)
         .unwrap_or_else(|| "anonymous".to_string());
@@ -3086,6 +3141,57 @@ mod tests {
             .all(|lease| lease.state == aiwork_core::LeaseState::Unknown));
     }
 
+    #[test]
+    fn repeated_core_lease_settlement_does_not_repeat_health_or_audit() {
+        let fixture = phase2_fixture(1);
+        let bridge = fixture.state.core.as_ref().unwrap().clone();
+        let body: Value = serde_json::from_slice(&chat_body(false)).unwrap();
+        let preflight = bridge
+            .preflight_chat_with_lease_for_accounts(
+                &fixture.principal,
+                &fixture.principal.key_id,
+                Some("duplicate-health"),
+                &body,
+                &["mock-account".into()],
+            )
+            .unwrap();
+        let lease = preflight.lease.clone().unwrap();
+        let context = CoreChatContext {
+            bridge: bridge.clone(),
+            principal: fixture.principal.clone(),
+            request_id: preflight.request_id,
+            reservation_id: preflight.reservation.unwrap().id,
+            lease: Some(lease),
+            reservation_amount: 1,
+        };
+        let outcome = UpstreamOutcome::Rejected {
+            status: 429,
+            code: "SoftRate".into(),
+            accepted: false,
+        };
+        let _ = settle_core_lease_outcome(&context, Response::new(Body::empty()), outcome.clone());
+        let store = &context.bridge.store;
+        let after_first = store.count_rows("audit_events").unwrap();
+        let db = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3")).unwrap();
+        let errors_after_first: i64 = db
+            .query_row(
+                "SELECT consecutive_errors FROM upstream_accounts WHERE id = 'mock-account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let _ = settle_core_lease_outcome(&context, Response::new(Body::empty()), outcome);
+        assert_eq!(store.count_rows("audit_events").unwrap(), after_first);
+        let errors_after_replay: i64 = db
+            .query_row(
+                "SELECT consecutive_errors FROM upstream_accounts WHERE id = 'mock-account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(errors_after_replay, errors_after_first);
+    }
+
     #[tokio::test]
     async fn core_unintegrated_stream_or_protocol_returns_scheduler_endpoint_not_enabled() {
         let fixture = core_fixture(1, &["chat:invoke"]);
@@ -3112,6 +3218,91 @@ mod tests {
         let response = completions(State(fixture.state.clone()), None, Bytes::from("{}")).await;
         let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+    }
+
+    #[tokio::test]
+    async fn core_unintegrated_asset_and_video_routes_fail_closed_before_legacy_pool() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let response = assets_upload(
+            State(fixture.state.clone()),
+            None,
+            Bytes::from("{}"),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+
+        let response = assets_content(
+            State(fixture.state.clone()),
+            Path("unintegrated-asset".into()),
+            Query(PublicAssetQuery { token: "token".into() }),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+
+        let response = videos_generations(
+            State(fixture.state.clone()),
+            None,
+            HeaderMap::new(),
+            Bytes::from("{}"),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+
+        let response = video_task(
+            State(fixture.state.clone()),
+            None,
+            Path("unintegrated-video".into()),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+
+        let response = video_content(
+            State(fixture.state.clone()),
+            None,
+            Path("unintegrated-video".into()),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+    }
+
+    #[test]
+    fn core_health_category_normalizes_credit_and_rate_error_labels() {
+        for (code, expected) in [
+            ("HardCredit", "hard_credit"),
+            ("hard_credit", "hard_credit"),
+            ("hard-credit", "hard_credit"),
+            ("PlanLimit", "plan_limit"),
+            ("plan_limit", "plan_limit"),
+            ("SoftRate", "soft_rate"),
+            ("soft_rate", "soft_rate"),
+        ] {
+            let outcome = UpstreamOutcome::Rejected {
+                status: 400,
+                code: code.into(),
+                accepted: false,
+            };
+            assert_eq!(core_health_category(&outcome), expected, "label {code}");
+        }
     }
 
     #[tokio::test]

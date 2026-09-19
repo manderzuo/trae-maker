@@ -53,8 +53,7 @@ pub fn core_store_for_admin(
 /// desktop management surfaces. This path works both while the HTTP server is
 /// running and when it is stopped, and never exposes account credentials,
 /// account identifiers, or another user's quota rows.
-#[allow(dead_code)]
-pub fn scheduler_status_for_admin(
+pub fn scheduler_status_for_admin_impl(
     state: &AppState,
     runtime: &Mutex<Option<ApiServerRuntime>>,
     scheduler_admin_key: Option<&str>,
@@ -75,6 +74,29 @@ pub fn scheduler_status_for_admin(
     store
         .scheduler_status_for_admin(&principal, now_ms)
         .map_err(|error| error.to_string())
+}
+
+/// Administrator-only desktop scheduler diagnostics. The key is required on
+/// every call; the ordinary `api_server_status` command intentionally exposes
+/// runtime flags without aggregate account/lease counters.
+#[tauri::command]
+pub fn scheduler_status_for_admin(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    scheduler_admin_key: Option<String>,
+) -> Result<serde_json::Value, String> {
+    scheduler_status_for_admin_impl(&state, &runtime, scheduler_admin_key.as_deref())
+}
+
+/// Strip administrator-only scheduler counters before returning desktop status
+/// through the compatibility command used by ordinary UI callers.
+pub fn public_scheduler_status(status: &SchedulerStatus) -> SchedulerStatus {
+    SchedulerStatus {
+        mode: status.mode,
+        ready: status.ready,
+        last_error: status.last_error.clone(),
+        ..SchedulerStatus::default()
+    }
 }
 
 // ==================== 启停命令 ====================
@@ -466,9 +488,10 @@ pub fn api_server_status(
                 .load(std::sync::atomic::Ordering::Relaxed);
             let active = safe_lock(&rt.shared.active_uid).clone();
             let last_err = safe_lock(&rt.shared.last_error).clone();
+            let scheduler = rt.shared.core.as_ref().and_then(|core| core.scheduler().ok())
+                .map(SchedulerRuntime::scheduler_status).unwrap_or_else(|| rt.scheduler_status.clone());
             ApiServiceStatus {
-                scheduler: rt.shared.core.as_ref().and_then(|core| core.scheduler().ok())
-                    .map(SchedulerRuntime::scheduler_status).unwrap_or_else(|| rt.scheduler_status.clone()),
+                scheduler: public_scheduler_status(&scheduler),
                 running: true,
                 host: host.clone(),
                 port,
@@ -1079,5 +1102,115 @@ mod pool_merge_tests {
         assert_eq!(m.wb_strategy, "");
         assert!(m.group_ids.is_empty());
         assert!(!m.wb_enabled);
+    }
+}
+
+#[cfg(test)]
+mod scheduler_status_tests {
+    use std::{collections::BTreeSet, fs, path::PathBuf, sync::Mutex};
+
+    use aiwork_core::{CoreStore, NewUser, UserRole};
+
+    use super::{public_scheduler_status, scheduler_status_for_admin_impl};
+    use crate::models::SchedulerStatus;
+    use crate::state::AppState;
+
+    fn test_state(dir: PathBuf) -> AppState {
+        AppState {
+            data_dir: dir,
+            python_dir: PathBuf::new(),
+            python_exe: String::new(),
+            jwt_refresh_lock: Mutex::new(()),
+        }
+    }
+
+    #[test]
+    fn desktop_scheduler_status_authenticates_admin_and_rejects_user() {
+        let dir = PathBuf::from(r"D:\gpt").join(format!(
+            "aiwork-task6-admin-status-{}",
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = CoreStore::open(&dir).unwrap();
+        store.migrate().unwrap();
+        store
+            .create_bootstrap_admin(
+                NewUser {
+                    id: "admin".into(),
+                    name: "Admin".into(),
+                    role: UserRole::Admin,
+                },
+                "bootstrap",
+            )
+            .unwrap();
+        store
+            .create_user(
+                NewUser {
+                    id: "user".into(),
+                    name: "User".into(),
+                    role: UserRole::User,
+                },
+                "admin",
+            )
+            .unwrap();
+        let admin_key = store
+            .issue_api_key("admin", "admin", BTreeSet::new(), "bootstrap")
+            .unwrap();
+        let user_key = store
+            .issue_api_key("user", "user", BTreeSet::new(), "admin")
+            .unwrap();
+        let state = test_state(dir.clone());
+        let runtime = Mutex::new(None);
+
+        let status = scheduler_status_for_admin_impl(&state, &runtime, Some(&admin_key.plaintext)).unwrap();
+        assert_eq!(status["accounts"], 0);
+        let error = scheduler_status_for_admin_impl(&state, &runtime, Some(&user_key.plaintext)).unwrap_err();
+        assert_eq!(error, "scheduler_admin_required");
+        drop(runtime);
+        drop(state);
+        drop(user_key);
+        drop(admin_key);
+        drop(store);
+        // SQLite/WAL cleanup is best effort on Windows; the fixture is already
+        // isolated under D:\gpt and a locked sidecar must not turn an auth test
+        // into a false failure.
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn desktop_scheduler_status_command_is_registered() {
+        let main_source = include_str!("../main.rs");
+        assert!(main_source.contains("commands::api_server::scheduler_status_for_admin"));
+    }
+
+    #[test]
+    fn ordinary_api_status_keeps_runtime_flags_without_admin_counts() {
+        let status = SchedulerStatus {
+            mode: super::super::api_server::scheduler::SchedulerMode::Enforce,
+            ready: true,
+            accounts: 4,
+            enabled_accounts: 3,
+            fresh_observations: 2,
+            stale_observations: 1,
+            active_leases: 2,
+            unknown_leases: 1,
+            recovered_leases: 1,
+            dry_runs: 3,
+            reader_failures: 1,
+            last_error: Some("scheduler_endpoint_not_enabled".into()),
+        };
+        let public = public_scheduler_status(&status);
+        assert_eq!(public.mode, status.mode);
+        assert!(public.ready);
+        assert_eq!(public.last_error, status.last_error);
+        assert_eq!(public.accounts, 0);
+        assert_eq!(public.enabled_accounts, 0);
+        assert_eq!(public.fresh_observations, 0);
+        assert_eq!(public.stale_observations, 0);
+        assert_eq!(public.active_leases, 0);
+        assert_eq!(public.unknown_leases, 0);
+        assert_eq!(public.recovered_leases, 0);
+        assert_eq!(public.dry_runs, 0);
+        assert_eq!(public.reader_failures, 0);
     }
 }
