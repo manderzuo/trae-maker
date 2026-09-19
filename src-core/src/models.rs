@@ -1,5 +1,6 @@
 use std::{collections::{BTreeMap, BTreeSet}, fmt, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{CoreStore, Principal};
@@ -292,6 +293,28 @@ pub struct User {
     pub id: String,
     pub name: String,
     pub role: UserRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreUserAdminView {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreApiKeyAdminView {
+    pub id: String,
+    pub user_id: String,
+    pub name: String,
+    pub prefix: String,
+    pub scopes: BTreeSet<String>,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub revoked_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

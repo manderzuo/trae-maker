@@ -66,6 +66,10 @@ pub enum CoreError {
     AdminRequired,
     #[error("target user is not active")]
     UserNotActive,
+    #[error("user {user_id} was not found")]
+    UserNotFound { user_id: String },
+    #[error("api key {api_key_id} was not found")]
+    ApiKeyNotFound { api_key_id: String },
     #[error("legacy migration validation failed: {reason}")]
     MigrationValidation { reason: String },
     #[error("reservation {reservation_id} is owned by another principal")]

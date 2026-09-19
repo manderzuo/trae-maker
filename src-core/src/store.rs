@@ -18,7 +18,7 @@ use crate::{
         normalize_health_category, validate_observation_summary, validate_opaque_credentials_ref,
         validate_required,
     },
-    AuthError, CoreError, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
+    AuthError, CoreApiKeyAdminView, CoreError, CoreUserAdminView, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
     AssetState, CoreAsset, CreateAssetInput, NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
     UpstreamAccountState,
     UpstreamLease, UpstreamObservation, User,
@@ -828,6 +828,152 @@ impl CoreStore {
         Ok(user)
     }
 
+    pub fn list_users_as_admin(
+        &self,
+        principal: &Principal,
+    ) -> Result<Vec<CoreUserAdminView>, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let users = {
+            let mut statement = transaction.prepare(
+                "SELECT id, name, role, status, created_at_ms, updated_at_ms
+                 FROM users ORDER BY created_at_ms, id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(CoreUserAdminView {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        role: row.get(2)?,
+                        status: row.get(3)?,
+                        created_at_ms: row.get(4)?,
+                        updated_at_ms: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        transaction.commit()?;
+        Ok(users)
+    }
+
+    pub fn list_api_keys_as_admin(
+        &self,
+        principal: &Principal,
+        user_id: Option<&str>,
+    ) -> Result<Vec<CoreApiKeyAdminView>, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let keys = {
+            let mut statement = if user_id.is_some() {
+                transaction.prepare(
+                    "SELECT id, user_id, name, prefix, scopes_json, status, created_at_ms, revoked_at_ms
+                     FROM api_keys WHERE user_id = ?1 ORDER BY created_at_ms, id",
+                )?
+            } else {
+                transaction.prepare(
+                    "SELECT id, user_id, name, prefix, scopes_json, status, created_at_ms, revoked_at_ms
+                     FROM api_keys ORDER BY created_at_ms, id",
+                )?
+            };
+            let rows = if let Some(user_id) = user_id {
+                statement.query([user_id])?
+            } else {
+                statement.query([])?
+            };
+            rows.mapped(|row| {
+                let scopes_json: String = row.get(4)?;
+                let scopes = serde_json::from_str(&scopes_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(CoreApiKeyAdminView {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    name: row.get(2)?,
+                    prefix: row.get(3)?,
+                    scopes,
+                    status: row.get(5)?,
+                    created_at_ms: row.get(6)?,
+                    revoked_at_ms: row.get(7)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.commit()?;
+        Ok(keys)
+    }
+
+    pub fn set_user_status_as_admin(
+        &self,
+        principal: &Principal,
+        user_id: &str,
+        active: bool,
+    ) -> Result<CoreUserAdminView, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let target = transaction
+            .query_row(
+                "SELECT role, status FROM users WHERE id = ?1",
+                [user_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::UserNotFound { user_id: user_id.into() })?;
+        if !active && user_id == principal.user_id {
+            return Err(CoreError::AdminRequired);
+        }
+        if !active && target.0 == "admin" {
+            let active_admins: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND status = 'active'",
+                [],
+                |row| row.get(0),
+            )?;
+            if active_admins <= 1 {
+                return Err(CoreError::AdminRequired);
+            }
+        }
+        let next_status = if active { "active" } else { "disabled" };
+        if target.1 != next_status {
+            let now = Utc::now().timestamp_millis();
+            transaction.execute(
+                "UPDATE users SET status = ?1, updated_at_ms = ?2 WHERE id = ?3",
+                params![next_status, now, user_id],
+            )?;
+            Self::insert_audit_event(
+                &transaction,
+                &principal.user_id,
+                "user.status",
+                "user",
+                user_id,
+                serde_json::json!({ "user_id": user_id, "status": next_status }),
+                now,
+            )?;
+        }
+        let view = transaction.query_row(
+            "SELECT id, name, role, status, created_at_ms, updated_at_ms FROM users WHERE id = ?1",
+            [user_id],
+            |row| {
+                Ok(CoreUserAdminView {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    role: row.get(2)?,
+                    status: row.get(3)?,
+                    created_at_ms: row.get(4)?,
+                    updated_at_ms: row.get(5)?,
+                })
+            },
+        )?;
+        transaction.commit()?;
+        Ok(view)
+    }
+
     /// The only bootstrap path: an empty Core database may create exactly one admin.
     pub fn create_bootstrap_admin(&self, input: NewUser, actor: &str) -> Result<User, CoreError> {
         if actor != "bootstrap" || input.role != crate::UserRole::Admin {
@@ -992,8 +1138,41 @@ impl CoreStore {
         self.revoke_api_key_inner(key_id, actor, false)
     }
 
-    pub fn revoke_api_key_as_admin(&self, key_id: &str, actor: &str) -> Result<(), CoreError> {
-        self.revoke_api_key_inner(key_id, actor, true)
+    pub fn revoke_api_key_as_admin(
+        &self,
+        principal: &Principal,
+        key_id: &str,
+    ) -> Result<(), CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = ?1)",
+            [key_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(CoreError::ApiKeyNotFound { api_key_id: key_id.into() });
+        }
+        let now = Utc::now().timestamp_millis();
+        let changed = transaction.execute(
+            "UPDATE api_keys SET status = 'revoked', revoked_at_ms = ?1
+             WHERE id = ?2 AND status = 'active'",
+            params![now, key_id],
+        )?;
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "api_key.revoke",
+            "api_key",
+            key_id,
+            serde_json::json!({
+                "id": key_id,
+                "result": if changed == 1 { "revoked" } else { "already_revoked" },
+            }),
+            now,
+        )?;
+        transaction.commit().map_err(CoreError::from)
     }
 
     fn revoke_api_key_inner(&self, key_id: &str, actor: &str, require_admin: bool) -> Result<(), CoreError> {

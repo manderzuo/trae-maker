@@ -7,6 +7,28 @@ use crate::{
 };
 
 impl CoreStore {
+    pub fn quota_balance_as_admin(
+        &self,
+        principal: &Principal,
+        user_id: &str,
+        resource_kind: &str,
+    ) -> Result<QuotaBalance, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let user_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)",
+            [user_id],
+            |row| row.get(0),
+        )?;
+        if !user_exists {
+            return Err(CoreError::UserNotFound { user_id: user_id.into() });
+        }
+        let balance = Self::balance_in_transaction(&transaction, user_id, resource_kind)?;
+        transaction.commit()?;
+        Ok(balance)
+    }
+
     pub fn grant(&self, input: QuotaGrant) -> Result<QuotaBalance, CoreError> {
         self.grant_inner(input, false)
     }
