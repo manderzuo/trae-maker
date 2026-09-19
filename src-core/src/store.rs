@@ -8,13 +8,13 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::{
-    schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4},
+    schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5},
     AuthError, CoreError, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, NewUser,
     Principal, User,
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 pub struct CoreStore {
     pub(crate) connection: Mutex<Connection>,
@@ -54,6 +54,7 @@ impl CoreStore {
                 Self::migrate_v1_to_v2(&transaction)?;
                 Self::migrate_v2_to_v3(&transaction)?;
                 Self::migrate_v3_to_v4(&transaction)?;
+                Self::migrate_v4_to_v5(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -65,6 +66,7 @@ impl CoreStore {
                 Self::migrate_v1_to_v2(&transaction)?;
                 Self::migrate_v2_to_v3(&transaction)?;
                 Self::migrate_v3_to_v4(&transaction)?;
+                Self::migrate_v4_to_v5(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -75,6 +77,7 @@ impl CoreStore {
             2 => {
                 Self::migrate_v2_to_v3(&transaction)?;
                 Self::migrate_v3_to_v4(&transaction)?;
+                Self::migrate_v4_to_v5(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -84,6 +87,16 @@ impl CoreStore {
             }
             3 => {
                 Self::migrate_v3_to_v4(&transaction)?;
+                Self::migrate_v4_to_v5(&transaction)?;
+                transaction
+                    .execute(
+                        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![CURRENT_SCHEMA_VERSION.to_string()],
+                    )
+                    .map_err(CoreError::migration)?;
+            }
+            4 => {
+                Self::migrate_v4_to_v5(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -610,6 +623,17 @@ impl CoreStore {
         seen.clear();
         for asset in &batch.assets {
             if !seen.insert(&asset.id) { return Err(CoreError::MigrationValidation { reason: "duplicate legacy asset id".into() }); }
+            let valid_storage_ref = Self::valid_legacy_storage_ref(&asset.storage_ref);
+            if (asset.migration_status == "verified" && !valid_storage_ref)
+                || (asset.migration_status != "verified"
+                    && !asset.storage_ref.is_empty()
+                    && !valid_storage_ref)
+            {
+                return Err(CoreError::MigrationValidation { reason: "legacy asset storage_ref is invalid for migration status".into() });
+            }
+            if !matches!(asset.migration_status.as_str(), "verified" | "legacy_unverified" | "reconcile_required") {
+                return Err(CoreError::MigrationValidation { reason: "unknown legacy asset migration status".into() });
+            }
             Self::ensure_active_user(transaction, &asset.user_id)?;
         }
         seen.clear();
@@ -635,6 +659,17 @@ impl CoreStore {
         let mut material = [0_u8; 32];
         OsRng.fill_bytes(&mut material);
         format!("aw_live_{}", URL_SAFE_NO_PAD.encode(material))
+    }
+
+    fn valid_legacy_storage_ref(storage_ref: &str) -> bool {
+        !storage_ref.is_empty()
+            && storage_ref == storage_ref.trim()
+            && storage_ref.starts_with("assets/")
+            && storage_ref.len() > "assets/".len()
+            && !storage_ref.contains("..")
+            && !storage_ref.contains('\\')
+            && !storage_ref.contains("//")
+            && !storage_ref.chars().any(|character| character.is_control())
     }
 
     pub(crate) fn new_id(kind: &str) -> String {
@@ -730,6 +765,10 @@ impl CoreStore {
 
     fn migrate_v3_to_v4(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
         transaction.execute_batch(SCHEMA_V4).map_err(CoreError::migration)
+    }
+
+    fn migrate_v4_to_v5(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        transaction.execute_batch(SCHEMA_V5).map_err(CoreError::migration)
     }
 }
 

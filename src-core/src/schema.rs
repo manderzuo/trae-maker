@@ -201,3 +201,67 @@ ALTER TABLE legacy_assets ADD COLUMN migration_status TEXT NOT NULL DEFAULT 'leg
 ALTER TABLE legacy_observations ADD COLUMN observed_value INTEGER;
 ALTER TABLE legacy_observations ADD COLUMN summary_json TEXT NOT NULL DEFAULT '{}';
 "#;
+
+pub(crate) const SCHEMA_V5: &str = r#"
+CREATE TRIGGER legacy_assets_storage_ref_guard_insert
+BEFORE INSERT ON legacy_assets
+WHEN (
+  (NEW.storage_ref <> '' AND (
+    NEW.storage_ref NOT GLOB 'assets/*'
+    OR length(NEW.storage_ref) <= length('assets/')
+    OR trim(NEW.storage_ref) <> NEW.storage_ref
+    OR instr(NEW.storage_ref, '..') > 0
+    OR instr(NEW.storage_ref, char(92)) > 0
+    OR instr(NEW.storage_ref, '//') > 0
+    OR instr(NEW.storage_ref, char(9)) > 0
+    OR instr(NEW.storage_ref, char(10)) > 0
+    OR instr(NEW.storage_ref, char(13)) > 0
+  ))
+  OR (NEW.migration_status = 'verified' AND (
+    NEW.storage_ref = ''
+    OR NEW.storage_ref NOT GLOB 'assets/*'
+    OR length(NEW.storage_ref) <= length('assets/')
+    OR trim(NEW.storage_ref) <> NEW.storage_ref
+    OR instr(NEW.storage_ref, '..') > 0
+    OR instr(NEW.storage_ref, char(92)) > 0
+    OR instr(NEW.storage_ref, '//') > 0
+    OR instr(NEW.storage_ref, char(9)) > 0
+    OR instr(NEW.storage_ref, char(10)) > 0
+    OR instr(NEW.storage_ref, char(13)) > 0
+  ))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid legacy asset storage_ref');
+END;
+
+CREATE TRIGGER legacy_assets_storage_ref_guard_update
+BEFORE UPDATE OF storage_ref, migration_status ON legacy_assets
+WHEN (
+  (NEW.storage_ref <> '' AND (
+    NEW.storage_ref NOT GLOB 'assets/*'
+    OR length(NEW.storage_ref) <= length('assets/')
+    OR trim(NEW.storage_ref) <> NEW.storage_ref
+    OR instr(NEW.storage_ref, '..') > 0
+    OR instr(NEW.storage_ref, char(92)) > 0
+    OR instr(NEW.storage_ref, '//') > 0
+    OR instr(NEW.storage_ref, char(9)) > 0
+    OR instr(NEW.storage_ref, char(10)) > 0
+    OR instr(NEW.storage_ref, char(13)) > 0
+  ))
+  OR (NEW.migration_status = 'verified' AND (
+    NEW.storage_ref = ''
+    OR NEW.storage_ref NOT GLOB 'assets/*'
+    OR length(NEW.storage_ref) <= length('assets/')
+    OR trim(NEW.storage_ref) <> NEW.storage_ref
+    OR instr(NEW.storage_ref, '..') > 0
+    OR instr(NEW.storage_ref, char(92)) > 0
+    OR instr(NEW.storage_ref, '//') > 0
+    OR instr(NEW.storage_ref, char(9)) > 0
+    OR instr(NEW.storage_ref, char(10)) > 0
+    OR instr(NEW.storage_ref, char(13)) > 0
+  ))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid legacy asset storage_ref');
+END;
+"#;

@@ -161,6 +161,51 @@ fn processing_legacy_job_is_rejected_before_any_batch_write() {
 }
 
 #[test]
+fn verified_legacy_asset_requires_valid_storage_ref_before_any_write() {
+    let (store, dir, admin_key_id) = store();
+    let mut migration = batch("invalid-asset-ref", &admin_key_id);
+    migration.assets[0].storage_ref.clear();
+    assert!(matches!(
+        store.apply_legacy_migration(migration),
+        Err(CoreError::MigrationValidation { reason }) if reason.contains("storage_ref")
+    ));
+
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM legacy_assets", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
+fn sqlite_rejects_verified_legacy_asset_with_invalid_storage_ref() {
+    let (_store, dir, _) = store();
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let result = connection.execute(
+        "INSERT INTO legacy_assets
+         (id, owner_key_id, user_id, filename, mime_type, extension, size,
+          content_sha256, created_at_ms, expires_at_ms, storage_ref,
+          migration_status, migration_id, actor_user_id, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        rusqlite::params![
+            "direct-invalid-asset",
+            "legacy-1",
+            "user",
+            "input.png",
+            "image/png",
+            "png",
+            3_i64,
+            "hash",
+            1_i64,
+            2_i64,
+            "assets/../secret.png",
+            "verified",
+            "direct-invalid",
+            "admin",
+            "test",
+        ],
+    );
+    assert!(result.is_err());
+}
+
+#[test]
 fn a_late_batch_constraint_failure_rolls_back_earlier_key_writes() {
     let (store, dir, admin_key_id) = store();
     let first = store.apply_legacy_migration(batch("migration-1", &admin_key_id)).unwrap();
