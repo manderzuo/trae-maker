@@ -405,6 +405,22 @@ impl CoreUpstreamExecutor {
         };
         adapter.execute_stream(lease, request, sink)
     }
+
+    /// Ask the explicitly bound provider adapter to cancel the exact leased
+    /// upstream request. Binding or credential mismatches are deliberately
+    /// reported as unknown rather than treated as unsupported cancellation.
+    pub fn cancel_stream(&self, lease: &UpstreamLeaseGrant) -> CancelSupport {
+        let Some(binding) = self.account_bindings.get(&lease.account_ref) else {
+            return CancelSupport::Unknown;
+        };
+        if binding.credentials_ref != lease.credentials_ref {
+            return CancelSupport::Unknown;
+        }
+        let Some(adapter) = self.stream_adapters.get(&binding.provider) else {
+            return CancelSupport::Unknown;
+        };
+        adapter.cancel_stream(lease)
+    }
 }
 
 struct ChatExecutorAdapter {

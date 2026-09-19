@@ -18,9 +18,10 @@ use aiwork_core::{
 use super::custom_route;
 use super::assets;
 use super::core_bridge::{
-    ChatOutcome, CoreLeaseError, CoreUpstreamExecutor, LeasePreflightResult, LeaseUpstreamAdapter,
-    UpstreamOutcome,
+    CancelSupport, ChatOutcome, CoreLeaseError, CoreUpstreamExecutor, LeasePreflightResult,
+    LeaseUpstreamAdapter, StreamTerminalOutcome, UpstreamOutcome,
 };
+use super::core_stream::core_stream_chat;
 use super::dispatch::{self, DispatchError, TargetPool};
 use super::retry::{retry_plan, RetryAction};
 use super::sse;
@@ -145,7 +146,7 @@ fn core_error_response(error: CoreError) -> Response {
     }
 }
 
-fn scheduler_endpoint_not_enabled_response() -> Response {
+pub(super) fn scheduler_endpoint_not_enabled_response() -> Response {
     openai_error(
         StatusCode::NOT_IMPLEMENTED,
         "scheduler_endpoint_not_enabled",
@@ -153,7 +154,7 @@ fn scheduler_endpoint_not_enabled_response() -> Response {
     )
 }
 
-fn core_lease_error_response(error: CoreLeaseError) -> Response {
+pub(super) fn core_lease_error_response(error: CoreLeaseError) -> Response {
     match error {
         CoreLeaseError::EndpointNotEnabled => scheduler_endpoint_not_enabled_response(),
         CoreLeaseError::Core(error) => core_error_response(error),
@@ -205,7 +206,7 @@ fn core_replay_response(preflight: &super::core_bridge::PreflightResult) -> Resp
     )
 }
 
-fn core_lease_replay_response(preflight: &LeasePreflightResult) -> Response {
+pub(super) fn core_lease_replay_response(preflight: &LeasePreflightResult) -> Response {
     core_replay_response_for(
         &preflight.request_id,
         preflight.state,
@@ -908,7 +909,20 @@ pub async fn chat_completions(
             return core_scope_error("chat:invoke");
         }
         if stream {
-            return scheduler_endpoint_not_enabled_response();
+            let idempotency_key = headers
+                .get("idempotency-key")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            return core_stream_chat(
+                state.clone(),
+                principal,
+                key_str,
+                peek,
+                Protocol::OpenAi,
+                idempotency_key,
+            );
         }
         let idempotency_key = headers
             .get("idempotency-key")
@@ -1093,6 +1107,7 @@ pub async fn chat_completions(
 pub async fn responses_api(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -1102,10 +1117,6 @@ pub async fn responses_api(
             "request_too_large",
             "request body exceeds 8MB limit",
         );
-    }
-
-    if core_enforcing(&state) {
-        return scheduler_endpoint_not_enabled_response();
     }
 
     state
@@ -1146,9 +1157,33 @@ pub async fn responses_api(
         super::conversation::merge_history(&state.data_dir, id, &mut chat_body);
     }
 
+    let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+    if core_enforcing(&state) {
+        if !stream {
+            return scheduler_endpoint_not_enabled_response();
+        }
+        let principal = match core_principal_or_unauthorized(principal.as_ref()) {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
+        let idempotency_key = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        return core_stream_chat(
+            state.clone(),
+            principal,
+            key_str,
+            chat_body,
+            Protocol::Responses,
+            idempotency_key,
+        );
+    }
+
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
-    let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
     // inflight guard：随执行路径持有至请求结束（§4.5）
     let guard = state.inflight_guard();
 
@@ -1207,6 +1242,7 @@ pub async fn responses_api(
 pub async fn messages(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -1218,8 +1254,17 @@ pub async fn messages(
         );
     }
 
+    // Preserve Core's fail-closed behavior for the non-stream Messages
+    // endpoint, including malformed/empty bodies. Only an explicit stream
+    // request enters the new Core lease path below.
     if core_enforcing(&state) {
-        return scheduler_endpoint_not_enabled_response();
+        let is_stream = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| value.get("stream").and_then(Value::as_bool))
+            .unwrap_or(false);
+        if !is_stream {
+            return scheduler_endpoint_not_enabled_response();
+        }
     }
 
     state
@@ -3195,16 +3240,19 @@ mod tests {
     #[tokio::test]
     async fn core_unintegrated_stream_or_protocol_returns_scheduler_endpoint_not_enabled() {
         let fixture = core_fixture(1, &["chat:invoke"]);
+        let mut stream_headers = HeaderMap::new();
+        stream_headers.insert("idempotency-key", "legacy-stream-test".parse().unwrap());
         let response = chat_completions(State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
-            Some(Extension(fixture.principal.clone())), HeaderMap::new(), chat_body(true)).await;
+            Some(Extension(fixture.principal.clone())), stream_headers, chat_body(true)).await;
         let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
-        let response = responses_api(State(fixture.state.clone()), None, HeaderMap::new(), Bytes::from("{}")).await;
+        let response = responses_api(State(fixture.state.clone()), None, None, HeaderMap::new(), Bytes::from("{}")).await;
         let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
         let response = messages(
             State(fixture.state.clone()),
+            None,
             None,
             HeaderMap::new(),
             Bytes::from("{}"),
@@ -3358,13 +3406,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_chat_stream_returns_phase1_not_implemented() {
+    async fn core_chat_stream_without_registered_adapter_returns_501() {
         let fixture = core_fixture(1, &["chat:invoke"]);
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "phase1-stream-test".parse().unwrap());
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
             Some(Extension(fixture.principal.clone())),
-            HeaderMap::new(),
+            headers,
             chat_body(true),
         ).await;
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
@@ -3799,5 +3849,254 @@ mod tests {
             assert!(out.len() <= n);
             assert!(body.starts_with(out));
         }
+    }
+
+    fn phase3_stream_fixture(
+        outcome: StreamTerminalOutcome,
+        cancel_support: CancelSupport,
+        register_stream: bool,
+    ) -> (CoreFixture, Arc<super::super::core_bridge::core_executor::MockStreamAdapter>) {
+        let mut fixture = core_fixture(2, &["chat:invoke"]);
+        let store = fixture.state.core.as_ref().unwrap().store.clone();
+        let mut account = aiwork_core::RegisterUpstreamAccount::new(
+            "mock-account".into(),
+            "mock".into(),
+            "vault://mock/account".into(),
+        );
+        account.capabilities.insert("chat".into());
+        store
+            .upsert_upstream_account(account, &fixture.admin)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        store
+            .append_upstream_observation(aiwork_core::UpstreamObservation::new(
+                "mock-observation".into(),
+                "mock-account".into(),
+                "chat_request".into(),
+                Some(100),
+                1,
+                "reader".into(),
+                aiwork_core::ObservationStatus::Fresh,
+                now,
+                now + 600_000,
+                json!({}),
+            ))
+            .unwrap();
+        let runtime = super::super::scheduler::SchedulerRuntime::new(
+            store.clone(),
+            fixture.dir.clone(),
+            super::super::scheduler::SchedulerMode::Enforce,
+            Default::default(),
+            Default::default(),
+            now,
+        )
+        .unwrap();
+        let stream_mock = Arc::new(
+            super::super::core_bridge::core_executor::MockStreamAdapter::with_outcome(outcome)
+                .with_cancel_support(cancel_support),
+        );
+        let nonstream_mock = Arc::new(
+            super::super::core_bridge::core_executor::MockUpstreamExecutor::ok(),
+        );
+        let mut executor = CoreUpstreamExecutor::new().with_provider("mock", nonstream_mock);
+        if register_stream {
+            executor = executor
+                .with_stream_provider("mock", stream_mock.clone())
+                .for_account("mock-account", "mock", "vault://mock/account");
+        }
+        let bridge = CoreBridge::new(store, CoreMode::Enforce)
+            .with_upstream_executor(executor)
+            .with_scheduler(Arc::new(runtime))
+            .unwrap();
+        Arc::get_mut(&mut fixture.state).unwrap().core = Some(Arc::new(bridge));
+        (fixture, stream_mock)
+    }
+
+    async fn response_body_text(response: Response) -> String {
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn core_stream_openai_mock_emits_done_and_settles_success() {
+        let (fixture, mock) = phase3_stream_fixture(
+            StreamTerminalOutcome::Success {
+                actual_units: None,
+                upstream_request_ref: None,
+            },
+            CancelSupport::Unsupported,
+            true,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "phase3-openai".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(true),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = response_body_text(response).await;
+        assert!(body.contains("data:"));
+        assert!(body.contains("hello"));
+        assert!(body.contains("data: [DONE]"));
+        assert_eq!(mock.calls().len(), 1);
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        assert_eq!(store.count_rows("upstream_leases").unwrap(), 1);
+        let lease_state: String = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3"))
+            .unwrap()
+            .query_row("SELECT state FROM upstream_leases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(lease_state, "succeeded");
+        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 0);
+    }
+
+    #[tokio::test]
+    async fn core_stream_anthropic_and_responses_emit_protocol_terminal_events() {
+        let (anthropic_fixture, _) = phase3_stream_fixture(
+            StreamTerminalOutcome::Success {
+                actual_units: None,
+                upstream_request_ref: None,
+            },
+            CancelSupport::Unsupported,
+            true,
+        );
+        let mut anthropic_headers = HeaderMap::new();
+        anthropic_headers.insert("idempotency-key", "phase3-anthropic".parse().unwrap());
+        let anthropic = messages(
+            State(anthropic_fixture.state.clone()),
+            Some(Extension(KeyId(anthropic_fixture.principal.key_id.clone()))),
+            Some(Extension(anthropic_fixture.principal.clone())),
+            anthropic_headers,
+            Bytes::from(
+                json!({
+                    "model": "mock-1",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": true
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(anthropic.status(), StatusCode::OK);
+        let anthropic_body = response_body_text(anthropic).await;
+        assert!(anthropic_body.contains("event: message_start"));
+        assert!(anthropic_body.contains("event: content_block_delta"));
+        assert!(anthropic_body.contains("event: message_stop"));
+        assert!(anthropic_body.find("message_start").unwrap() < anthropic_body.find("message_stop").unwrap());
+
+        let (responses_fixture, _) = phase3_stream_fixture(
+            StreamTerminalOutcome::Success {
+                actual_units: None,
+                upstream_request_ref: None,
+            },
+            CancelSupport::Unsupported,
+            true,
+        );
+        let mut responses_headers = HeaderMap::new();
+        responses_headers.insert("idempotency-key", "phase3-responses".parse().unwrap());
+        let responses = responses_api(
+            State(responses_fixture.state.clone()),
+            Some(Extension(KeyId(responses_fixture.principal.key_id.clone()))),
+            Some(Extension(responses_fixture.principal.clone())),
+            responses_headers,
+            Bytes::from(
+                json!({"model": "mock-1", "input": "hello", "stream": true}).to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(responses.status(), StatusCode::OK);
+        let responses_body = response_body_text(responses).await;
+        assert!(responses_body.contains("event: response.output_text.delta"));
+        assert!(responses_body.contains("event: response.completed"));
+        assert!(responses_body.find("response.output_text.delta").unwrap() < responses_body.find("response.completed").unwrap());
+    }
+
+    #[tokio::test]
+    async fn closed_client_channel_requests_cancel_and_unknown_without_release() {
+        let (fixture, _) = phase3_stream_fixture(
+            StreamTerminalOutcome::Success {
+                actual_units: None,
+                upstream_request_ref: None,
+            },
+            CancelSupport::Unsupported,
+            true,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "phase3-disconnect".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(true),
+        )
+        .await;
+        drop(response);
+
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        let mut lease_state = String::new();
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            lease_state = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3"))
+                .unwrap()
+                .query_row("SELECT state FROM upstream_leases", [], |row| row.get(0))
+                .unwrap_or_default();
+            if lease_state == "unknown" {
+                break;
+            }
+        }
+        assert_eq!(lease_state, "unknown");
+        let request_id: String = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3"))
+            .unwrap()
+            .query_row("SELECT request_id FROM upstream_leases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(store.request_state(&request_id).unwrap(), RequestState::Unknown);
+        assert_eq!(store.reservation_for_request(&request_id).unwrap().unwrap().state, aiwork_core::ReservationState::Unknown);
+        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 1);
+    }
+
+    #[tokio::test]
+    async fn core_stream_without_registered_adapter_returns_501_before_lease() {
+        let (fixture, _) = phase3_stream_fixture(
+            StreamTerminalOutcome::Success {
+                actual_units: None,
+                upstream_request_ref: None,
+            },
+            CancelSupport::Unsupported,
+            false,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "phase3-no-stream-adapter".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(true),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "scheduler_endpoint_not_enabled");
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        assert_eq!(store.count_rows("requests").unwrap(), 0);
+        assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
     }
 }
