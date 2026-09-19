@@ -6,8 +6,9 @@ use std::{
 };
 
 use aiwork_core::{
-    BeginRequestInput, CoreStore, CostPolicy, LeaseState, NewUser, ObservationStatus, Principal,
-    PreflightReserveInput, QuotaGrant, QuotaReserve, RegisterUpstreamAccount, ReserveResult,
+    BeginRequestInput, CoreError, CoreStore, CostPolicy, KeyQuotaGrant, LeaseState,
+    LegacyQuotaAllocation, NewUser, ObservationStatus, Principal, PreflightReserveInput,
+    QuotaBudgetScope, QuotaGrant, QuotaReserve, RegisterUpstreamAccount, ReserveResult,
     SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, Settlement, UpstreamAccountState,
     UpstreamObservation, UserRole, CORE_DB_FILE,
 };
@@ -454,6 +455,155 @@ fn user_quota_usage_projection_is_owner_scoped_bounded_and_redacted() {
         Err(aiwork_core::CoreError::Validation { .. })
     ));
 
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn key_grant_rejects_cross_user_key_and_non_positive_amount() {
+    let (store, dir) = test_store_with_grant(20);
+    store.create_user(user("u2", UserRole::User), "admin-1").unwrap();
+    let key_a = store
+        .issue_api_key("u1", "key-a", Default::default(), "admin-1")
+        .unwrap();
+    let key_b = store
+        .issue_api_key("u2", "key-b", Default::default(), "admin-1")
+        .unwrap();
+    let admin_key = store
+        .issue_api_key("admin-1", "admin", Default::default(), "admin-1")
+        .unwrap();
+    let admin = Principal {
+        user_id: "admin-1".into(),
+        key_id: admin_key.id,
+        scopes: Default::default(),
+    };
+    let user_principal = Principal {
+        user_id: "u1".into(),
+        key_id: key_a.id.clone(),
+        scopes: Default::default(),
+    };
+
+    let balance = store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: key_a.id.clone(),
+                resource_kind: "chat_request".into(),
+                amount: 10,
+                actor_user_id: "forged-user".into(),
+                reason: "initial".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(balance.scope, QuotaBudgetScope::Key);
+    assert_eq!(balance.api_key_id.as_deref(), Some(key_a.id.as_str()));
+    assert_eq!(balance.user_id, "u1");
+    assert_eq!(balance.available, 10);
+    assert!(balance.key_quota_configured);
+
+    assert!(matches!(
+        store.key_quota_balance_as_admin(&user_principal, &key_a.id, "chat_request"),
+        Err(CoreError::AdminRequired)
+    ));
+    assert!(matches!(
+        store.key_quota_grant_as_admin(
+            &user_principal,
+            KeyQuotaGrant {
+                api_key_id: key_b.id.clone(),
+                resource_kind: "chat_request".into(),
+                amount: 1,
+                actor_user_id: "user".into(),
+                reason: "forged".into(),
+            },
+        ),
+        Err(CoreError::AdminRequired)
+    ));
+    assert!(matches!(
+        store.key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: key_a.id.clone(),
+                resource_kind: "chat_request".into(),
+                amount: 0,
+                actor_user_id: "admin-1".into(),
+                reason: "invalid".into(),
+            },
+        ),
+        Err(CoreError::InvalidQuotaAmount)
+    ));
+    assert!(matches!(
+        store.key_quota_balance_as_admin(&admin, &key_b.id, "video_job"),
+        Err(CoreError::KeyQuotaNotConfigured { .. })
+    ));
+
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn legacy_allocation_moves_once_without_copying() {
+    let (store, dir) = test_store_with_grant(20);
+    let key = store
+        .issue_api_key("u1", "key-a", Default::default(), "admin-1")
+        .unwrap();
+    let admin_key = store
+        .issue_api_key("admin-1", "admin", Default::default(), "admin-1")
+        .unwrap();
+    let admin = Principal {
+        user_id: "admin-1".into(),
+        key_id: admin_key.id,
+        scopes: Default::default(),
+    };
+    let input = LegacyQuotaAllocation {
+        source_user_id: "u1".into(),
+        api_key_id: key.id.clone(),
+        resource_kind: "chat_request".into(),
+        amount: 7,
+        actor_user_id: "forged-user".into(),
+        reason: "legacy split".into(),
+        migration_id: "legacy-split-1".into(),
+    };
+
+    let first = store
+        .key_quota_allocate_legacy_as_admin(&admin, input.clone())
+        .unwrap();
+    let second = store
+        .key_quota_allocate_legacy_as_admin(&admin, input)
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.available, 7);
+    assert_eq!(first.migration_state, aiwork_core::QuotaMigrationState::Ready);
+
+    let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
+    let (account_count, key_ledger_count, event_group_count): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM quota_budget_accounts WHERE scope = 'key'),
+                (SELECT COUNT(*) FROM quota_ledger WHERE api_key_id = ?1 AND event_group_id = ?2),
+                (SELECT COUNT(*) FROM quota_ledger WHERE event_group_id = ?2)",
+            [&key.id, &"legacy-split-1".to_owned()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(account_count, 1);
+    assert_eq!(key_ledger_count, 1);
+    assert_eq!(event_group_count, 2);
+
+    let (source_available, source_state): (i64, String) = connection
+        .query_row(
+            "SELECT
+                COALESCE((SELECT SUM(delta) FROM quota_ledger WHERE budget_account_id = q.id), 0),
+                q.migration_state
+             FROM quota_budget_accounts q
+             WHERE q.scope = 'user_cap' AND q.user_id = 'u1' AND q.resource_kind = 'chat_request'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(source_available, 13);
+    assert_eq!(source_state, "ready");
+
+    drop(connection);
     drop(store);
     fs::remove_dir_all(dir).unwrap();
 }

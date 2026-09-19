@@ -701,6 +701,14 @@ pub enum QuotaBudgetScope {
 }
 
 impl QuotaBudgetScope {
+    pub(crate) fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "user_cap" => Some(Self::UserCap),
+            "key" => Some(Self::Key),
+            _ => None,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UserCap => "user_cap",
@@ -717,6 +725,15 @@ pub enum QuotaMigrationState {
 }
 
 impl QuotaMigrationState {
+    pub(crate) fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "ready" => Some(Self::Ready),
+            "legacy_unassigned" => Some(Self::LegacyUnassigned),
+            "reconcile_required" => Some(Self::ReconcileRequired),
+            _ => None,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ready => "ready",

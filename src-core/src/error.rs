@@ -52,6 +52,14 @@ pub enum CoreError {
     MissingScope { scope: String },
     #[error("quota is insufficient: available {available}, required {required}")]
     QuotaInsufficient { available: i64, required: i64 },
+    #[error("key quota is not configured for api key {api_key_id} and resource {resource_kind}")]
+    KeyQuotaNotConfigured { api_key_id: String, resource_kind: String },
+    #[error("quota budget account {account_id} requires migration reconciliation")]
+    QuotaMigrationPending { account_id: String },
+    #[error("api key {api_key_id} does not belong to user {user_id}")]
+    ApiKeyOwnershipMismatch { api_key_id: String, user_id: String },
+    #[error("quota migration {migration_id} conflicts with an existing allocation")]
+    QuotaMigrationConflict { migration_id: String },
     #[error("idempotency key conflicts with an existing request")]
     IdempotencyConflict,
     #[error("reservation {reservation_id} failed after reservation: {source}")]
