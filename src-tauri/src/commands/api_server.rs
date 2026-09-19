@@ -14,12 +14,15 @@ use crate::api_server::models_sync;
 use crate::api_server::pool::ApiPool;
 use crate::api_server::server::{start_api_server, ApiServerHandle};
 use crate::api_server::{ApiLogger, ApiSharedState};
+use crate::api_server::scheduler::{self, AccountDirectory, SchedulerError, SchedulerMode, SchedulerRuntime};
+use crate::models::SchedulerStatus;
 
 /// 运行时状态：服务器句柄 + 共享状态
 pub struct ApiServerRuntime {
     pub handle: ApiServerHandle,
     pub shared: Arc<ApiSharedState>,
     pub started_at: u64,
+    pub scheduler_status: SchedulerStatus,
 }
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
@@ -55,6 +58,15 @@ pub async fn do_start(
     state: &AppState,
     runtime: &Mutex<Option<ApiServerRuntime>>,
 ) -> Result<ApiServiceStatus, String> {
+    do_start_with_scheduler_key(app, state, runtime, None).await
+}
+
+async fn do_start_with_scheduler_key(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
+    scheduler_admin_key: Option<&str>,
+) -> Result<ApiServiceStatus, String> {
     // 检查是否已运行
     {
         let guard = safe_lock(runtime);
@@ -66,7 +78,9 @@ pub async fn do_start(
     // 网关设置（§8.1/§9.2）：port / default_model 改读 data/api_gateway_settings.json；
     // 新文件缺失时从 app_settings.json 旧字段一次性迁移（旧字段保留不删，防回滚）。
     // load 已将空 default_model 兜底为内置默认，无需再 trim 判空
-    let gw = crate::api_server::gateway_settings::load(&state.data_dir);
+    let gw = crate::api_server::gateway_settings::load_checked(&state.data_dir)?;
+    let scheduler_mode = crate::api_server::gateway_settings::validate_modes(&gw)?;
+    let mut scheduler_status = SchedulerStatus { mode: scheduler_mode, ..Default::default() };
     // 恢复跨重启仍可查询的视频任务，并清理过期产物。任务索引目录跟随
     // AppState/AIWORK_DATA_DIR，视频文件目录可由 AIWORK_VIDEO_DIR 独立指定。
     crate::api_server::video::load_persisted(&state.data_dir);
@@ -84,8 +98,15 @@ pub async fn do_start(
     let cors_origins = gw.cors_origins.clone();
     let core_mode = crate::api_server::CoreMode::try_from(gw.core_mode.as_str())
         .map_err(|error| error.to_string())?;
-    let core = crate::api_server::CoreBridge::open_for_mode(core_mode, &state.data_dir)
-        .map_err(|error| error.to_string())?;
+    let mut core = match crate::api_server::CoreBridge::open_for_mode(core_mode, &state.data_dir) {
+        Ok(core) => core,
+        Err(_) if core_mode == crate::api_server::CoreMode::Shadow => {
+            scheduler_status.last_error = Some(SchedulerError::StorageUnavailable.code().into());
+            fs_utils::app_log(&state.data_dir, SchedulerError::StorageUnavailable.code());
+            None
+        }
+        Err(_) => return Err(SchedulerError::StorageUnavailable.to_string()),
+    };
 
     // LAN 监听不可在无 API Key 的情况下启动，避免把本机凭证池直接暴露给同网段设备。
     let lan_listener = !matches!(listen_host.as_str(), "127.0.0.1" | "localhost" | "::1");
@@ -235,6 +256,44 @@ pub async fn do_start(
     );
     wb_pool.set_strategy(wb_strategy);
 
+    // Sync only when a scheduler is enabled. No reader or executor is invoked at startup.
+    if scheduler_mode != SchedulerMode::Off {
+        if let Some(bridge) = core.as_ref() {
+            let store = bridge.store.clone();
+            let synced = AccountDirectory::from_legacy(
+                &accounts.accounts, &wb_accounts, &pool_file, &groups_file, &cooldowns_file,
+                &credits_file, chrono::Utc::now().timestamp_millis(),
+            ).and_then(|directory| {
+                let principal = scheduler::authenticate_sync_admin(&store, scheduler_admin_key)?;
+                scheduler::sync_upstream_accounts(&store, &state.data_dir, &principal, &directory)?;
+                Ok(directory.readers(app))
+            });
+            let (readers, sync_error) = match synced {
+                Ok(readers) => (readers, None),
+                Err(error) if scheduler_mode == SchedulerMode::Shadow => (Default::default(), Some(error)),
+                Err(error) => return Err(error.to_string()),
+            };
+            let scheduler = Arc::new(SchedulerRuntime::new(
+                store.clone(), state.data_dir.clone(), scheduler_mode, readers, Default::default(),
+                chrono::Utc::now().timestamp_millis(),
+            ).map_err(|error| error.to_string())?);
+            if let Some(error) = sync_error { scheduler.note_error(error); }
+            scheduler_status = if scheduler_mode == SchedulerMode::Shadow {
+                scheduler.shadow_dry_run(chrono::Utc::now().timestamp_millis())
+            } else { scheduler.scheduler_status() };
+            core = Some(Arc::new(crate::api_server::CoreBridge::new(store, core_mode)
+                .with_scheduler(scheduler).map_err(|error| error.to_string())?));
+        }
+    }
+
+    // Task 5 owns endpoint wiring. Until then do not expose the Phase 1 legacy-backed
+    // enforcing Chat route, even if account sync and lease recovery succeeded.
+    if core_mode == crate::api_server::CoreMode::Enforce {
+        core.as_ref().ok_or_else(|| SchedulerError::NotReady.to_string())?
+            .scheduler().map_err(|error| error.to_string())?
+            .require_endpoint("chat").map_err(|error| error.to_string())?;
+    }
+
     // 池为空时给出明确警告
     if pool_count == 0 {
         fs_utils::app_log(
@@ -289,6 +348,7 @@ pub async fn do_start(
         .as_secs();
 
     let status = ApiServiceStatus {
+        scheduler: scheduler_status.clone(),
         running: true,
         host: listen_host.clone(),
         port,
@@ -302,6 +362,7 @@ pub async fn do_start(
         handle,
         shared: shared.clone(),
         started_at: now,
+        scheduler_status,
     });
 
     // 同步托盘菜单文本 + 系统通知
@@ -320,8 +381,9 @@ pub async fn api_server_start(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    scheduler_admin_key: Option<String>,
 ) -> Result<ApiServiceStatus, String> {
-    do_start(&app, &state, &runtime).await
+    do_start_with_scheduler_key(&app, &state, &runtime, scheduler_admin_key.as_deref()).await
 }
 
 /// 停止 API 服务核心逻辑（页面命令 / 托盘菜单共用）
@@ -377,6 +439,8 @@ pub fn api_server_status(
             let active = safe_lock(&rt.shared.active_uid).clone();
             let last_err = safe_lock(&rt.shared.last_error).clone();
             ApiServiceStatus {
+                scheduler: rt.shared.core.as_ref().and_then(|core| core.scheduler().ok())
+                    .map(SchedulerRuntime::scheduler_status).unwrap_or_else(|| rt.scheduler_status.clone()),
                 running: true,
                 host: host.clone(),
                 port,
@@ -387,6 +451,7 @@ pub fn api_server_status(
             }
         }
         None => ApiServiceStatus {
+            scheduler: SchedulerStatus::default(),
             running: false,
             host,
             port,

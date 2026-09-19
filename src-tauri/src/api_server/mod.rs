@@ -16,6 +16,7 @@ pub mod payload;
 pub mod retry;
 pub mod routes;
 pub mod server;
+pub mod scheduler;
 pub mod sse;
 pub mod unified_catalog;
 pub mod upstream_observation;

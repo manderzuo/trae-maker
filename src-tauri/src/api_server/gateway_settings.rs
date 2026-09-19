@@ -36,6 +36,9 @@ pub struct GatewaySettings {
     /// Core bridge mode: off, shadow, or enforce.
     #[serde(default = "default_core_mode")]
     pub core_mode: String,
+    /// Scheduler rollout is opt-in and bounded by core_mode.
+    #[serde(default = "default_core_mode")]
+    pub scheduler_mode: String,
     #[serde(default)]
     pub updated_at: i64,
 }
@@ -65,6 +68,7 @@ impl Default for GatewaySettings {
             cors_origins: String::new(),
             asset_public_base_url: String::new(),
             core_mode: default_core_mode(),
+            scheduler_mode: default_core_mode(),
             updated_at: 0,
         }
     }
@@ -158,6 +162,7 @@ pub fn load(data_dir: &Path) -> GatewaySettings {
         cors_origins: String::new(),
         asset_public_base_url: String::new(),
         core_mode: default_core_mode(),
+        scheduler_mode: default_core_mode(),
         updated_at: 0,
     });
     // 迁移落盘失败不阻塞启动（下次启动重试），内存值仍生效
@@ -167,6 +172,7 @@ pub fn load(data_dir: &Path) -> GatewaySettings {
 
 /// 保存网关设置（端口/模型合法性由调用方校验后传入；这里兜底端口范围）
 pub fn save(data_dir: &Path, s: GatewaySettings) -> Result<(), String> {
+    validate_modes(&s)?;
     if s.port == 0 {
         return Err("端口无效（1-65535）".into());
     }
@@ -178,10 +184,60 @@ pub fn save(data_dir: &Path, s: GatewaySettings) -> Result<(), String> {
     crate::fs_utils::write_json(&settings_path(data_dir), &s)
 }
 
+/// Startup must not silently turn malformed enforcing settings into legacy/off.
+pub fn load_checked(data_dir: &Path) -> Result<GatewaySettings, String> {
+    let path = settings_path(data_dir);
+    let settings = if path.exists() {
+        let text = std::fs::read_to_string(path).map_err(|_| "gateway_settings_unreadable".to_string())?;
+        apply_env(serde_json::from_str(&text).map_err(|_| "gateway_settings_invalid".to_string())?)
+    } else { load(data_dir) };
+    validate_modes(&settings)?;
+    Ok(settings)
+}
+
+pub fn validate_modes(settings: &GatewaySettings) -> Result<crate::api_server::scheduler::SchedulerMode, String> {
+    let core = crate::api_server::CoreMode::try_from(settings.core_mode.as_str())
+        .map_err(|_| "core_mode_invalid".to_string())?;
+    let scheduler = crate::api_server::scheduler::SchedulerMode::try_from(settings.scheduler_mode.as_str())
+        .map_err(|e| e.to_string())?;
+    crate::api_server::scheduler::validate_modes(core, scheduler).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn scheduler_mode_defaults_to_off_and_round_trips_unknown_as_error() {
+        use crate::api_server::scheduler::SchedulerMode;
+        let legacy: GatewaySettings = serde_json::from_value(json!({"port": 8000})).unwrap();
+        assert_eq!(legacy.scheduler_mode, "off");
+        assert_eq!(SchedulerMode::try_from(legacy.scheduler_mode.as_str()).unwrap(), SchedulerMode::Off);
+        let f = fixture(None);
+        for mode in ["off", "shadow", "enforce"] {
+            let settings = GatewaySettings { scheduler_mode: mode.into(), ..Default::default() };
+            save(&f.dir, settings).unwrap();
+            assert_eq!(load_checked(&f.dir).unwrap().scheduler_mode, mode);
+        }
+        let invalid = GatewaySettings { scheduler_mode: "typo-secret".into(), ..Default::default() };
+        let error = save(&f.dir, invalid).unwrap_err();
+        assert!(error.contains("scheduler_mode_invalid"));
+        assert!(!error.contains("typo-secret"));
+    }
+
+    #[test]
+    fn scheduler_startup_does_not_default_corrupt_or_invalid_modes_to_off() {
+        let f = fixture(None);
+        for value in [r#"{"scheduler_mode":"typo"}"#, r#"{"scheduler_mode":7}"#, "broken"] {
+            std::fs::write(settings_path(&f.dir), value).unwrap();
+            assert!(load_checked(&f.dir).is_err());
+        }
+        for mode in ["off", "shadow"] {
+            let settings = GatewaySettings { core_mode: "enforce".into(), scheduler_mode: mode.into(), ..Default::default() };
+            assert!(save(&f.dir, settings).is_err());
+        }
+    }
 
     struct Fixture {
         dir: std::path::PathBuf,
@@ -259,6 +315,7 @@ mod tests {
                 cors_origins: String::new(),
                 asset_public_base_url: String::new(),
                 core_mode: default_core_mode(),
+                scheduler_mode: default_core_mode(),
                 updated_at: 0,
             },
         )
@@ -277,6 +334,7 @@ mod tests {
                 cors_origins: String::new(),
                 asset_public_base_url: String::new(),
                 core_mode: default_core_mode(),
+                scheduler_mode: default_core_mode(),
                 updated_at: 0,
             },
         )
@@ -292,6 +350,7 @@ mod tests {
                 cors_origins: String::new(),
                 asset_public_base_url: String::new(),
                 core_mode: default_core_mode(),
+                scheduler_mode: default_core_mode(),
                 updated_at: 0
             },
         )
@@ -310,6 +369,7 @@ mod tests {
                 cors_origins: String::new(),
                 asset_public_base_url: "  https://example.test/v1///  ".into(),
                 core_mode: default_core_mode(),
+                scheduler_mode: default_core_mode(),
                 updated_at: 0,
             },
         )

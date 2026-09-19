@@ -399,6 +399,8 @@ pub struct PoolStatus {
 /// API 服务整体状态（给前端用）
 #[derive(Serialize, Clone)]
 pub struct ApiServiceStatus {
+    /// Local management diagnostics only; not included in public health responses.
+    pub scheduler: SchedulerStatus,
     pub running: bool,
     pub host: String,
     pub port: u16,
@@ -406,4 +408,20 @@ pub struct ApiServiceStatus {
     pub active_uid: Option<String>,
     pub last_error: Option<String>,
     pub started_at: Option<u64>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct SchedulerStatus {
+    pub mode: crate::api_server::scheduler::SchedulerMode,
+    pub ready: bool,
+    pub accounts: u64,
+    pub enabled_accounts: u64,
+    pub fresh_observations: u64,
+    pub stale_observations: u64,
+    pub active_leases: u64,
+    pub unknown_leases: u64,
+    pub recovered_leases: u64,
+    pub dry_runs: u64,
+    pub reader_failures: u64,
+    pub last_error: Option<String>,
 }

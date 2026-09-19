@@ -51,11 +51,27 @@ pub enum ChatOutcome {
 pub struct CoreBridge {
     pub store: Arc<CoreStore>,
     pub mode: CoreMode,
+    scheduler: Option<Arc<super::scheduler::SchedulerRuntime>>,
 }
 
 impl CoreBridge {
     pub fn new(store: Arc<CoreStore>, mode: CoreMode) -> Self {
-        Self { store, mode }
+        Self { store, mode, scheduler: None }
+    }
+
+    pub fn with_scheduler(mut self, scheduler: Arc<super::scheduler::SchedulerRuntime>) -> Result<Self, super::scheduler::SchedulerError> {
+        use super::scheduler::{validate_modes, SchedulerError, SchedulerMode};
+        let effective = validate_modes(self.mode, scheduler.mode)?;
+        if effective == SchedulerMode::Off || effective != scheduler.mode || !Arc::ptr_eq(&self.store, &scheduler.store) {
+            return Err(SchedulerError::NotReady);
+        }
+        self.scheduler = Some(scheduler);
+        Ok(self)
+    }
+
+    /// A missing runtime is an error, never permission to use a legacy pool.
+    pub fn scheduler(&self) -> Result<&super::scheduler::SchedulerRuntime, super::scheduler::SchedulerError> {
+        self.scheduler.as_deref().ok_or(super::scheduler::SchedulerError::NotReady)
     }
 
     pub fn open_for_mode(mode: CoreMode, data_dir: &Path) -> Result<Option<Arc<Self>>, CoreError> {
