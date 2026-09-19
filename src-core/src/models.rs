@@ -502,6 +502,13 @@ pub struct CoreJobAttempt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoJobQueueClaim {
+    pub job: CoreJob,
+    pub attempt: CoreJobAttempt,
+    pub lease: UpstreamLease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeginRequestInput {
     pub user_id: String,
     pub api_key_id: String,

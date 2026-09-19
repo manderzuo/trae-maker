@@ -1,8 +1,8 @@
 use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::{
-    CoreError, CoreJob, CoreJobAttempt, CreateVideoJobInput, JobAttemptState, JobState, Principal,
-    RequestState, UpstreamLease,
+    CoreError, CoreJob, CoreJobAttempt, CreateVideoJobInput, JobAttemptState, JobState, LeaseState,
+    Principal, RequestState, ScheduleError, UpstreamLease, VideoJobQueueClaim,
 };
 use crate::upstream::audit_hash;
 
@@ -175,6 +175,170 @@ impl crate::CoreStore {
         };
         drop(connection);
         self.video_job_bundle_for_user(principal, &job_id)
+    }
+
+    pub fn claim_next_video_job(
+        &self,
+        worker_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<VideoJobQueueClaim>, ScheduleError> {
+        let worker_id = worker_id.trim();
+        if worker_id.is_empty() || worker_id.len() > 128 || worker_id.chars().any(char::is_control) {
+            return Err(ScheduleError::Core(CoreError::Validation {
+                field: "queue.worker_id".into(),
+                reason: "must be a bounded non-control identifier".into(),
+            }));
+        }
+
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let last_user_id = transaction
+            .query_row(
+                "SELECT last_user_id FROM dispatch_queue_cursors WHERE resource_kind = 'video_job'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+
+        let user_id = match next_video_queue_user(&transaction, last_user_id.as_deref())? {
+            Some(user_id) => Some(user_id),
+            None if last_user_id.is_some() => next_video_queue_user(&transaction, None)?,
+            None => None,
+        };
+        let Some(user_id) = user_id else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+
+        let Some(job_id) = transaction
+            .query_row(
+                "SELECT j.id
+                 FROM jobs j
+                 INNER JOIN requests r ON r.id = j.request_id
+                 WHERE j.user_id = ?1
+                   AND j.kind = 'video'
+                   AND j.state = 'queued'
+                   AND r.user_id = j.user_id
+                   AND r.state = 'queued'
+                 ORDER BY j.created_at_ms ASC, j.id ASC
+                 LIMIT 1",
+                [&user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+
+        let job = job_by_id_in_transaction(&transaction, &job_id)?.ok_or_else(|| {
+            ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.queue".into(),
+                value: "queue candidate disappeared before claim".into(),
+            })
+        })?;
+        let attempt = attempt_by_job_in_transaction(&transaction, &job.id)?.ok_or_else(|| {
+            ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.attempt".into(),
+                value: "queued video job has no attempt".into(),
+            })
+        })?;
+        let lease = lease_in_transaction(&transaction, &attempt.lease_id)?.ok_or_else(|| {
+            ScheduleError::Core(CoreError::ReservationNotFound {
+                reservation_id: attempt.lease_id.clone(),
+            })
+        })?;
+        let request_state = Self::request_state_in_transaction(&transaction, &job.request_id)?;
+        if job.user_id != user_id
+            || job.kind != "video"
+            || job.state != JobState::Queued
+            || request_state != RequestState::Queued
+            || attempt.job_id != job.id
+            || attempt.state != JobAttemptState::Queued
+            || attempt.account_ref != lease.account_ref
+            || lease.request_id != job.request_id
+            || lease.resource_kind != "video_job"
+            || lease.state != LeaseState::Held
+        {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.queue".into(),
+                value: "queued video job, attempt, request, and lease are inconsistent".into(),
+            }));
+        }
+
+        Self::transition_request_on_connection(
+            &transaction,
+            &job.request_id,
+            RequestState::Queued,
+            RequestState::Dispatched,
+            None,
+            now_ms,
+        )?;
+        if transaction.execute(
+            "UPDATE jobs
+             SET state = 'running', updated_at_ms = ?1, last_heartbeat_ms = ?1
+             WHERE id = ?2 AND state = 'queued'",
+            params![now_ms, &job.id],
+        )? != 1 {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.state".into(),
+                value: "queue claim could not transition job".into(),
+            }));
+        }
+        if transaction.execute(
+            "UPDATE job_attempts
+             SET state = 'running', updated_at_ms = ?1, last_heartbeat_ms = ?1
+             WHERE id = ?2 AND state = 'queued'",
+            params![now_ms, &attempt.id],
+        )? != 1 {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "job_attempts.state".into(),
+                value: "queue claim could not transition attempt".into(),
+            }));
+        }
+        if transaction.execute(
+            "UPDATE upstream_leases
+             SET state = 'active', updated_at_ms = ?1
+             WHERE id = ?2 AND state = 'held'",
+            params![now_ms, &lease.id],
+        )? != 1 {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "upstream_leases.state".into(),
+                value: "queue claim could not activate lease".into(),
+            }));
+        }
+        transaction.execute(
+            "INSERT INTO dispatch_queue_cursors (resource_kind, last_user_id, updated_at_ms)
+             VALUES ('video_job', ?1, ?2)
+             ON CONFLICT(resource_kind) DO UPDATE SET
+               last_user_id = excluded.last_user_id,
+               updated_at_ms = excluded.updated_at_ms",
+            params![&job.user_id, now_ms],
+        )?;
+        Self::insert_audit_event(
+            &transaction,
+            "system",
+            "video.job_claim",
+            "job",
+            &audit_hash(&job.id),
+            serde_json::json!({
+                "worker": audit_hash(worker_id),
+                "job": audit_hash(&job.id),
+                "attempt": audit_hash(&attempt.id),
+                "lease": audit_hash(&lease.id),
+            }),
+            now_ms,
+        )?;
+
+        let claimed_job = job_by_id_in_transaction(&transaction, &job.id)?.expect("claimed job remains in transaction");
+        let claimed_attempt = attempt_by_job_in_transaction(&transaction, &job.id)?.expect("claimed attempt remains in transaction");
+        let claimed_lease = lease_in_transaction(&transaction, &lease.id)?.expect("claimed lease remains in transaction");
+        transaction.commit()?;
+        Ok(Some(VideoJobQueueClaim {
+            job: claimed_job,
+            attempt: claimed_attempt,
+            lease: claimed_lease,
+        }))
     }
 
     pub fn mark_video_job_running(
@@ -471,6 +635,73 @@ impl crate::CoreStore {
         )?;
         Ok(())
     }
+}
+
+fn next_video_queue_user(
+    transaction: &Transaction<'_>,
+    after_user_id: Option<&str>,
+) -> Result<Option<String>, CoreError> {
+    transaction
+        .query_row(
+            "WITH queued_users AS (
+                 SELECT j.user_id, MIN(j.created_at_ms) AS earliest_created_at_ms
+                 FROM jobs j
+                 INNER JOIN requests r ON r.id = j.request_id
+                 INNER JOIN users u ON u.id = j.user_id
+                 WHERE j.kind = 'video'
+                   AND j.state = 'queued'
+                   AND r.user_id = j.user_id
+                   AND r.state = 'queued'
+                   AND u.status = 'active'
+                 GROUP BY j.user_id
+             )
+             SELECT user_id
+             FROM queued_users
+             WHERE (?1 IS NULL OR user_id > ?1)
+             ORDER BY earliest_created_at_ms ASC, user_id ASC
+             LIMIT 1",
+            [after_user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(CoreError::from)
+}
+
+fn job_by_id_in_transaction(
+    transaction: &Transaction<'_>,
+    job_id: &str,
+) -> Result<Option<CoreJob>, CoreError> {
+    transaction
+        .query_row(
+            "SELECT id, request_id, user_id, kind, model, input_hash, state,
+                    output_ref, artifact_ref, error_code, reconcile_required,
+                    created_at_ms, updated_at_ms, last_heartbeat_ms, cancel_requested_at_ms
+             FROM jobs WHERE id = ?1",
+            [job_id],
+            job_from_row,
+        )
+        .optional()
+        .map_err(CoreError::from)
+}
+
+fn attempt_by_job_in_transaction(
+    transaction: &Transaction<'_>,
+    job_id: &str,
+) -> Result<Option<CoreJobAttempt>, CoreError> {
+    transaction
+        .query_row(
+            "SELECT id, job_id, attempt_no, account_ref, lease_id,
+                    upstream_request_ref, state, error_code, retryable,
+                    created_at_ms, updated_at_ms, last_heartbeat_ms, finished_at_ms
+             FROM job_attempts
+             WHERE job_id = ?1
+             ORDER BY attempt_no DESC
+             LIMIT 1",
+            [job_id],
+            attempt_from_row,
+        )
+        .optional()
+        .map_err(CoreError::from)
 }
 
 fn job_in_transaction(

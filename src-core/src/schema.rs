@@ -409,3 +409,12 @@ CREATE INDEX jobs_by_recovery ON jobs(state, reconcile_required, updated_at_ms);
 CREATE INDEX job_attempts_by_job_attempt ON job_attempts(job_id, attempt_no DESC);
 CREATE INDEX job_attempts_by_recovery ON job_attempts(state, updated_at_ms);
 "#;
+
+pub(crate) const SCHEMA_V10: &str = r#"
+CREATE TABLE dispatch_queue_cursors (
+  resource_kind TEXT PRIMARY KEY,
+  last_user_id TEXT,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX jobs_by_queue_claim ON jobs(kind, state, created_at_ms, id);
+"#;

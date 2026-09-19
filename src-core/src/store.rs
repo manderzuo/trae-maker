@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 use crate::{
     schema::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
-        SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+        SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
@@ -25,7 +25,7 @@ use crate::{
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 pub struct CoreStore {
     pub(crate) connection: Mutex<Connection>,
@@ -104,6 +104,7 @@ impl CoreStore {
                 Self::migrate_v6_to_v7(&transaction)?;
                 Self::migrate_v7_to_v8(&transaction)?;
                 Self::migrate_v8_to_v9(&transaction)?;
+                Self::migrate_v9_to_v10(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -120,6 +121,7 @@ impl CoreStore {
                 Self::migrate_v6_to_v7(&transaction)?;
                 Self::migrate_v7_to_v8(&transaction)?;
                 Self::migrate_v8_to_v9(&transaction)?;
+                Self::migrate_v9_to_v10(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -135,6 +137,7 @@ impl CoreStore {
                 Self::migrate_v6_to_v7(&transaction)?;
                 Self::migrate_v7_to_v8(&transaction)?;
                 Self::migrate_v8_to_v9(&transaction)?;
+                Self::migrate_v9_to_v10(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -149,6 +152,7 @@ impl CoreStore {
                 Self::migrate_v6_to_v7(&transaction)?;
                 Self::migrate_v7_to_v8(&transaction)?;
                 Self::migrate_v8_to_v9(&transaction)?;
+                Self::migrate_v9_to_v10(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -162,6 +166,7 @@ impl CoreStore {
                 Self::migrate_v6_to_v7(&transaction)?;
                 Self::migrate_v7_to_v8(&transaction)?;
                 Self::migrate_v8_to_v9(&transaction)?;
+                Self::migrate_v9_to_v10(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -174,6 +179,7 @@ impl CoreStore {
                 Self::migrate_v6_to_v7(&transaction)?;
                 Self::migrate_v7_to_v8(&transaction)?;
                 Self::migrate_v8_to_v9(&transaction)?;
+                Self::migrate_v9_to_v10(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -185,6 +191,7 @@ impl CoreStore {
                 Self::migrate_v6_to_v7(&transaction)?;
                 Self::migrate_v7_to_v8(&transaction)?;
                 Self::migrate_v8_to_v9(&transaction)?;
+                Self::migrate_v9_to_v10(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -195,6 +202,7 @@ impl CoreStore {
             7 => {
                 Self::migrate_v7_to_v8(&transaction)?;
                 Self::migrate_v8_to_v9(&transaction)?;
+                Self::migrate_v9_to_v10(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -204,6 +212,15 @@ impl CoreStore {
             }
             8 => {
                 Self::migrate_v8_to_v9(&transaction)?;
+                transaction
+                    .execute(
+                        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![CURRENT_SCHEMA_VERSION.to_string()],
+                    )
+                    .map_err(CoreError::migration)?;
+            }
+            9 => {
+                Self::migrate_v9_to_v10(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -1901,6 +1918,10 @@ impl CoreStore {
 
     fn migrate_v8_to_v9(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
         transaction.execute_batch(SCHEMA_V9).map_err(CoreError::migration)
+    }
+
+    fn migrate_v9_to_v10(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        transaction.execute_batch(SCHEMA_V10).map_err(CoreError::migration)
     }
 
     fn migrate_v5_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
