@@ -9,7 +9,7 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH},
-    upstream::{validate_observation_summary, validate_required},
+    upstream::{validate_observation_summary, validate_opaque_credentials_ref, validate_required},
     AuthError, CoreError, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
     NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
     UpstreamLease, UpstreamObservation, User,
@@ -120,7 +120,7 @@ impl CoreStore {
                     )
                     .map_err(CoreError::migration)?;
             }
-            CURRENT_SCHEMA_VERSION => {}
+            CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
             version => return Err(CoreError::UnsupportedSchemaVersion { version }),
         }
 
@@ -244,7 +244,7 @@ impl CoreStore {
 
     pub fn append_upstream_observation(
         &self,
-        observation: UpstreamObservation,
+        mut observation: UpstreamObservation,
     ) -> Result<UpstreamObservation, CoreError> {
         Self::validate_upstream_observation(&observation)?;
         let summary_json = validate_observation_summary(&observation.summary)?;
@@ -266,6 +266,24 @@ impl CoreStore {
                 field: "summary".into(),
                 reason: "must not contain credentials_ref".into(),
             });
+        }
+        if observation.status == ObservationStatus::Failed {
+            observation.observed_value = transaction
+                .query_row(
+                    "SELECT observed_value FROM upstream_observations
+                     WHERE account_ref = ?1 AND resource_kind = ?2
+                       AND status = 'fresh' AND observed_value IS NOT NULL
+                       AND observed_at_ms <= ?3
+                     ORDER BY observed_at_ms DESC, id DESC
+                     LIMIT 1",
+                    params![
+                        &observation.account_ref,
+                        &observation.resource_kind,
+                        observation.observed_at_ms,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
         }
         transaction.execute(
             "INSERT INTO upstream_observations
@@ -846,7 +864,7 @@ impl CoreStore {
     fn validate_upstream_account(input: &RegisterUpstreamAccount) -> Result<(), CoreError> {
         validate_required("upstream account id", &input.id)?;
         validate_required("upstream account provider", &input.provider)?;
-        validate_required("credentials_ref", &input.credentials_ref)?;
+        validate_opaque_credentials_ref(&input.credentials_ref)?;
         if input.max_concurrency <= 0 {
             return Err(CoreError::Validation { field: "max_concurrency".into(), reason: "must be positive".into() });
         }
@@ -1079,7 +1097,77 @@ impl CoreStore {
             "DROP TABLE upstream_observations;
              ALTER TABLE upstream_observations_next RENAME TO upstream_observations;",
         ).map_err(CoreError::migration)?;
-        transaction.execute_batch(SCHEMA_V6_FINISH).map_err(CoreError::migration)
+        transaction
+            .execute_batch(SCHEMA_V6_FINISH)
+            .map_err(CoreError::migration)?;
+        Self::harden_v6_records(transaction)
+    }
+
+    fn harden_v6_records(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        let accounts = {
+            let mut statement = transaction.prepare(
+                "SELECT id, credentials_ref FROM upstream_accounts",
+            )?;
+            let records = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            records
+        };
+        let now = Utc::now().timestamp_millis();
+        for (id, credentials_ref) in accounts {
+            if validate_opaque_credentials_ref(&credentials_ref).is_err() {
+                let redacted_ref = format!(
+                    "opaque://redacted/{}",
+                    URL_SAFE_NO_PAD.encode(Self::digest_api_key(&id))
+                );
+                transaction.execute(
+                    "UPDATE upstream_accounts
+                     SET credentials_ref = ?1, enabled = 0, state = 'disabled',
+                         cooldown_reason = 'credentials_ref_redacted', updated_at_ms = ?2
+                     WHERE id = ?3",
+                    params![redacted_ref, now, id],
+                )?;
+            }
+        }
+
+        let summaries = {
+            let mut statement = transaction.prepare(
+                "SELECT id, summary_json FROM upstream_observations",
+            )?;
+            let records = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            records
+        };
+        for (id, summary_json) in summaries {
+            let is_safe = serde_json::from_str::<serde_json::Value>(&summary_json)
+                .ok()
+                .and_then(|summary| validate_observation_summary(&summary).ok())
+                .is_some();
+            if !is_safe {
+                transaction.execute(
+                    "UPDATE upstream_observations SET summary_json = '{}' WHERE id = ?1",
+                    [id],
+                )?;
+            }
+        }
+        transaction.execute(
+            "UPDATE upstream_observations AS failed
+             SET observed_value = (
+               SELECT fresh.observed_value
+               FROM upstream_observations AS fresh
+               WHERE fresh.account_ref = failed.account_ref
+                 AND fresh.resource_kind = failed.resource_kind
+                 AND fresh.status = 'fresh'
+                 AND fresh.observed_value IS NOT NULL
+                 AND fresh.observed_at_ms <= failed.observed_at_ms
+               ORDER BY fresh.observed_at_ms DESC, fresh.id DESC
+               LIMIT 1
+             )
+             WHERE failed.status = 'failed'",
+            [],
+        )?;
+        Ok(())
     }
 }
 
