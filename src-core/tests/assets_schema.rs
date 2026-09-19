@@ -83,7 +83,7 @@ fn input(id: &str, expires_at_ms: i64, token: u8) -> CreateAssetInput {
 fn bootstrap_and_migration_create_authoritative_assets_table() {
     let (store, _principal_a, _principal_b, dir) = fixture();
     assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    assert_eq!(CURRENT_SCHEMA_VERSION, 10);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 11);
     assert_eq!(store.table_count("assets").unwrap(), 1);
     assert_eq!(store.count_rows("assets").unwrap(), 0);
     drop(store);
@@ -91,7 +91,7 @@ fn bootstrap_and_migration_create_authoritative_assets_table() {
 }
 
 #[test]
-fn v7_databases_migrate_to_v10_without_importing_legacy_assets() {
+fn v7_databases_migrate_to_v11_without_importing_legacy_assets() {
     let dir = test_dir("v7-migration");
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
@@ -111,7 +111,7 @@ fn v7_databases_migrate_to_v10_without_importing_legacy_assets() {
 
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(store.schema_version().unwrap(), 11);
     assert_eq!(store.count_rows("assets").unwrap(), 0);
     drop(store);
     fs::remove_dir_all(dir).unwrap();

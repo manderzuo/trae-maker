@@ -21,7 +21,8 @@ pub use models::{
     PreflightReserveInput, PreflightReserveResult, QuotaReserve, RequestHandle, RequestResult,
     LeaseState, ObservationStatus, RegisterUpstreamAccount, RequestState, Reservation,
     ReservationState, ReserveResult, Settlement, SharedCoreStore, UpstreamAccount,
-    UpstreamAccountState, UpstreamLease, UpstreamObservation, User, UserRole, VideoJobQueueClaim,
+    UpstreamAccountState, UpstreamLease, UpstreamObservation, User, UserRole, VideoJobEnqueueResult,
+    VideoJobQueueClaim,
 };
 pub use ports::{
     ChatExecutionRequest, ChatExecutionResult, ChatExecutor, MockChatExecutor,

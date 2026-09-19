@@ -3,7 +3,8 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 use aiwork_core::{
     BeginRequestInput, CoreStore, CostPolicy, CreateVideoJobInput, LeaseOutcome, LeaseState, NewUser, ObservationStatus,
     PreflightReserveInput, Principal, QuotaGrant, RegisterUpstreamAccount, SchedulerLeaseRequest,
-    SelectionStrategy, UpstreamObservation, UserRole, VideoJobLeaseResult, CURRENT_SCHEMA_VERSION,
+    SelectionStrategy, UpstreamObservation, UserRole, VideoJobEnqueueResult, VideoJobLeaseResult,
+    CURRENT_SCHEMA_VERSION,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -232,8 +233,8 @@ fn durable_video_queue_claim_round_robins_users_and_claims_each_job_once() {
     .into_iter()
     .enumerate()
     {
-        store
-            .preflight_video_job(
+        let result = store
+            .enqueue_video_job(
                 owner,
                 queue_request(owner, user_id, &format!("queue-{index}"), 1_800_000_000_000 + index as i64),
                 CreateVideoJobInput {
@@ -242,7 +243,10 @@ fn durable_video_queue_claim_round_robins_users_and_claims_each_job_once() {
                 },
             )
             .unwrap();
+        assert!(matches!(result, VideoJobEnqueueResult::Created { .. }));
     }
+
+    assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
 
     let claimed = (0..4)
         .map(|index| {
@@ -268,8 +272,8 @@ fn durable_video_queue_claim_round_robins_users_and_claims_each_job_once() {
 #[test]
 fn bootstrap_creates_authoritative_video_job_tables() {
     let (store, _admin, _principal, dir) = fixture();
-    assert_eq!(CURRENT_SCHEMA_VERSION, 10);
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 11);
+    assert_eq!(store.schema_version().unwrap(), 11);
     for table in ["jobs", "job_attempts", "dispatch_queue_cursors"] {
         assert_eq!(store.table_count(table).unwrap(), 1, "missing table {table}");
         assert_eq!(store.count_rows(table).unwrap(), 0);
@@ -295,6 +299,7 @@ fn v8_migration_preserves_assets_and_does_not_import_legacy_video_jobs() {
              SELECT 'legacy-video', 'legacy-key', id, 'processing', 1, 1, 1,
                     'phase3c-test', id, 'fixture'
                FROM users WHERE id = 'video-user';
+             DROP TABLE dispatch_queue_cursors;
              DROP TABLE jobs;
              DROP TABLE job_attempts;
              UPDATE schema_meta SET value = '8' WHERE key = 'schema_version';",
@@ -304,7 +309,7 @@ fn v8_migration_preserves_assets_and_does_not_import_legacy_video_jobs() {
 
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(store.schema_version().unwrap(), 11);
     assert_eq!(store.count_rows("jobs").unwrap(), 0);
     assert_eq!(store.count_rows("job_attempts").unwrap(), 0);
     assert_eq!(store.table_count("assets").unwrap(), 1);

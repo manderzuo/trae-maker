@@ -1,8 +1,11 @@
 use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
+use serde_json::Value;
 
 use crate::{
-    CoreError, CoreJob, CoreJobAttempt, CreateVideoJobInput, JobAttemptState, JobState, LeaseState,
-    Principal, RequestState, ScheduleError, UpstreamLease, VideoJobQueueClaim,
+    BeginRequestInput, CoreError, CoreJob, CoreJobAttempt, CreateVideoJobInput, JobAttemptState,
+    JobState, LeaseState, PreflightReserveInput, Principal, RequestState,
+    ReservationState, ScheduleError, SchedulerLeaseRequest, SelectionStrategy, UpstreamLease,
+    VideoJobQueueClaim,
 };
 use crate::upstream::audit_hash;
 
@@ -86,6 +89,47 @@ pub(crate) fn insert_video_job_and_attempt(
             "attempt": audit_hash(&attempt_id),
             "model": crate::upstream::audit_label(model),
             "state": "queued"
+        }),
+        now_ms,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn insert_video_job_without_attempt(
+    transaction: &Transaction<'_>,
+    principal: &Principal,
+    request_id: &str,
+    model: &str,
+    input: &CreateVideoJobInput,
+    now_ms: i64,
+) -> Result<(), CoreError> {
+    validate_video_job_input(input)?;
+    transaction.execute(
+        "INSERT INTO jobs
+         (id, request_id, user_id, kind, model, input_hash, state, reconcile_required,
+          created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, 'video', ?4, ?5, 'queued', 0, ?6, ?6)",
+        params![&input.id, request_id, &principal.user_id, model, &input.input_hash, now_ms],
+    )?;
+    crate::CoreStore::transition_request_on_connection(
+        transaction,
+        request_id,
+        RequestState::Reserved,
+        RequestState::Queued,
+        None,
+        now_ms,
+    )?;
+    crate::CoreStore::insert_audit_event(
+        transaction,
+        &principal.user_id,
+        "video.job_enqueue",
+        "job",
+        &audit_hash(&input.id),
+        serde_json::json!({
+            "job": audit_hash(&input.id),
+            "request": audit_hash(request_id),
+            "model": crate::upstream::audit_label(model),
+            "state": "queued",
         }),
         now_ms,
     )?;
@@ -237,17 +281,103 @@ impl crate::CoreStore {
                 value: "queue candidate disappeared before claim".into(),
             })
         })?;
-        let attempt = attempt_by_job_in_transaction(&transaction, &job.id)?.ok_or_else(|| {
-            ScheduleError::Core(CoreError::InvalidConfiguration {
-                key: "jobs.attempt".into(),
-                value: "queued video job has no attempt".into(),
-            })
-        })?;
-        let lease = lease_in_transaction(&transaction, &attempt.lease_id)?.ok_or_else(|| {
-            ScheduleError::Core(CoreError::ReservationNotFound {
-                reservation_id: attempt.lease_id.clone(),
-            })
-        })?;
+        let (attempt, lease) = if let Some(attempt) = attempt_by_job_in_transaction(&transaction, &job.id)? {
+            let lease = lease_in_transaction(&transaction, &attempt.lease_id)?.ok_or_else(|| {
+                ScheduleError::Core(CoreError::ReservationNotFound {
+                    reservation_id: attempt.lease_id.clone(),
+                })
+            })?;
+            (attempt, lease)
+        } else {
+            let queue_input = scheduler_request_for_queued_video_job(&transaction, &job, now_ms)?;
+            let reservation = Self::reservation_by_request(&transaction, &job.request_id)?
+                .ok_or_else(|| ScheduleError::Core(CoreError::ReservationNotFound {
+                    reservation_id: job.request_id.clone(),
+                }))?;
+            if reservation.user_id != job.user_id
+                || reservation.resource_kind != "video_job"
+                || reservation.state != ReservationState::Held
+            {
+                return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                    key: "jobs.reservation".into(),
+                    value: "queued video job does not have a held user reservation".into(),
+                }));
+            }
+            let candidate = Self::select_upstream_candidate(&transaction, &queue_input)?;
+            let lease_expires_at_ms = now_ms
+                .checked_add(queue_input.lease_ttl_ms)
+                .ok_or(CoreError::InvalidQuotaAmount)?;
+            let reconcile_until_ms = now_ms
+                .checked_add(queue_input.reconcile_ttl_ms)
+                .ok_or(CoreError::InvalidQuotaAmount)?;
+            let lease = UpstreamLease {
+                id: Self::new_id("lease"),
+                request_id: job.request_id.clone(),
+                account_ref: candidate.id.clone(),
+                resource_kind: "video_job".into(),
+                predicted_units: queue_input.predicted_units,
+                observation_id: Some(candidate.observation_id.clone()),
+                state: LeaseState::Held,
+                lease_expires_at_ms,
+                reconcile_until_ms: Some(reconcile_until_ms),
+                upstream_request_ref: None,
+                error_kind: None,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                settled_at_ms: None,
+            };
+            transaction.execute(
+                "INSERT INTO upstream_leases
+                 (id, request_id, account_ref, resource_kind, predicted_units, observation_id,
+                  state, lease_expires_at_ms, reconcile_until_ms, upstream_request_ref, error_kind,
+                  created_at_ms, updated_at_ms, settled_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?10, NULL)",
+                params![
+                    &lease.id,
+                    &lease.request_id,
+                    &lease.account_ref,
+                    &lease.resource_kind,
+                    lease.predicted_units,
+                    &lease.observation_id,
+                    lease.state.as_str(),
+                    lease.lease_expires_at_ms,
+                    lease.reconcile_until_ms,
+                    now_ms,
+                ],
+            )?;
+            let attempt_id = Self::new_id("attempt");
+            transaction.execute(
+                "INSERT INTO job_attempts
+                 (id, job_id, attempt_no, account_ref, lease_id, state, retryable,
+                  created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 1, ?3, ?4, 'queued', 0, ?5, ?5)",
+                params![&attempt_id, &job.id, &lease.account_ref, &lease.id, now_ms],
+            )?;
+            Self::insert_audit_event(
+                &transaction,
+                "system",
+                "upstream.lease_acquire",
+                "upstream_lease",
+                &audit_hash(&lease.id),
+                serde_json::json!({
+                    "request": audit_hash(&job.request_id),
+                    "lease": audit_hash(&lease.id),
+                    "account": audit_hash(&lease.account_ref),
+                    "provider": crate::upstream::audit_label(&candidate.provider),
+                    "resource_kind": "video_job",
+                    "observation": audit_hash(&candidate.observation_id),
+                    "reservation": audit_hash(&reservation.id),
+                }),
+                now_ms,
+            )?;
+            let attempt = attempt_by_job_in_transaction(&transaction, &job.id)?.ok_or_else(|| {
+                ScheduleError::Core(CoreError::InvalidConfiguration {
+                    key: "jobs.attempt".into(),
+                    value: "queue claim did not persist attempt".into(),
+                })
+            })?;
+            (attempt, lease)
+        };
         let request_state = Self::request_state_in_transaction(&transaction, &job.request_id)?;
         if job.user_id != user_id
             || job.kind != "video"
@@ -276,9 +406,10 @@ impl crate::CoreStore {
         )?;
         if transaction.execute(
             "UPDATE jobs
-             SET state = 'running', updated_at_ms = ?1, last_heartbeat_ms = ?1
-             WHERE id = ?2 AND state = 'queued'",
-            params![now_ms, &job.id],
+             SET state = 'running', updated_at_ms = ?1, last_heartbeat_ms = ?1,
+                 queue_claim_owner = ?2, queue_claim_expires_at_ms = ?3
+             WHERE id = ?4 AND state = 'queued'",
+            params![now_ms, worker_id, lease.lease_expires_at_ms, &job.id],
         )? != 1 {
             return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
                 key: "jobs.state".into(),
@@ -637,6 +768,141 @@ impl crate::CoreStore {
     }
 }
 
+fn scheduler_request_for_queued_video_job(
+    transaction: &Transaction<'_>,
+    job: &CoreJob,
+    now_ms: i64,
+) -> Result<SchedulerLeaseRequest, ScheduleError> {
+    let (
+        user_id,
+        api_key_id,
+        protocol,
+        endpoint,
+        provider_hint,
+        required_capabilities_json,
+        region,
+        predicted_units,
+        safety_margin_units,
+        observation_max_age_ms,
+        allowed_accounts_json,
+        dedicated_account,
+        selection_strategy,
+        lease_ttl_ms,
+        reconcile_ttl_ms,
+    ) = transaction.query_row(
+        "SELECT r.user_id, r.api_key_id, r.protocol, r.endpoint,
+                j.queue_provider_hint, j.queue_required_capabilities_json, j.queue_region,
+                j.queue_predicted_units, j.queue_safety_margin_units, j.queue_observation_max_age_ms,
+                j.queue_allowed_accounts_json, j.queue_dedicated_account, j.queue_selection_strategy,
+                j.queue_lease_ttl_ms, j.queue_reconcile_ttl_ms
+         FROM jobs j INNER JOIN requests r ON r.id = j.request_id
+         WHERE j.id = ?1",
+        [&job.id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+                row.get::<_, Option<i64>>(14)?,
+            ))
+        },
+    )?;
+    if user_id != job.user_id || endpoint != "videos" {
+        return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+            key: "jobs.queue.request".into(),
+            value: "queued video job request ownership or endpoint is invalid".into(),
+        }));
+    }
+    let required_capabilities_json = required_capabilities_json.ok_or_else(|| {
+        CoreError::InvalidConfiguration {
+            key: "jobs.queue.required_capabilities".into(),
+            value: "queued video job has no scheduler constraints".into(),
+        }
+    })?;
+    let required_capabilities = serde_json::from_str(&required_capabilities_json).map_err(|_| {
+        ScheduleError::Core(CoreError::InvalidConfiguration {
+            key: "jobs.queue.required_capabilities".into(),
+            value: "queued video job has invalid scheduler constraints".into(),
+        })
+    })?;
+    let allowed_accounts = allowed_accounts_json
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|_| {
+            ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.queue.allowed_accounts".into(),
+                value: "queued video job has invalid account constraints".into(),
+            })
+        })?;
+    let selection_strategy = match selection_strategy.as_deref() {
+        Some("highest_normalized_available") => SelectionStrategy::HighestNormalizedAvailable,
+        Some("least_active_slots") => SelectionStrategy::LeastActiveSlots,
+        _ => {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.queue.selection_strategy".into(),
+                value: "queued video job has an invalid selection strategy".into(),
+            }))
+        }
+    };
+    let predicted_units = predicted_units.ok_or(CoreError::InvalidQuotaAmount)?;
+    let safety_margin_units = safety_margin_units.ok_or(CoreError::InvalidQuotaAmount)?;
+    let observation_max_age_ms = observation_max_age_ms.ok_or(CoreError::InvalidQuotaAmount)?;
+    let lease_ttl_ms = lease_ttl_ms.ok_or(CoreError::InvalidQuotaAmount)?;
+    let reconcile_ttl_ms = reconcile_ttl_ms.ok_or(CoreError::InvalidQuotaAmount)?;
+    if predicted_units <= 0
+        || safety_margin_units < 0
+        || observation_max_age_ms < 0
+        || lease_ttl_ms <= 0
+        || reconcile_ttl_ms <= 0
+    {
+        return Err(ScheduleError::Core(CoreError::InvalidQuotaAmount));
+    }
+    let amount: i64 = transaction.query_row(
+        "SELECT amount FROM quota_reservations WHERE request_id = ?1",
+        [&job.request_id],
+        |row| row.get(0),
+    )?;
+    Ok(SchedulerLeaseRequest {
+        preflight: PreflightReserveInput {
+            request: BeginRequestInput {
+                user_id,
+                api_key_id,
+                protocol,
+                endpoint,
+                model: job.model.clone(),
+                idempotency_key: "queue-claim".into(),
+                body: Value::Null,
+            },
+            resource_kind: "video_job".into(),
+            amount,
+            ttl_ms: 0,
+        },
+        provider_hint,
+        required_capabilities,
+        region,
+        predicted_units,
+        safety_margin_units,
+        observation_max_age_ms,
+        allowed_accounts,
+        dedicated_account,
+        selection_strategy,
+        now_ms,
+        lease_ttl_ms,
+        reconcile_ttl_ms,
+    })
+}
+
 fn next_video_queue_user(
     transaction: &Transaction<'_>,
     after_user_id: Option<&str>,
@@ -761,7 +1027,7 @@ fn lease_in_transaction(
         .map_err(CoreError::from)
 }
 
-fn job_for_request_in_transaction(
+pub(crate) fn job_for_request_in_transaction(
     transaction: &Transaction<'_>,
     request_id: &str,
 ) -> Result<Option<CoreJob>, CoreError> {

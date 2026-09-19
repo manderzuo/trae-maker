@@ -418,3 +418,20 @@ CREATE TABLE dispatch_queue_cursors (
 );
 CREATE INDEX jobs_by_queue_claim ON jobs(kind, state, created_at_ms, id);
 "#;
+
+pub(crate) const SCHEMA_V11: &str = r#"
+ALTER TABLE jobs ADD COLUMN queue_provider_hint TEXT;
+ALTER TABLE jobs ADD COLUMN queue_required_capabilities_json TEXT;
+ALTER TABLE jobs ADD COLUMN queue_region TEXT;
+ALTER TABLE jobs ADD COLUMN queue_predicted_units INTEGER;
+ALTER TABLE jobs ADD COLUMN queue_safety_margin_units INTEGER;
+ALTER TABLE jobs ADD COLUMN queue_observation_max_age_ms INTEGER;
+ALTER TABLE jobs ADD COLUMN queue_allowed_accounts_json TEXT;
+ALTER TABLE jobs ADD COLUMN queue_dedicated_account TEXT;
+ALTER TABLE jobs ADD COLUMN queue_selection_strategy TEXT;
+ALTER TABLE jobs ADD COLUMN queue_lease_ttl_ms INTEGER;
+ALTER TABLE jobs ADD COLUMN queue_reconcile_ttl_ms INTEGER;
+ALTER TABLE jobs ADD COLUMN queue_claim_owner TEXT;
+ALTER TABLE jobs ADD COLUMN queue_claim_expires_at_ms INTEGER;
+CREATE INDEX jobs_by_queue_owner ON jobs(queue_claim_owner, queue_claim_expires_at_ms);
+"#;

@@ -10,7 +10,7 @@ use crate::{
     LeaseOutcome, LeaseState, ObservationStatus, PreflightReserveInput, PreflightReserveResult,
     CreateVideoJobInput, JobAttemptState, JobState, QuotaReserve, RequestHandle, RequestResult,
     RequestState, ScheduleError, Settlement, SchedulerLeaseRequest, SchedulerLeaseResult,
-    SelectionStrategy, UpstreamLease, UpstreamLeaseGrant, VideoJobLeaseResult,
+    SelectionStrategy, UpstreamLease, UpstreamLeaseGrant, VideoJobEnqueueResult, VideoJobLeaseResult,
     upstream::LeaseSettlement,
     upstream::{
         account_matches_constraints, sanitize_error_category, sanitize_upstream_request_ref,
@@ -118,6 +118,241 @@ impl CoreStore {
                 Ok(VideoJobLeaseResult::Replay { job, attempt, lease })
             }
         }
+    }
+
+    pub fn enqueue_video_job(
+        &self,
+        principal: &crate::Principal,
+        input: SchedulerLeaseRequest,
+        job_input: CreateVideoJobInput,
+    ) -> Result<VideoJobEnqueueResult, ScheduleError> {
+        if input.preflight.request.endpoint != "videos"
+            || input.preflight.resource_kind != "video_job"
+        {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "video_job.endpoint_or_resource".into(),
+                value: format!(
+                    "endpoint={}, resource_kind={}",
+                    input.preflight.request.endpoint, input.preflight.resource_kind
+                ),
+            }));
+        }
+        crate::jobs::validate_video_job_input(&job_input)?;
+        validate_scheduler_request(&input)?;
+        if principal.user_id != input.preflight.request.user_id
+            || principal.key_id != input.preflight.request.api_key_id
+        {
+            return Err(ScheduleError::InvalidRequestIdentity);
+        }
+        if !principal.scopes.contains("videos:submit") {
+            return Err(ScheduleError::MissingScope("videos:submit".into()));
+        }
+        let request_hash = request_hash(
+            &input.preflight.request.endpoint,
+            &input.preflight.request.model,
+            &input.preflight.request.body,
+        );
+        let scope = format!(
+            "{}:{}",
+            input.preflight.request.user_id, input.preflight.request.endpoint
+        );
+        let required_capabilities_json = serde_json::to_string(&input.required_capabilities).map_err(|_| {
+            ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.queue.required_capabilities".into(),
+                value: "cannot serialize queue capabilities".into(),
+            })
+        })?;
+        let allowed_accounts_json = input
+            .allowed_accounts
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| {
+                ScheduleError::Core(CoreError::InvalidConfiguration {
+                    key: "jobs.queue.allowed_accounts".into(),
+                    value: "cannot serialize queue account filter".into(),
+                })
+            })?;
+        let selection_strategy = match input.selection_strategy {
+            SelectionStrategy::HighestNormalizedAvailable => "highest_normalized_available",
+            SelectionStrategy::LeastActiveSlots => "least_active_slots",
+        };
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active_key = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = ?1 AND user_id = ?2 AND status = 'active')",
+            params![&principal.key_id, &principal.user_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !active_key {
+            return Err(ScheduleError::InvalidRequestIdentity);
+        }
+        let estimate = Self::estimate_in_connection(
+            &transaction,
+            &input.preflight.request.endpoint,
+            &input.preflight.request.model,
+            &input.preflight.request.body,
+        )?;
+        if estimate.resource_kind != input.preflight.resource_kind {
+            return Err(ScheduleError::Core(CoreError::BudgetPolicyMissing {
+                endpoint: input.preflight.request.endpoint.clone(),
+                model: input.preflight.request.model.clone(),
+            }));
+        }
+        if let Some((stored_hash, request_id)) = transaction
+            .query_row(
+                "SELECT request_hash, request_id FROM idempotency_keys WHERE scope = ?1 AND client_key = ?2",
+                params![&scope, &input.preflight.request.idempotency_key],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if stored_hash != request_hash {
+                return Err(ScheduleError::IdempotencyConflict);
+            }
+            let request = Self::request_handle_in_transaction(&transaction, &request_id)?;
+            let reservation = Self::reservation_by_request(&transaction, &request_id)?;
+            let job = crate::jobs::job_for_request_in_transaction(&transaction, &request_id)?
+                .ok_or_else(|| ScheduleError::Core(CoreError::ReservationRequestConflict {
+                    request_id: request_id.clone(),
+                }))?;
+            transaction.commit()?;
+            return Ok(VideoJobEnqueueResult::Replay {
+                request,
+                reservation,
+                job,
+            });
+        }
+        let balance = Self::balance_in_transaction(
+            &transaction,
+            &input.preflight.request.user_id,
+            &input.preflight.resource_kind,
+        )?;
+        if balance.available < input.preflight.amount {
+            return Err(ScheduleError::Core(CoreError::QuotaInsufficient {
+                available: balance.available,
+                required: input.preflight.amount,
+            }));
+        }
+        let now = input.now_ms;
+        let reservation_expires = now
+            .checked_add(input.preflight.ttl_ms)
+            .ok_or(CoreError::InvalidQuotaAmount)?;
+        let request_id = Self::new_id("request");
+        transaction.execute(
+            "INSERT INTO requests (id, user_id, api_key_id, protocol, endpoint, model, request_hash, state, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'received', ?8, ?8)",
+            params![
+                &request_id,
+                &input.preflight.request.user_id,
+                &input.preflight.request.api_key_id,
+                &input.preflight.request.protocol,
+                &input.preflight.request.endpoint,
+                &input.preflight.request.model,
+                request_hash.to_vec(),
+                now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO idempotency_keys (scope, client_key, request_hash, request_id, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &scope,
+                &input.preflight.request.idempotency_key,
+                request_hash.to_vec(),
+                &request_id,
+                now
+            ],
+        )?;
+        Self::transition_request_on_connection(
+            &transaction,
+            &request_id,
+            RequestState::Received,
+            RequestState::Validating,
+            None,
+            now,
+        )?;
+        let reservation = match Self::reserve_in_transaction(
+            &transaction,
+            &QuotaReserve {
+                user_id: input.preflight.request.user_id.clone(),
+                request_id: request_id.clone(),
+                resource_kind: input.preflight.resource_kind.clone(),
+                amount: input.preflight.amount,
+                ttl_ms: input.preflight.ttl_ms,
+            },
+            now,
+            reservation_expires,
+        )? {
+            crate::ReserveResult::Created(reservation) => reservation,
+            crate::ReserveResult::Insufficient { available } => {
+                return Err(ScheduleError::Core(CoreError::QuotaInsufficient {
+                    available,
+                    required: input.preflight.amount,
+                }))
+            }
+            crate::ReserveResult::Existing(_) => {
+                return Err(ScheduleError::Core(CoreError::ReservationRequestConflict {
+                    request_id,
+                }))
+            }
+        };
+        Self::transition_request_on_connection(
+            &transaction,
+            &request_id,
+            RequestState::Validating,
+            RequestState::Reserved,
+            None,
+            now,
+        )?;
+        crate::jobs::insert_video_job_without_attempt(
+            &transaction,
+            principal,
+            &request_id,
+            &input.preflight.request.model,
+            &job_input,
+            now,
+        )?;
+        transaction.execute(
+            "UPDATE jobs SET
+                queue_provider_hint = ?1,
+                queue_required_capabilities_json = ?2,
+                queue_region = ?3,
+                queue_predicted_units = ?4,
+                queue_safety_margin_units = ?5,
+                queue_observation_max_age_ms = ?6,
+                queue_allowed_accounts_json = ?7,
+                queue_dedicated_account = ?8,
+                queue_selection_strategy = ?9,
+                queue_lease_ttl_ms = ?10,
+                queue_reconcile_ttl_ms = ?11
+             WHERE id = ?12",
+            params![
+                &input.provider_hint,
+                &required_capabilities_json,
+                &input.region,
+                input.predicted_units,
+                input.safety_margin_units,
+                input.observation_max_age_ms,
+                &allowed_accounts_json,
+                &input.dedicated_account,
+                selection_strategy,
+                input.lease_ttl_ms,
+                input.reconcile_ttl_ms,
+                &job_input.id,
+            ],
+        )?;
+        let request = Self::request_handle_in_transaction(&transaction, &request_id)?;
+        let job = crate::jobs::job_for_request_in_transaction(&transaction, &request_id)?
+            .ok_or_else(|| CoreError::RequestNotFound {
+                request_id: request_id.clone(),
+            })?;
+        transaction.commit()?;
+        Ok(VideoJobEnqueueResult::Created {
+            request,
+            reservation,
+            job,
+        })
     }
 
     fn preflight_reserve_with_lease_internal(
@@ -971,7 +1206,7 @@ impl CoreStore {
         })
     }
 
-    fn select_upstream_candidate(
+    pub(crate) fn select_upstream_candidate(
         transaction: &Transaction<'_>, input: &SchedulerLeaseRequest,
     ) -> Result<CandidateAccount, ScheduleError> {
         let mut statement = transaction.prepare(

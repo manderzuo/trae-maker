@@ -509,6 +509,20 @@ pub struct VideoJobQueueClaim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoJobEnqueueResult {
+    Created {
+        request: RequestHandle,
+        reservation: Reservation,
+        job: CoreJob,
+    },
+    Replay {
+        request: RequestHandle,
+        reservation: Option<Reservation>,
+        job: CoreJob,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeginRequestInput {
     pub user_id: String,
     pub api_key_id: String,
