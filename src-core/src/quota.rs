@@ -2,8 +2,8 @@ use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
-    CoreError, CoreStore, QuotaBalance, QuotaGrant, QuotaReserve, Reservation,
-    ReservationState, ReserveResult, Settlement,
+    CoreError, CoreStore, Principal, QuotaBalance, QuotaGrant, QuotaReserve, RequestResult,
+    RequestState, Reservation, ReservationState, ReserveResult, Settlement,
 };
 
 impl CoreStore {
@@ -59,20 +59,209 @@ impl CoreStore {
         let expires_at_ms = now.checked_add(input.ttl_ms).ok_or(CoreError::InvalidQuotaAmount)?;
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = Self::reserve_in_transaction(&transaction, &input, now, expires_at_ms)?;
+        transaction.commit()?;
+        Ok(result)
+    }
 
-        if let Some(reservation) = Self::reservation_by_request(&transaction, &input.request_id)? {
+    pub fn reserve_request(&self, input: QuotaReserve) -> Result<ReserveResult, CoreError> {
+        if input.amount <= 0 || input.ttl_ms < 0 {
+            return Err(CoreError::InvalidQuotaAmount);
+        }
+        let now = Utc::now().timestamp_millis();
+        let expires_at_ms = now.checked_add(input.ttl_ms).ok_or(CoreError::InvalidQuotaAmount)?;
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (request_user_id, request_state) = transaction
+            .query_row(
+                "SELECT user_id, state FROM requests WHERE id = ?1",
+                [&input.request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::RequestNotFound {
+                request_id: input.request_id.clone(),
+            })?;
+        if request_user_id != input.user_id {
+            return Err(CoreError::InvalidRequestIdentity {
+                user_id: request_user_id,
+                api_key_id: String::new(),
+            });
+        }
+        let request_state = RequestState::from_db(&request_state).ok_or_else(|| {
+            CoreError::InvalidConfiguration {
+                key: "requests.state".into(),
+                value: request_state,
+            }
+        })?;
+        if request_state != RequestState::Validating {
+            return Err(CoreError::InvalidTransition {
+                request_id: input.request_id.clone(),
+                expected: RequestState::Validating,
+                next: RequestState::Reserved,
+            });
+        }
+
+        let result = Self::reserve_in_transaction(&transaction, &input, now, expires_at_ms)?;
+        match &result {
+            ReserveResult::Insufficient { .. } => {
+                Self::transition_request_on_connection(
+                    &transaction,
+                    &input.request_id,
+                    RequestState::Validating,
+                    RequestState::Failed,
+                    Some(RequestResult {
+                        status: Some(429),
+                        error_code: Some("insufficient_quota".into()),
+                    }),
+                    now,
+                )
+                .map_err(|source| CoreError::RequestContext {
+                    request_id: input.request_id.clone(),
+                    source: Box::new(source),
+                })?;
+            }
+            ReserveResult::Created(_) => {
+                Self::transition_request_on_connection(
+                    &transaction,
+                    &input.request_id,
+                    RequestState::Validating,
+                    RequestState::Reserved,
+                    None,
+                    now,
+                )
+                .map_err(|source| CoreError::RequestContext {
+                    request_id: input.request_id.clone(),
+                    source: Box::new(source),
+                })?;
+            }
+            ReserveResult::Existing(_) => {}
+        }
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn reservation_for_request(&self, request_id: &str) -> Result<Option<Reservation>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        connection
+            .query_row(
+                "SELECT id, user_id, request_id, resource_kind, amount, state, expires_at_ms \
+                 FROM quota_reservations WHERE request_id = ?1",
+                [request_id],
+                Self::reservation_from_row,
+            )
+            .optional()
+            .map_err(CoreError::from)
+    }
+
+    pub fn settle(
+        &self,
+        principal: &Principal,
+        reservation_id: &str,
+        settlement: Settlement,
+    ) -> Result<QuotaBalance, CoreError> {
+        self.settle_impl(principal, reservation_id, settlement, None, None)
+    }
+
+    pub fn settle_request(
+        &self,
+        principal: &Principal,
+        reservation_id: &str,
+        settlement: Settlement,
+        final_state: RequestState,
+        result: Option<RequestResult>,
+    ) -> Result<QuotaBalance, CoreError> {
+        self.settle_impl(
+            principal,
+            reservation_id,
+            settlement,
+            Some(final_state),
+            Some(result),
+        )
+    }
+
+    fn settle_impl(
+        &self,
+        principal: &Principal,
+        reservation_id: &str,
+        settlement: Settlement,
+        final_state: Option<RequestState>,
+        result: Option<Option<RequestResult>>,
+    ) -> Result<QuotaBalance, CoreError> {
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reservation = Self::reservation_by_id(&transaction, reservation_id)?.ok_or_else(|| {
+            CoreError::ReservationNotFound {
+                reservation_id: reservation_id.to_owned(),
+            }
+        })?;
+        Self::validate_reservation_owner(&transaction, &reservation, principal)?;
+
+        if reservation.state != ReservationState::Held {
+            let balance = Self::balance_in_transaction(
+                &transaction,
+                &reservation.user_id,
+                &reservation.resource_kind,
+            )?;
+            transaction.commit()?;
+            return Ok(balance);
+        }
+
+        if let Some(final_state) = final_state {
+            let request_state = transaction
+                .query_row(
+                    "SELECT state FROM requests WHERE id = ?1",
+                    [&reservation.request_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(request_state) = request_state {
+                let request_state = RequestState::from_db(&request_state).ok_or_else(|| {
+                    CoreError::InvalidConfiguration {
+                        key: "requests.state".into(),
+                        value: request_state,
+                    }
+                })?;
+                Self::settle_request_state(
+                    &transaction,
+                    &reservation.request_id,
+                    request_state,
+                    final_state,
+                    result.flatten(),
+                    now,
+                )?;
+            }
+        }
+
+        Self::apply_settlement(&transaction, &reservation, settlement, now)?;
+
+        let balance = Self::balance_in_transaction(
+            &transaction,
+            &reservation.user_id,
+            &reservation.resource_kind,
+        )?;
+        transaction.commit()?;
+        Ok(balance)
+    }
+
+    fn reserve_in_transaction(
+        transaction: &Transaction<'_>,
+        input: &QuotaReserve,
+        now: i64,
+        expires_at_ms: i64,
+    ) -> Result<ReserveResult, CoreError> {
+        if let Some(reservation) = Self::reservation_by_request(transaction, &input.request_id)? {
             if reservation.user_id != input.user_id || reservation.resource_kind != input.resource_kind {
                 return Err(CoreError::ReservationRequestConflict {
-                    request_id: input.request_id,
+                    request_id: input.request_id.clone(),
                 });
             }
-            transaction.commit()?;
             return Ok(ReserveResult::Existing(reservation));
         }
 
-        let balance = Self::balance_in_transaction(&transaction, &input.user_id, &input.resource_kind)?;
+        let balance = Self::balance_in_transaction(transaction, &input.user_id, &input.resource_kind)?;
         if balance.available < input.amount {
-            transaction.commit()?;
             return Ok(ReserveResult::Insufficient {
                 available: balance.available,
             });
@@ -80,9 +269,9 @@ impl CoreStore {
 
         let reservation = Reservation {
             id: Self::new_id("reservation"),
-            user_id: input.user_id,
-            request_id: input.request_id,
-            resource_kind: input.resource_kind,
+            user_id: input.user_id.clone(),
+            request_id: input.request_id.clone(),
+            resource_kind: input.resource_kind.clone(),
             amount: input.amount,
             state: ReservationState::Held,
             expires_at_ms,
@@ -103,7 +292,7 @@ impl CoreStore {
             ],
         )?;
         Self::insert_ledger_entry(
-            &transaction,
+            transaction,
             &reservation.user_id,
             &reservation.resource_kind,
             "reserve",
@@ -114,36 +303,20 @@ impl CoreStore {
             None,
             now,
         )?;
-        transaction.commit()?;
-
         Ok(ReserveResult::Created(reservation))
     }
 
-    pub fn settle(&self, reservation_id: &str, settlement: Settlement) -> Result<QuotaBalance, CoreError> {
-        let now = Utc::now().timestamp_millis();
-        let mut connection = self.connection.lock().expect("core store mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let reservation = Self::reservation_by_id(&transaction, reservation_id)?.ok_or_else(|| {
-            CoreError::ReservationNotFound {
-                reservation_id: reservation_id.to_owned(),
-            }
-        })?;
-
-        if reservation.state != ReservationState::Held {
-            let balance = Self::balance_in_transaction(
-                &transaction,
-                &reservation.user_id,
-                &reservation.resource_kind,
-            )?;
-            transaction.commit()?;
-            return Ok(balance);
-        }
-
+    fn apply_settlement(
+        transaction: &Transaction<'_>,
+        reservation: &Reservation,
+        settlement: Settlement,
+        now: i64,
+    ) -> Result<(), CoreError> {
         match settlement {
             Settlement::Release => {
-                Self::set_reservation_state(&transaction, reservation_id, ReservationState::Released, now)?;
+                Self::set_reservation_state(transaction, &reservation.id, ReservationState::Released, now)?;
                 Self::insert_ledger_entry(
-                    &transaction,
+                    transaction,
                     &reservation.user_id,
                     &reservation.resource_kind,
                     "release",
@@ -164,9 +337,9 @@ impl CoreStore {
                 if actual_amount > reservation.amount {
                     return Err(CoreError::ActualAmountExceedsReservation);
                 }
-                Self::set_reservation_state(&transaction, reservation_id, ReservationState::Committed, now)?;
+                Self::set_reservation_state(transaction, &reservation.id, ReservationState::Committed, now)?;
                 Self::insert_ledger_entry(
-                    &transaction,
+                    transaction,
                     &reservation.user_id,
                     &reservation.resource_kind,
                     "commit",
@@ -179,17 +352,85 @@ impl CoreStore {
                 )?;
             }
             Settlement::Unknown => {
-                Self::set_reservation_state(&transaction, reservation_id, ReservationState::Unknown, now)?;
+                Self::set_reservation_state(transaction, &reservation.id, ReservationState::Unknown, now)?;
             }
         }
+        Ok(())
+    }
 
-        let balance = Self::balance_in_transaction(
-            &transaction,
-            &reservation.user_id,
-            &reservation.resource_kind,
-        )?;
-        transaction.commit()?;
-        Ok(balance)
+    fn validate_reservation_owner(
+        transaction: &Transaction<'_>,
+        reservation: &Reservation,
+        principal: &Principal,
+    ) -> Result<(), CoreError> {
+        if reservation.user_id != principal.user_id {
+            return Err(CoreError::ReservationOwnerMismatch {
+                reservation_id: reservation.id.clone(),
+            });
+        }
+        let request_owner = transaction
+            .query_row(
+                "SELECT user_id, api_key_id FROM requests WHERE id = ?1",
+                [&reservation.request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((user_id, api_key_id)) = request_owner {
+            if user_id != principal.user_id || api_key_id != principal.key_id {
+                return Err(CoreError::ReservationOwnerMismatch {
+                    reservation_id: reservation.id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_request_state(
+        transaction: &Transaction<'_>,
+        request_id: &str,
+        current: RequestState,
+        final_state: RequestState,
+        result: Option<RequestResult>,
+        now: i64,
+    ) -> Result<(), CoreError> {
+        let intermediate: Vec<RequestState> = match final_state {
+            RequestState::Succeeded => vec![
+                RequestState::Queued,
+                RequestState::Dispatched,
+                RequestState::Completing,
+                RequestState::Succeeded,
+            ],
+            RequestState::Failed | RequestState::Unknown => vec![final_state],
+            RequestState::Settled => return Ok(()),
+            _ => {
+                return Err(CoreError::InvalidTransition {
+                    request_id: request_id.to_owned(),
+                    expected: current,
+                    next: final_state,
+                })
+            }
+        };
+        let mut expected = current;
+        for (index, next) in intermediate.iter().copied().enumerate() {
+            let transition_result = (index + 1 == intermediate.len()).then(|| result.clone()).flatten();
+            Self::transition_request_on_connection(
+                transaction,
+                request_id,
+                expected,
+                next,
+                transition_result,
+                now,
+            )?;
+            expected = next;
+        }
+        Self::transition_request_on_connection(
+            transaction,
+            request_id,
+            expected,
+            RequestState::Settled,
+            None,
+            now,
+        )
     }
 
     pub fn balance(&self, user_id: &str, resource_kind: &str) -> Result<QuotaBalance, CoreError> {

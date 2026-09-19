@@ -6,7 +6,7 @@ use std::{
 };
 
 use aiwork_core::{
-    CoreStore, NewUser, QuotaGrant, QuotaReserve, ReserveResult, Settlement, UserRole,
+    CoreStore, NewUser, Principal, QuotaGrant, QuotaReserve, ReserveResult, Settlement, UserRole,
     CORE_DB_FILE,
 };
 use rusqlite::Connection;
@@ -63,6 +63,14 @@ fn reserve_for(
         resource_kind: resource_kind.to_owned(),
         amount,
         ttl_ms,
+    }
+}
+
+fn principal(user_id: &str) -> Principal {
+    Principal {
+        user_id: user_id.to_owned(),
+        key_id: "test-key".to_owned(),
+        scopes: Default::default(),
     }
 }
 
@@ -146,7 +154,7 @@ fn duplicate_request_id_from_another_owner_or_resource_is_rejected_without_discl
 
     assert_eq!(store.balance("u1", "chat_request").unwrap().available, 90);
     assert_eq!(
-        store.settle(&reservation_id, Settlement::Release).unwrap().available,
+        store.settle(&principal("u1"), &reservation_id, Settlement::Release).unwrap().available,
         100
     );
 }
@@ -157,11 +165,11 @@ fn release_is_idempotent_and_restores_the_full_hold_once() {
     let reservation_id = created(&store, "release-request", 10);
 
     assert_eq!(
-        store.settle(&reservation_id, Settlement::Release).unwrap().available,
+        store.settle(&principal("u1"), &reservation_id, Settlement::Release).unwrap().available,
         100
     );
     assert_eq!(
-        store.settle(&reservation_id, Settlement::Release).unwrap().available,
+        store.settle(&principal("u1"), &reservation_id, Settlement::Release).unwrap().available,
         100
     );
 }
@@ -174,6 +182,7 @@ fn commit_is_idempotent_and_releases_only_the_unused_hold() {
     assert_eq!(
         store
             .settle(
+                &principal("u1"),
                 &reservation_id,
                 Settlement::Commit {
                     actual_amount: Some(7),
@@ -186,6 +195,7 @@ fn commit_is_idempotent_and_releases_only_the_unused_hold() {
     assert_eq!(
         store
             .settle(
+                &principal("u1"),
                 &reservation_id,
                 Settlement::Commit {
                     actual_amount: Some(7),
@@ -205,6 +215,7 @@ fn commit_without_actual_amount_keeps_the_full_hold_and_marks_it_unknown() {
     assert_eq!(
         store
             .settle(
+                &principal("u1"),
                 &reservation_id,
                 Settlement::Commit {
                     actual_amount: None,
@@ -254,7 +265,7 @@ fn unknown_settlement_keeps_the_reservation_held_even_after_its_ttl() {
     );
 
     assert_eq!(
-        store.settle(&reservation_id, Settlement::Unknown).unwrap().available,
+        store.settle(&principal("u1"), &reservation_id, Settlement::Unknown).unwrap().available,
         90
     );
     let balance = store.balance("u1", "chat_request").unwrap();
@@ -269,7 +280,7 @@ fn unknown_settlement_keeps_the_reservation_held_even_after_its_ttl() {
         .unwrap();
     assert_eq!(state, "unknown");
     assert_eq!(
-        store.settle(&reservation_id, Settlement::Unknown).unwrap().available,
+        store.settle(&principal("u1"), &reservation_id, Settlement::Unknown).unwrap().available,
         90
     );
     let state_after_repeat: String = connection

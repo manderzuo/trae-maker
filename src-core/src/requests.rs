@@ -15,6 +15,24 @@ pub fn canonical_json_hash(value: &Value) -> [u8; 32] {
 }
 
 impl CoreStore {
+    pub fn request_state(&self, request_id: &str) -> Result<RequestState, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let value = connection
+            .query_row(
+                "SELECT state FROM requests WHERE id = ?1",
+                [request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::RequestNotFound {
+                request_id: request_id.to_owned(),
+            })?;
+        RequestState::from_db(&value).ok_or_else(|| CoreError::InvalidConfiguration {
+            key: "requests.state".into(),
+            value,
+        })
+    }
+
     pub fn estimate_cost(
         &self,
         endpoint: &str,
@@ -121,6 +139,26 @@ impl CoreStore {
         next: RequestState,
         result: Option<RequestResult>,
     ) -> Result<(), CoreError> {
+        let now = Utc::now().timestamp_millis();
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        Self::transition_request_on_connection(
+            &connection,
+            request_id,
+            expected,
+            next,
+            result,
+            now,
+        )
+    }
+
+    pub(crate) fn transition_request_on_connection(
+        connection: &rusqlite::Connection,
+        request_id: &str,
+        expected: RequestState,
+        next: RequestState,
+        result: Option<RequestResult>,
+        now: i64,
+    ) -> Result<(), CoreError> {
         if !expected.can_transition_to(next) {
             return Err(CoreError::InvalidTransition {
                 request_id: request_id.to_owned(),
@@ -129,8 +167,6 @@ impl CoreStore {
             });
         }
 
-        let now = Utc::now().timestamp_millis();
-        let connection = self.connection.lock().expect("core store mutex poisoned");
         let changed = match result {
             Some(result) => connection.execute(
                 "UPDATE requests SET state = ?1, result_status = ?2, error_code = ?3, updated_at_ms = ?4 \

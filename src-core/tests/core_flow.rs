@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 use aiwork_core::{
     BeginRequest, BeginRequestInput, ChatExecutionRequest, ChatExecutionResult, ChatExecutor,
     CoreStore, CostPolicy, MockChatExecutor, NewUser, QuotaGrant, QuotaReserve,
-    ReservationState, ReserveResult, Settlement, UserRole,
+    Principal, ReservationState, ReserveResult, Settlement, UserRole,
 };
 use serde_json::json;
 
@@ -91,6 +91,14 @@ fn reserve_amount(store: &CoreStore, request_id: &str, amount: i64) -> ReserveRe
         .unwrap()
 }
 
+fn principal(key_id: &str) -> Principal {
+    Principal {
+        user_id: "u1".into(),
+        key_id: key_id.into(),
+        scopes: BTreeSet::from(["chat:invoke".to_owned()]),
+    }
+}
+
 #[test]
 fn mock_chat_flow_reserves_before_execution_and_settles_once() {
     let (store, key_id) = test_store(1);
@@ -115,6 +123,7 @@ fn mock_chat_flow_reserves_before_execution_and_settles_once() {
     assert_eq!(result, ChatExecutionResult::ok());
     store
         .settle(
+            &principal(&key_id),
             &reservation.id,
             Settlement::Commit {
                 actual_amount: result.actual_amount,
@@ -179,7 +188,7 @@ fn uncertain_upstream_keeps_reservation_unknown() {
         other => panic!("expected a new reservation, got {other:?}"),
     };
     store
-        .settle(&reservation.id, Settlement::Unknown)
+        .settle(&principal(&key_id), &reservation.id, Settlement::Unknown)
         .unwrap();
 
     assert_eq!(store.balance("u1", "chat_request").unwrap().held, 1);

@@ -58,4 +58,16 @@ pub enum CoreError {
         #[source]
         source: Box<CoreError>,
     },
+    #[error("core mode {mode} does not permit enforcing chat operations")]
+    CoreModeNotEnforcing { mode: String },
+    #[error("reservation {reservation_id} is owned by another principal")]
+    ReservationOwnerMismatch { reservation_id: String },
+    #[error("request {request_id} was not found")]
+    RequestNotFound { request_id: String },
+    #[error("request {request_id} operation failed: {source}")]
+    RequestContext {
+        request_id: String,
+        #[source]
+        source: Box<CoreError>,
+    },
 }
