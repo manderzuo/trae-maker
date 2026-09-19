@@ -5,7 +5,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CostError, CostEstimate, CostPolicy, BeginRequest, BeginRequestInput, CoreError, CoreStore,
-    RequestHandle, RequestResult, RequestState,
+    PreflightReserveInput, PreflightReserveResult, QuotaReserve, RequestHandle, RequestResult,
+    RequestState,
 };
 
 pub fn canonical_json_hash(value: &Value) -> [u8; 32] {
@@ -132,6 +133,150 @@ impl CoreStore {
         Ok(BeginRequest::Created(handle))
     }
 
+    pub fn preflight_reserve(
+        &self,
+        input: PreflightReserveInput,
+    ) -> Result<PreflightReserveResult, CoreError> {
+        if input.amount <= 0 || input.ttl_ms < 0 {
+            return Err(CoreError::InvalidQuotaAmount);
+        }
+        let now = Utc::now().timestamp_millis();
+        let expires_at_ms = now
+            .checked_add(input.ttl_ms)
+            .ok_or(CoreError::InvalidQuotaAmount)?;
+        let request_hash = request_hash(
+            &input.request.endpoint,
+            &input.request.model,
+            &input.request.body,
+        );
+        let scope = format!("{}:{}", input.request.user_id, input.request.endpoint);
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let active_key = transaction
+            .query_row(
+                "SELECT 1 FROM api_keys WHERE id = ?1 AND user_id = ?2 AND status = 'active'",
+                params![&input.request.api_key_id, &input.request.user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !active_key {
+            return Err(CoreError::InvalidRequestIdentity {
+                user_id: input.request.user_id,
+                api_key_id: input.request.api_key_id,
+            });
+        }
+
+        if let Some((stored_hash, request_id)) = transaction
+            .query_row(
+                "SELECT request_hash, request_id FROM idempotency_keys WHERE scope = ?1 AND client_key = ?2",
+                params![&scope, &input.request.idempotency_key],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            let request = Self::request_handle_in_transaction(&transaction, &request_id)?;
+            return if stored_hash == request_hash {
+                Ok(PreflightReserveResult::Existing {
+                    request,
+                    reservation: Self::reservation_by_request(&transaction, &request_id)?,
+                })
+            } else {
+                Ok(PreflightReserveResult::Conflict)
+            };
+        }
+
+        let balance = Self::balance_in_transaction(
+            &transaction,
+            &input.request.user_id,
+            &input.resource_kind,
+        )?;
+        if balance.available < input.amount {
+            return Ok(PreflightReserveResult::Insufficient {
+                available: balance.available,
+                required: input.amount,
+            });
+        }
+
+        let request_id = Self::new_id("request");
+        transaction.execute(
+            "INSERT INTO requests \
+             (id, user_id, api_key_id, protocol, endpoint, model, request_hash, state, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'received', ?8, ?8)",
+            params![
+                &request_id,
+                &input.request.user_id,
+                &input.request.api_key_id,
+                &input.request.protocol,
+                &input.request.endpoint,
+                &input.request.model,
+                request_hash.to_vec(),
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO idempotency_keys (scope, client_key, request_hash, request_id, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &scope,
+                &input.request.idempotency_key,
+                request_hash.to_vec(),
+                &request_id,
+                now,
+            ],
+        )?;
+
+        let request = Self::request_handle_in_transaction(&transaction, &request_id)?;
+        Self::transition_request_on_connection(
+            &transaction,
+            &request_id,
+            RequestState::Received,
+            RequestState::Validating,
+            None,
+            now,
+        )?;
+        let reservation = match Self::reserve_in_transaction(
+            &transaction,
+            &QuotaReserve {
+                user_id: request.user_id.clone(),
+                request_id: request_id.clone(),
+                resource_kind: input.resource_kind,
+                amount: input.amount,
+                ttl_ms: input.ttl_ms,
+            },
+            now,
+            expires_at_ms,
+        )? {
+            crate::ReserveResult::Created(reservation) => reservation,
+            crate::ReserveResult::Insufficient { available } => {
+                return Ok(PreflightReserveResult::Insufficient {
+                    available,
+                    required: input.amount,
+                });
+            }
+            crate::ReserveResult::Existing(_) => {
+                return Err(CoreError::ReservationRequestConflict { request_id });
+            }
+        };
+        Self::transition_request_on_connection(
+            &transaction,
+            &request_id,
+            RequestState::Validating,
+            RequestState::Reserved,
+            None,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(PreflightReserveResult::Created {
+            request: RequestHandle {
+                state: RequestState::Reserved,
+                ..request
+            },
+            reservation,
+        })
+    }
+
     pub fn transition_request(
         &self,
         request_id: &str,
@@ -232,7 +377,7 @@ impl CoreStore {
         })
     }
 
-    fn request_handle_in_transaction(
+    pub(crate) fn request_handle_in_transaction(
         transaction: &Transaction<'_>,
         request_id: &str,
     ) -> Result<RequestHandle, CoreError> {
@@ -262,7 +407,7 @@ impl CoreStore {
     }
 }
 
-fn request_hash(endpoint: &str, model: &str, body: &Value) -> [u8; 32] {
+pub(crate) fn request_hash(endpoint: &str, model: &str, body: &Value) -> [u8; 32] {
     canonical_json_hash(&serde_json::json!({
         "endpoint": endpoint,
         "model": model,

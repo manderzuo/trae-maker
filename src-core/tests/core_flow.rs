@@ -2,9 +2,11 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use aiwork_core::{
     BeginRequest, BeginRequestInput, ChatExecutionRequest, ChatExecutionResult, ChatExecutor,
-    CoreStore, CostPolicy, MockChatExecutor, NewUser, QuotaGrant, QuotaReserve,
-    Principal, ReservationState, ReserveResult, Settlement, UserRole,
+    CoreStore, CostPolicy, MockChatExecutor, NewUser, PreflightReserveInput,
+    PreflightReserveResult, Principal, QuotaGrant, QuotaReserve, ReservationState,
+    ReserveResult, Settlement, UserRole, CORE_DB_FILE,
 };
+use rusqlite::Connection;
 use serde_json::json;
 
 fn test_dir(prefix: &str) -> PathBuf {
@@ -17,7 +19,13 @@ fn test_dir(prefix: &str) -> PathBuf {
 }
 
 fn test_store(grant: i64) -> (CoreStore, String) {
-    let store = CoreStore::open(&test_dir("store")).unwrap();
+    let (store, key_id, _) = test_store_with_dir(grant);
+    (store, key_id)
+}
+
+fn test_store_with_dir(grant: i64) -> (CoreStore, String, PathBuf) {
+    let dir = test_dir("store");
+    let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
     store
         .create_user(
@@ -49,16 +57,18 @@ fn test_store(grant: i64) -> (CoreStore, String) {
             enabled: true,
         })
         .unwrap();
-    store
-        .grant(QuotaGrant {
-            user_id: "u1".into(),
-            resource_kind: "chat_request".into(),
-            amount: grant,
-            actor_user_id: "u1".into(),
-            reason: "test grant".into(),
-        })
-        .unwrap();
-    (store, key.id)
+    if grant > 0 {
+        store
+            .grant(QuotaGrant {
+                user_id: "u1".into(),
+                resource_kind: "chat_request".into(),
+                amount: grant,
+                actor_user_id: "u1".into(),
+                reason: "test grant".into(),
+            })
+            .unwrap();
+    }
+    (store, key.id, dir)
 }
 
 fn begin(store: &CoreStore, key_id: &str, idempotency_key: &str) -> BeginRequest {
@@ -89,6 +99,23 @@ fn reserve_amount(store: &CoreStore, request_id: &str, amount: i64) -> ReserveRe
             ttl_ms: 60_000,
         })
         .unwrap()
+}
+
+fn preflight_input(key_id: &str, idempotency_key: &str) -> PreflightReserveInput {
+    PreflightReserveInput {
+        request: BeginRequestInput {
+            user_id: "u1".into(),
+            api_key_id: key_id.into(),
+            protocol: "openai".into(),
+            endpoint: "chat".into(),
+            model: "mock-1".into(),
+            idempotency_key: idempotency_key.into(),
+            body: json!({"model": "mock-1", "messages": []}),
+        },
+        resource_kind: "chat_request".into(),
+        amount: 1,
+        ttl_ms: 60_000,
+    }
 }
 
 fn principal(key_id: &str) -> Principal {
@@ -193,4 +220,38 @@ fn uncertain_upstream_keeps_reservation_unknown() {
 
     assert_eq!(store.balance("u1", "chat_request").unwrap().held, 1);
     assert_eq!(reservation.state, ReservationState::Held);
+}
+
+#[test]
+fn atomic_preflight_insufficient_quota_leaves_no_orphan_and_can_retry() {
+    let (store, key_id, dir) = test_store_with_dir(0);
+    let input = preflight_input(&key_id, "idem-atomic-insufficient");
+
+    assert!(matches!(
+        store.preflight_reserve(input),
+        Ok(PreflightReserveResult::Insufficient {
+            available: 0,
+            required: 1,
+        })
+    ));
+
+    let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
+    for table in ["requests", "idempotency_keys", "quota_reservations"] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "atomic preflight left rows in {table}");
+    }
+
+    store
+        .grant(QuotaGrant {
+            user_id: "u1".into(),
+            resource_kind: "chat_request".into(),
+            amount: 1,
+            actor_user_id: "u1".into(),
+            reason: "retry grant".into(),
+        })
+        .unwrap();
+    let retry = store.preflight_reserve(preflight_input(&key_id, "idem-atomic-insufficient"));
+    assert!(matches!(retry, Ok(PreflightReserveResult::Created { .. })));
 }

@@ -49,6 +49,14 @@ pub struct BeginRequestInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightReserveInput {
+    pub request: BeginRequestInput,
+    pub resource_kind: String,
+    pub amount: i64,
+    pub ttl_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestHandle {
     pub id: String,
     pub user_id: String,
@@ -64,6 +72,20 @@ pub enum BeginRequest {
     Created(RequestHandle),
     Existing(RequestHandle),
     Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreflightReserveResult {
+    Created {
+        request: RequestHandle,
+        reservation: Reservation,
+    },
+    Existing {
+        request: RequestHandle,
+        reservation: Option<Reservation>,
+    },
+    Conflict,
+    Insufficient { available: i64, required: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

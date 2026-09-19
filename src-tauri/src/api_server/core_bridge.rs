@@ -1,9 +1,9 @@
 use std::{path::Path, sync::Arc};
 
 use aiwork_core::{
-    require_scope, BeginRequest, BeginRequestInput, ChatExecutionRequest, ChatExecutionResult,
-    CoreError, CoreStore, Principal, QuotaReserve, RequestResult, RequestState, Reservation,
-    ReserveResult, Settlement, UpstreamError,
+    require_scope, BeginRequestInput, ChatExecutionRequest, ChatExecutionResult, CoreError,
+    CoreStore, PreflightReserveInput, PreflightReserveResult, Principal, RequestResult,
+    RequestState, Reservation, Settlement, UpstreamError,
 };
 use serde_json::Value;
 
@@ -87,8 +87,8 @@ impl CoreBridge {
                 value: "missing or non-string".into(),
             })?;
 
-        // Cost policy is checked before begin_request so a missing policy
-        // cannot create a request record or consume a client idempotency key.
+        // Cost policy is checked before the atomic preflight so a missing
+        // policy cannot create a request record or consume a client key.
         let estimate = self.store.estimate_cost(CHAT_ENDPOINT, model, body)?;
         if principal.key_id != api_key_id {
             return Err(CoreError::InvalidRequestIdentity {
@@ -100,69 +100,44 @@ impl CoreBridge {
             .filter(|key| !key.trim().is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| generated_idempotency_key(CHAT_ENDPOINT, model, body));
-        let begin = self.store.begin_request(BeginRequestInput {
-            user_id: principal.user_id.clone(),
-            api_key_id: api_key_id.into(),
-            protocol: "openai".into(),
-            endpoint: CHAT_ENDPOINT.into(),
-            model: model.into(),
-            idempotency_key,
-            body: body.clone(),
-        })?;
-        let handle = match begin {
-            BeginRequest::Created(handle) => handle,
-            BeginRequest::Existing(handle) => {
-                return Ok(PreflightResult {
-                    request_id: handle.id.clone(),
-                    state: handle.state,
-                    reservation: self.store.reservation_for_request(&handle.id)?,
-                    execution: None,
-                })
-            }
-            BeginRequest::Conflict => return Err(CoreError::IdempotencyConflict),
-        };
-
-        self.store
-            .transition_request(&handle.id, RequestState::Received, RequestState::Validating, None)
-            .map_err(|source| CoreError::RequestContext {
-                request_id: handle.id.clone(),
-                source: Box::new(source),
-            })?;
-        let reservation = self.store.reserve_request(QuotaReserve {
-            user_id: principal.user_id.clone(),
-            request_id: handle.id.clone(),
+        let result = self.store.preflight_reserve(PreflightReserveInput {
+            request: BeginRequestInput {
+                user_id: principal.user_id.clone(),
+                api_key_id: api_key_id.into(),
+                protocol: "openai".into(),
+                endpoint: CHAT_ENDPOINT.into(),
+                model: model.into(),
+                idempotency_key,
+                body: body.clone(),
+            },
             resource_kind: estimate.resource_kind,
             amount: estimate.reserve_amount,
             ttl_ms: 15 * 60 * 1000,
         })?;
-        let reservation = match reservation {
-            ReserveResult::Created(reservation) => reservation,
-            ReserveResult::Insufficient { available } => {
-                return Err(CoreError::QuotaInsufficient {
-                    available,
-                    required: estimate.reserve_amount,
-                });
+        let (request, reservation, execution) = match result {
+            PreflightReserveResult::Created { request, reservation } => {
+                let execution = ChatExecutionRequest {
+                    request_id: request.id.clone(),
+                    endpoint: CHAT_ENDPOINT.into(),
+                    model: request.model.clone(),
+                    body: body.clone(),
+                };
+                (request, Some(reservation), Some(execution))
             }
-            ReserveResult::Existing(reservation) => {
-                return Ok(PreflightResult {
-                    request_id: handle.id,
-                    state: RequestState::Reserved,
-                    reservation: Some(reservation),
-                    execution: None,
-                });
+            PreflightReserveResult::Existing { request, reservation } => {
+                (request, reservation, None)
+            }
+            PreflightReserveResult::Conflict => return Err(CoreError::IdempotencyConflict),
+            PreflightReserveResult::Insufficient { available, required } => {
+                return Err(CoreError::QuotaInsufficient { available, required });
             }
         };
 
         Ok(PreflightResult {
-            request_id: handle.id.clone(),
-            state: RequestState::Reserved,
-            reservation: Some(reservation),
-            execution: Some(ChatExecutionRequest {
-                request_id: handle.id,
-                endpoint: CHAT_ENDPOINT.into(),
-                model: model.into(),
-                body: body.clone(),
-            }),
+            request_id: request.id,
+            state: request.state,
+            reservation,
+            execution,
         })
     }
 
@@ -398,6 +373,16 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, CoreError::QuotaInsufficient { .. }));
+        bridge
+            .store
+            .grant(QuotaGrant {
+                user_id: "u1".into(),
+                resource_kind: "chat_request".into(),
+                amount: 1,
+                actor_user_id: "u1".into(),
+                reason: "retry grant".into(),
+            })
+            .unwrap();
         let replay = bridge
             .preflight_chat(
                 &principal,
@@ -406,8 +391,8 @@ mod tests {
                 &chat_body(),
             )
             .unwrap();
-        assert!(replay.execution.is_none());
-        assert_eq!(replay.state, RequestState::Failed);
+        assert!(replay.execution.is_some());
+        assert_eq!(replay.state, RequestState::Reserved);
     }
 
     #[test]

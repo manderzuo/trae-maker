@@ -245,7 +245,7 @@ impl CoreStore {
         Ok(balance)
     }
 
-    fn reserve_in_transaction(
+    pub(crate) fn reserve_in_transaction(
         transaction: &Transaction<'_>,
         input: &QuotaReserve,
         now: i64,
@@ -442,7 +442,7 @@ impl CoreStore {
         amount.checked_abs().filter(|amount| *amount > 0).ok_or(CoreError::InvalidQuotaAmount)
     }
 
-    fn balance_in_transaction(
+    pub(crate) fn balance_in_transaction(
         transaction: &Transaction<'_>,
         user_id: &str,
         resource_kind: &str,
@@ -471,7 +471,7 @@ impl CoreStore {
         })
     }
 
-    fn reservation_by_request(
+    pub(crate) fn reservation_by_request(
         transaction: &Transaction<'_>,
         request_id: &str,
     ) -> Result<Option<Reservation>, CoreError> {
