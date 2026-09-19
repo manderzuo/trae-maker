@@ -768,6 +768,30 @@ impl CoreStore {
     }
 
     fn migrate_v4_to_v5(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        transaction
+            .execute(
+                "UPDATE legacy_assets
+                 SET migration_status = 'legacy_unverified',
+                     storage_ref = CASE
+                       WHEN storage_ref = '' THEN storage_ref
+                       ELSE ''
+                     END
+                 WHERE migration_status = 'verified'
+                   AND (
+                     storage_ref = ''
+                     OR storage_ref NOT GLOB 'assets/*'
+                     OR length(storage_ref) <= length('assets/')
+                     OR trim(storage_ref) <> storage_ref
+                     OR instr(storage_ref, '..') > 0
+                     OR instr(storage_ref, char(92)) > 0
+                     OR instr(storage_ref, '//') > 0
+                     OR instr(storage_ref, char(9)) > 0
+                     OR instr(storage_ref, char(10)) > 0
+                     OR instr(storage_ref, char(13)) > 0
+                   )",
+                [],
+            )
+            .map_err(CoreError::migration)?;
         transaction.execute_batch(SCHEMA_V5).map_err(CoreError::migration)
     }
 }

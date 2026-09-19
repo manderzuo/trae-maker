@@ -279,3 +279,62 @@ fn migrates_v3_assets_as_unverified_until_physical_validation() {
     drop(connection);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn migrates_v4_pseudo_verified_assets_to_unverified_before_v5_guards() {
+    let dir = test_dir("v4-pseudo-verified-assets");
+    let database_dir = dir.join("data");
+    fs::create_dir_all(&database_dir).unwrap();
+    let connection = Connection::open(database_dir.join(CORE_DB_FILE)).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '4');
+             CREATE TABLE users (id TEXT PRIMARY KEY);
+             CREATE TABLE legacy_assets (
+               id TEXT PRIMARY KEY,
+               owner_key_id TEXT NOT NULL,
+               user_id TEXT NOT NULL REFERENCES users(id),
+               filename TEXT NOT NULL,
+               mime_type TEXT NOT NULL,
+               extension TEXT NOT NULL,
+               size INTEGER NOT NULL CHECK(size >= 0),
+               content_sha256 TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               expires_at_ms INTEGER NOT NULL,
+               storage_ref TEXT NOT NULL DEFAULT '',
+               migration_status TEXT NOT NULL DEFAULT 'legacy_unverified'
+                 CHECK(migration_status IN ('verified','legacy_unverified','reconcile_required')),
+               migration_id TEXT NOT NULL,
+               actor_user_id TEXT NOT NULL REFERENCES users(id),
+               reason TEXT NOT NULL
+             );
+             INSERT INTO users (id) VALUES ('admin');
+             INSERT INTO legacy_assets
+               (id, owner_key_id, user_id, filename, mime_type, extension, size,
+                content_sha256, created_at_ms, expires_at_ms, storage_ref,
+                migration_status, migration_id, actor_user_id, reason)
+             VALUES
+               ('asset-v4', 'legacy-key', 'admin', 'old.png', 'image/png', 'png', 7,
+                'old-hash', 1, 2, '', 'verified', 'old-migration', 'admin', 'old import');",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = CoreStore::open(&dir).unwrap();
+    store.migrate().unwrap();
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    drop(store);
+
+    let connection = Connection::open(database_dir.join(CORE_DB_FILE)).unwrap();
+    let asset: (String, String) = connection
+        .query_row(
+            "SELECT storage_ref, migration_status FROM legacy_assets WHERE id = 'asset-v4'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(asset, ("".into(), "legacy_unverified".into()));
+    drop(connection);
+    fs::remove_dir_all(dir).unwrap();
+}
