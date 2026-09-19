@@ -2,6 +2,7 @@ mod cost;
 mod error;
 mod identity;
 mod models;
+mod ports;
 mod quota;
 mod requests;
 mod schema;
@@ -15,5 +16,6 @@ pub use models::{
     QuotaReserve, RequestHandle, RequestResult, RequestState, Reservation, ReservationState,
     ReserveResult, Settlement, SharedCoreStore, User, UserRole,
 };
+pub use ports::{ChatExecutionRequest, ChatExecutionResult, ChatExecutor, MockChatExecutor, UpstreamError};
 pub use requests::canonical_json_hash;
 pub use store::{CoreStore, CORE_DB_FILE, CURRENT_SCHEMA_VERSION};

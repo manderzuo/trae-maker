@@ -4,8 +4,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CostError, CostPolicy, BeginRequest, BeginRequestInput, CoreError, CoreStore, RequestHandle,
-    RequestResult, RequestState,
+    CostError, CostEstimate, CostPolicy, BeginRequest, BeginRequestInput, CoreError, CoreStore,
+    RequestHandle, RequestResult, RequestState,
 };
 
 pub fn canonical_json_hash(value: &Value) -> [u8; 32] {
@@ -15,6 +15,16 @@ pub fn canonical_json_hash(value: &Value) -> [u8; 32] {
 }
 
 impl CoreStore {
+    pub fn estimate_cost(
+        &self,
+        endpoint: &str,
+        model: &str,
+        body: &Value,
+    ) -> Result<CostEstimate, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        Self::estimate_in_connection(&connection, endpoint, model, body)
+    }
+
     pub fn upsert_cost_policy(&self, policy: CostPolicy) -> Result<(), CoreError> {
         let connection = self.connection.lock().expect("core store mutex poisoned");
         connection.execute(
@@ -149,7 +159,16 @@ impl CoreStore {
         model: &str,
         body: &Value,
     ) -> Result<(), CoreError> {
-        let mut statement = transaction.prepare(
+        Self::estimate_in_connection(transaction, endpoint, model, body).map(|_| ())
+    }
+
+    fn estimate_in_connection(
+        connection: &rusqlite::Connection,
+        endpoint: &str,
+        model: &str,
+        body: &Value,
+    ) -> Result<CostEstimate, CoreError> {
+        let mut statement = connection.prepare(
             "SELECT id, endpoint, model_pattern, resource_kind, reserve_amount, max_actual_amount, version, enabled \
              FROM cost_policies WHERE endpoint = ?1 AND enabled = 1 ORDER BY version DESC, id ASC",
         )?;
@@ -167,7 +186,7 @@ impl CoreStore {
         })?;
         for policy in policies {
             match policy?.estimate(endpoint, model, body) {
-                Ok(_) => return Ok(()),
+                Ok(estimate) => return Ok(estimate),
                 Err(CostError::BudgetPolicyMissing { .. }) => {}
             }
         }

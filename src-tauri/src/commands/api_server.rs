@@ -62,6 +62,10 @@ pub async fn do_start(
     // （Rust 2024 已标 unsafe），且污染 python 签到等子进程的代理行为，已移除
     let default_model = gw.default_model;
     let cors_origins = gw.cors_origins.clone();
+    let core_mode = crate::api_server::CoreMode::try_from(gw.core_mode.as_str())
+        .map_err(|error| error.to_string())?;
+    let core = crate::api_server::CoreBridge::open_for_mode(core_mode, &state.data_dir)
+        .map_err(|error| error.to_string())?;
 
     // LAN 监听不可在无 API Key 的情况下启动，避免把本机凭证池直接暴露给同网段设备。
     let lan_listener = !matches!(listen_host.as_str(), "127.0.0.1" | "localhost" | "::1");
@@ -225,6 +229,7 @@ pub async fn do_start(
     }
 
     let shared = Arc::new(ApiSharedState {
+        core,
         pool,
         wb_pool,
         wb_enabled: std::sync::atomic::AtomicBool::new(pool_file.wb_enabled),

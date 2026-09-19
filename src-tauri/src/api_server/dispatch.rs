@@ -606,6 +606,7 @@ mod tests {
             .unwrap();
         }
         let state = Arc::new(ApiSharedState {
+            core: None,
             pool: super::super::pool::ApiPool::new(),
             wb_pool: super::super::pool::ApiPool::new(),
             wb_enabled: AtomicBool::new(true),

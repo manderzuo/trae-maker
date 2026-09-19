@@ -29,10 +29,13 @@ pub struct GatewaySettings {
     /// 浏览器客户端允许的来源，逗号分隔；为空时不发送 CORS 允许头。
     #[serde(default)]
     pub cors_origins: String,
-    /// 参考素材给 Trae 云端回取的公开基址；为空时不生成公开素材 URL。
+    /// 参考素材的短时查看基址；为空时不生成公开素材 URL。Seedance 原生上传不依赖此项。
     /// 例如 `https://api.example.com/v1`，不含查询参数。
     #[serde(default)]
     pub asset_public_base_url: String,
+    /// Core bridge mode: off, shadow, or enforce.
+    #[serde(default = "default_core_mode")]
+    pub core_mode: String,
     #[serde(default)]
     pub updated_at: i64,
 }
@@ -49,6 +52,10 @@ fn default_listen_host() -> String {
     "127.0.0.1".into()
 }
 
+fn default_core_mode() -> String {
+    "off".into()
+}
+
 impl Default for GatewaySettings {
     fn default() -> Self {
         GatewaySettings {
@@ -57,6 +64,7 @@ impl Default for GatewaySettings {
             listen_host: default_listen_host(),
             cors_origins: String::new(),
             asset_public_base_url: String::new(),
+            core_mode: default_core_mode(),
             updated_at: 0,
         }
     }
@@ -149,6 +157,7 @@ pub fn load(data_dir: &Path) -> GatewaySettings {
         listen_host: default_listen_host(),
         cors_origins: String::new(),
         asset_public_base_url: String::new(),
+        core_mode: default_core_mode(),
         updated_at: 0,
     });
     // 迁移落盘失败不阻塞启动（下次启动重试），内存值仍生效
@@ -249,6 +258,7 @@ mod tests {
                 listen_host: "127.0.0.1".into(),
                 cors_origins: String::new(),
                 asset_public_base_url: String::new(),
+                core_mode: default_core_mode(),
                 updated_at: 0,
             },
         )
@@ -266,6 +276,7 @@ mod tests {
                 listen_host: "127.0.0.1".into(),
                 cors_origins: String::new(),
                 asset_public_base_url: String::new(),
+                core_mode: default_core_mode(),
                 updated_at: 0,
             },
         )
@@ -280,6 +291,7 @@ mod tests {
                 listen_host: "127.0.0.1".into(),
                 cors_origins: String::new(),
                 asset_public_base_url: String::new(),
+                core_mode: default_core_mode(),
                 updated_at: 0
             },
         )
@@ -297,6 +309,7 @@ mod tests {
                 listen_host: "127.0.0.1".into(),
                 cors_origins: String::new(),
                 asset_public_base_url: "  https://example.test/v1///  ".into(),
+                core_mode: default_core_mode(),
                 updated_at: 0,
             },
         )

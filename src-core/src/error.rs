@@ -44,4 +44,18 @@ pub enum CoreError {
         expected: crate::RequestState,
         next: crate::RequestState,
     },
+    #[error("invalid configuration for {key}: {value}")]
+    InvalidConfiguration { key: String, value: String },
+    #[error("missing required scope: {scope}")]
+    MissingScope { scope: String },
+    #[error("quota is insufficient: available {available}, required {required}")]
+    QuotaInsufficient { available: i64, required: i64 },
+    #[error("idempotency key conflicts with an existing request")]
+    IdempotencyConflict,
+    #[error("reservation {reservation_id} failed after reservation: {source}")]
+    ReservationContext {
+        reservation_id: String,
+        #[source]
+        source: Box<CoreError>,
+    },
 }

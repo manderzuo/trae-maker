@@ -6,6 +6,7 @@ pub mod custom_models;
 pub mod custom_route;
 pub mod conversation;
 pub mod cors;
+pub mod core_bridge;
 pub mod dispatch;
 pub mod gateway_settings;
 pub mod limits;
@@ -35,6 +36,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 pub use api_logger::ApiLogger;
+pub use core_bridge::{CoreBridge, CoreMode};
 pub use pool::ApiPool;
 
 /// SOLO 上游常量
@@ -50,6 +52,8 @@ pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";
 
 /// API 服务器运行时共享状态（传入 axum State）
 pub struct ApiSharedState {
+    /// Optional Core identity/quota bridge. `None` keeps the legacy gateway path.
+    pub core: Option<Arc<CoreBridge>>,
     /// SOLO 上游账号池（trae llm_utils_chat）
     pub pool: ApiPool,
     /// WorkBuddy 上游账号池（copilot /v2/chat/completions，T2.1）；
@@ -388,6 +392,7 @@ mod inflight_tests {
     fn t03_state_helper_pairs() {
         let dir = std::env::temp_dir().join(format!("twa_inflight_{}", std::process::id()));
         let state = ApiSharedState {
+            core: None,
             pool: pool::ApiPool::new(),
             wb_pool: pool::ApiPool::new(),
             wb_enabled: std::sync::atomic::AtomicBool::new(true),
