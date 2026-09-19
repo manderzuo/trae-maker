@@ -237,6 +237,8 @@ fn downgrade_request_tables_to_v6(dir: &PathBuf) {
              DROP TABLE requests;
              ALTER TABLE requests_v6 RENAME TO requests;
              ALTER TABLE idempotency_keys_v6 RENAME TO idempotency_keys;
+             DROP TABLE job_attempts;
+             DROP TABLE jobs;
              DROP TABLE assets;
              UPDATE schema_meta SET value = '6' WHERE key = 'schema_version';",
         )
@@ -244,10 +246,10 @@ fn downgrade_request_tables_to_v6(dir: &PathBuf) {
 }
 
 #[test]
-fn v8_preserves_request_rows_and_allows_cancel_state_transitions() {
+fn v9_preserves_request_rows_and_allows_cancel_state_transitions() {
     let (store, key_id, admin_key_id, dir) = test_store();
     configure_account(&store, &admin_key_id);
-    assert_eq!(store.schema_version().unwrap(), 8);
+    assert_eq!(store.schema_version().unwrap(), 9);
 
     let grant = acquired(store.preflight_reserve_with_lease(
         &principal(&key_id),
@@ -259,7 +261,7 @@ fn v8_preserves_request_rows_and_allows_cancel_state_transitions() {
     downgrade_request_tables_to_v6(&dir);
     let store = Arc::new(CoreStore::open(&dir).unwrap());
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 8);
+    assert_eq!(store.schema_version().unwrap(), 9);
     assert_eq!(store.request_state(&request_id).unwrap(), RequestState::Reserved);
 
     store
@@ -318,7 +320,7 @@ fn v8_preserves_request_rows_and_allows_cancel_state_transitions() {
     drop(store);
     let reopened = CoreStore::open(&dir).unwrap();
     reopened.migrate().unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 8);
+    assert_eq!(reopened.schema_version().unwrap(), 9);
     assert_eq!(reopened.request_state(&request_id).unwrap(), RequestState::Settled);
 }
 

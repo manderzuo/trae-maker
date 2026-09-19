@@ -7,6 +7,7 @@ pub mod custom_route;
 pub mod conversation;
 pub mod cors;
 pub mod core_bridge;
+pub mod core_video;
 pub mod core_stream;
 pub mod dispatch;
 pub mod gateway_settings;

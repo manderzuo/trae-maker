@@ -83,7 +83,7 @@ fn input(id: &str, expires_at_ms: i64, token: u8) -> CreateAssetInput {
 fn bootstrap_and_migration_create_authoritative_assets_table() {
     let (store, _principal_a, _principal_b, dir) = fixture();
     assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    assert_eq!(CURRENT_SCHEMA_VERSION, 8);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 9);
     assert_eq!(store.table_count("assets").unwrap(), 1);
     assert_eq!(store.count_rows("assets").unwrap(), 0);
     drop(store);
@@ -91,7 +91,7 @@ fn bootstrap_and_migration_create_authoritative_assets_table() {
 }
 
 #[test]
-fn v7_databases_migrate_to_v8_without_importing_legacy_assets() {
+fn v7_databases_migrate_to_v9_without_importing_legacy_assets() {
     let dir = test_dir("v7-migration");
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
@@ -100,7 +100,9 @@ fn v7_databases_migrate_to_v8_without_importing_legacy_assets() {
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE assets;
+            "DROP TABLE job_attempts;
+             DROP TABLE jobs;
+             DROP TABLE assets;
              UPDATE schema_meta SET value = '7' WHERE key = 'schema_version';",
         )
         .unwrap();
@@ -108,7 +110,7 @@ fn v7_databases_migrate_to_v8_without_importing_legacy_assets() {
 
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 8);
+    assert_eq!(store.schema_version().unwrap(), 9);
     assert_eq!(store.count_rows("assets").unwrap(), 0);
     drop(store);
     fs::remove_dir_all(dir).unwrap();

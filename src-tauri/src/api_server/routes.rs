@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 
 use aiwork_core::{
-    require_scope, ChatExecutionResult, CoreError, LeaseState, Principal, RequestState,
-    UpstreamError, UpstreamLeaseGrant,
+    require_scope, ChatExecutionResult, CoreError, CoreJob, CoreJobAttempt, JobState, LeaseState,
+    Principal, RequestState, UpstreamError, UpstreamLeaseGrant, VideoJobLeaseResult,
 };
 
 use super::custom_route;
@@ -21,6 +21,7 @@ use super::core_bridge::{
     CancelSupport, ChatOutcome, CoreLeaseError, CoreUpstreamExecutor, LeasePreflightResult,
     LeaseUpstreamAdapter, StreamTerminalOutcome, UpstreamOutcome,
 };
+use super::core_video::{VideoAdapterOutcome, VideoCancelOutcome, VideoExecutionRequest};
 use super::core_stream::core_stream_chat;
 use super::dispatch::{self, DispatchError, TargetPool};
 use super::retry::{retry_plan, RetryAction};
@@ -1821,16 +1822,280 @@ async fn core_assets_upload(
     Json(response).into_response()
 }
 
+fn core_video_status(state: JobState) -> &'static str {
+    match state {
+        JobState::Created => "created",
+        JobState::Queued => "queued",
+        JobState::Running => "running",
+        JobState::CancelRequested => "cancel_requested",
+        JobState::Canceled => "canceled",
+        JobState::Succeeded => "completed",
+        JobState::Failed => "failed",
+        JobState::Unknown => "unknown",
+    }
+}
+
+fn core_video_projection(job: &CoreJob, attempt: &CoreJobAttempt, data_dir: &std::path::Path) -> Value {
+    let mut payload = json!({
+        "id": job.id,
+        "object": "video",
+        "model": job.model,
+        "status": core_video_status(job.state),
+        "created_at": job.created_at_ms / 1_000,
+        "updated_at": job.updated_at_ms / 1_000,
+        "attempt": attempt.attempt_no,
+    });
+    if let Some(error_code) = job.error_code.as_deref() {
+        payload["error"] = json!({ "code": error_code });
+    }
+    if job.reconcile_required {
+        payload["reconcile_required"] = json!(true);
+    }
+    let expected_ref = format!("video-store:{}", job.id);
+    if job.artifact_ref.as_deref() == Some(expected_ref.as_str())
+        && super::video_store::artifact_path(data_dir, &job.id)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+    {
+        if let Ok(content_url) = super::video_store::content_url(&job.id) {
+            payload["content_url"] = json!(content_url);
+        }
+    }
+    payload
+}
+
+fn core_video_bundle(
+    bridge: &super::CoreBridge,
+    principal: &Principal,
+    job_id: &str,
+) -> Result<Option<(CoreJob, CoreJobAttempt)>, CoreError> {
+    let Some(job) = bridge.store.video_job_for_user(principal, job_id)? else {
+        return Ok(None);
+    };
+    let attempt = bridge
+        .store
+        .video_job_attempt_for_user(principal, job_id)?
+        .ok_or_else(|| CoreError::InvalidConfiguration {
+            key: "jobs.attempt".into(),
+            value: "video job has no attempt".into(),
+        })?;
+    Ok(Some((job, attempt)))
+}
+
+fn core_video_response(
+    bridge: &super::CoreBridge,
+    principal: &Principal,
+    job_id: &str,
+    request_id: Option<&str>,
+    status: StatusCode,
+    wrapped: bool,
+    replay: bool,
+    data_dir: &std::path::Path,
+) -> Response {
+    let bundle = match core_video_bundle(bridge, principal, job_id) {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => return openai_error(StatusCode::NOT_FOUND, "task_not_found", "video task not found"),
+        Err(error) => return core_error_response(error),
+    };
+    let task = core_video_projection(&bundle.0, &bundle.1, data_dir);
+    let body = if wrapped {
+        json!({ "task": task, "idempotent_replay": replay })
+    } else {
+        task
+    };
+    let mut response = Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| internal_error_response());
+    if let Some(request_id) = request_id {
+        response = with_core_request_id(response, request_id);
+    }
+    response
+}
+
+async fn core_videos_generations(
+    state: Arc<ApiSharedState>,
+    principal: Principal,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if require_scope(&principal, "videos:submit").is_err() {
+        return core_scope_error("videos:submit");
+    }
+    if body.len() > MAX_BODY_BYTES {
+        return openai_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "request body exceeds 8MB limit",
+        );
+    }
+    let input: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("invalid JSON body: {error}"),
+            )
+        }
+    };
+    let (model, _) = match video::validate_request(&input) {
+        Ok(value) => value,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &error),
+    };
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if idempotency_key.is_none() {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "idempotency_key_required",
+            "Idempotency-Key is required in Core enforce mode",
+        );
+    }
+    let bridge = match state.core.as_ref() {
+        Some(bridge) => bridge.clone(),
+        None => return scheduler_endpoint_not_enabled_response(),
+    };
+    // This readiness check deliberately precedes Core preflight. A missing
+    // adapter must not create a request, quota hold, lease, or job row.
+    let executor = match bridge.video_executor() {
+        Ok(executor) => executor,
+        Err(error) => return core_lease_error_response(error),
+    };
+    let job_id = format!(
+        "video-{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        rand::random::<u64>()
+    );
+    let preflight = match bridge.preflight_video_job(
+        &principal,
+        &principal.key_id,
+        idempotency_key,
+        &input,
+        job_id,
+    ) {
+        Ok(result) => result,
+        Err(error) => return core_lease_error_response(error),
+    };
+    let (job, lease) = match preflight {
+        VideoJobLeaseResult::Replay { job, .. } => {
+            return core_video_response(
+                &bridge,
+                &principal,
+                &job.id,
+                Some(&job.request_id),
+                StatusCode::ACCEPTED,
+                true,
+                true,
+                &state.data_dir,
+            )
+        }
+        VideoJobLeaseResult::Acquired { job, lease, .. } => (job, lease),
+    };
+
+    if let Err(error) = bridge.mark_video_job_running(&principal, &job.id) {
+        let _ = bridge.settle_video_job(
+            &principal,
+            &job.id,
+            &lease.lease_id,
+            VideoAdapterOutcome::TransportUnknown {
+                reason: "dispatch_state_failed".into(),
+                upstream_request_ref: None,
+            },
+        );
+        return core_lease_error_response(error);
+    }
+    let request = VideoExecutionRequest {
+        job_id: job.id.clone(),
+        request_id: job.request_id.clone(),
+        model,
+        body: input,
+    };
+    let lease_for_adapter = lease.clone();
+    let outcome = match tokio::task::spawn_blocking(move || executor.submit_video(&lease_for_adapter, request)).await {
+        Ok(outcome) => outcome,
+        Err(_) => VideoAdapterOutcome::TransportUnknown {
+            reason: "adapter_task_join_failed".into(),
+            upstream_request_ref: None,
+        },
+    };
+    match &outcome {
+        VideoAdapterOutcome::Accepted { upstream_request_ref } => {
+            if let Err(error) = bridge.record_video_job_acceptance(
+                &principal,
+                &job.id,
+                upstream_request_ref,
+            ) {
+                let _ = bridge.settle_video_job(
+                    &principal,
+                    &job.id,
+                    &lease.lease_id,
+                    VideoAdapterOutcome::TransportUnknown {
+                        reason: "acceptance_persistence_failed".into(),
+                        upstream_request_ref: None,
+                    },
+                );
+                return core_lease_error_response(error);
+            }
+        }
+        VideoAdapterOutcome::Succeeded { .. }
+        | VideoAdapterOutcome::Canceled { .. }
+        | VideoAdapterOutcome::Rejected { .. }
+        | VideoAdapterOutcome::TransportUnknown { .. } => {
+            if let Err(error) = bridge.settle_video_job(
+                &principal,
+                &job.id,
+                &lease.lease_id,
+                outcome.clone(),
+            ) {
+                return core_lease_error_response(error);
+            }
+        }
+    }
+    if let VideoAdapterOutcome::Rejected {
+        status,
+        accepted: false,
+        code,
+    } = &outcome
+    {
+        let response = openai_error(
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
+            "upstream_error",
+            code,
+        );
+        return with_core_request_id(response, &job.request_id);
+    }
+    core_video_response(
+        &bridge,
+        &principal,
+        &job.id,
+        Some(&job.request_id),
+        StatusCode::ACCEPTED,
+        true,
+        false,
+        &state.data_dir,
+    )
+}
+
 /// W-02 Seedance 文生视频入口。Work 积分账号异步转发到 Trae Work CN
 /// 原生 SSE 接口，客户端通过任务查询接口获取最终资源地址。
 pub async fn videos_generations(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     if core_enforcing(&state) {
-        return scheduler_endpoint_not_enabled_response();
+        let principal = match core_principal_or_unauthorized(principal.as_ref()) {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
+        return core_videos_generations(state, principal, headers, body).await;
     }
     state
         .total_requests
@@ -1930,10 +2195,30 @@ pub async fn videos_generations(
 pub async fn video_task(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    principal: Option<Extension<Principal>>,
     Path(task_id): Path<String>,
 ) -> Response {
     if core_enforcing(&state) {
-        return scheduler_endpoint_not_enabled_response();
+        let principal = match core_principal_or_unauthorized(principal.as_ref()) {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
+        if require_scope(&principal, "videos:read").is_err() {
+            return core_scope_error("videos:read");
+        }
+        let Some(bridge) = state.core.as_ref() else {
+            return scheduler_endpoint_not_enabled_response();
+        };
+        return core_video_response(
+            bridge,
+            &principal,
+            &task_id,
+            None,
+            StatusCode::OK,
+            false,
+            false,
+            &state.data_dir,
+        );
     }
     let owner_key_id = key_id
         .map(|Extension(k)| k.0)
@@ -1963,10 +2248,71 @@ pub async fn video_task(
 pub async fn video_content(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    principal: Option<Extension<Principal>>,
     Path(task_id): Path<String>,
 ) -> Response {
     if core_enforcing(&state) {
-        return scheduler_endpoint_not_enabled_response();
+        let principal = match core_principal_or_unauthorized(principal.as_ref()) {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
+        if require_scope(&principal, "videos:read").is_err() {
+            return core_scope_error("videos:read");
+        }
+        let Some(bridge) = state.core.as_ref() else {
+            return scheduler_endpoint_not_enabled_response();
+        };
+        let Some(bundle) = (match core_video_bundle(bridge, &principal, &task_id) {
+            Ok(bundle) => bundle,
+            Err(error) => return core_error_response(error),
+        }) else {
+            return openai_error(StatusCode::NOT_FOUND, "task_not_found", "video task not found");
+        };
+        let expected_ref = format!("video-store:{task_id}");
+        if bundle.0.artifact_ref.as_deref() != Some(expected_ref.as_str()) {
+            return openai_error(StatusCode::NOT_FOUND, "video_not_found", "video artifact not found");
+        }
+        let path = match super::video_store::artifact_path(&state.data_dir, &task_id) {
+            Ok(path) => path,
+            Err(_) => return openai_error(StatusCode::NOT_FOUND, "video_not_found", "video artifact not found"),
+        };
+        let Some(metadata) = std::fs::metadata(&path).ok().filter(|metadata| metadata.is_file()) else {
+            return openai_error(StatusCode::NOT_FOUND, "video_not_found", "video artifact not found");
+        };
+        let size = metadata.len();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+        let path_for_reader = path.clone();
+        std::thread::spawn(move || {
+            let mut file = match std::fs::File::open(path_for_reader) {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = tx.blocking_send(Err(error));
+                    return;
+                }
+            };
+            let mut buffer = vec![0u8; 128 * 1024];
+            loop {
+                match file.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.blocking_send(Ok(bytes::Bytes::copy_from_slice(&buffer[..n]))).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.blocking_send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "video/mp4")
+            .header("content-length", size)
+            .header("cache-control", "private, max-age=3600")
+            .body(Body::from_stream(ReceiverStream::new(rx)))
+            .unwrap_or_else(|_| internal_error_response());
     }
     let owner_key_id = key_id
         .map(|Extension(k)| k.0)
@@ -2028,6 +2374,126 @@ pub async fn video_content(
         .header("cache-control", "private, max-age=3600")
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .unwrap_or_else(|_| internal_error_response())
+}
+
+/// Request cancellation of a Core video job. A client request only records
+/// intent; the quota hold is released only after the adapter confirms cancel.
+pub async fn video_cancel(
+    State(state): State<Arc<ApiSharedState>>,
+    principal: Option<Extension<Principal>>,
+    Path(task_id): Path<String>,
+) -> Response {
+    if !core_enforcing(&state) {
+        return scheduler_endpoint_not_enabled_response();
+    }
+    let principal = match core_principal_or_unauthorized(principal.as_ref()) {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if require_scope(&principal, "videos:cancel").is_err() {
+        return core_scope_error("videos:cancel");
+    }
+    let Some(bridge) = state.core.as_ref() else {
+        return scheduler_endpoint_not_enabled_response();
+    };
+    let job = match bridge.request_video_cancel(&principal, &task_id) {
+        Ok(job) => job,
+        Err(CoreLeaseError::Core(CoreError::RequestNotFound { .. })) => {
+            return openai_error(StatusCode::NOT_FOUND, "task_not_found", "video task not found")
+        }
+        Err(error) => return core_lease_error_response(error),
+    };
+    if matches!(
+        job.state,
+        JobState::Canceled | JobState::Succeeded | JobState::Failed | JobState::Unknown
+    ) {
+        return core_video_response(
+            bridge,
+            &principal,
+            &task_id,
+            None,
+            StatusCode::OK,
+            false,
+            false,
+            &state.data_dir,
+        );
+    }
+    let lease = match bridge.video_job_lease(&principal, &task_id) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            return core_video_response(
+                bridge,
+                &principal,
+                &task_id,
+                None,
+                StatusCode::ACCEPTED,
+                false,
+                false,
+                &state.data_dir,
+            )
+        }
+        Err(error) => return core_lease_error_response(error),
+    };
+    let outcome = match bridge.video_executor() {
+        Ok(executor) => {
+            match executor.grant_for_lease(&lease) {
+                Some(grant) => {
+                    let outcome = tokio::task::spawn_blocking(move || executor.cancel_video(&grant)).await;
+                    match outcome {
+                        Ok(outcome) => outcome,
+                        Err(_) => VideoCancelOutcome::Unknown {
+                            reason: "cancel_adapter_task_join_failed".into(),
+                            upstream_request_ref: lease.upstream_request_ref.clone(),
+                        },
+                    }
+                }
+                None => VideoCancelOutcome::Unknown {
+                    reason: "cancel_lease_binding_missing".into(),
+                    upstream_request_ref: lease.upstream_request_ref.clone(),
+                },
+            }
+        }
+        Err(_) => VideoCancelOutcome::Unknown {
+            reason: "cancel_adapter_unavailable".into(),
+            upstream_request_ref: lease.upstream_request_ref.clone(),
+        },
+    };
+    let settlement_outcome = match outcome {
+        VideoCancelOutcome::Confirmed {
+            upstream_request_ref,
+        } => VideoAdapterOutcome::Canceled {
+            upstream_request_ref,
+        },
+        VideoCancelOutcome::Unsupported => VideoAdapterOutcome::TransportUnknown {
+            reason: "cancel_unsupported".into(),
+            upstream_request_ref: lease.upstream_request_ref.clone(),
+        },
+        VideoCancelOutcome::Unknown {
+            reason,
+            upstream_request_ref,
+        } => VideoAdapterOutcome::TransportUnknown {
+            reason,
+            upstream_request_ref,
+        },
+    };
+    if let Err(error) = bridge.settle_video_job(
+        &principal,
+        &task_id,
+        &lease.id,
+        settlement_outcome,
+    ) {
+        return core_lease_error_response(error);
+    }
+    core_video_response(
+        bridge,
+        &principal,
+        &task_id,
+        None,
+        StatusCode::ACCEPTED,
+        false,
+        false,
+        &state.data_dir,
+    )
 }
 
 async fn images_entry(
@@ -3095,6 +3561,90 @@ mod tests {
         fixture
     }
 
+    fn phase3_video_fixture(
+        grant: i64,
+        submit_outcomes: Vec<VideoAdapterOutcome>,
+        cancel_outcomes: Vec<VideoCancelOutcome>,
+    ) -> (CoreFixture, Arc<super::super::core_video::MockVideoAdapter>) {
+        let mut fixture = core_fixture(
+            0,
+            &["videos:submit", "videos:read", "videos:cancel"],
+        );
+        let store = fixture.state.core.as_ref().unwrap().store.clone();
+        store
+            .upsert_cost_policy(CostPolicy {
+                id: "route-video-policy".into(),
+                endpoint: "videos".into(),
+                model_pattern: "mock-video".into(),
+                resource_kind: "video_job".into(),
+                reserve_amount: 1,
+                max_actual_amount: Some(1),
+                version: 1,
+                enabled: true,
+            })
+            .unwrap();
+        if grant > 0 {
+            store
+                .grant(QuotaGrant {
+                    user_id: "route-user".into(),
+                    resource_kind: "video_job".into(),
+                    amount: grant,
+                    actor_user_id: "route-user".into(),
+                    reason: "video route test grant".into(),
+                })
+                .unwrap();
+        }
+        let mut account = aiwork_core::RegisterUpstreamAccount::new(
+            "mock-video-account".into(),
+            "mock-video".into(),
+            "vault://mock/video".into(),
+        );
+        account.capabilities.insert("video".into());
+        store.upsert_upstream_account(account, &fixture.admin).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        store
+            .append_upstream_observation(aiwork_core::UpstreamObservation::new(
+                "mock-video-observation".into(),
+                "mock-video-account".into(),
+                "video_job".into(),
+                Some(100),
+                1,
+                "reader".into(),
+                aiwork_core::ObservationStatus::Fresh,
+                now,
+                now + 600_000,
+                json!({}),
+            ))
+            .unwrap();
+        let runtime = super::super::scheduler::SchedulerRuntime::new(
+            store.clone(),
+            fixture.dir.clone(),
+            super::super::scheduler::SchedulerMode::Enforce,
+            Default::default(),
+            Default::default(),
+            now,
+        )
+        .unwrap();
+        let adapter = Arc::new(super::super::core_video::MockVideoAdapter::new(
+            submit_outcomes,
+            cancel_outcomes,
+        ));
+        let executor = super::super::core_video::CoreVideoExecutor::new()
+            .with_provider("mock-video", adapter.clone())
+            .for_account(
+                "mock-video-account",
+                "mock-video",
+                "vault://mock/video",
+            );
+        Arc::get_mut(&mut fixture.state).unwrap().core = Some(Arc::new(
+            CoreBridge::new(store, CoreMode::Enforce)
+                .with_video_executor(executor)
+                .with_scheduler(Arc::new(runtime))
+                .unwrap(),
+        ));
+        (fixture, adapter)
+    }
+
     #[tokio::test]
     async fn core_enforce_chat_uses_core_lease_and_mock_executor_once() {
         let fixture = phase2_fixture(2);
@@ -3457,6 +4007,7 @@ mod tests {
         let response = videos_generations(
             State(fixture.state.clone()),
             None,
+            Some(Extension(fixture.principal.clone())),
             HeaderMap::new(),
             Bytes::from("{}"),
         )
@@ -3465,11 +4016,12 @@ mod tests {
             &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
         )
         .unwrap();
-        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+        assert_eq!(payload["error"]["code"], "insufficient_scope");
 
         let response = video_task(
             State(fixture.state.clone()),
             None,
+            Some(Extension(fixture.principal.clone())),
             Path("unintegrated-video".into()),
         )
         .await;
@@ -3477,11 +4029,12 @@ mod tests {
             &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
         )
         .unwrap();
-        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+        assert_eq!(payload["error"]["code"], "insufficient_scope");
 
         let response = video_content(
             State(fixture.state.clone()),
             None,
+            Some(Extension(fixture.principal.clone())),
             Path("unintegrated-video".into()),
         )
         .await;
@@ -3489,7 +4042,7 @@ mod tests {
             &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
         )
         .unwrap();
-        assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
+        assert_eq!(payload["error"]["code"], "insufficient_scope");
     }
 
     #[tokio::test]
@@ -4334,5 +4887,243 @@ mod tests {
         let store = &fixture.state.core.as_ref().unwrap().store;
         assert_eq!(store.count_rows("requests").unwrap(), 0);
         assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn core_video_without_adapter_returns_501_before_any_persistent_write() {
+        let fixture = core_fixture(
+            0,
+            &["videos:submit", "videos:read", "videos:cancel"],
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "video-no-adapter".parse().unwrap());
+        let response = videos_generations(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            Bytes::from(json!({"model":"mock-video","prompt":"hello"}).to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "scheduler_endpoint_not_enabled");
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        assert_eq!(store.count_rows("requests").unwrap(), 0);
+        assert_eq!(store.count_rows("quota_reservations").unwrap(), 0);
+        assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
+        assert_eq!(store.count_rows("jobs").unwrap(), 0);
+        assert_eq!(store.count_rows("job_attempts").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn core_video_submission_is_persistent_running_and_idempotent() {
+        let (fixture, adapter) = phase3_video_fixture(
+            2,
+            vec![VideoAdapterOutcome::Accepted {
+                upstream_request_ref: "upstream-video-1".into(),
+            }],
+            Vec::new(),
+        );
+        let body = Bytes::from(json!({"model":"mock-video","prompt":"hello"}).to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "video-idempotent".parse().unwrap());
+        let first = videos_generations(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers.clone(),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_body["task"]["status"], "running");
+
+        let replay = videos_generations(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            body,
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let replay_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay_body["idempotent_replay"], true);
+        assert_eq!(replay_body["task"]["status"], "running");
+        assert_eq!(adapter.calls(), vec![replay_body["task"]["id"].as_str().unwrap().to_string()]);
+
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        assert_eq!(store.count_rows("requests").unwrap(), 1);
+        assert_eq!(store.count_rows("quota_reservations").unwrap(), 1);
+        assert_eq!(store.count_rows("upstream_leases").unwrap(), 1);
+        assert_eq!(store.count_rows("jobs").unwrap(), 1);
+        assert_eq!(store.count_rows("job_attempts").unwrap(), 1);
+        assert_eq!(store.balance("route-user", "video_job").unwrap().held, 1);
+        let job_id = replay_body["task"]["id"].as_str().unwrap();
+        let job = store
+            .video_job_for_user(&fixture.principal, job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, aiwork_core::JobState::Running);
+        let attempt = store
+            .video_job_attempt_for_user(&fixture.principal, job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.upstream_request_ref.as_deref(), Some("upstream-video-1"));
+    }
+
+    #[tokio::test]
+    async fn core_video_confirmed_cancel_releases_hold_once() {
+        let (fixture, _) = phase3_video_fixture(
+            1,
+            vec![VideoAdapterOutcome::Accepted {
+                upstream_request_ref: "upstream-video-cancel".into(),
+            }],
+            vec![VideoCancelOutcome::Confirmed {
+                upstream_request_ref: Some("upstream-video-cancel".into()),
+            }],
+        );
+        let body = Bytes::from(json!({"model":"mock-video","prompt":"cancel me"}).to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "video-cancel".parse().unwrap());
+        let submitted = videos_generations(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            body,
+        )
+        .await;
+        let submitted_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(submitted.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let job_id = submitted_body["task"]["id"].as_str().unwrap().to_owned();
+
+        let canceled = video_cancel(
+            State(fixture.state.clone()),
+            Some(Extension(fixture.principal.clone())),
+            Path(job_id.clone()),
+        )
+        .await;
+        let canceled_status = canceled.status();
+        let canceled_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(canceled.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(canceled_status, StatusCode::ACCEPTED);
+        assert_eq!(canceled_body["status"], "canceled");
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        assert_eq!(store.balance("route-user", "video_job").unwrap().held, 0);
+        assert_eq!(store.balance("route-user", "video_job").unwrap().available, 1);
+        assert_eq!(
+            store.video_job_for_user(&fixture.principal, &job_id).unwrap().unwrap().state,
+            aiwork_core::JobState::Canceled
+        );
+        assert_eq!(
+            store
+                .count_rows("quota_ledger")
+                .unwrap(),
+            3,
+            "grant, reservation hold, plus one cancel release ledger entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_video_explicit_rejection_releases_without_success() {
+        let (fixture, adapter) = phase3_video_fixture(
+            1,
+            vec![VideoAdapterOutcome::Rejected {
+                status: 400,
+                code: "invalid_request".into(),
+                accepted: false,
+            }],
+            Vec::new(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "video-rejected".parse().unwrap());
+        let response = videos_generations(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            Bytes::from(json!({"model":"mock-video","prompt":"reject me"}).to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "upstream_error");
+        assert_eq!(adapter.calls().len(), 1);
+        let job_id = adapter.calls()[0].clone();
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        assert_eq!(store.balance("route-user", "video_job").unwrap().held, 0);
+        assert_eq!(store.balance("route-user", "video_job").unwrap().available, 1);
+        assert_eq!(
+            store.video_job_for_user(&fixture.principal, &job_id).unwrap().unwrap().state,
+            aiwork_core::JobState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn core_video_unknown_submission_keeps_hold_for_reconciliation() {
+        let (fixture, _) = phase3_video_fixture(
+            1,
+            vec![VideoAdapterOutcome::TransportUnknown {
+                reason: "transport_timeout".into(),
+                upstream_request_ref: None,
+            }],
+            Vec::new(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "video-unknown".parse().unwrap());
+        let response = videos_generations(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            Bytes::from(json!({"model":"mock-video","prompt":"uncertain"}).to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["task"]["status"], "unknown");
+        assert_eq!(body["task"]["reconcile_required"], true);
+        let store = &fixture.state.core.as_ref().unwrap().store;
+        assert_eq!(store.balance("route-user", "video_job").unwrap().held, 1);
+        assert_eq!(
+            store.video_job_for_user(&fixture.principal, body["task"]["id"].as_str().unwrap()).unwrap().unwrap().state,
+            aiwork_core::JobState::Unknown
+        );
     }
 }

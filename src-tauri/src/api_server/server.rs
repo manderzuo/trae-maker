@@ -112,6 +112,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         // W-02 Seedance 视频接口契约：异步 Work 额度任务桥，原生插件仍可降级。
         .route("/v1/videos/generations", post(routes::videos_generations))
         .route("/v1/videos/:task_id", get(routes::video_task))
+        .route("/v1/videos/:task_id/cancel", post(routes::video_cancel))
         .route("/v1/videos/:task_id/content", get(routes::video_content))
         .layer(from_fn_with_state(state.clone(), super::cors::headers))
         .layer(from_fn_with_state(state.clone(), auth::bearer_auth))

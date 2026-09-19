@@ -1,6 +1,7 @@
 mod cost;
 mod error;
 mod identity;
+mod jobs;
 mod models;
 mod ports;
 mod quota;
@@ -13,7 +14,8 @@ pub use cost::{CostError, CostEstimate, CostPolicy};
 pub use error::CoreError;
 pub use identity::{require_scope, AuthError, Principal};
 pub use models::{
-    AssetState, BeginRequest, BeginRequestInput, CoreAsset, CreateAssetInput, IssuedApiKey, NewUser, QuotaBalance, QuotaGrant,
+    AssetState, BeginRequest, BeginRequestInput, CoreAsset, CreateAssetInput, CreateVideoJobInput, CoreJob,
+    CoreJobAttempt, IssuedApiKey, JobAttemptState, JobState, NewUser, QuotaBalance, QuotaGrant,
     LegacyMigrationAsset, LegacyMigrationBatch, LegacyMigrationJob, LegacyMigrationKey,
     LegacyMigrationObservation, LegacyMigrationResult,
     PreflightReserveInput, PreflightReserveResult, QuotaReserve, RequestHandle, RequestResult,
@@ -30,7 +32,7 @@ pub use requests::canonical_json_hash;
 pub use store::{CoreStore, CORE_DB_FILE, CURRENT_SCHEMA_VERSION};
 pub use upstream::{
     LeaseOutcome, LeaseSettlement, ScheduleError, SchedulerLeaseRequest, SchedulerLeaseResult,
-    SelectionStrategy, UpstreamLeaseGrant,
+    SelectionStrategy, UpstreamLeaseGrant, VideoJobLeaseResult,
 };
 
 impl CoreStore {

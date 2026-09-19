@@ -405,7 +405,7 @@ ai-work-assistant/
 
 ## 16. Phase 2 信用感知调度运维契约
 
-- Core 数据库为 `<AIWORK_DATA_DIR>\data\core.sqlite3`，schema v8 的 `upstream_accounts`、`upstream_observations`、`upstream_leases`、用户 `quota_*` 账本和活动素材 `assets` 分离；`credentials_ref` 永远是不透明引用，不能写入 JWT、Cookie、refresh token、prompt 或完整上游响应。
+- Core 数据库为 `<AIWORK_DATA_DIR>\data\core.sqlite3`，当前 schema v9（Phase 2 基线为 v8，Phase 3B/3C 分别完成 v7→v8 与 v8→v9）将 `upstream_accounts`、`upstream_observations`、`upstream_leases`、用户 `quota_*` 账本、活动素材 `assets` 和视频 `jobs/job_attempts` 分离；`credentials_ref` 永远是不透明引用，不能写入 JWT、Cookie、refresh token、prompt 或完整上游响应。
 - `core_mode`/`scheduler_mode` 只按 `docs/credit-aware-scheduler-operations.md` 的兼容矩阵启用。`off` 保留 legacy `ApiPool`；`shadow` 只诊断、不扣额度；`enforce` 没有可信 reader/executor、fresh observation、policy、grant 或明确账号绑定时必须 fail-closed，禁止回退 `ApiPool`。
 - 过期 `held`/`active` upstream lease 只能进入 `unknown`；reservation/request 保持 unknown、hold 不释放、不写 release ledger、不自动重试。必须经过明确对账/人工处理。
 - 管理员 scheduler status 只返回聚合计数和固定错误码；HTTP enforce `/status` 与桌面管理辅助路径要求 admin Principal。普通用户不能读取管理员投影、账号凭据或其他用户的 quota/request。
@@ -440,3 +440,12 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 - enforce 上传先把文件原子写到 `data/assets/` 下的安全单级 `storage_ref`，再插入 Core；Core 失败必须清理孤立文件。内容读回必须验证路径、大小、SHA-256 和未过期的内容 token；错误 token、跨用户和过期记录不得回退到 legacy 索引。
 - `core_mode=off`/`shadow` 的 legacy `assets.json` 只用于兼容，不是 Core 用户归属证明。服务启动可将过期 Core 素材标为 `expired` 并清理文件，但不得删除审计事实。
 - Phase 3B 的 Core、Tauri 和 route focused tests 只使用 Mock/fixture；不得访问真实网络、真实账号或运行中的服务。`TEMP`、`TMP`、Cargo target、日志和 fixture 统一放在 `D:\gpt`，命令使用 `--offline --locked`，并先清空、断言 `AIWORK_*` 环境变量为空。
+
+## 19. Phase 3C 持久化视频 jobs/attempts 与回滚
+
+- schema v8→v9 只创建 Core `jobs`、`job_attempts` 及索引，不导入 legacy `video_tasks.json` 或其他任务文件；请求、reservation、lease、job、attempt 必须在同一用户和同一资源类型链路上。
+- enforce `POST /v1/videos/generations` 必须具备认证 Principal、`videos:submit`、严格 `Idempotency-Key`、fresh observation、policy/grant、明确视频 adapter 绑定；缺 adapter 时在 preflight 前返回 `501/scheduler_endpoint_not_enabled`，不得写 request/lease/quota/job，也不得回退 legacy pool。
+- Core 只持久化输入摘要、受限模型/状态和安全引用，不持久化 prompt、完整请求体、credentials 或账号敏感信息。job 从 `queued` 到 `running`/`cancel_requested`，终态为 `succeeded`、`failed`、`canceled` 或 `unknown`；`unknown` 和未确认取消保留 hold，等待对账。
+- `videos:read` 只返回 owner-scoped 安全投影；`videos:cancel` 先记录取消意图，只有 adapter 明确确认取消才释放 hold。内容分发只接受受信任的 `video-store:` artifact 引用和本地安全路径，enforce 不回退任意 legacy 内容。
+- Phase 3C 验证只使用 D 盘 Mock/fixture：Core 全套回归通过，Tauri focused 4 项通过，Tauri 全量 `440 passed; 0 failed; 4 ignored`；这证明本地生命周期、隔离、幂等和不确定结果处理，不证明真实上游账号、余额、计费或视频协议可用。
+- 绑定、reader、健康数据或真实适配器不可信时，保持 fail-closed 或回退到 `off`；回退不得删除 `unknown` job、quota hold、lease、审计或历史事实。Phase 4 管理、部署和真实 adapter 接入完成前，不得宣称总目标完成。

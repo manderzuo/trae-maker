@@ -3,7 +3,10 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{CoreError, PreflightReserveInput, RequestHandle, UpstreamAccountState, UpstreamLease};
+use crate::{
+    CoreError, CoreJob, CoreJobAttempt, PreflightReserveInput, RequestHandle, UpstreamAccountState,
+    UpstreamLease,
+};
 
 pub(crate) const MAX_OBSERVATION_SUMMARY_BYTES: usize = 4 * 1024;
 pub(crate) const DEFAULT_RECONCILE_TTL_MS: i64 = 600_000;
@@ -68,6 +71,20 @@ pub struct LeaseSettlement {
 pub enum SchedulerLeaseResult {
     Acquired(UpstreamLeaseGrant),
     Replay { request: RequestHandle, lease: UpstreamLease },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoJobLeaseResult {
+    Acquired {
+        job: CoreJob,
+        attempt: CoreJobAttempt,
+        lease: UpstreamLeaseGrant,
+    },
+    Replay {
+        job: CoreJob,
+        attempt: CoreJobAttempt,
+        lease: UpstreamLease,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

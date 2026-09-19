@@ -369,3 +369,43 @@ CREATE TABLE assets (
 CREATE INDEX assets_by_user_state_created ON assets(user_id, state, created_at_ms DESC);
 CREATE INDEX assets_by_expiry ON assets(state, expires_at_ms);
 "#;
+
+pub(crate) const SCHEMA_V9: &str = r#"
+CREATE TABLE jobs (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL UNIQUE REFERENCES requests(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  kind TEXT NOT NULL CHECK(kind = 'video'),
+  model TEXT NOT NULL,
+  input_hash BLOB NOT NULL CHECK(length(input_hash) = 32),
+  state TEXT NOT NULL CHECK(state IN ('created','queued','running','cancel_requested','canceled','succeeded','failed','unknown')),
+  output_ref TEXT,
+  artifact_ref TEXT,
+  error_code TEXT,
+  reconcile_required INTEGER NOT NULL CHECK(reconcile_required IN (0,1)),
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  last_heartbeat_ms INTEGER,
+  cancel_requested_at_ms INTEGER
+);
+CREATE TABLE job_attempts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  attempt_no INTEGER NOT NULL CHECK(attempt_no > 0),
+  account_ref TEXT NOT NULL REFERENCES upstream_accounts(id),
+  lease_id TEXT NOT NULL UNIQUE REFERENCES upstream_leases(id),
+  upstream_request_ref TEXT,
+  state TEXT NOT NULL CHECK(state IN ('queued','running','cancel_requested','canceled','succeeded','failed','unknown')),
+  error_code TEXT,
+  retryable INTEGER NOT NULL CHECK(retryable IN (0,1)),
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  last_heartbeat_ms INTEGER,
+  finished_at_ms INTEGER,
+  UNIQUE(job_id, attempt_no)
+);
+CREATE INDEX jobs_by_user_state_updated ON jobs(user_id, state, updated_at_ms DESC);
+CREATE INDEX jobs_by_recovery ON jobs(state, reconcile_required, updated_at_ms);
+CREATE INDEX job_attempts_by_job_attempt ON job_attempts(job_id, attempt_no DESC);
+CREATE INDEX job_attempts_by_recovery ON job_attempts(state, updated_at_ms);
+"#;

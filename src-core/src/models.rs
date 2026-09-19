@@ -347,6 +347,137 @@ pub struct CoreAsset {
     pub state: AssetState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    Created,
+    Queued,
+    Running,
+    CancelRequested,
+    Canceled,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+impl JobState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::CancelRequested => "cancel_requested",
+            Self::Canceled => "canceled",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub(crate) fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "created" => Some(Self::Created),
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "cancel_requested" => Some(Self::CancelRequested),
+            "canceled" => Some(Self::Canceled),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Created, Self::Queued | Self::Failed | Self::Unknown)
+                | (Self::Queued, Self::Running | Self::CancelRequested | Self::Failed | Self::Unknown)
+                | (Self::Running, Self::Succeeded | Self::Failed | Self::CancelRequested | Self::Unknown)
+                | (Self::CancelRequested, Self::Canceled | Self::Unknown)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobAttemptState {
+    Queued,
+    Running,
+    CancelRequested,
+    Canceled,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+impl JobAttemptState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::CancelRequested => "cancel_requested",
+            Self::Canceled => "canceled",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub(crate) fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "cancel_requested" => Some(Self::CancelRequested),
+            "canceled" => Some(Self::Canceled),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateVideoJobInput {
+    pub id: String,
+    pub input_hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreJob {
+    pub id: String,
+    pub request_id: String,
+    pub user_id: String,
+    pub kind: String,
+    pub model: String,
+    pub input_hash: Vec<u8>,
+    pub state: JobState,
+    pub output_ref: Option<String>,
+    pub artifact_ref: Option<String>,
+    pub error_code: Option<String>,
+    pub reconcile_required: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub last_heartbeat_ms: Option<i64>,
+    pub cancel_requested_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreJobAttempt {
+    pub id: String,
+    pub job_id: String,
+    pub attempt_no: i64,
+    pub account_ref: String,
+    pub lease_id: String,
+    pub upstream_request_ref: Option<String>,
+    pub state: JobAttemptState,
+    pub error_code: Option<String>,
+    pub retryable: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub last_heartbeat_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeginRequestInput {
     pub user_id: String,

@@ -1,11 +1,11 @@
 use std::{path::Path, sync::Arc};
 
 use aiwork_core::{
-    require_scope, BeginRequest, BeginRequestInput, ChatExecutionRequest, ChatExecutionResult, CoreError,
-    CoreStore, LeaseOutcome, LeaseSettlement, PreflightReserveInput, PreflightReserveResult, Principal,
-    RequestResult, RequestState, Reservation, ScheduleError, SchedulerLeaseRequest,
-    SchedulerLeaseResult, SelectionStrategy, Settlement, UpstreamError, UpstreamLease,
-    UpstreamLeaseGrant,
+    canonical_json_hash, require_scope, BeginRequest, BeginRequestInput, ChatExecutionRequest,
+    ChatExecutionResult, CoreError, CoreStore, CreateVideoJobInput, LeaseOutcome, LeaseSettlement,
+    PreflightReserveInput, PreflightReserveResult, Principal, RequestResult, RequestState, Reservation,
+    ScheduleError, SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, Settlement,
+    UpstreamError, UpstreamLease, UpstreamLeaseGrant, VideoJobLeaseResult,
 };
 use serde_json::Value;
 
@@ -17,6 +17,11 @@ pub use core_executor::{
     CancelSupport, CoreUpstreamExecutor, LegacyChatTransport, LegacyPoolLeaseAdapter,
     LegacyPoolStreamAdapter, LegacyStreamTransport, LeaseStreamAdapter, LeaseUpstreamAdapter,
     StreamEvent, StreamSink, StreamTerminalOutcome, StreamUsage, UpstreamOutcome,
+};
+#[allow(unused_imports)]
+pub use super::core_video::{
+    CoreVideoExecutor, LeaseVideoAdapter, MockVideoAdapter, VideoAdapterOutcome,
+    VideoCancelOutcome, VideoExecutionRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,15 +116,27 @@ pub struct CoreBridge {
     pub mode: CoreMode,
     scheduler: Option<Arc<super::scheduler::SchedulerRuntime>>,
     upstream_executor: Option<CoreUpstreamExecutor>,
+    video_executor: Option<CoreVideoExecutor>,
 }
 
 impl CoreBridge {
     pub fn new(store: Arc<CoreStore>, mode: CoreMode) -> Self {
-        Self { store, mode, scheduler: None, upstream_executor: None }
+        Self {
+            store,
+            mode,
+            scheduler: None,
+            upstream_executor: None,
+            video_executor: None,
+        }
     }
 
     pub fn with_upstream_executor(mut self, executor: CoreUpstreamExecutor) -> Self {
         self.upstream_executor = Some(executor);
+        self
+    }
+
+    pub fn with_video_executor(mut self, executor: CoreVideoExecutor) -> Self {
+        self.video_executor = Some(executor);
         self
     }
 
@@ -423,6 +440,218 @@ impl CoreBridge {
         self.store
             .settle_upstream_lease_with_status(principal, lease_id, outcome)
             .map_err(CoreLeaseError::from)
+    }
+
+    /// Video dispatch is enabled only when an explicit provider/account-bound
+    /// adapter was injected. The legacy video pool is never an implicit
+    /// fallback for this path.
+    pub fn video_executor(&self) -> Result<CoreVideoExecutor, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if self.scheduler.is_none() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        let executor = self
+            .video_executor
+            .as_ref()
+            .ok_or(CoreLeaseError::EndpointNotEnabled)?;
+        if executor.is_empty() || !executor.can_dispatch() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        Ok(executor.clone())
+    }
+
+    pub fn preflight_video_job(
+        &self,
+        principal: &Principal,
+        api_key_id: &str,
+        client_idempotency_key: Option<&str>,
+        body: &Value,
+        job_id: String,
+    ) -> Result<VideoJobLeaseResult, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        require_scope(principal, "videos:submit").map_err(|_| {
+            CoreLeaseError::Core(CoreError::MissingScope {
+                scope: "videos:submit".into(),
+            })
+        })?;
+        if principal.key_id != api_key_id {
+            return Err(CoreLeaseError::Core(CoreError::InvalidRequestIdentity {
+                user_id: principal.user_id.clone(),
+                api_key_id: api_key_id.into(),
+            }));
+        }
+        let idempotency_key = client_idempotency_key
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| CoreLeaseError::Core(CoreError::InvalidConfiguration {
+                key: "idempotency_key".into(),
+                value: "required in Core enforce mode".into(),
+            }))?;
+        let executor = self.video_executor()?;
+        let body = super::payload::sanitize_scheduler_chat_body(body);
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| CoreLeaseError::Core(CoreError::InvalidConfiguration {
+                key: "videos.model".into(),
+                value: "missing or non-string".into(),
+            }))?;
+        let estimate = self.store.estimate_cost("videos", model, &body)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let input = SchedulerLeaseRequest {
+            preflight: PreflightReserveInput {
+                request: BeginRequestInput {
+                    user_id: principal.user_id.clone(),
+                    api_key_id: api_key_id.into(),
+                    protocol: "openai".into(),
+                    endpoint: "videos".into(),
+                    model: model.into(),
+                    idempotency_key: idempotency_key.into(),
+                    body: body.clone(),
+                },
+                resource_kind: "video_job".into(),
+                amount: estimate.reserve_amount,
+                ttl_ms: 15 * 60 * 1000,
+            },
+            provider_hint: None,
+            required_capabilities: vec!["video".into()],
+            region: None,
+            predicted_units: estimate.reserve_amount,
+            safety_margin_units: 0,
+            observation_max_age_ms: 10 * 60 * 1000,
+            allowed_accounts: Some(executor.bound_account_refs()),
+            dedicated_account: None,
+            selection_strategy: SelectionStrategy::HighestNormalizedAvailable,
+            now_ms,
+            lease_ttl_ms: 15 * 60 * 1000,
+            reconcile_ttl_ms: 10 * 60 * 1000,
+        };
+        self.store
+            .preflight_video_job(
+                principal,
+                input,
+                CreateVideoJobInput {
+                    id: job_id,
+                    input_hash: canonical_json_hash(&body).to_vec(),
+                },
+            )
+            .map_err(CoreLeaseError::from)
+    }
+
+    pub fn mark_video_job_running(
+        &self,
+        principal: &Principal,
+        job_id: &str,
+    ) -> Result<aiwork_core::CoreJob, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if self.scheduler.is_none() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        self.store
+            .mark_video_job_running(principal, job_id, chrono::Utc::now().timestamp_millis())
+            .map_err(CoreLeaseError::Core)
+    }
+
+    pub fn record_video_job_acceptance(
+        &self,
+        principal: &Principal,
+        job_id: &str,
+        upstream_request_ref: &str,
+    ) -> Result<aiwork_core::CoreJob, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if self.scheduler.is_none() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        self.store
+            .record_video_job_acceptance(
+                principal,
+                job_id,
+                upstream_request_ref,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(CoreLeaseError::Core)
+    }
+
+    pub fn settle_video_job(
+        &self,
+        principal: &Principal,
+        job_id: &str,
+        lease_id: &str,
+        outcome: VideoAdapterOutcome,
+    ) -> Result<LeaseSettlement, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if self.scheduler.is_none() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let (output_ref, artifact_ref) = outcome.output_refs();
+        for (field, value) in [
+            ("jobs.output_ref", output_ref),
+            ("jobs.artifact_ref", artifact_ref),
+        ] {
+            if let Some(value) = value {
+                if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+                    return Err(CoreLeaseError::Core(CoreError::Validation {
+                        field: field.into(),
+                        reason: "must be a bounded non-control reference".into(),
+                    }));
+                }
+            }
+        }
+        let lease_outcome = outcome.lease_outcome(now_ms).ok_or_else(|| {
+            CoreLeaseError::Core(CoreError::InvalidConfiguration {
+                key: "video.outcome".into(),
+                value: "accepted outcome must be recorded before settlement".into(),
+            })
+        })?;
+        let settlement = self
+            .store
+            .settle_upstream_lease_with_status(principal, lease_id, lease_outcome)
+            .map_err(CoreLeaseError::from)?;
+        if settlement.applied && (output_ref.is_some() || artifact_ref.is_some()) {
+            self.store
+                .set_video_job_result_refs(
+                    principal,
+                    job_id,
+                    output_ref,
+                    artifact_ref,
+                    now_ms,
+                )
+                .map_err(CoreLeaseError::Core)?;
+        }
+        Ok(settlement)
+    }
+
+    pub fn request_video_cancel(
+        &self,
+        principal: &Principal,
+        job_id: &str,
+    ) -> Result<aiwork_core::CoreJob, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if self.scheduler.is_none() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        require_scope(principal, "videos:cancel").map_err(|_| {
+            CoreLeaseError::Core(CoreError::MissingScope {
+                scope: "videos:cancel".into(),
+            })
+        })?;
+        self.store
+            .request_video_cancel(principal, job_id, chrono::Utc::now().timestamp_millis())
+            .map_err(CoreLeaseError::Core)
+    }
+
+    pub fn video_job_lease(
+        &self,
+        principal: &Principal,
+        job_id: &str,
+    ) -> Result<Option<UpstreamLease>, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        let job = self.store.video_job_for_user(principal, job_id)?;
+        let Some(job) = job else { return Ok(None) };
+        self.store
+            .upstream_lease_for_request(&job.request_id, "video_job")
+            .map_err(CoreLeaseError::Core)
     }
 
     pub fn open_for_mode(mode: CoreMode, data_dir: &Path) -> Result<Option<Arc<Self>>, CoreError> {

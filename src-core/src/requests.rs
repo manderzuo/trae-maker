@@ -8,8 +8,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     CostError, CostEstimate, CostPolicy, BeginRequest, BeginRequestInput, CoreError, CoreStore,
     LeaseOutcome, LeaseState, ObservationStatus, PreflightReserveInput, PreflightReserveResult,
-    QuotaReserve, RequestHandle, RequestResult, RequestState, ScheduleError, Settlement,
-    SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, UpstreamLease, UpstreamLeaseGrant,
+    CreateVideoJobInput, JobAttemptState, JobState, QuotaReserve, RequestHandle, RequestResult,
+    RequestState, ScheduleError, Settlement, SchedulerLeaseRequest, SchedulerLeaseResult,
+    SelectionStrategy, UpstreamLease, UpstreamLeaseGrant, VideoJobLeaseResult,
     upstream::LeaseSettlement,
     upstream::{
         account_matches_constraints, sanitize_error_category, sanitize_upstream_request_ref,
@@ -75,11 +76,65 @@ impl CoreStore {
         principal: &crate::Principal,
         input: SchedulerLeaseRequest,
     ) -> Result<SchedulerLeaseResult, ScheduleError> {
+        self.preflight_reserve_with_lease_internal(principal, input, None)
+    }
+
+    pub fn preflight_video_job(
+        &self,
+        principal: &crate::Principal,
+        input: SchedulerLeaseRequest,
+        job: CreateVideoJobInput,
+    ) -> Result<VideoJobLeaseResult, ScheduleError> {
+        if input.preflight.request.endpoint != "videos"
+            || input.preflight.resource_kind != "video_job"
+        {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "video_job.endpoint_or_resource".into(),
+                value: format!(
+                    "endpoint={}, resource_kind={}",
+                    input.preflight.request.endpoint, input.preflight.resource_kind
+                ),
+            }));
+        }
+        crate::jobs::validate_video_job_input(&job)?;
+        let result = self.preflight_reserve_with_lease_internal(principal, input, Some(&job))?;
+        match result {
+            SchedulerLeaseResult::Acquired(lease) => {
+                let (job, attempt) = self
+                    .video_job_bundle_for_user(principal, &job.id)?
+                    .ok_or_else(|| CoreError::InvalidConfiguration {
+                        key: "jobs.create".into(),
+                        value: "video job missing after lease preflight".into(),
+                    })?;
+                Ok(VideoJobLeaseResult::Acquired { job, attempt, lease })
+            }
+            SchedulerLeaseResult::Replay { request, lease } => {
+                let (job, attempt) = self
+                    .video_job_bundle_for_request(principal, &request.id)?
+                    .ok_or_else(|| CoreError::InvalidConfiguration {
+                        key: "jobs.replay".into(),
+                        value: "idempotent video request has no job".into(),
+                    })?;
+                Ok(VideoJobLeaseResult::Replay { job, attempt, lease })
+            }
+        }
+    }
+
+    fn preflight_reserve_with_lease_internal(
+        &self,
+        principal: &crate::Principal,
+        input: SchedulerLeaseRequest,
+        video_job: Option<&CreateVideoJobInput>,
+    ) -> Result<SchedulerLeaseResult, ScheduleError> {
         validate_scheduler_request(&input)?;
         if principal.user_id != input.preflight.request.user_id || principal.key_id != input.preflight.request.api_key_id {
             return Err(ScheduleError::InvalidRequestIdentity);
         }
-        let required_scope = format!("{}:invoke", input.preflight.request.endpoint);
+        let required_scope = if input.preflight.request.endpoint == "videos" {
+            "videos:submit".to_owned()
+        } else {
+            format!("{}:invoke", input.preflight.request.endpoint)
+        };
         if !principal.scopes.contains(&required_scope) {
             return Err(ScheduleError::MissingScope(required_scope));
         }
@@ -176,6 +231,17 @@ impl CoreStore {
             params![&lease.id, &lease.request_id, &lease.account_ref, &lease.resource_kind, lease.predicted_units,
                 &lease.observation_id, lease.state.as_str(), lease.lease_expires_at_ms, lease.reconcile_until_ms, now],
         )?;
+        if let Some(video_job) = video_job {
+            crate::jobs::insert_video_job_and_attempt(
+                &transaction,
+                principal,
+                &request_id,
+                &input.preflight.request.model,
+                &lease,
+                video_job,
+                now,
+            )?;
+        }
         Self::insert_audit_event(&transaction, &principal.user_id, "upstream.lease_acquire", "upstream_lease", &lease.id,
             serde_json::json!({"request_id": request_id, "lease_id": lease.id, "account_ref": lease.account_ref,
                 "provider": candidate.provider, "resource_kind": lease.resource_kind, "observation_id": candidate.observation_id,
@@ -284,6 +350,7 @@ impl CoreStore {
             .ok_or_else(|| ScheduleError::Core(CoreError::ReservationNotFound { reservation_id: lease.request_id.clone() }))?;
         Self::validate_reservation_owner(&transaction, &reservation, principal)?;
         let current_request_state = Self::request_state_in_transaction(&transaction, &lease.request_id)?;
+        let canceled_outcome = matches!(&outcome, LeaseOutcome::Canceled { .. });
         let (lease_state, settlement, request_state, result, error_kind, upstream_request_ref, reconcile_until_ms) = match outcome {
             LeaseOutcome::Success { actual_units, upstream_request_ref, .. } => (
                 LeaseState::Succeeded, crate::Settlement::Commit { actual_amount: actual_units }, RequestState::Succeeded,
@@ -327,6 +394,28 @@ impl CoreStore {
             params![lease_state.as_str(), reconcile_until_ms, upstream_request_ref, error_kind, now,
                 if lease_state == LeaseState::Unknown { None } else { Some(now) }, lease_id],
         )?;
+        if lease.resource_kind == "video_job" {
+            let (job_state, attempt_state, reconcile_required) = if canceled_outcome {
+                (JobState::Canceled, JobAttemptState::Canceled, false)
+            } else {
+                match lease_state {
+                    LeaseState::Succeeded => (JobState::Succeeded, JobAttemptState::Succeeded, false),
+                    LeaseState::Failed => (JobState::Failed, JobAttemptState::Failed, false),
+                    LeaseState::Unknown => (JobState::Unknown, JobAttemptState::Unknown, true),
+                    _ => (JobState::Unknown, JobAttemptState::Unknown, true),
+                }
+            };
+            Self::sync_video_job_settlement(
+                &transaction,
+                &lease,
+                job_state,
+                attempt_state,
+                error_kind.as_deref(),
+                upstream_request_ref.as_deref(),
+                reconcile_required,
+                now,
+            )?;
+        }
         Self::insert_audit_event(&transaction, &principal.user_id, "upstream.lease_settle", "upstream_lease", lease_id,
             serde_json::json!({"request_id": lease.request_id, "lease_id": lease_id, "outcome": lease_state.as_str(), "error_kind": error_kind}), now)?;
         let settled = Self::upstream_lease_by_id(&transaction, lease_id)?.expect("lease exists inside transaction");
@@ -355,6 +444,18 @@ impl CoreStore {
                 "UPDATE upstream_leases SET state = 'unknown', reconcile_until_ms = ?1, error_kind = 'lease_expired', updated_at_ms = ?2 WHERE id = ?3 AND state IN ('held', 'active')",
                 params![now_ms.checked_add(crate::upstream::DEFAULT_RECONCILE_TTL_MS).ok_or(CoreError::InvalidQuotaAmount)?, now_ms, &lease.id],
             )?;
+            if lease.resource_kind == "video_job" {
+                Self::sync_video_job_settlement(
+                    &transaction,
+                    lease,
+                    JobState::Unknown,
+                    JobAttemptState::Unknown,
+                    Some("lease_expired"),
+                    lease.upstream_request_ref.as_deref(),
+                    true,
+                    now_ms,
+                )?;
+            }
             let current_request_state = Self::request_state_in_transaction(&transaction, &lease.request_id)?;
             if current_request_state != RequestState::Unknown {
                 Self::transition_request_on_connection(&transaction, &lease.request_id, current_request_state, RequestState::Unknown,
@@ -859,7 +960,7 @@ impl CoreStore {
         }
     }
 
-    fn request_state_in_transaction(
+    pub(crate) fn request_state_in_transaction(
         transaction: &Transaction<'_>, request_id: &str,
     ) -> Result<RequestState, CoreError> {
         let state = transaction.query_row(

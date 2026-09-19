@@ -1,6 +1,6 @@
 # Credit-Aware Scheduler 运维手册（Phase 2–3B）
 
-本文说明 Core schema v8、`scheduler_mode`、账号健康、观测刷新、lease 恢复、用户素材、
+本文说明当前 Core schema v9（Phase 2 基线为 v8）、`scheduler_mode`、账号健康、观测刷新、lease 恢复、用户素材、
 管理员状态和回滚边界。它描述的是本地持久化与 Mock/fixture 验证结果，不等同于真实上游
 余额、真实扣费或生产账号可用性证明。
 
@@ -11,9 +11,10 @@ Core 数据库位于 `<AIWORK_DATA_DIR>\data\core.sqlite3`，默认根目录为
 `data` 目录，至少保留 `core.sqlite3`，以及存在时的 `core.sqlite3-wal` 和
 `core.sqlite3-shm`。不要在 SQLite 正在写入时只复制单个主库文件。
 
-schema v8 的 `upstream_accounts`、`upstream_observations`、`upstream_leases`、用户
-`quota_*` 账本和用户素材 `assets` 分离。`credentials_ref` 是不透明引用，不是 credential 内容。
-schema v7→v8 只建立活动素材表，不把旧 `assets.json` 导入 Core。旧的
+当前 schema v9 的 `upstream_accounts`、`upstream_observations`、`upstream_leases`、用户
+`quota_*` 账本、用户素材 `assets` 和视频 `jobs/job_attempts` 分离。`credentials_ref` 是不透明引用，不是 credential 内容。
+schema v7→v8 只建立活动素材表，v8→v9 只建立视频 job/attempt 表，不把旧的
+`assets.json` 或 `video_tasks.json` 导入 Core。旧的
 `remaining_credits.json`、WorkBuddy cache 和其他 JSON 只可作为迁移/诊断输入；同步时会
 标记为 `json_cache`/stale，不能成为 enforce 的 fresh reader 结果，也不能给用户发 grant。
 
@@ -169,3 +170,34 @@ Phase 3B 的验证只使用 D 盘 fixture：Core `assets_schema` 覆盖 v7→v8 
 覆盖 enforce 上传、owner 绑定、错误 token 和不回退 legacy。测试 target、日志和临时文件必须
 放在 `D:\gpt`，Cargo 命令使用 `--offline --locked`，并在同一 PowerShell 进程清空并断言
 `AIWORK_*` 环境变量为空。这些证据仍不证明真实上游账号、余额或计费规则。
+
+## 11. Phase 3C 视频 jobs/attempts 启用与回滚
+
+Phase 3C 在 `core_mode=enforce` 下把视频异步任务、尝试、request、reservation、upstream
+lease 和 quota 结算链路交给 Core `jobs`/`job_attempts` 表。schema v8→v9 不导入
+`video_tasks.json`；旧任务只在 `off`/`shadow` 的兼容路径存在，不是 enforce 的状态来源。
+
+启用前必须同时满足：
+
+1. Principal 具有 `videos:submit`，请求带严格 `Idempotency-Key`，Core 有 fresh observation、
+   video policy、grant 和容量。
+2. 启动注册表提供精确的 `(account_ref, provider, credentials_ref)` 绑定以及对应视频
+   adapter；Core 负责选择 lease，adapter 不得自行选账号或读取持久化敏感数据。
+3. adapter 能区分 accepted、成功、明确未接受的 rejection、确认 canceled 和
+   transport unknown；accepted 后没有可信终态时必须保持 `unknown` 与 hold。
+
+缺少 adapter、账号绑定、credentials locator 或 scheduler readiness 时，路由必须在
+preflight 前返回 `501/scheduler_endpoint_not_enabled`，不创建 request、lease、quota hold、
+job 或 attempt，也绝不能回退 legacy pool。相同幂等键只重放已有 job，不得再次调用上游。
+
+视频 job 的查询要求 `videos:read` 并按 Principal owner 隔离；取消要求 `videos:cancel`，
+先记录 `cancel_requested`，只有 adapter 明确确认取消才释放 hold。拒绝且明确未接受时释放
+hold；网络超时、取消不支持、进程崩溃或重启恢复不确定时进入 `unknown`，保留 hold 并标记
+reconcile。成功结果只保存受限 output/artifact 引用，内容读回仅允许受信任的 `video-store:`
+引用和本地安全路径。
+
+Phase 3C 的离线证据固定在 `D:\gpt`：Core 全套回归通过，Tauri focused 通过，Tauri 全量
+`440 passed; 0 failed; 4 ignored`。这些测试覆盖 schema 迁移、owner/状态约束、幂等、成功、
+拒绝、确认取消、不确定提交和缺 adapter fail-closed；它们不证明真实上游账号、余额、计费
+规则或视频协议可用。回滚时停止服务并备份 Core 数据库，改回 `core_mode=off` 或 `shadow`；
+不得删除 jobs、unknown lease、quota hold、审计事实或把它们伪造为成功。

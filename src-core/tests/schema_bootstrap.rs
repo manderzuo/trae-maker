@@ -35,6 +35,8 @@ fn bootstrap_creates_authoritative_schema() {
         "upstream_observations",
         "upstream_leases",
         "audit_events",
+        "jobs",
+        "job_attempts",
     ] {
         assert_eq!(store.table_count(table).unwrap(), 1, "missing table {table}");
     }
@@ -60,7 +62,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     connection
         .execute_batch(
             "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
-             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '9');",
+             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '10');",
         )
         .unwrap();
     drop(connection);
@@ -68,7 +70,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     let store = CoreStore::open(&future_dir).unwrap();
     assert!(matches!(
         store.migrate(),
-        Err(CoreError::UnsupportedSchemaVersion { version: 9 })
+        Err(CoreError::UnsupportedSchemaVersion { version: 10 })
     ));
     drop(store);
     fs::remove_dir_all(future_dir).unwrap();
