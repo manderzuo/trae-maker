@@ -11,6 +11,8 @@ mod python;
 mod state;
 mod vault;
 mod api_server;
+#[path = "api_server/core_migration.rs"]
+mod core_migration;
 mod workbuddy_cli;
 mod native_snapshot;
 
@@ -160,6 +162,12 @@ fn main() {
             commands::api_server::api_logs_search,
             commands::api_server::api_debug_toggle,
             commands::api_server::api_debug_status,
+            commands::core::core_status,
+            commands::core::core_migration_inspect,
+            commands::core::core_migration_apply,
+            commands::core::core_user_create,
+            commands::core::core_api_key_issue,
+            commands::core::core_quota_grant,
             commands::api_server::api_models_list,
             commands::api_server::api_models_sync,
             commands::api_server::api_usage_stats,

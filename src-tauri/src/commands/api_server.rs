@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use aiwork_core::CoreStore;
 use tauri::{Manager, State};
 
 use crate::fs_utils;
@@ -24,6 +25,25 @@ pub struct ApiServerRuntime {
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
 fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Resolve the authoritative CoreStore for management commands. A running API
+/// server shares its bridge store; otherwise the command opens/migrates the
+/// same data-dir database without starting the server.
+pub fn core_store_for_admin(
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
+) -> Result<Arc<CoreStore>, String> {
+    if let Some(store) = safe_lock(runtime)
+        .as_ref()
+        .and_then(|runtime| runtime.shared.core.as_ref())
+        .map(|bridge| bridge.store.clone())
+    {
+        return Ok(store);
+    }
+    let store = Arc::new(CoreStore::open(&state.data_dir).map_err(|error| error.to_string())?);
+    store.migrate().map_err(|error| error.to_string())?;
+    Ok(store)
 }
 
 // ==================== 启停命令 ====================

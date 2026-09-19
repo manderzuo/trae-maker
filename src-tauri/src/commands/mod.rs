@@ -4,6 +4,7 @@ pub mod bitbrowser;
 pub mod cert;
 pub mod ccswitch;
 pub mod checkin;
+pub mod core;
 pub mod doubao;
 pub mod env;
 pub mod frp;
