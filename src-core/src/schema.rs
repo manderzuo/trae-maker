@@ -304,3 +304,61 @@ CREATE INDEX upstream_leases_by_account_state ON upstream_leases(account_ref, st
 CREATE INDEX upstream_leases_by_request_resource ON upstream_leases(request_id, resource_kind);
 CREATE INDEX upstream_leases_recoverable ON upstream_leases(state, lease_expires_at_ms) WHERE state IN ('held','active','unknown');
 "#;
+
+pub(crate) const SCHEMA_V7: &str = r#"
+CREATE TABLE requests_next (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+  protocol TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  model TEXT NOT NULL,
+  request_hash BLOB NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('received','validating','reserved','queued','dispatched','completing','cancel_requested','canceled','succeeded','failed','unknown','settled')),
+  result_status INTEGER,
+  error_code TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+INSERT INTO requests_next
+  (id, user_id, api_key_id, protocol, endpoint, model, request_hash, state, result_status, error_code, created_at_ms, updated_at_ms)
+  SELECT id, user_id, api_key_id, protocol, endpoint, model, request_hash, state, result_status, error_code, created_at_ms, updated_at_ms
+  FROM requests;
+CREATE TABLE idempotency_keys_next (
+  scope TEXT NOT NULL,
+  client_key TEXT NOT NULL,
+  request_hash BLOB NOT NULL,
+  request_id TEXT NOT NULL REFERENCES requests_next(id),
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(scope, client_key)
+);
+INSERT INTO idempotency_keys_next (scope, client_key, request_hash, request_id, created_at_ms)
+  SELECT scope, client_key, request_hash, request_id, created_at_ms FROM idempotency_keys;
+DROP TABLE idempotency_keys;
+DROP TABLE requests;
+ALTER TABLE requests_next RENAME TO requests;
+ALTER TABLE idempotency_keys_next RENAME TO idempotency_keys;
+"#;
+
+pub(crate) const SCHEMA_V7_REQUESTS_ONLY: &str = r#"
+CREATE TABLE requests_next (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+  protocol TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  model TEXT NOT NULL,
+  request_hash BLOB NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('received','validating','reserved','queued','dispatched','completing','cancel_requested','canceled','succeeded','failed','unknown','settled')),
+  result_status INTEGER,
+  error_code TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+INSERT INTO requests_next
+  (id, user_id, api_key_id, protocol, endpoint, model, request_hash, state, result_status, error_code, created_at_ms, updated_at_ms)
+  SELECT id, user_id, api_key_id, protocol, endpoint, model, request_hash, state, result_status, error_code, created_at_ms, updated_at_ms
+  FROM requests;
+DROP TABLE requests;
+ALTER TABLE requests_next RENAME TO requests;
+"#;

@@ -142,7 +142,7 @@ fn migrates_v5_to_v6_without_importing_user_quota_or_secrets() {
     store.migrate().unwrap();
     store.migrate().unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
     assert!(store.table_exists("upstream_accounts").unwrap());
     assert!(store.table_exists("upstream_leases").unwrap());
     assert_eq!(store.count_rows("quota_ledger").unwrap(), 0);

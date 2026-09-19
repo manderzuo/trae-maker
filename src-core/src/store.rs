@@ -9,7 +9,10 @@ use serde_json::{Map, Value};
 use subtle::ConstantTimeEq;
 
 use crate::{
-    schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH},
+    schema::{
+        SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
+        SCHEMA_V7, SCHEMA_V7_REQUESTS_ONLY,
+    },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
         normalize_health_category, validate_observation_summary, validate_opaque_credentials_ref,
@@ -22,7 +25,7 @@ use crate::{
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 pub struct CoreStore {
     pub(crate) connection: Mutex<Connection>,
@@ -45,12 +48,46 @@ impl CoreStore {
 
     pub fn migrate(&self) -> Result<(), CoreError> {
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(CoreError::migration)?;
-        let version = Self::schema_version_in_transaction(&transaction)?;
+        let version_before_migration = {
+            let schema_meta_exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !schema_meta_exists {
+                0
+            } else {
+                let value = connection
+                    .query_row(
+                        "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                match value {
+                    Some(value) => value
+                        .parse()
+                        .map_err(|_| CoreError::InvalidSchemaVersion { value })?,
+                    None => 0,
+                }
+            }
+        };
+        // v7 rebuilds the requests parent table while upstream_leases already
+        // references it. SQLite cannot drop that parent with foreign keys on;
+        // disable enforcement only for the migration transaction and restore
+        // it immediately after commit/rollback.
+        let relax_foreign_keys = version_before_migration <= 6;
+        if relax_foreign_keys {
+            connection.pragma_update(None, "foreign_keys", "OFF")?;
+        }
 
-        match version {
+        let migration_result = (|| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(CoreError::migration)?;
+            let version = Self::schema_version_in_transaction(&transaction)?;
+
+            match version {
             0 => {
                 transaction.execute_batch(SCHEMA_V1).map_err(CoreError::migration)?;
                 transaction
@@ -64,6 +101,7 @@ impl CoreStore {
                 Self::migrate_v3_to_v4(&transaction)?;
                 Self::migrate_v4_to_v5(&transaction)?;
                 Self::migrate_v5_to_v6(&transaction)?;
+                Self::migrate_v6_to_v7(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -77,6 +115,7 @@ impl CoreStore {
                 Self::migrate_v3_to_v4(&transaction)?;
                 Self::migrate_v4_to_v5(&transaction)?;
                 Self::migrate_v5_to_v6(&transaction)?;
+                Self::migrate_v6_to_v7(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -89,6 +128,7 @@ impl CoreStore {
                 Self::migrate_v3_to_v4(&transaction)?;
                 Self::migrate_v4_to_v5(&transaction)?;
                 Self::migrate_v5_to_v6(&transaction)?;
+                Self::migrate_v6_to_v7(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -100,6 +140,7 @@ impl CoreStore {
                 Self::migrate_v3_to_v4(&transaction)?;
                 Self::migrate_v4_to_v5(&transaction)?;
                 Self::migrate_v5_to_v6(&transaction)?;
+                Self::migrate_v6_to_v7(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -110,6 +151,7 @@ impl CoreStore {
             4 => {
                 Self::migrate_v4_to_v5(&transaction)?;
                 Self::migrate_v5_to_v6(&transaction)?;
+                Self::migrate_v6_to_v7(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -119,6 +161,16 @@ impl CoreStore {
             }
             5 => {
                 Self::migrate_v5_to_v6(&transaction)?;
+                Self::migrate_v6_to_v7(&transaction)?;
+                transaction
+                    .execute(
+                        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![CURRENT_SCHEMA_VERSION.to_string()],
+                    )
+                    .map_err(CoreError::migration)?;
+            }
+            6 => {
+                Self::migrate_v6_to_v7(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -127,10 +179,23 @@ impl CoreStore {
                     .map_err(CoreError::migration)?;
             }
             CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
-            version => return Err(CoreError::UnsupportedSchemaVersion { version }),
-        }
+                version => return Err(CoreError::UnsupportedSchemaVersion { version }),
+            }
 
-        transaction.commit().map_err(CoreError::migration)
+            transaction.commit().map_err(CoreError::migration)
+        })();
+
+        if relax_foreign_keys {
+            let restore_result = connection
+                .pragma_update(None, "foreign_keys", "ON")
+                .map_err(CoreError::from);
+            if let Err(error) = migration_result {
+                let _ = restore_result;
+                return Err(error);
+            }
+            restore_result?;
+        }
+        migration_result
     }
 
     pub fn schema_version(&self) -> Result<u32, CoreError> {
@@ -1466,6 +1531,68 @@ impl CoreStore {
             .execute_batch(SCHEMA_V6_FINISH)
             .map_err(CoreError::migration)?;
         Self::harden_v6_records(transaction)
+    }
+
+    fn migrate_v6_to_v7(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        let requests_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'requests')",
+            [],
+            |row| row.get(0),
+        ).map_err(CoreError::migration)?;
+        if !requests_exists {
+            return Ok(());
+        }
+
+        let requests_have_state = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(requests)")
+                .map_err(CoreError::migration)?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(CoreError::migration)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CoreError::migration)?;
+            columns.iter().any(|column| column == "state")
+        };
+        // Some pre-v6 migration fixtures contain only a request id because no
+        // request data was imported. There is no state constraint to upgrade
+        // in that shape; leave the inert table untouched and let the next
+        // authoritative bootstrap create the v7 schema.
+        if !requests_have_state {
+            return Ok(());
+        }
+
+        let idempotency_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'idempotency_keys')",
+            [],
+            |row| row.get(0),
+        ).map_err(CoreError::migration)?;
+        let request_indexes = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT sql FROM sqlite_master \
+                     WHERE type = 'index' AND tbl_name IN ('requests', 'idempotency_keys') AND sql IS NOT NULL",
+                )
+                .map_err(CoreError::migration)?;
+            let indexes = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(CoreError::migration)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CoreError::migration)?;
+            indexes
+        };
+
+        if idempotency_exists {
+            transaction.execute_batch(SCHEMA_V7).map_err(CoreError::migration)?;
+        } else {
+            transaction
+                .execute_batch(SCHEMA_V7_REQUESTS_ONLY)
+                .map_err(CoreError::migration)?;
+        }
+        for index_sql in request_indexes {
+            transaction.execute_batch(&index_sql).map_err(CoreError::migration)?;
+        }
+        Ok(())
     }
 
     fn harden_v6_records(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {

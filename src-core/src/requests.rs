@@ -163,6 +163,52 @@ impl CoreStore {
         Ok(lease)
     }
 
+    pub fn request_upstream_cancel(
+        &self,
+        principal: &crate::Principal,
+        lease_id: &str,
+        now_ms: i64,
+    ) -> Result<UpstreamLease, ScheduleError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lease = Self::upstream_lease_by_id(&transaction, lease_id)?
+            .ok_or_else(|| ScheduleError::LeaseNotFound(lease_id.into()))?;
+        Self::validate_lease_owner(&transaction, &lease, principal)?;
+
+        if !matches!(lease.state, LeaseState::Held | LeaseState::Active) {
+            transaction.commit()?;
+            return Ok(lease);
+        }
+
+        let current_request_state = Self::request_state_in_transaction(&transaction, &lease.request_id)?;
+        if current_request_state != RequestState::CancelRequested {
+            Self::transition_request_on_connection(
+                &transaction,
+                &lease.request_id,
+                current_request_state,
+                RequestState::CancelRequested,
+                None,
+                now_ms,
+            )?;
+            Self::insert_audit_event(
+                &transaction,
+                &principal.user_id,
+                "upstream.lease_cancel_requested",
+                "upstream_lease",
+                lease_id,
+                serde_json::json!({
+                    "request_id": lease.request_id,
+                    "lease_id": lease_id,
+                    "reason": "client_cancel",
+                }),
+                now_ms,
+            )?;
+        }
+        let lease = Self::upstream_lease_by_id(&transaction, lease_id)?.expect("lease exists inside transaction");
+        transaction.commit()?;
+        Ok(lease)
+    }
+
     pub fn settle_upstream_lease(
         &self, principal: &crate::Principal, lease_id: &str, outcome: LeaseOutcome,
     ) -> Result<UpstreamLease, ScheduleError> {
@@ -174,7 +220,10 @@ impl CoreStore {
         &self, principal: &crate::Principal, lease_id: &str, outcome: LeaseOutcome,
     ) -> Result<LeaseSettlement, ScheduleError> {
         let now = match &outcome {
-            LeaseOutcome::Success { now_ms, .. } | LeaseOutcome::Rejected { now_ms, .. } | LeaseOutcome::TransportUnknown { now_ms, .. } => *now_ms,
+            LeaseOutcome::Success { now_ms, .. }
+            | LeaseOutcome::Rejected { now_ms, .. }
+            | LeaseOutcome::TransportUnknown { now_ms, .. }
+            | LeaseOutcome::Canceled { now_ms, .. } => *now_ms,
         };
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -209,6 +258,11 @@ impl CoreStore {
                 Some(RequestResult { status: None, error_code: Some(sanitize_error_category(&reason, true).into()) }),
                 Some(sanitize_error_category(&reason, true).into()), sanitize_upstream_request_ref(upstream_request_ref),
                 lease.reconcile_until_ms.or(Some(now.checked_add(crate::upstream::DEFAULT_RECONCILE_TTL_MS).ok_or(CoreError::InvalidQuotaAmount)?)),
+            ),
+            LeaseOutcome::Canceled { upstream_request_ref, .. } => (
+                LeaseState::Failed, crate::Settlement::Release, RequestState::Canceled,
+                Some(RequestResult { status: Some(499), error_code: Some("canceled".into()) }),
+                Some("canceled".into()), sanitize_upstream_request_ref(upstream_request_ref), None,
             ),
         };
         if request_state == RequestState::Unknown {

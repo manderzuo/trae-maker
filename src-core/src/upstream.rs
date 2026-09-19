@@ -85,6 +85,10 @@ pub enum LeaseOutcome {
         upstream_request_ref: Option<String>,
         now_ms: i64,
     },
+    Canceled {
+        upstream_request_ref: Option<String>,
+        now_ms: i64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

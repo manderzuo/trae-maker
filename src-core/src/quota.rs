@@ -475,6 +475,16 @@ impl CoreStore {
                 progression[position + 1..].to_vec()
             }
             RequestState::Failed | RequestState::Unknown => vec![final_state],
+            RequestState::Canceled => {
+                if current != RequestState::CancelRequested {
+                    return Err(CoreError::InvalidTransition {
+                        request_id: request_id.to_owned(),
+                        expected: current,
+                        next: final_state,
+                    });
+                }
+                vec![RequestState::Canceled]
+            }
             RequestState::Settled => return Ok(()),
             _ => {
                 return Err(CoreError::InvalidTransition {

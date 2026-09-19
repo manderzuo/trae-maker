@@ -360,6 +360,8 @@ pub enum RequestState {
     Queued,
     Dispatched,
     Completing,
+    CancelRequested,
+    Canceled,
     Succeeded,
     Failed,
     Unknown,
@@ -375,6 +377,8 @@ impl RequestState {
             Self::Queued => "queued",
             Self::Dispatched => "dispatched",
             Self::Completing => "completing",
+            Self::CancelRequested => "cancel_requested",
+            Self::Canceled => "canceled",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Unknown => "unknown",
@@ -390,6 +394,8 @@ impl RequestState {
             "queued" => Some(Self::Queued),
             "dispatched" => Some(Self::Dispatched),
             "completing" => Some(Self::Completing),
+            "cancel_requested" => Some(Self::CancelRequested),
+            "canceled" => Some(Self::Canceled),
             "succeeded" => Some(Self::Succeeded),
             "failed" => Some(Self::Failed),
             "unknown" => Some(Self::Unknown),
@@ -404,9 +410,15 @@ impl RequestState {
             (Self::Received, Self::Validating)
                 | (Self::Validating, Self::Reserved | Self::Failed | Self::Unknown)
                 | (Self::Reserved, Self::Queued | Self::Failed | Self::Unknown)
+                | (Self::Reserved, Self::CancelRequested)
                 | (Self::Queued, Self::Dispatched | Self::Failed | Self::Unknown)
+                | (Self::Queued, Self::CancelRequested)
                 | (Self::Dispatched, Self::Completing | Self::Failed | Self::Unknown)
+                | (Self::Dispatched, Self::CancelRequested)
                 | (Self::Completing, Self::Succeeded | Self::Failed | Self::Unknown)
+                | (Self::Completing, Self::CancelRequested)
+                | (Self::CancelRequested, Self::Canceled | Self::Unknown)
+                | (Self::Canceled, Self::Settled)
                 | (Self::Succeeded | Self::Failed | Self::Unknown, Self::Settled)
         )
     }
