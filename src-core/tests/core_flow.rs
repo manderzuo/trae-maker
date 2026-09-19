@@ -30,11 +30,21 @@ fn test_store_with_dir(grant: i64) -> (CoreStore, String, PathBuf) {
     store
         .create_user(
             NewUser {
+                id: "admin-1".into(),
+                name: "Admin".into(),
+                role: UserRole::Admin,
+            },
+            "bootstrap",
+        )
+        .unwrap();
+    store
+        .create_user(
+            NewUser {
                 id: "u1".into(),
                 name: "Test user".into(),
                 role: UserRole::User,
             },
-            "bootstrap",
+            "admin-1",
         )
         .unwrap();
     let key = store
@@ -42,7 +52,7 @@ fn test_store_with_dir(grant: i64) -> (CoreStore, String, PathBuf) {
             "u1",
             "test",
             BTreeSet::from(["chat:invoke".to_owned()]),
-            "bootstrap",
+            "admin-1",
         )
         .unwrap();
     store
@@ -63,7 +73,7 @@ fn test_store_with_dir(grant: i64) -> (CoreStore, String, PathBuf) {
                 user_id: "u1".into(),
                 resource_kind: "chat_request".into(),
                 amount: grant,
-                actor_user_id: "u1".into(),
+                actor_user_id: "admin-1".into(),
                 reason: "test grant".into(),
             })
             .unwrap();
@@ -248,7 +258,7 @@ fn atomic_preflight_insufficient_quota_leaves_no_orphan_and_can_retry() {
             user_id: "u1".into(),
             resource_kind: "chat_request".into(),
             amount: 1,
-            actor_user_id: "u1".into(),
+            actor_user_id: "admin-1".into(),
             reason: "retry grant".into(),
         })
         .unwrap();

@@ -8,10 +8,22 @@ use crate::{
 
 impl CoreStore {
     pub fn grant(&self, input: QuotaGrant) -> Result<QuotaBalance, CoreError> {
+        self.grant_inner(input, false)
+    }
+
+    pub fn grant_as_admin(&self, input: QuotaGrant) -> Result<QuotaBalance, CoreError> {
+        self.grant_inner(input, true)
+    }
+
+    fn grant_inner(&self, input: QuotaGrant, require_admin: bool) -> Result<QuotaBalance, CoreError> {
         let amount = Self::absolute_amount(input.amount)?;
         let now = Utc::now().timestamp_millis();
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if require_admin {
+            Self::authorize_admin_in_transaction(&transaction, &input.actor_user_id)?;
+        }
+        Self::ensure_active_user(&transaction, &input.user_id)?;
 
         transaction.execute(
             "INSERT INTO quota_ledger \

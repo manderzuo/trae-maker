@@ -60,6 +60,12 @@ pub enum CoreError {
     },
     #[error("core mode {mode} does not permit enforcing chat operations")]
     CoreModeNotEnforcing { mode: String },
+    #[error("active admin authorization is required")]
+    AdminRequired,
+    #[error("target user is not active")]
+    UserNotActive,
+    #[error("legacy migration validation failed: {reason}")]
+    MigrationValidation { reason: String },
     #[error("reservation {reservation_id} is owned by another principal")]
     ReservationOwnerMismatch { reservation_id: String },
     #[error("request {request_id} was not found")]

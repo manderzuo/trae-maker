@@ -28,13 +28,14 @@ fn test_store() -> (CoreStore, String, String) {
     let dir = test_dir("store");
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
-    store.create_user(user("u1", UserRole::User), "bootstrap").unwrap();
-    store.create_user(user("u2", UserRole::User), "bootstrap").unwrap();
+    store.create_user(user("admin-1", UserRole::Admin), "bootstrap").unwrap();
+    store.create_user(user("u1", UserRole::User), "admin-1").unwrap();
+    store.create_user(user("u2", UserRole::User), "admin-1").unwrap();
     let first_key = store
-        .issue_api_key("u1", "test", BTreeSet::new(), "bootstrap")
+        .issue_api_key("u1", "test", BTreeSet::new(), "admin-1")
         .unwrap();
     let second_key = store
-        .issue_api_key("u2", "test", BTreeSet::new(), "bootstrap")
+        .issue_api_key("u2", "test", BTreeSet::new(), "admin-1")
         .unwrap();
     (store, first_key.id, second_key.id)
 }
@@ -148,7 +149,7 @@ fn begin_request_rejects_a_revoked_api_key() {
     let (store, first_key, _) = test_store();
     let endpoint = "/v1/chat/completions";
     install_chat_policy(&store, endpoint);
-    store.revoke_api_key(&first_key, "bootstrap").unwrap();
+    store.revoke_api_key(&first_key, "admin-1").unwrap();
 
     let error = store
         .begin_request(input("u1", &first_key, endpoint, "revoked", json!({"model":"mock-1"})))
@@ -207,9 +208,10 @@ fn request_records_store_metadata_but_not_the_full_prompt_or_output() {
     let dir = test_dir("privacy");
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
-    store.create_user(user("u1", UserRole::User), "bootstrap").unwrap();
+    store.create_user(user("admin-1", UserRole::Admin), "bootstrap").unwrap();
+    store.create_user(user("u1", UserRole::User), "admin-1").unwrap();
     let key = store
-        .issue_api_key("u1", "test", BTreeSet::new(), "bootstrap")
+        .issue_api_key("u1", "test", BTreeSet::new(), "admin-1")
         .unwrap();
     let endpoint = "/v1/chat/completions";
     install_chat_policy(&store, endpoint);

@@ -7,10 +7,14 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::{schema::{SCHEMA_V1, SCHEMA_V2}, AuthError, CoreError, IssuedApiKey, NewUser, Principal, User};
+use crate::{
+    schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3},
+    AuthError, CoreError, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, NewUser,
+    Principal, User,
+};
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 pub struct CoreStore {
     pub(crate) connection: Mutex<Connection>,
@@ -48,6 +52,7 @@ impl CoreStore {
                     )
                     .map_err(CoreError::migration)?;
                 Self::migrate_v1_to_v2(&transaction)?;
+                Self::migrate_v2_to_v3(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -57,6 +62,16 @@ impl CoreStore {
             }
             1 => {
                 Self::migrate_v1_to_v2(&transaction)?;
+                Self::migrate_v2_to_v3(&transaction)?;
+                transaction
+                    .execute(
+                        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![CURRENT_SCHEMA_VERSION.to_string()],
+                    )
+                    .map_err(CoreError::migration)?;
+            }
+            2 => {
+                Self::migrate_v2_to_v3(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -106,10 +121,51 @@ impl CoreStore {
     }
 
     pub fn create_user(&self, input: NewUser, actor: &str) -> Result<User, CoreError> {
+        self.create_user_inner(input, actor, false)
+    }
+
+    pub fn create_user_as_admin(&self, input: NewUser, actor: &str) -> Result<User, CoreError> {
+        self.create_user_inner(input, actor, true)
+    }
+
+    /// The only bootstrap path: an empty Core database may create exactly one admin.
+    pub fn create_bootstrap_admin(&self, input: NewUser, actor: &str) -> Result<User, CoreError> {
+        if actor != "bootstrap" || input.role != crate::UserRole::Admin {
+            return Err(CoreError::AdminRequired);
+        }
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = Utc::now().timestamp_millis();
+        let user_count: i64 = transaction.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        if user_count != 0 {
+            return Err(CoreError::AdminRequired);
+        }
+        let user = Self::insert_user_in_transaction(&transaction, input, actor)?;
+        transaction.commit()?;
+        Ok(user)
+    }
 
+    fn create_user_inner(
+        &self,
+        input: NewUser,
+        actor: &str,
+        require_admin: bool,
+    ) -> Result<User, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if require_admin {
+            Self::authorize_admin_in_transaction(&transaction, actor)?;
+        }
+        let user = Self::insert_user_in_transaction(&transaction, input, actor)?;
+        transaction.commit()?;
+        Ok(user)
+    }
+
+    fn insert_user_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        input: NewUser,
+        actor: &str,
+    ) -> Result<User, CoreError> {
+        let now = Utc::now().timestamp_millis();
         transaction.execute(
             "INSERT INTO users (id, name, role, status, created_at_ms, updated_at_ms) \
              VALUES (?1, ?2, ?3, 'active', ?4, ?4)",
@@ -124,8 +180,6 @@ impl CoreStore {
             serde_json::json!({"id": input.id, "role": input.role.as_str(), "result": "created"}),
             now,
         )?;
-        transaction.commit()?;
-
         Ok(User {
             id: input.id,
             name: input.name,
@@ -140,6 +194,27 @@ impl CoreStore {
         scopes: BTreeSet<String>,
         actor: &str,
     ) -> Result<IssuedApiKey, CoreError> {
+        self.issue_api_key_inner(user_id, name, scopes, actor, false)
+    }
+
+    pub fn issue_api_key_as_admin(
+        &self,
+        user_id: &str,
+        name: &str,
+        scopes: BTreeSet<String>,
+        actor: &str,
+    ) -> Result<IssuedApiKey, CoreError> {
+        self.issue_api_key_inner(user_id, name, scopes, actor, true)
+    }
+
+    fn issue_api_key_inner(
+        &self,
+        user_id: &str,
+        name: &str,
+        scopes: BTreeSet<String>,
+        actor: &str,
+        require_admin: bool,
+    ) -> Result<IssuedApiKey, CoreError> {
         let plaintext = Self::new_api_key();
         let prefix = plaintext[..16].to_owned();
         let key_digest = Self::digest_api_key(&plaintext);
@@ -149,6 +224,10 @@ impl CoreStore {
 
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if require_admin {
+            Self::authorize_admin_in_transaction(&transaction, actor)?;
+        }
+        Self::ensure_active_user(&transaction, user_id)?;
         transaction.execute(
             "INSERT INTO api_keys \
              (id, user_id, name, prefix, key_digest, scopes_json, status, created_at_ms) \
@@ -176,8 +255,19 @@ impl CoreStore {
     }
 
     pub fn revoke_api_key(&self, key_id: &str, actor: &str) -> Result<(), CoreError> {
+        self.revoke_api_key_inner(key_id, actor, false)
+    }
+
+    pub fn revoke_api_key_as_admin(&self, key_id: &str, actor: &str) -> Result<(), CoreError> {
+        self.revoke_api_key_inner(key_id, actor, true)
+    }
+
+    fn revoke_api_key_inner(&self, key_id: &str, actor: &str, require_admin: bool) -> Result<(), CoreError> {
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if require_admin {
+            Self::authorize_admin_in_transaction(&transaction, actor)?;
+        }
         let now = Utc::now().timestamp_millis();
         let changed = transaction.execute(
             "UPDATE api_keys SET status = 'revoked', revoked_at_ms = ?1 \
@@ -227,6 +317,237 @@ impl CoreStore {
             }
         }
         Err(AuthError::InvalidApiKey)
+    }
+
+    /// Management authorization is deliberately checked inside the write transaction.
+    pub fn authorize_admin(&self, actor_user_id: &str) -> Result<(), CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        Self::authorize_admin_in_connection(&connection, actor_user_id)
+    }
+
+    pub fn legacy_key_is_disabled(data_dir: &Path, presented: &str) -> Result<bool, CoreError> {
+        let database_path = data_dir.join("data").join(CORE_DB_FILE);
+        if !database_path.is_file() {
+            return Ok(false);
+        }
+        let connection = Connection::open(database_path)?;
+        let registry_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'legacy_key_registry')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !registry_exists {
+            return Ok(false);
+        }
+        let digest = Self::digest_api_key(presented);
+        let disabled = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM legacy_key_registry WHERE key_digest = ?1 AND status IN ('migration_legacy','disabled'))",
+                [digest],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        Ok(disabled.unwrap_or(false))
+    }
+
+    /// Import all validated legacy records in one SQLite `BEGIN IMMEDIATE` transaction.
+    /// The legacy plaintext keys are accepted only as transient input for digesting.
+    pub fn apply_legacy_migration(
+        &self,
+        batch: LegacyMigrationBatch,
+    ) -> Result<LegacyMigrationResult, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_in_transaction(&transaction, &batch.actor_user_id)?;
+        Self::validate_migration_batch(&transaction, &batch)?;
+
+        let now = Utc::now().timestamp_millis();
+        for (source_file, source_hash) in &batch.source_hashes {
+            transaction.execute(
+                "INSERT INTO legacy_migration_records (migration_id, source_file, source_hash, actor_user_id, reason, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![batch.migration_id, source_file, source_hash, batch.actor_user_id, batch.reason, now],
+            )?;
+        }
+        Self::insert_audit_event(
+            &transaction,
+            &batch.actor_user_id,
+            "legacy.migration",
+            "legacy_migration",
+            &batch.migration_id,
+            serde_json::json!({"source_files": batch.source_hashes.len(), "reason": batch.reason}),
+            now,
+        )?;
+
+        let mut issued_keys = Vec::with_capacity(batch.keys.len());
+        for key in &batch.keys {
+            let plaintext = Self::new_api_key();
+            let prefix = plaintext[..16].to_owned();
+            let key_digest = Self::digest_api_key(&plaintext);
+            let key_id = Self::new_id("key");
+            let scopes_json = serde_json::to_string(&batch.scopes)?;
+            transaction.execute(
+                "INSERT INTO api_keys (id, user_id, name, prefix, key_digest, scopes_json, status, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
+                params![key_id, key.user_id, "legacy migration", prefix, key_digest, scopes_json, now],
+            )?;
+            transaction.execute(
+                "INSERT INTO legacy_key_registry (legacy_key_id, key_digest, migrated_user_id, status, migration_id, actor_user_id, reason, disabled_at_ms) VALUES (?1, ?2, ?3, 'disabled', ?4, ?5, ?6, ?7)",
+                params![key.legacy_key_id, Self::digest_api_key(&key.legacy_key), key.user_id, batch.migration_id, batch.actor_user_id, batch.reason, now],
+            )?;
+            Self::insert_audit_event(
+                &transaction,
+                &batch.actor_user_id,
+                "api_key.issue",
+                "api_key",
+                &key_id,
+                serde_json::json!({"migration_id": batch.migration_id, "reason": batch.reason, "result": "issued"}),
+                now,
+            )?;
+            Self::insert_audit_event(
+                &transaction,
+                &batch.actor_user_id,
+                "legacy.key_migrate",
+                "legacy_key",
+                &key.legacy_key_id,
+                serde_json::json!({"migration_id": batch.migration_id, "reason": batch.reason, "status": "disabled"}),
+                now,
+            )?;
+            issued_keys.push(IssuedApiKey {
+                id: key_id,
+                plaintext,
+                prefix,
+                user_id: key.user_id.clone(),
+                scopes: batch.scopes.clone(),
+            });
+        }
+
+        for asset in &batch.assets {
+            transaction.execute(
+                "INSERT INTO legacy_assets (id, owner_key_id, user_id, filename, mime_type, extension, size, content_sha256, created_at_ms, expires_at_ms, migration_id, actor_user_id, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![asset.id, asset.owner_key_id, asset.user_id, asset.filename, asset.mime_type, asset.extension, asset.size, asset.content_sha256, asset.created_at_ms, asset.expires_at_ms, batch.migration_id, batch.actor_user_id, batch.reason],
+            )?;
+            Self::insert_audit_event(&transaction, &batch.actor_user_id, "legacy.asset_import", "legacy_asset", &asset.id, serde_json::json!({"migration_id": batch.migration_id, "reason": batch.reason}), now)?;
+        }
+
+        for job in &batch.jobs {
+            let reconcile_required = i64::from(job.status == "processing");
+            let status = if job.status == "processing" { "unknown" } else { job.status.as_str() };
+            transaction.execute(
+                "INSERT INTO legacy_jobs (id, owner_key_id, user_id, status, reconcile_required, created_at_ms, updated_at_ms, migration_id, actor_user_id, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![job.id, job.owner_key_id, job.user_id, status, reconcile_required, job.created_at_ms, job.updated_at_ms, batch.migration_id, batch.actor_user_id, batch.reason],
+            )?;
+            Self::insert_audit_event(&transaction, &batch.actor_user_id, "legacy.job_import", "legacy_job", &job.id, serde_json::json!({"migration_id": batch.migration_id, "reason": batch.reason, "reconcile_required": reconcile_required == 1}), now)?;
+        }
+
+        for observation in &batch.observations {
+            transaction.execute(
+                "INSERT INTO legacy_observations (id, account_ref, resource_kind, value_json, source, observed_at_ms, migration_id, actor_user_id, reason) VALUES (?1, ?2, ?3, ?4, 'json_cache', ?5, ?6, ?7, ?8)",
+                params![observation.id, observation.account_ref, observation.resource_kind, observation.value_json, observation.observed_at_ms, batch.migration_id, batch.actor_user_id, batch.reason],
+            )?;
+            Self::insert_audit_event(&transaction, &batch.actor_user_id, "legacy.observation_import", "legacy_observation", &observation.id, serde_json::json!({"migration_id": batch.migration_id, "reason": batch.reason, "source": "json_cache"}), now)?;
+        }
+
+        transaction.commit()?;
+        Ok(LegacyMigrationResult {
+            migration_id: batch.migration_id,
+            issued_keys,
+        })
+    }
+
+    pub(crate) fn authorize_admin_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        actor_user_id: &str,
+    ) -> Result<(), CoreError> {
+        let role = transaction
+            .query_row(
+                "SELECT role FROM users WHERE id = ?1 AND status = 'active'",
+                [actor_user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if role.as_deref() == Some("admin") {
+            Ok(())
+        } else {
+            Err(CoreError::AdminRequired)
+        }
+    }
+
+    fn authorize_admin_in_connection(
+        connection: &Connection,
+        actor_user_id: &str,
+    ) -> Result<(), CoreError> {
+        let role = connection
+            .query_row(
+                "SELECT role FROM users WHERE id = ?1 AND status = 'active'",
+                [actor_user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if role.as_deref() == Some("admin") {
+            Ok(())
+        } else {
+            Err(CoreError::AdminRequired)
+        }
+    }
+
+    pub(crate) fn ensure_active_user(
+        transaction: &rusqlite::Transaction<'_>,
+        user_id: &str,
+    ) -> Result<(), CoreError> {
+        let active = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active')",
+            [user_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if active { Ok(()) } else { Err(CoreError::UserNotActive) }
+    }
+
+    fn validate_migration_batch(
+        transaction: &rusqlite::Transaction<'_>,
+        batch: &LegacyMigrationBatch,
+    ) -> Result<(), CoreError> {
+        if batch.migration_id.trim().is_empty() || batch.reason.trim().is_empty() {
+            return Err(CoreError::MigrationValidation { reason: "migration id and reason are required".into() });
+        }
+        if batch.source_hashes.is_empty() || batch.source_hashes.values().any(|hash| hash == "missing" || hash.is_empty()) {
+            return Err(CoreError::MigrationValidation { reason: "all source files must be present and hashed".into() });
+        }
+        let existing: Option<String> = transaction.query_row("SELECT migration_id FROM legacy_migration_records WHERE migration_id = ?1 LIMIT 1", [&batch.migration_id], |row| row.get(0)).optional()?;
+        if existing.is_some() {
+            return Err(CoreError::MigrationValidation { reason: "migration id already exists".into() });
+        }
+        let mut seen = BTreeSet::new();
+        for key in &batch.keys {
+            if key.legacy_key_id.trim().is_empty() || key.legacy_key.is_empty() {
+                return Err(CoreError::MigrationValidation { reason: "legacy key record is incomplete".into() });
+            }
+            if !seen.insert(&key.legacy_key_id) {
+                return Err(CoreError::MigrationValidation { reason: "duplicate legacy key id".into() });
+            }
+            Self::ensure_active_user(transaction, &key.user_id)?;
+            let exists: Option<String> = transaction.query_row("SELECT legacy_key_id FROM legacy_key_registry WHERE legacy_key_id = ?1", [&key.legacy_key_id], |row| row.get(0)).optional()?;
+            if exists.is_some() {
+                return Err(CoreError::MigrationValidation { reason: "legacy key was already migrated".into() });
+            }
+        }
+        seen.clear();
+        for asset in &batch.assets {
+            if !seen.insert(&asset.id) { return Err(CoreError::MigrationValidation { reason: "duplicate legacy asset id".into() }); }
+            Self::ensure_active_user(transaction, &asset.user_id)?;
+        }
+        seen.clear();
+        for job in &batch.jobs {
+            if !seen.insert(&job.id) { return Err(CoreError::MigrationValidation { reason: "duplicate legacy job id".into() }); }
+            if !matches!(job.status.as_str(), "queued" | "processing" | "completed" | "failed") {
+                return Err(CoreError::MigrationValidation { reason: "unknown legacy job status".into() });
+            }
+            Self::ensure_active_user(transaction, &job.user_id)?;
+        }
+        seen.clear();
+        for observation in &batch.observations {
+            if !seen.insert(&observation.id) { return Err(CoreError::MigrationValidation { reason: "duplicate legacy observation id".into() }); }
+            serde_json::from_str::<serde_json::Value>(&observation.value_json)?;
+        }
+        Ok(())
     }
 
     fn new_api_key() -> String {
@@ -320,6 +641,10 @@ impl CoreStore {
             transaction.execute_batch(&index_sql).map_err(CoreError::migration)?;
         }
         Ok(())
+    }
+
+    fn migrate_v2_to_v3(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        transaction.execute_batch(SCHEMA_V3).map_err(CoreError::migration)
     }
 }
 

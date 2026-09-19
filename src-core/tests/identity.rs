@@ -47,6 +47,12 @@ fn user(id: &str, role: UserRole) -> NewUser {
     }
 }
 
+fn create_admin(store: &CoreStore) {
+    store
+        .create_user(user("admin-1", UserRole::Admin), "bootstrap")
+        .unwrap();
+}
+
 fn scopes(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -59,7 +65,7 @@ fn creates_admin_and_user_with_their_requested_roles() {
         .create_user(user("admin-1", UserRole::Admin), "bootstrap")
         .unwrap();
     let regular_user = store
-        .create_user(user("user-1", UserRole::User), "bootstrap")
+        .create_user(user("user-1", UserRole::User), "admin-1")
         .unwrap();
 
     assert_eq!(admin.role, UserRole::Admin);
@@ -69,11 +75,12 @@ fn creates_admin_and_user_with_their_requested_roles() {
 #[test]
 fn issued_key_is_hash_only_and_authenticates_its_user() {
     let (store, dir) = test_store();
+    create_admin(&store);
     let user = store
-        .create_user(user("u1", UserRole::User), "bootstrap")
+        .create_user(user("u1", UserRole::User), "admin-1")
         .unwrap();
     let issued = store
-        .issue_api_key(&user.id, "test", scopes(&["models:read"]), "bootstrap")
+        .issue_api_key(&user.id, "test", scopes(&["models:read"]), "admin-1")
         .unwrap();
 
     let principal = store.authenticate_api_key(&issued.plaintext).unwrap();
@@ -89,11 +96,12 @@ fn issued_key_is_hash_only_and_authenticates_its_user() {
 #[test]
 fn issued_key_debug_output_does_not_include_plaintext() {
     let (store, _) = test_store();
+    create_admin(&store);
     let user = store
-        .create_user(user("u1", UserRole::User), "bootstrap")
+        .create_user(user("u1", UserRole::User), "admin-1")
         .unwrap();
     let issued = store
-        .issue_api_key(&user.id, "test", scopes(&["models:read"]), "bootstrap")
+        .issue_api_key(&user.id, "test", scopes(&["models:read"]), "admin-1")
         .unwrap();
 
     let debug = format!("{issued:?}");
@@ -105,19 +113,20 @@ fn issued_key_debug_output_does_not_include_plaintext() {
 #[test]
 fn rejects_unknown_and_revoked_keys() {
     let (store, _) = test_store();
+    create_admin(&store);
     let user = store
-        .create_user(user("u1", UserRole::User), "bootstrap")
+        .create_user(user("u1", UserRole::User), "admin-1")
         .unwrap();
     let issued = store
-        .issue_api_key(&user.id, "test", scopes(&[]), "bootstrap")
+        .issue_api_key(&user.id, "test", scopes(&[]), "admin-1")
         .unwrap();
 
     assert!(matches!(
         store.authenticate_api_key("aw_live_not-a-real-key"),
         Err(AuthError::InvalidApiKey)
     ));
-    store.revoke_api_key(&issued.id, "bootstrap").unwrap();
-    store.revoke_api_key(&issued.id, "bootstrap").unwrap();
+    store.revoke_api_key(&issued.id, "admin-1").unwrap();
+    store.revoke_api_key(&issued.id, "admin-1").unwrap();
     assert!(matches!(
         store.authenticate_api_key(&issued.plaintext),
         Err(AuthError::InvalidApiKey)
@@ -127,11 +136,12 @@ fn rejects_unknown_and_revoked_keys() {
 #[test]
 fn scope_check_rejects_a_scope_the_key_does_not_hold() {
     let (store, _) = test_store();
+    create_admin(&store);
     let user = store
-        .create_user(user("u1", UserRole::User), "bootstrap")
+        .create_user(user("u1", UserRole::User), "admin-1")
         .unwrap();
     let issued = store
-        .issue_api_key(&user.id, "test", scopes(&["models:read"]), "bootstrap")
+        .issue_api_key(&user.id, "test", scopes(&["models:read"]), "admin-1")
         .unwrap();
     let principal = store.authenticate_api_key(&issued.plaintext).unwrap();
 
@@ -144,14 +154,15 @@ fn scope_check_rejects_a_scope_the_key_does_not_hold() {
 #[test]
 fn key_identity_cannot_be_used_as_another_users_identity() {
     let (store, _) = test_store();
+    create_admin(&store);
     let first_user = store
-        .create_user(user("u1", UserRole::User), "bootstrap")
+        .create_user(user("u1", UserRole::User), "admin-1")
         .unwrap();
     let second_user = store
-        .create_user(user("u2", UserRole::User), "bootstrap")
+        .create_user(user("u2", UserRole::User), "admin-1")
         .unwrap();
     let issued = store
-        .issue_api_key(&first_user.id, "test", scopes(&["models:read"]), "bootstrap")
+        .issue_api_key(&first_user.id, "test", scopes(&["models:read"]), "admin-1")
         .unwrap();
 
     let principal = store.authenticate_api_key(&issued.plaintext).unwrap();
@@ -163,11 +174,12 @@ fn key_identity_cannot_be_used_as_another_users_identity() {
 #[test]
 fn active_key_for_disabled_user_is_rejected() {
     let (store, dir) = test_store();
+    create_admin(&store);
     let user = store
-        .create_user(user("u1", UserRole::User), "bootstrap")
+        .create_user(user("u1", UserRole::User), "admin-1")
         .unwrap();
     let issued = store
-        .issue_api_key(&user.id, "test", scopes(&["models:read"]), "bootstrap")
+        .issue_api_key(&user.id, "test", scopes(&["models:read"]), "admin-1")
         .unwrap();
     let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
     connection

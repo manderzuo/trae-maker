@@ -146,16 +146,13 @@ pub fn core_user_create(
 ) -> Result<CoreUserResponse, String> {
     let role_value = parse_role(&role)?;
     let store = core_store_for_admin(&state, &runtime)?;
-    let user = store
-        .create_user(
-            NewUser {
-                id,
-                name,
-                role: role_value,
-            },
-            &actor_user_id,
-        )
-        .map_err(|error| error.to_string())?;
+    let input = NewUser { id, name, role: role_value };
+    let user = if actor_user_id == "bootstrap" {
+        store.create_bootstrap_admin(input, &actor_user_id)
+    } else {
+        store.create_user_as_admin(input, &actor_user_id)
+    }
+    .map_err(|error| error.to_string())?;
     Ok(CoreUserResponse {
         id: user.id,
         name: user.name,
@@ -174,7 +171,7 @@ pub fn core_api_key_issue(
 ) -> Result<IssuedApiKeyResponse, String> {
     let store = core_store_for_admin(&state, &runtime)?;
     let key = store
-        .issue_api_key(&user_id, &name, normalize_scopes(scopes), &actor_user_id)
+        .issue_api_key_as_admin(&user_id, &name, normalize_scopes(scopes), &actor_user_id)
         .map_err(|error| error.to_string())?;
     Ok(issued_response(key))
 }
@@ -194,7 +191,7 @@ pub fn core_quota_grant(
     }
     let store = core_store_for_admin(&state, &runtime)?;
     let balance = store
-        .grant(QuotaGrant {
+        .grant_as_admin(QuotaGrant {
             user_id,
             resource_kind,
             amount,

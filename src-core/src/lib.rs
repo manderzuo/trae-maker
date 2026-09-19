@@ -13,6 +13,8 @@ pub use error::CoreError;
 pub use identity::{require_scope, AuthError, Principal};
 pub use models::{
     BeginRequest, BeginRequestInput, IssuedApiKey, NewUser, QuotaBalance, QuotaGrant,
+    LegacyMigrationAsset, LegacyMigrationBatch, LegacyMigrationJob, LegacyMigrationKey,
+    LegacyMigrationObservation, LegacyMigrationResult,
     PreflightReserveInput, PreflightReserveResult, QuotaReserve, RequestHandle, RequestResult,
     RequestState, Reservation, ReservationState, ReserveResult, Settlement, SharedCoreStore, User,
     UserRole,

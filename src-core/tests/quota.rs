@@ -33,7 +33,7 @@ fn test_store_with_grant(amount: i64) -> (Arc<CoreStore>, PathBuf) {
     let store = Arc::new(CoreStore::open(&dir).unwrap());
     store.migrate().unwrap();
     store.create_user(user("admin-1", UserRole::Admin), "bootstrap").unwrap();
-    store.create_user(user("u1", UserRole::User), "bootstrap").unwrap();
+    store.create_user(user("u1", UserRole::User), "admin-1").unwrap();
     store
         .grant(QuotaGrant {
             user_id: "u1".to_owned(),

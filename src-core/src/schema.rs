@@ -134,3 +134,63 @@ DROP TABLE requests;
 ALTER TABLE requests_next RENAME TO requests;
 ALTER TABLE idempotency_keys_next RENAME TO idempotency_keys;
 "#;
+
+pub(crate) const SCHEMA_V3: &str = r#"
+CREATE TABLE legacy_migration_records (
+  migration_id TEXT NOT NULL,
+  source_file TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  actor_user_id TEXT NOT NULL REFERENCES users(id),
+  reason TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(migration_id, source_file)
+);
+CREATE TABLE legacy_key_registry (
+  legacy_key_id TEXT PRIMARY KEY,
+  key_digest BLOB NOT NULL UNIQUE,
+  migrated_user_id TEXT NOT NULL REFERENCES users(id),
+  status TEXT NOT NULL CHECK(status IN ('migration_legacy','disabled')),
+  migration_id TEXT NOT NULL,
+  actor_user_id TEXT NOT NULL REFERENCES users(id),
+  reason TEXT NOT NULL,
+  disabled_at_ms INTEGER NOT NULL
+);
+CREATE TABLE legacy_assets (
+  id TEXT PRIMARY KEY,
+  owner_key_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  filename TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  extension TEXT NOT NULL,
+  size INTEGER NOT NULL CHECK(size >= 0),
+  content_sha256 TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL,
+  migration_id TEXT NOT NULL,
+  actor_user_id TEXT NOT NULL REFERENCES users(id),
+  reason TEXT NOT NULL
+);
+CREATE TABLE legacy_jobs (
+  id TEXT PRIMARY KEY,
+  owner_key_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  status TEXT NOT NULL CHECK(status IN ('queued','completed','failed','unknown')),
+  reconcile_required INTEGER NOT NULL CHECK(reconcile_required IN (0,1)),
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  migration_id TEXT NOT NULL,
+  actor_user_id TEXT NOT NULL REFERENCES users(id),
+  reason TEXT NOT NULL
+);
+CREATE TABLE legacy_observations (
+  id TEXT PRIMARY KEY,
+  account_ref TEXT NOT NULL,
+  resource_kind TEXT NOT NULL,
+  value_json TEXT NOT NULL,
+  source TEXT NOT NULL CHECK(source = 'json_cache'),
+  observed_at_ms INTEGER NOT NULL,
+  migration_id TEXT NOT NULL,
+  actor_user_id TEXT NOT NULL REFERENCES users(id),
+  reason TEXT NOT NULL
+);
+"#;

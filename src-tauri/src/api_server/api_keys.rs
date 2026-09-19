@@ -239,6 +239,10 @@ fn keys_file_changed(before: &[u8], f: &ApiKeysFile) -> bool {
 /// auth 中间件每请求调用本函数，禁止绕开锁直接 load+save。
 pub fn verify_and_consume_locked(data_dir: &Path, presented: &str, today: &str) -> KeyCheck {
     let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    match aiwork_core::CoreStore::legacy_key_is_disabled(data_dir, presented) {
+        Ok(false) => {}
+        Ok(true) | Err(_) => return KeyCheck::Invalid,
+    }
     let mut f = load(data_dir);
     let before = serde_json::to_vec(&f).unwrap_or_default();
     let r = f.verify_and_consume(presented, today);
@@ -250,6 +254,12 @@ pub fn verify_and_consume_locked(data_dir: &Path, presented: &str, today: &str) 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use aiwork_core::{
+        CoreStore, LegacyMigrationBatch, LegacyMigrationKey, NewUser, UserRole,
+    };
+
     use super::*;
 
     fn entry(id: &str, key: &str, enabled: bool, limit: u64) -> ApiKeyEntry {
@@ -391,6 +401,52 @@ mod tests {
         ));
         let updated = load(&dir);
         assert_eq!(updated.keys[0].used_today, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrated_legacy_key_is_rejected_by_locked_legacy_auth() {
+        let dir = std::env::temp_dir().join(format!("twa_keys_migration_{}", rand::random::<u64>()));
+        let store = CoreStore::open(&dir).unwrap();
+        store.migrate().unwrap();
+        store
+            .create_user(
+                NewUser { id: "admin".into(), name: "Admin".into(), role: UserRole::Admin },
+                "bootstrap",
+            )
+            .unwrap();
+        store
+            .create_user(
+                NewUser { id: "user".into(), name: "User".into(), role: UserRole::User },
+                "admin",
+            )
+            .unwrap();
+        store
+            .apply_legacy_migration(LegacyMigrationBatch {
+                migration_id: "migration-1".into(),
+                actor_user_id: "admin".into(),
+                reason: "test migration".into(),
+                scopes: BTreeSet::new(),
+                source_hashes: BTreeMap::from([("api_keys.json".into(), "hash".into())]),
+                keys: vec![LegacyMigrationKey {
+                    legacy_key_id: "legacy-1".into(),
+                    legacy_key: "legacy-secret".into(),
+                    user_id: "user".into(),
+                }],
+                assets: vec![],
+                jobs: vec![],
+                observations: vec![],
+            })
+            .unwrap();
+        save(&dir, &ApiKeysFile {
+            keys: vec![entry("legacy-1", "legacy-secret", true, 0)],
+            auth_disabled: false,
+        });
+
+        assert!(matches!(
+            verify_and_consume_locked(&dir, "legacy-secret", "2026-09-19"),
+            KeyCheck::Invalid
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

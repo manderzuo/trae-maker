@@ -1,12 +1,14 @@
 //! Legacy JSON inspection and explicitly mapped Core migration.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use aiwork_core::{CoreError, CoreStore, IssuedApiKey};
-use rusqlite::{Connection, OptionalExtension};
+use aiwork_core::{
+    CoreError, CoreStore, IssuedApiKey, LegacyMigrationAsset, LegacyMigrationBatch,
+    LegacyMigrationJob, LegacyMigrationKey, LegacyMigrationObservation,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -64,6 +66,10 @@ struct LegacyKeyDailyStat {
     _requests: u64,
 }
 
+fn default_legacy_key_enabled() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 struct LegacyApiKey {
     id: String,
@@ -71,7 +77,7 @@ struct LegacyApiKey {
     _name: String,
     #[serde(rename = "key")]
     _key: String,
-    #[serde(default)]
+    #[serde(default = "default_legacy_key_enabled")]
     _enabled: bool,
     #[serde(default)]
     _daily_limit: u64,
@@ -179,6 +185,7 @@ struct LegacyAsset {
 
 struct LegacySnapshot {
     keys: Vec<LegacyApiKey>,
+    credits: HashMap<String, f64>,
     videos: Vec<LegacyVideoTask>,
     assets: Vec<LegacyAsset>,
 }
@@ -190,6 +197,8 @@ fn source_path(data_dir: &Path, file_name: &str) -> std::path::PathBuf {
 fn read_source(data_dir: &Path, file_name: &str, report: &mut MigrationReport) -> Result<Option<Vec<u8>>, CoreError> {
     let path = source_path(data_dir, file_name);
     if !path.is_file() {
+        report.source_hashes.insert(file_name.to_string(), "missing".into());
+        report.errors.push(format!("missing legacy file: {file_name}"));
         return Ok(None);
     }
     let bytes = fs::read(path)?;
@@ -303,6 +312,7 @@ fn scan_legacy(data_dir: &Path) -> Result<(MigrationReport, LegacySnapshot), Cor
         report,
         LegacySnapshot {
             keys: keys.keys,
+            credits: credits.credits,
             videos,
             assets: assets_file.assets,
         },
@@ -312,46 +322,6 @@ fn scan_legacy(data_dir: &Path) -> Result<(MigrationReport, LegacySnapshot), Cor
 /// Inspect legacy files without opening or creating Core storage.
 pub fn inspect_legacy(data_dir: &Path) -> Result<MigrationReport, CoreError> {
     scan_legacy(data_dir).map(|(report, _)| report)
-}
-
-fn validate_core_owners(
-    data_dir: &Path,
-    owner_ids: impl Iterator<Item = String>,
-    actor_user_id: &str,
-    report: &mut MigrationReport,
-) -> Result<(), CoreError> {
-    let db_path = data_dir.join("data").join(aiwork_core::CORE_DB_FILE);
-    if !db_path.is_file() {
-        report.errors.push("Core owner does not exist".into());
-        return Ok(());
-    }
-    let connection = Connection::open(db_path)?;
-    let mut owners = HashSet::new();
-    for owner_id in owner_ids {
-        if owners.insert(owner_id.clone()) {
-            let exists = connection
-                .query_row(
-                    "SELECT 1 FROM users WHERE id = ?1 AND status = 'active'",
-                    [&owner_id],
-                    |_| Ok(()),
-                )
-                .optional()?;
-            if exists.is_none() {
-                report.errors.push("mapped Core owner does not exist or is disabled".into());
-            }
-        }
-    }
-    let actor_role = connection
-        .query_row(
-            "SELECT role FROM users WHERE id = ?1 AND status = 'active'",
-            [actor_user_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if actor_role.as_deref() != Some("admin") {
-        report.errors.push("actor_user_id is not an active admin".into());
-    }
-    Ok(())
 }
 
 fn response_from_issued(key: IssuedApiKey) -> IssuedApiKeyResponse {
@@ -417,39 +387,92 @@ fn prepare_legacy_apply(
     if !report.unmapped_keys.is_empty() {
         report.errors.push("legacy key mapping is incomplete".into());
     }
-    if actor_user_id.trim().is_empty() == false && report.unmapped_keys.is_empty() {
-        validate_core_owners(
-            data_dir,
-            mappings.iter().map(|mapping| mapping.user_id.clone()),
-            actor_user_id,
-            &mut report,
-        )?;
+    if !data_dir.join("data").join(aiwork_core::CORE_DB_FILE).is_file() {
+        report.errors.push("mapped Core owner or admin actor does not exist".into());
     }
     Ok((report, snapshot))
 }
 
-fn issue_migrated_keys(
-    store: Arc<CoreStore>,
+fn build_migration_batch(
+    snapshot: &LegacySnapshot,
     mappings: &[LegacyMigrationMapping],
     actor_user_id: &str,
-    report: MigrationReport,
-) -> Result<MigrationApplyResponse, CoreError> {
-    store.migrate()?;
-    let scopes = MIGRATION_SCOPES
+    report: &MigrationReport,
+) -> Result<LegacyMigrationBatch, CoreError> {
+    let mapping_by_key = mappings
+        .iter()
+        .map(|mapping| (mapping.legacy_key_id.as_str(), mapping.user_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let keys = snapshot
+        .keys
+        .iter()
+        .map(|key| LegacyMigrationKey {
+            legacy_key_id: key.id.clone(),
+            legacy_key: key._key.clone(),
+            user_id: mapping_by_key[key.id.as_str()].to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let assets = snapshot
+        .assets
+        .iter()
+        .map(|asset| LegacyMigrationAsset {
+            id: asset.id.clone(),
+            owner_key_id: asset.owner_key_id.clone(),
+            user_id: mapping_by_key[asset.owner_key_id.as_str()].to_owned(),
+            filename: asset._filename.clone(),
+            mime_type: asset._mime_type.clone(),
+            extension: asset._extension.clone(),
+            size: asset._size as i64,
+            content_sha256: asset._sha256.clone(),
+            created_at_ms: asset._created_at as i64 * 1000,
+            expires_at_ms: asset._expires_at as i64 * 1000,
+        })
+        .collect::<Vec<_>>();
+    let jobs = snapshot
+        .videos
+        .iter()
+        .map(|task| LegacyMigrationJob {
+            id: task.id.clone(),
+            owner_key_id: task.owner_key_id.clone(),
+            user_id: mapping_by_key[task.owner_key_id.as_str()].to_owned(),
+            status: task.status.clone(),
+            created_at_ms: task._created_at as i64 * 1000,
+            updated_at_ms: task._updated_at as i64 * 1000,
+        })
+        .collect::<Vec<_>>();
+    let observations = snapshot
+        .credits
+        .iter()
+        .enumerate()
+        .map(|(index, (account_ref, value))| Ok(LegacyMigrationObservation {
+            id: format!("{}-credit-{index}", report.source_hashes.get("remaining_credits.json").unwrap_or(&String::new())),
+            account_ref: account_ref.clone(),
+            resource_kind: "remaining_credit".into(),
+            value_json: serde_json::to_string(value)?,
+            observed_at_ms: chrono::Utc::now().timestamp_millis(),
+        }))
+        .collect::<Result<Vec<_>, CoreError>>()?;
+    Ok(LegacyMigrationBatch {
+        migration_id: format!("legacy-migration-{:x}", rand::random::<u64>()),
+        actor_user_id: actor_user_id.to_owned(),
+        reason: "explicit legacy JSON migration".into(),
+        scopes: MIGRATION_SCOPES
         .into_iter()
         .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-    let mut issued_keys = Vec::with_capacity(mappings.len());
-    for mapping in mappings {
-        let issued = store.issue_api_key(
-            &mapping.user_id,
-            &format!("legacy migration {}", mapping.legacy_key_id),
-            scopes.clone(),
-            actor_user_id,
-        )?;
-        issued_keys.push(response_from_issued(issued));
-    }
-    Ok(MigrationApplyResponse { report, issued_keys })
+        .collect::<BTreeSet<_>>(),
+        source_hashes: report.source_hashes.clone(),
+        keys,
+        assets,
+        jobs,
+        observations,
+    })
+}
+
+fn is_blocking_report(report: &MigrationReport) -> bool {
+    report
+        .errors
+        .iter()
+        .any(|error| !error.starts_with("reconcile_required:"))
 }
 
 pub fn apply_legacy_with_store(
@@ -458,14 +481,25 @@ pub fn apply_legacy_with_store(
     mappings: &[LegacyMigrationMapping],
     actor_user_id: &str,
 ) -> Result<MigrationApplyResponse, CoreError> {
-    let (report, _snapshot) = prepare_legacy_apply(data_dir, mappings, actor_user_id)?;
-    if !report.errors.is_empty() {
+    let (mut report, snapshot) = prepare_legacy_apply(data_dir, mappings, actor_user_id)?;
+    if is_blocking_report(&report) {
         return Ok(MigrationApplyResponse {
             report,
             issued_keys: Vec::new(),
         });
     }
-    issue_migrated_keys(store, mappings, actor_user_id, report)
+    store.migrate()?;
+    let batch = build_migration_batch(&snapshot, mappings, actor_user_id, &report)?;
+    match store.apply_legacy_migration(batch) {
+        Ok(result) => Ok(MigrationApplyResponse {
+            report,
+            issued_keys: result.issued_keys.into_iter().map(response_from_issued).collect(),
+        }),
+        Err(error) => {
+            report.errors.push(safe_migration_error(&error));
+            Ok(MigrationApplyResponse { report, issued_keys: Vec::new() })
+        }
+    }
 }
 
 pub fn apply_legacy(
@@ -474,11 +508,20 @@ pub fn apply_legacy(
     actor_user_id: &str,
 ) -> Result<MigrationReport, CoreError> {
     let (report, _) = prepare_legacy_apply(data_dir, mappings, actor_user_id)?;
-    if !report.errors.is_empty() {
+    if is_blocking_report(&report) {
         return Ok(report);
     }
     let store = Arc::new(CoreStore::open(data_dir)?);
-    Ok(issue_migrated_keys(store, mappings, actor_user_id, report)?.report)
+    Ok(apply_legacy_with_store(data_dir, store, mappings, actor_user_id)?.report)
+}
+
+fn safe_migration_error(error: &CoreError) -> String {
+    match error {
+        CoreError::AdminRequired => "actor_user_id is not an active admin".into(),
+        CoreError::UserNotActive => "mapped Core owner does not exist or is disabled".into(),
+        CoreError::MigrationValidation { reason } => format!("migration batch rejected: {reason}"),
+        _ => "migration batch rejected by Core storage".into(),
+    }
 }
 
 #[cfg(test)]
@@ -658,6 +701,22 @@ mod tests {
     }
 
     #[test]
+    fn inspect_reports_missing_legacy_files_instead_of_treating_them_as_empty() {
+        let fixture = Fixture::new("missing");
+        let report = inspect_legacy(&fixture.dir).unwrap();
+
+        for name in [
+            "api_keys.json",
+            "remaining_credits.json",
+            "video_tasks.json",
+            "assets.json",
+        ] {
+            assert_eq!(report.source_hashes.get(name).map(String::as_str), Some("missing"));
+            assert!(report.errors.iter().any(|error| error.contains(name)));
+        }
+    }
+
+    #[test]
     fn apply_without_complete_mapping_returns_report_and_writes_nothing() {
         let (fixture, _) = valid_fixture();
         let report = apply_legacy(&fixture.dir, &[], "admin-1").unwrap();
@@ -731,19 +790,19 @@ mod tests {
         store
             .create_user(
                 aiwork_core::NewUser {
-                    id: "user-1".into(),
-                    name: "User 1".into(),
-                    role: aiwork_core::UserRole::User,
+                    id: "admin-1".into(),
+                    name: "Admin 1".into(),
+                    role: aiwork_core::UserRole::Admin,
                 },
-                "admin-1",
+                "bootstrap",
             )
             .unwrap();
         store
             .create_user(
                 aiwork_core::NewUser {
-                    id: "admin-1".into(),
-                    name: "Admin 1".into(),
-                    role: aiwork_core::UserRole::Admin,
+                    id: "user-1".into(),
+                    name: "User 1".into(),
+                    role: aiwork_core::UserRole::User,
                 },
                 "admin-1",
             )

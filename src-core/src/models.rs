@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, fmt, sync::Arc};
 
 use serde_json::Value;
 
@@ -28,6 +28,67 @@ pub struct NewUser {
     pub id: String,
     pub name: String,
     pub role: UserRole,
+}
+
+/// Sanitized legacy records accepted by the atomic migration boundary.
+/// `legacy_key` is transient input only and is never persisted by CoreStore.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LegacyMigrationKey {
+    pub legacy_key_id: String,
+    pub legacy_key: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyMigrationAsset {
+    pub id: String,
+    pub owner_key_id: String,
+    pub user_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub extension: String,
+    pub size: i64,
+    pub content_sha256: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyMigrationJob {
+    pub id: String,
+    pub owner_key_id: String,
+    pub user_id: String,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyMigrationObservation {
+    pub id: String,
+    pub account_ref: String,
+    pub resource_kind: String,
+    pub value_json: String,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LegacyMigrationBatch {
+    pub migration_id: String,
+    pub actor_user_id: String,
+    pub reason: String,
+    pub scopes: BTreeSet<String>,
+    pub source_hashes: BTreeMap<String, String>,
+    pub keys: Vec<LegacyMigrationKey>,
+    pub assets: Vec<LegacyMigrationAsset>,
+    pub jobs: Vec<LegacyMigrationJob>,
+    pub observations: Vec<LegacyMigrationObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyMigrationResult {
+    pub migration_id: String,
+    pub issued_keys: Vec<IssuedApiKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
