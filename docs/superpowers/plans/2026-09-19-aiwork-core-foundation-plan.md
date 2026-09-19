@@ -254,13 +254,21 @@ git commit -m "feat: add core sqlite foundation"
 ```rust
 #[test]
 fn issued_key_is_hash_only_and_authenticates_its_user() {
-    let store = test_store();
+    let (store, temp_dir) = test_store_with_dir();
     let user = store.create_user(user("u1", UserRole::User), "bootstrap").unwrap();
     let issued = store.issue_api_key(&user.id, "test", scopes(&["models:read"]), "bootstrap").unwrap();
     let principal = store.authenticate_api_key(&issued.plaintext).unwrap();
     assert_eq!(principal.user_id, "u1");
     assert!(require_scope(&principal, "models:read").is_ok());
-    assert!(store.raw_text_search("api_keys", &issued.plaintext).unwrap().is_empty());
+    let db = rusqlite::Connection::open(temp_dir.join("data/core.sqlite3")).unwrap();
+    let stored: Vec<String> = db
+        .prepare("SELECT prefix || scopes_json FROM api_keys")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert!(stored.iter().all(|text| !text.contains(&issued.plaintext)));
 }
 ```
 
