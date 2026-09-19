@@ -94,6 +94,6 @@
 - Produces: operator instructions that distinguish Core permanent quota from legacy daily limits and explicitly document admin-key handling.
 
 - [x] **Step 1: Update docs** with exact command/UI workflow, redaction rules, rollback and current limitation that no公网 admin API or online payment exists.
-- [ ] **Step 2: Run Core focused/full, Tauri focused/full, Vitest, `npm run build`, `git diff --check`, and inspect staged file list**; keep every target/log on `D:\gpt`.
-- [ ] **Step 3: Commit** with `docs: document core admin management`.
-- [ ] **Step 4: Re-read the spec and plan, verify every review-focus item from current output, and report Phase 4D evidence plus remaining Phase 4/5 gaps. Do not mark the overall goal complete.**
+- [x] **Step 2: Run Core focused/full, Tauri focused/full, Vitest, `npm run build`, `git diff --check`, and inspect staged file list**; keep every target/log on `D:\gpt`.
+- [x] **Step 3: Commit** the Core admin management implementation and documentation.
+- [x] **Step 4: Re-read the spec and plan, verify every review-focus item from current output, and report Phase 4D evidence plus remaining Phase 4/5 gaps. Do not mark the overall goal complete.**
