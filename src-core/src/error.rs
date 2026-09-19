@@ -34,4 +34,12 @@ pub enum CoreError {
     ReservationRequestConflict { request_id: String },
     #[error("quota adjustment would overdraw the available balance")]
     QuotaOverdrawn,
+    #[error("no enabled cost policy matches endpoint {endpoint} and model {model}")]
+    BudgetPolicyMissing { endpoint: String, model: String },
+    #[error("request {request_id} cannot transition from {expected:?} to {next:?}")]
+    InvalidTransition {
+        request_id: String,
+        expected: crate::RequestState,
+        next: crate::RequestState,
+    },
 }

@@ -64,7 +64,7 @@ CREATE TABLE requests (
   endpoint TEXT NOT NULL,
   model TEXT NOT NULL,
   request_hash BLOB NOT NULL,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('received','validating','reserved','queued','dispatched','completing','succeeded','failed','unknown','settled')),
   result_status INTEGER,
   error_code TEXT,
   created_at_ms INTEGER NOT NULL,

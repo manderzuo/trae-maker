@@ -1,14 +1,19 @@
+mod cost;
 mod error;
 mod identity;
 mod models;
 mod quota;
+mod requests;
 mod schema;
 mod store;
 
+pub use cost::{CostError, CostEstimate, CostPolicy};
 pub use error::CoreError;
 pub use identity::{require_scope, AuthError, Principal};
 pub use models::{
-    IssuedApiKey, NewUser, QuotaBalance, QuotaGrant, QuotaReserve, Reservation,
-    ReservationState, ReserveResult, Settlement, SharedCoreStore, User, UserRole,
+    BeginRequest, BeginRequestInput, IssuedApiKey, NewUser, QuotaBalance, QuotaGrant,
+    QuotaReserve, RequestHandle, RequestResult, RequestState, Reservation, ReservationState,
+    ReserveResult, Settlement, SharedCoreStore, User, UserRole,
 };
+pub use requests::canonical_json_hash;
 pub use store::{CoreStore, CORE_DB_FILE, CURRENT_SCHEMA_VERSION};

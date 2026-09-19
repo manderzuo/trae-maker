@@ -1,5 +1,7 @@
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
+use serde_json::Value;
+
 use crate::CoreStore;
 
 pub type SharedCoreStore = Arc<CoreStore>;
@@ -33,6 +35,101 @@ pub struct User {
     pub id: String,
     pub name: String,
     pub role: UserRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeginRequestInput {
+    pub user_id: String,
+    pub api_key_id: String,
+    pub protocol: String,
+    pub endpoint: String,
+    pub model: String,
+    pub idempotency_key: String,
+    pub body: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestHandle {
+    pub id: String,
+    pub user_id: String,
+    pub api_key_id: String,
+    pub protocol: String,
+    pub endpoint: String,
+    pub model: String,
+    pub state: RequestState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginRequest {
+    Created(RequestHandle),
+    Existing(RequestHandle),
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestResult {
+    pub status: Option<i64>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestState {
+    Received,
+    Validating,
+    Reserved,
+    Queued,
+    Dispatched,
+    Completing,
+    Succeeded,
+    Failed,
+    Unknown,
+    Settled,
+}
+
+impl RequestState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Validating => "validating",
+            Self::Reserved => "reserved",
+            Self::Queued => "queued",
+            Self::Dispatched => "dispatched",
+            Self::Completing => "completing",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+            Self::Settled => "settled",
+        }
+    }
+
+    pub(crate) fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "received" => Some(Self::Received),
+            "validating" => Some(Self::Validating),
+            "reserved" => Some(Self::Reserved),
+            "queued" => Some(Self::Queued),
+            "dispatched" => Some(Self::Dispatched),
+            "completing" => Some(Self::Completing),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "unknown" => Some(Self::Unknown),
+            "settled" => Some(Self::Settled),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Received, Self::Validating)
+                | (Self::Validating, Self::Reserved | Self::Failed | Self::Unknown)
+                | (Self::Reserved, Self::Queued | Self::Failed | Self::Unknown)
+                | (Self::Queued, Self::Dispatched | Self::Failed | Self::Unknown)
+                | (Self::Dispatched, Self::Completing | Self::Failed | Self::Unknown)
+                | (Self::Completing, Self::Succeeded | Self::Failed | Self::Unknown)
+                | (Self::Succeeded | Self::Failed | Self::Unknown, Self::Settled)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
