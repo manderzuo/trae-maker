@@ -6,19 +6,39 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+use aiwork_core::Principal;
+
 use super::api_keys::{self, ApiKeysFile, KeyCheck};
+use super::core_bridge::{CoreBridge, CoreMode};
 use super::usage::KeyId;
 use super::ApiSharedState;
 
+/// Shadow mode leaves legacy authorization in charge, but records whether the
+/// presented credential also matched a Core key.  It is deliberately not a
+/// Principal: shadow mode must not make Core identity authoritative.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreAuthObservation {
+    pub presented: bool,
+    pub matched: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreAuthFailure {
+    MissingCredentials,
+    InvalidCredentials,
+    Unavailable,
+}
+
 /// API Key 鉴权中间件：
 /// - /health 跳过鉴权
-/// - Key 统一在 data/api_keys.json 列表中维护（带每日配额），
+/// - Core enforce 使用已启动的 CoreStore；off/shadow 保留 data/api_keys.json，
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
 /// - 存在启用 Key 时必须鉴权；无任何启用 Key 时：auth_disabled=true（显式关闭鉴权）放行记 anonymous，
-///   否则拒绝（默认）并返回引导提示
+///   否则拒绝（默认）并返回引导提示（仅 legacy off/shadow 路径）
 /// - Key 每次命中即累加当日用量并写盘，超配额返回 429
 /// - 每次请求重读 api_keys.json：新增/删除/禁用/开关立即生效
-/// 校验通过后向 request extensions 插入命中的 Key 标识（KeyId），供 handler 用量记账
+/// 校验通过后向 request extensions 插入命中的 Key 标识（KeyId），供 handler 用量记账；
+/// Core enforce 另外插入权威 Principal。
 pub async fn bearer_auth(
     State(state): State<Arc<ApiSharedState>>,
     mut request: Request,
@@ -48,6 +68,28 @@ pub async fn bearer_auth(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let presented = bearer.or(xkey);
+
+    match state
+        .core
+        .as_ref()
+        .map(|bridge| bridge.mode)
+        .unwrap_or(CoreMode::Off)
+    {
+        CoreMode::Enforce => {
+            return match authenticate_enforce_request(
+                &mut request,
+                state.core.as_ref(),
+                presented.as_deref(),
+            ) {
+                Ok(()) => next.run(request).await,
+                Err(_) => core_auth_rejected(),
+            };
+        }
+        CoreMode::Shadow => {
+            observe_shadow_auth(&mut request, state.core.as_ref(), presented.as_deref());
+        }
+        CoreMode::Off => {}
+    }
 
     // 鉴权热路径（P1 修复5b）：load + verify_and_consume_locked（内含记账写盘）
     // 全为同步磁盘 IO，整体移入 spawn_blocking（参数转 owned），避免阻塞
@@ -95,6 +137,56 @@ pub async fn bearer_auth(
     }
 
     (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
+}
+
+/// Enforce-mode authentication is intentionally isolated from the legacy JSON
+/// key store.  A successful Core lookup supplies both the authoritative
+/// Principal and the existing KeyId extension used by legacy handlers.
+fn authenticate_enforce_request(
+    request: &mut Request,
+    core: Option<&Arc<CoreBridge>>,
+    presented: Option<&str>,
+) -> Result<(), CoreAuthFailure> {
+    let presented = presented.ok_or(CoreAuthFailure::MissingCredentials)?;
+    let bridge = core
+        .filter(|bridge| bridge.mode == CoreMode::Enforce)
+        .ok_or(CoreAuthFailure::Unavailable)?;
+    let principal = bridge
+        .store
+        .authenticate_api_key(presented)
+        .map_err(|_| CoreAuthFailure::InvalidCredentials)?;
+    let key_id = principal.key_id.clone();
+    request.extensions_mut().insert(principal);
+    request.extensions_mut().insert(KeyId(key_id));
+    Ok(())
+}
+
+/// Shadow mode is observational only.  It never inserts a Principal and does
+/// not affect the legacy JSON-key decision made below.
+fn observe_shadow_auth(
+    request: &mut Request,
+    core: Option<&Arc<CoreBridge>>,
+    presented: Option<&str>,
+) {
+    let matched = core
+        .filter(|bridge| bridge.mode == CoreMode::Shadow)
+        .and_then(|bridge| presented.and_then(|key| bridge.store.authenticate_api_key(key).ok()))
+        .is_some();
+    request.extensions_mut().insert(CoreAuthObservation {
+        presented: presented.is_some(),
+        matched,
+    });
+}
+
+/// Scope checks are based only on the middleware-installed Core Principal.
+/// The requested scope is intentionally not echoed to avoid disclosing policy
+/// details to unauthenticated or partially authenticated callers.
+pub fn require_request_scope(request: &Request, scope: &str) -> Result<(), Response> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .ok_or_else(core_auth_rejected)?;
+    aiwork_core::require_scope(principal, scope).map_err(|_| insufficient_scope())
 }
 
 /// 不带凭证的探活端点。只允许严格的根路径，避免把 `/status` 等诊断接口
@@ -154,7 +246,54 @@ fn quota_exceeded(limit: u64) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_public_asset_content_path, is_public_liveness_path};
+    use std::{collections::BTreeSet, fs, sync::Arc};
+
+    use aiwork_core::{CoreStore, NewUser, UserRole};
+    use axum::{body::Body, http::Request};
+
+    use super::{
+        authenticate_enforce_request, is_public_asset_content_path, is_public_liveness_path,
+        require_request_scope,
+    };
+    use crate::api_server::{CoreBridge, CoreMode};
+
+    fn core_fixture_with_mode(mode: CoreMode) -> (Arc<CoreBridge>, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "twa-auth-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(CoreStore::open(&dir).unwrap());
+        store.migrate().unwrap();
+        store
+            .create_user(
+                NewUser {
+                    id: "core-user".into(),
+                    name: "Core user".into(),
+                    role: UserRole::User,
+                },
+                "bootstrap",
+            )
+            .unwrap();
+        let issued = store
+            .issue_api_key(
+                "core-user",
+                "test",
+                BTreeSet::from(["models:read".to_owned(), "chat:invoke".to_owned()]),
+                "bootstrap",
+            )
+            .unwrap();
+        let bridge = Arc::new(CoreBridge::new(store, mode));
+        // The CoreStore owns the temporary directory through the test process; clean up is
+        // intentionally best-effort because Windows may still hold SQLite handles briefly.
+        let _ = fs::remove_dir_all(&dir);
+        (bridge, issued.plaintext)
+    }
+
+    fn core_fixture() -> (Arc<CoreBridge>, String) {
+        core_fixture_with_mode(CoreMode::Enforce)
+    }
 
     #[test]
     fn public_liveness_paths_are_strictly_scoped() {
@@ -172,4 +311,91 @@ mod tests {
         assert!(!is_public_asset_content_path("/v1/assets/../content"));
         assert!(!is_public_asset_content_path("/v1/assets/asset-1/content/extra"));
     }
+
+    #[test]
+    fn enforce_auth_inserts_core_principal_and_key_id_not_request_user_id() {
+        let (bridge, plaintext) = core_fixture();
+        let mut request = Request::builder()
+            .uri("/v1/models?user_id=attacker")
+            .header("x-user-id", "attacker")
+            .body(Body::from(r#"{"user_id":"attacker"}"#))
+            .unwrap();
+
+        authenticate_enforce_request(&mut request, Some(&bridge), Some(&plaintext)).unwrap();
+
+        let principal = request
+            .extensions()
+            .get::<aiwork_core::Principal>()
+            .unwrap();
+        assert_eq!(principal.user_id, "core-user");
+        assert_eq!(
+            request.extensions().get::<super::KeyId>().unwrap().0,
+            principal.key_id
+        );
+    }
+
+    #[test]
+    fn enforce_auth_without_core_key_is_rejected() {
+        let (bridge, _) = core_fixture();
+        let mut request = Request::new(Body::empty());
+
+        assert!(matches!(
+            authenticate_enforce_request(&mut request, Some(&bridge), None),
+            Err(super::CoreAuthFailure::MissingCredentials)
+        ));
+    }
+
+    #[test]
+    fn shadow_auth_only_records_observation_without_principal() {
+        let (bridge, plaintext) = core_fixture_with_mode(CoreMode::Shadow);
+        let mut request = Request::new(Body::empty());
+
+        super::observe_shadow_auth(&mut request, Some(&bridge), Some(&plaintext));
+
+        assert_eq!(
+            request
+                .extensions()
+                .get::<super::CoreAuthObservation>(),
+            Some(&super::CoreAuthObservation {
+                presented: true,
+                matched: true,
+            })
+        );
+        assert!(request
+            .extensions()
+            .get::<aiwork_core::Principal>()
+            .is_none());
+    }
+
+    #[test]
+    fn core_auth_rejection_is_unauthorized_and_minimal() {
+        assert_eq!(super::core_auth_rejected().status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_request_scope_reads_only_the_core_principal() {
+        let principal = aiwork_core::Principal {
+            user_id: "core-user".into(),
+            key_id: "core-key".into(),
+            scopes: BTreeSet::from(["models:read".to_owned()]),
+        };
+        let mut request = Request::builder()
+            .uri("/v1/chat/completions?user_id=attacker")
+            .header("x-user-id", "attacker")
+            .body(Body::from(r#"{"user_id":"attacker"}"#))
+            .unwrap();
+        request.extensions_mut().insert(principal);
+
+        assert!(require_request_scope(&request, "models:read").is_ok());
+        let response = require_request_scope(&request, "chat:invoke").unwrap_err();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+}
+
+fn core_auth_rejected() -> Response {
+    (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+}
+
+fn insufficient_scope() -> Response {
+    (StatusCode::FORBIDDEN, "insufficient scope").into_response()
 }

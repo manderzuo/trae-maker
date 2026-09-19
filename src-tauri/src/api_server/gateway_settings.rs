@@ -323,4 +323,16 @@ mod tests {
         .unwrap();
         assert!(load(&f.dir).asset_public_base_url.is_empty());
     }
+
+    #[test]
+    fn t05_old_settings_default_core_mode_to_off() {
+        let f = fixture(None);
+        std::fs::write(
+            f.dir.join("data").join("api_gateway_settings.json"),
+            r#"{"port":8004,"default_model":"x","listen_host":"127.0.0.1","cors_origins":""}"#,
+        )
+        .unwrap();
+
+        assert_eq!(load(&f.dir).core_mode, "off");
+    }
 }
