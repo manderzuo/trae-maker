@@ -316,11 +316,12 @@ async fn do_start_with_scheduler_key(
             ).and_then(|directory| {
                 let principal = scheduler::authenticate_sync_admin(&store, scheduler_admin_key)?;
                 scheduler::sync_upstream_accounts(&store, &state.data_dir, &principal, &directory)?;
-                Ok(directory.readers(app))
+                let readers = directory.readers(app);
+                Ok((directory, readers))
             });
-            let (readers, sync_error) = match synced {
-                Ok(readers) => (readers, None),
-                Err(error) if scheduler_mode == SchedulerMode::Shadow => (Default::default(), Some(error)),
+            let (directory, readers, sync_error) = match synced {
+                Ok((directory, readers)) => (Some(directory), readers, None),
+                Err(error) if scheduler_mode == SchedulerMode::Shadow => (None, Default::default(), Some(error)),
                 Err(error) => return Err(error.to_string()),
             };
             let scheduler = Arc::new(SchedulerRuntime::new(
@@ -331,17 +332,31 @@ async fn do_start_with_scheduler_key(
             scheduler_status = if scheduler_mode == SchedulerMode::Shadow {
                 scheduler.shadow_dry_run(chrono::Utc::now().timestamp_millis())
             } else { scheduler.scheduler_status() };
-            core = Some(Arc::new(crate::api_server::CoreBridge::new(store, core_mode)
-                .with_scheduler(scheduler).map_err(|error| error.to_string())?));
+            let bridge = crate::api_server::CoreBridge::new(store, core_mode)
+                .with_scheduler(scheduler)
+                .map_err(|error| error.to_string())?;
+            let bridge = if core_mode == crate::api_server::CoreMode::Enforce {
+                let directory = directory.as_ref().ok_or_else(|| SchedulerError::SyncFailed.to_string())?;
+                let executor = scheduler::build_legacy_executor(directory, pool.clone(), wb_pool.clone());
+                if executor.is_empty() || !executor.can_dispatch_without_provider_binding() {
+                    return Err(SchedulerError::EndpointNotEnabled.to_string());
+                }
+                bridge.with_upstream_executor(executor)
+            } else {
+                bridge
+            };
+            core = Some(Arc::new(bridge));
         }
     }
 
-    // Task 5 owns endpoint wiring. Until then do not expose the Phase 1 legacy-backed
-    // enforcing Chat route, even if account sync and lease recovery succeeded.
+    // Enforce startup is allowed only when the Core-selected accounts have an
+    // explicit provider/credential executor binding. A missing binding fails
+    // closed before the listener is started; it never re-enters ApiPool.
     if core_mode == crate::api_server::CoreMode::Enforce {
-        core.as_ref().ok_or_else(|| SchedulerError::NotReady.to_string())?
-            .scheduler().map_err(|error| error.to_string())?
-            .require_endpoint("chat").map_err(|error| error.to_string())?;
+        core.as_ref()
+            .ok_or_else(|| SchedulerError::NotReady.to_string())?
+            .upstream_executor()
+            .map_err(|error| error.to_string())?;
     }
 
     // 池为空时给出明确警告

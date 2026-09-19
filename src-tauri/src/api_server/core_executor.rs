@@ -13,6 +13,9 @@ use aiwork_core::{
 };
 use serde_json::{json, Value};
 
+use crate::api_server::{payload, routes, sse, wb_payload, wb_sse, wb_upstream};
+use crate::api_server::pool::{ApiPool, PickedAccount};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamOutcome {
     Success {
@@ -308,6 +311,229 @@ impl LeaseUpstreamAdapter for ChatExecutorAdapter {
     }
 }
 
+/// The production bridge for the legacy provider transports. Core has already
+/// selected the account; this adapter only resolves that exact account and
+/// never calls a pool-wide picker or rotates to another account.
+pub trait LegacyChatTransport: Send + Sync {
+    fn execute(
+        &self,
+        provider: &str,
+        account: &PickedAccount,
+        request: ChatExecutionRequest,
+    ) -> UpstreamOutcome;
+}
+
+#[derive(Clone)]
+pub struct LegacyPoolLeaseAdapter {
+    provider: String,
+    account_uids: BTreeMap<String, String>,
+    resolve_account: Arc<dyn Fn(&str) -> Option<PickedAccount> + Send + Sync>,
+    transport: Arc<dyn LegacyChatTransport>,
+}
+
+impl LegacyPoolLeaseAdapter {
+    pub fn with_transport(
+        provider: impl Into<String>,
+        account_uids: BTreeMap<String, String>,
+        resolve_account: Arc<dyn Fn(&str) -> Option<PickedAccount> + Send + Sync>,
+        transport: Arc<dyn LegacyChatTransport>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            account_uids,
+            resolve_account,
+            transport,
+        }
+    }
+
+    pub fn from_pool(
+        provider: impl Into<String>,
+        pool: ApiPool,
+        account_uids: BTreeMap<String, String>,
+    ) -> Self {
+        let resolve_account = Arc::new(move |uid: &str| pool.pick_by_uid(uid));
+        Self::with_transport(
+            provider,
+            account_uids,
+            resolve_account,
+            Arc::new(LegacyNetworkChatTransport),
+        )
+    }
+}
+
+impl LeaseUpstreamAdapter for LegacyPoolLeaseAdapter {
+    fn execute_nonstream_chat(
+        &self,
+        lease: &UpstreamLeaseGrant,
+        request: ChatExecutionRequest,
+    ) -> UpstreamOutcome {
+        let Some(uid) = self.account_uids.get(&lease.account_ref) else {
+            return UpstreamOutcome::TransportUnknown {
+                reason: "account_binding_missing".into(),
+                upstream_request_ref: None,
+            };
+        };
+        let Some(account) = (self.resolve_account)(uid) else {
+            return UpstreamOutcome::TransportUnknown {
+                reason: "account_unavailable".into(),
+                upstream_request_ref: None,
+            };
+        };
+        self.transport.execute(&self.provider, &account, request)
+    }
+}
+
+struct LegacyNetworkChatTransport;
+
+impl LegacyChatTransport for LegacyNetworkChatTransport {
+    fn execute(
+        &self,
+        provider: &str,
+        account: &PickedAccount,
+        request: ChatExecutionRequest,
+    ) -> UpstreamOutcome {
+        let body = match serde_json::to_vec(&request.body) {
+            Ok(body) => body,
+            Err(_) => {
+                return UpstreamOutcome::Rejected {
+                    status: 400,
+                    code: "invalid_request".into(),
+                    accepted: false,
+                }
+            }
+        };
+        match provider {
+            "trae" => execute_trae_chat(account, &request, &body),
+            "workbuddy" => execute_workbuddy_chat(account, &request, &body),
+            _ => UpstreamOutcome::TransportUnknown {
+                reason: "adapter_unavailable".into(),
+                upstream_request_ref: None,
+            },
+        }
+    }
+}
+
+fn execute_trae_chat(
+    account: &PickedAccount,
+    request: &ChatExecutionRequest,
+    body: &[u8],
+) -> UpstreamOutcome {
+    let converted = payload::prepare_llm_chat_body(
+        body,
+        &request.model,
+        &account.uid,
+        &account.device_id,
+        &account.machine_id,
+    );
+    let reader = match routes::make_upstream_request(
+        &account.jwt,
+        &account.uid,
+        &account.device_id,
+        &account.machine_id,
+        &converted,
+    ) {
+        Ok(reader) => reader,
+        Err((status, _, _)) if status == 502 => {
+            return UpstreamOutcome::TransportUnknown {
+                reason: "transport_unknown".into(),
+                upstream_request_ref: None,
+            }
+        }
+        Err((status, _, _)) => {
+            return UpstreamOutcome::Rejected {
+                status,
+                code: rejected_code(status).into(),
+                accepted: false,
+            }
+        }
+    };
+    let chat_id = format!("chatcmpl-{}", request.request_id);
+    let (response, error) = sse::aggregate(reader, &chat_id);
+    match (response, error) {
+        (Some(body), None) => UpstreamOutcome::Success {
+            body,
+            actual_units: None,
+            upstream_request_ref: None,
+        },
+        _ => UpstreamOutcome::TransportUnknown {
+            reason: "upstream_sse_unknown".into(),
+            upstream_request_ref: None,
+        },
+    }
+}
+
+fn execute_workbuddy_chat(
+    account: &PickedAccount,
+    request: &ChatExecutionRequest,
+    body: &[u8],
+) -> UpstreamOutcome {
+    let converted = wb_payload::prepare_wb_chat_body(
+        body,
+        &request.model,
+        &request.request_id,
+        None,
+        true,
+        &wb_payload::default_template_map(),
+    );
+    let reader = match wb_upstream::make_wb_request(
+        &wb_upstream::WbCreds {
+            id: account.uid.clone(),
+            uid: account.uid.clone(),
+            name: String::new(),
+            token: account.jwt.clone(),
+            domain: account.domain.clone(),
+            enterprise_id: account.enterprise_id.clone(),
+            global_region: account.global_region,
+        },
+        &converted,
+    ) {
+        Ok(reader) => reader,
+        Err((status, _, _)) if status == 502 => {
+            return UpstreamOutcome::TransportUnknown {
+                reason: "transport_unknown".into(),
+                upstream_request_ref: None,
+            }
+        }
+        Err((status, _, _)) => {
+            return UpstreamOutcome::Rejected {
+                status,
+                code: rejected_code(status).into(),
+                accepted: false,
+            }
+        }
+    };
+    let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
+        Ok(lines) => lines,
+        Err(()) => {
+            return UpstreamOutcome::TransportUnknown {
+                reason: "transport_timeout".into(),
+                upstream_request_ref: None,
+            }
+        }
+    };
+    let (response, _) = wb_sse::aggregate(lines, &format!("chatcmpl-{}", request.request_id));
+    match response {
+        Some(body) => UpstreamOutcome::Success {
+            body,
+            actual_units: None,
+            upstream_request_ref: None,
+        },
+        None => UpstreamOutcome::TransportUnknown {
+            reason: "upstream_sse_unknown".into(),
+            upstream_request_ref: None,
+        },
+    }
+}
+
+fn rejected_code(status: u16) -> &'static str {
+    match status {
+        401 | 403 => "authentication_error",
+        408 | 409 | 429 => "rate_limited",
+        400..=499 => "invalid_request",
+        _ => "upstream_rejected",
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockUpstreamCall {
@@ -396,8 +622,8 @@ pub fn run_phase2_mock_chat(outcome: UpstreamOutcome) -> Phase2MockChatReport {
 
     use aiwork_core::{
         BeginRequestInput, CoreStore, CostPolicy, NewUser, PreflightReserveInput, Principal,
-        QuotaGrant, RegisterUpstreamAccount, RequestState, SchedulerLeaseRequest,
-        SchedulerLeaseResult, SelectionStrategy, UserRole, UpstreamObservation,
+        QuotaGrant, RegisterUpstreamAccount, SchedulerLeaseRequest, SchedulerLeaseResult,
+        SelectionStrategy, UserRole, UpstreamObservation,
     };
     use chrono::Utc;
 
@@ -772,5 +998,74 @@ mod tests {
             UpstreamOutcome::TransportUnknown { reason, .. } if reason == "lease_credentials_mismatch"
         ));
         assert_eq!(chat.calls().len(), 1);
+    }
+
+    #[derive(Default)]
+    struct RecordingLegacyTransport {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl LegacyChatTransport for RecordingLegacyTransport {
+        fn execute(
+            &self,
+            provider: &str,
+            account: &crate::api_server::pool::PickedAccount,
+            request: ChatExecutionRequest,
+        ) -> UpstreamOutcome {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(format!("{provider}:{}:{}", account.uid, request.request_id));
+            UpstreamOutcome::Success {
+                body: serde_json::json!({"choices": []}),
+                actual_units: Some(1),
+                upstream_request_ref: Some(request.request_id),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_lease_adapter_dispatches_only_the_core_bound_account() {
+        let account = crate::api_server::pool::PickedAccount {
+            uid: "uid-a".into(),
+            jwt: "jwt-a".into(),
+            device_id: "device-a".into(),
+            machine_id: "machine-a".into(),
+            domain: String::new(),
+            enterprise_id: String::new(),
+            global_region: false,
+        };
+        let resolver_account = account.clone();
+        let transport = Arc::new(RecordingLegacyTransport::default());
+        let adapter = LegacyPoolLeaseAdapter::with_transport(
+            "trae",
+            BTreeMap::from([(String::from("account-a"), String::from("uid-a"))]),
+            Arc::new(move |uid| (uid == "uid-a").then_some(resolver_account.clone())),
+            transport.clone(),
+        );
+
+        let exact = adapter.execute_nonstream_chat(
+            &lease("account-a", "vault://a"),
+            request(),
+        );
+        assert!(matches!(exact, UpstreamOutcome::Success { .. }));
+
+        let unbound = adapter.execute_nonstream_chat(
+            &lease("account-b", "vault://b"),
+            request(),
+        );
+        assert!(matches!(
+            unbound,
+            UpstreamOutcome::TransportUnknown { reason, .. }
+                if reason == "account_binding_missing"
+        ));
+        assert_eq!(
+            transport
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &["trae:uid-a:request-test".to_string()]
+        );
     }
 }

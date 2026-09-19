@@ -12,7 +12,10 @@ use serde_json::Value;
 #[path = "core_executor.rs"]
 pub mod core_executor;
 
-pub use core_executor::{CoreUpstreamExecutor, LeaseUpstreamAdapter, UpstreamOutcome};
+pub use core_executor::{
+    CoreUpstreamExecutor, LegacyChatTransport, LegacyPoolLeaseAdapter, LeaseUpstreamAdapter,
+    UpstreamOutcome,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreMode {
@@ -105,11 +108,17 @@ pub struct CoreBridge {
     pub store: Arc<CoreStore>,
     pub mode: CoreMode,
     scheduler: Option<Arc<super::scheduler::SchedulerRuntime>>,
+    upstream_executor: Option<CoreUpstreamExecutor>,
 }
 
 impl CoreBridge {
     pub fn new(store: Arc<CoreStore>, mode: CoreMode) -> Self {
-        Self { store, mode, scheduler: None }
+        Self { store, mode, scheduler: None, upstream_executor: None }
+    }
+
+    pub fn with_upstream_executor(mut self, executor: CoreUpstreamExecutor) -> Self {
+        self.upstream_executor = Some(executor);
+        self
     }
 
     pub fn with_scheduler(mut self, scheduler: Arc<super::scheduler::SchedulerRuntime>) -> Result<Self, super::scheduler::SchedulerError> {
@@ -148,6 +157,12 @@ impl CoreBridge {
         I: IntoIterator<Item = (String, String, String)>,
     {
         self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if let Some(executor) = &self.upstream_executor {
+            if executor.is_empty() || !executor.can_dispatch_without_provider_binding() {
+                return Err(CoreLeaseError::EndpointNotEnabled);
+            }
+            return Ok(executor.clone());
+        }
         let scheduler = self.scheduler.as_ref().ok_or(CoreLeaseError::EndpointNotEnabled)?;
         let executor = CoreUpstreamExecutor::from_chat_executors_with_accounts(
             &scheduler.executors,

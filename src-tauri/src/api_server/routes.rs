@@ -2534,7 +2534,7 @@ fn read_limited_body(response: ureq::Response) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn make_upstream_request(
+pub(crate) fn make_upstream_request(
     jwt: &str,
     _uid: &str,
     device_id: &str,

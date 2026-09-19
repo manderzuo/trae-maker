@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Sha256, Digest};
@@ -160,12 +160,13 @@ impl PoolEntry {
 }
 
 /// 账号池：内存索引 + 冷却/禁用状态机
+#[derive(Clone)]
 pub struct ApiPool {
-    entries: Mutex<HashMap<String, PoolEntry>>,
-    balances: Mutex<HashMap<String, CreditBalance>>,
-    strategy: Mutex<PoolStrategy>,
+    entries: Arc<Mutex<HashMap<String, PoolEntry>>>,
+    balances: Arc<Mutex<HashMap<String, CreditBalance>>>,
+    strategy: Arc<Mutex<PoolStrategy>>,
     /// 防惊群（T2.2）：100ms 内重复选中同一 uid 且存在其他候选时让位
-    recent_pick: Mutex<(String, i64)>, // (uid, 毫秒时间戳)
+    recent_pick: Arc<Mutex<(String, i64)>>, // (uid, 毫秒时间戳)
 }
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
@@ -176,10 +177,10 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 impl ApiPool {
     pub fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
-            balances: Mutex::new(HashMap::new()),
-            strategy: Mutex::new(PoolStrategy::ExpireFirst),
-            recent_pick: Mutex::new((String::new(), 0)),
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            balances: Arc::new(Mutex::new(HashMap::new())),
+            strategy: Arc::new(Mutex::new(PoolStrategy::ExpireFirst)),
+            recent_pick: Arc::new(Mutex::new((String::new(), 0))),
         }
     }
 
@@ -765,6 +766,7 @@ pub struct PoolDiagnosis {
     pub reason: String,
 }
 
+#[derive(Clone)]
 pub struct PickedAccount {
     pub uid: String,
     pub jwt: String,

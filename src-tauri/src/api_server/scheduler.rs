@@ -9,7 +9,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 
-use super::{core_bridge::CoreMode, pool::WbSyncAccount, upstream_observation::TauriObservationReader};
+use super::{
+    core_bridge::{CoreMode, CoreUpstreamExecutor, LegacyPoolLeaseAdapter},
+    pool::{ApiPool, WbSyncAccount},
+    upstream_observation::TauriObservationReader,
+};
 use crate::models::{AccountCooldownsFile, ApiPoolFile, GroupsFile, RawAccount, RemainingCreditsFile, SchedulerStatus};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,6 +377,63 @@ impl AccountDirectory {
         let reader: Arc<dyn ObservationReader> = Arc::new(RegisteredTauriReader { app: app.clone(), ids: self.adapter_ids.clone() });
         BTreeMap::from([("trae".into(), reader.clone()), ("workbuddy".into(), reader)])
     }
+
+    pub fn legacy_account_ids(&self, provider: &str) -> BTreeMap<String, String> {
+        self.accounts
+            .iter()
+            .filter(|account| account.provider == provider)
+            .filter_map(|account| {
+                self.adapter_ids
+                    .get(&account.id)
+                    .map(|uid| (account.id.clone(), uid.clone()))
+            })
+            .collect()
+    }
+
+    pub fn executor_bindings(&self) -> Vec<(String, String, String)> {
+        self.accounts
+            .iter()
+            .filter(|account| self.adapter_ids.contains_key(&account.id))
+            .map(|account| {
+                (
+                    account.id.clone(),
+                    account.provider.clone(),
+                    account.credentials_ref.clone(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Build the production executor registry from the already-synced legacy
+/// pools. The registry is explicit per Core account; provider-only adapters
+/// never become a wildcard for an unbound account.
+pub fn build_legacy_executor(
+    directory: &AccountDirectory,
+    trae_pool: ApiPool,
+    wb_pool: ApiPool,
+) -> CoreUpstreamExecutor {
+    let mut executor = CoreUpstreamExecutor::new()
+        .with_provider(
+            "trae",
+            Arc::new(LegacyPoolLeaseAdapter::from_pool(
+                "trae",
+                trae_pool,
+                directory.legacy_account_ids("trae"),
+            )),
+        )
+        .with_provider(
+            "workbuddy",
+            Arc::new(LegacyPoolLeaseAdapter::from_pool(
+                "workbuddy",
+                wb_pool,
+                directory.legacy_account_ids("workbuddy"),
+            )),
+        );
+    for (account_ref, provider, credentials_ref) in directory.executor_bindings() {
+        executor = executor.for_account(account_ref, provider, credentials_ref);
+    }
+    executor
 }
 
 struct RegisteredTauriReader { app: tauri::AppHandle, ids: BTreeMap<String, String> }
@@ -554,6 +615,20 @@ mod tests {
         };
         let credits: crate::models::RemainingCreditsFile = serde_json::from_value(json!({"general":{"fixture-user-sensitive":12.5}, "work":{"fixture-user-sensitive":3.0}})).unwrap();
         AccountDirectory::from_legacy(&[trae], &[wb], &pool, &Default::default(), &Default::default(), &credits, NOW).unwrap()
+    }
+
+    #[test]
+    fn production_executor_contains_only_explicit_synced_account_bindings() {
+        let directory = directory();
+        let executor = build_legacy_executor(&directory, ApiPool::new(), ApiPool::new());
+
+        assert!(executor.can_dispatch_without_provider_binding());
+        assert_eq!(executor.bound_account_refs().len(), directory.accounts.len());
+        assert_eq!(directory.legacy_account_ids("trae").len(), 1);
+        assert_eq!(directory.legacy_account_ids("workbuddy").len(), 1);
+        for account in &directory.accounts {
+            assert!(executor.bound_account_refs().contains(&account.id));
+        }
     }
 
     #[test]
