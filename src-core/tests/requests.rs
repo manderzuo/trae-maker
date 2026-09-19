@@ -77,6 +77,16 @@ fn canonical_hash_sorts_object_keys_but_preserves_values() {
 }
 
 #[test]
+fn canonical_hash_sorts_nested_objects_but_preserves_array_order() {
+    let first = json!({"items":[{"outer":{"b":2,"a":1},"first":"first"}]});
+    let reordered_object = json!({"items":[{"first":"first","outer":{"a":1,"b":2}}]});
+    let reordered_array = json!({"items":["first", {"outer":{"a":1,"b":2}}]});
+
+    assert_eq!(canonical_json_hash(&first), canonical_json_hash(&reordered_object));
+    assert_ne!(canonical_json_hash(&first), canonical_json_hash(&reordered_array));
+}
+
+#[test]
 fn idempotency_is_user_and_endpoint_scoped() {
     let (store, first_key, second_key) = test_store();
     let endpoint = "/v1/chat/completions";
@@ -118,6 +128,33 @@ fn begin_request_requires_an_enabled_matching_cost_policy() {
         .expect_err("a missing policy must not fall back to a default cost");
 
     assert!(matches!(error, CoreError::BudgetPolicyMissing { .. }));
+}
+
+#[test]
+fn begin_request_rejects_an_api_key_owned_by_a_different_user() {
+    let (store, _, second_key) = test_store();
+    let endpoint = "/v1/chat/completions";
+    install_chat_policy(&store, endpoint);
+
+    let error = store
+        .begin_request(input("u1", &second_key, endpoint, "cross-user", json!({"model":"mock-1"})))
+        .expect_err("a key cannot be used as another user's identity");
+
+    assert!(matches!(error, CoreError::InvalidRequestIdentity { .. }));
+}
+
+#[test]
+fn begin_request_rejects_a_revoked_api_key() {
+    let (store, first_key, _) = test_store();
+    let endpoint = "/v1/chat/completions";
+    install_chat_policy(&store, endpoint);
+    store.revoke_api_key(&first_key, "bootstrap").unwrap();
+
+    let error = store
+        .begin_request(input("u1", &first_key, endpoint, "revoked", json!({"model":"mock-1"})))
+        .expect_err("a revoked key cannot create a request");
+
+    assert!(matches!(error, CoreError::InvalidRequestIdentity { .. }));
 }
 
 #[test]

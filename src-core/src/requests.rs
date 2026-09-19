@@ -46,6 +46,21 @@ impl CoreStore {
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+        let active_key = transaction
+            .query_row(
+                "SELECT 1 FROM api_keys WHERE id = ?1 AND user_id = ?2 AND status = 'active'",
+                params![input.api_key_id, input.user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !active_key {
+            return Err(CoreError::InvalidRequestIdentity {
+                user_id: input.user_id,
+                api_key_id: input.api_key_id,
+            });
+        }
+
         if let Some((stored_hash, request_id)) = transaction
             .query_row(
                 "SELECT request_hash, request_id FROM idempotency_keys WHERE scope = ?1 AND client_key = ?2",
@@ -136,7 +151,7 @@ impl CoreStore {
     ) -> Result<(), CoreError> {
         let mut statement = transaction.prepare(
             "SELECT id, endpoint, model_pattern, resource_kind, reserve_amount, max_actual_amount, version, enabled \
-             FROM cost_policies WHERE endpoint = ?1 AND enabled = 1 ORDER BY version DESC",
+             FROM cost_policies WHERE endpoint = ?1 AND enabled = 1 ORDER BY version DESC, id ASC",
         )?;
         let policies = statement.query_map([endpoint], |row| {
             Ok(CostPolicy {

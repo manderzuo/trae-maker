@@ -36,6 +36,8 @@ pub enum CoreError {
     QuotaOverdrawn,
     #[error("no enabled cost policy matches endpoint {endpoint} and model {model}")]
     BudgetPolicyMissing { endpoint: String, model: String },
+    #[error("api key {api_key_id} is not active for user {user_id}")]
+    InvalidRequestIdentity { user_id: String, api_key_id: String },
     #[error("request {request_id} cannot transition from {expected:?} to {next:?}")]
     InvalidTransition {
         request_id: String,

@@ -58,7 +58,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     connection
         .execute_batch(
             "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
-             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '2');",
+             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '3');",
         )
         .unwrap();
     drop(connection);
@@ -66,7 +66,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     let store = CoreStore::open(&future_dir).unwrap();
     assert!(matches!(
         store.migrate(),
-        Err(CoreError::UnsupportedSchemaVersion { version: 2 })
+        Err(CoreError::UnsupportedSchemaVersion { version: 3 })
     ));
     drop(store);
     fs::remove_dir_all(future_dir).unwrap();
@@ -96,4 +96,118 @@ fn failed_migration_rolls_back_schema_bootstrap() {
     assert_eq!(schema_meta_count, 0);
     drop(connection);
     fs::remove_dir_all(dir).unwrap();
+}
+
+fn create_v1_database(dir: &PathBuf, state: &str) {
+    let database_dir = dir.join("data");
+    fs::create_dir_all(&database_dir).unwrap();
+    let connection = Connection::open(database_dir.join(CORE_DB_FILE)).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1');
+             CREATE TABLE users (id TEXT PRIMARY KEY);
+             CREATE TABLE api_keys (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id));
+             CREATE TABLE requests (
+               id TEXT PRIMARY KEY,
+               user_id TEXT NOT NULL REFERENCES users(id),
+               api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+               protocol TEXT NOT NULL,
+               endpoint TEXT NOT NULL,
+               model TEXT NOT NULL,
+               request_hash BLOB NOT NULL,
+               state TEXT NOT NULL,
+               result_status INTEGER,
+               error_code TEXT,
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX requests_by_model ON requests(model);
+             CREATE TABLE idempotency_keys (
+               scope TEXT NOT NULL,
+               client_key TEXT NOT NULL,
+               request_hash BLOB NOT NULL,
+               request_id TEXT NOT NULL REFERENCES requests(id),
+               created_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(scope, client_key)
+             );
+             INSERT INTO users (id) VALUES ('u1');
+             INSERT INTO api_keys (id, user_id) VALUES ('key-1', 'u1');",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO requests \
+             (id, user_id, api_key_id, protocol, endpoint, model, request_hash, state, created_at_ms, updated_at_ms) \
+             VALUES ('request-1', 'u1', 'key-1', 'openai', '/v1/chat/completions', 'mock-1', X'01', ?1, 1, 1)",
+            [state],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO idempotency_keys (scope, client_key, request_hash, request_id, created_at_ms) \
+             VALUES ('u1:/v1/chat/completions', 'idem-1', X'01', 'request-1', 1)",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn migrates_v1_requests_to_a_checked_state_machine_without_losing_data_or_indexes() {
+    let dir = test_dir("v1-requests");
+    create_v1_database(&dir, "queued");
+    let store = CoreStore::open(&dir).unwrap();
+
+    store.migrate().unwrap();
+    store.migrate().unwrap();
+
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    drop(store);
+    let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
+    let state: String = connection
+        .query_row("SELECT state FROM requests WHERE id = 'request-1'", [], |row| row.get(0))
+        .unwrap();
+    let idempotency_request_id: String = connection
+        .query_row(
+            "SELECT request_id FROM idempotency_keys WHERE scope = 'u1:/v1/chat/completions' AND client_key = 'idem-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let index_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'requests_by_model')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let foreign_key_targets = {
+        let mut statement = connection.prepare("PRAGMA foreign_key_list('idempotency_keys')").unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(state, "queued");
+    assert_eq!(idempotency_request_id, "request-1");
+    assert!(index_exists);
+    assert_eq!(foreign_key_targets, vec!["requests"]);
+}
+
+#[test]
+fn rejects_and_rolls_back_a_v1_database_with_an_illegal_request_state() {
+    let dir = test_dir("v1-illegal-state");
+    create_v1_database(&dir, "invented");
+    let store = CoreStore::open(&dir).unwrap();
+
+    assert!(store.migrate().is_err());
+    assert_eq!(store.schema_version().unwrap(), 1);
+    drop(store);
+    let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
+    let state: String = connection
+        .query_row("SELECT state FROM requests WHERE id = 'request-1'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(state, "invented");
 }

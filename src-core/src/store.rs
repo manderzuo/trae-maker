@@ -7,10 +7,10 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::{schema::SCHEMA_V1, AuthError, CoreError, IssuedApiKey, NewUser, Principal, User};
+use crate::{schema::{SCHEMA_V1, SCHEMA_V2}, AuthError, CoreError, IssuedApiKey, NewUser, Principal, User};
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 pub struct CoreStore {
     pub(crate) connection: Mutex<Connection>,
@@ -44,6 +44,22 @@ impl CoreStore {
                 transaction
                     .execute(
                         "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)",
+                        params!["1"],
+                    )
+                    .map_err(CoreError::migration)?;
+                Self::migrate_v1_to_v2(&transaction)?;
+                transaction
+                    .execute(
+                        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![CURRENT_SCHEMA_VERSION.to_string()],
+                    )
+                    .map_err(CoreError::migration)?;
+            }
+            1 => {
+                Self::migrate_v1_to_v2(&transaction)?;
+                transaction
+                    .execute(
+                        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
                         params![CURRENT_SCHEMA_VERSION.to_string()],
                     )
                     .map_err(CoreError::migration)?;
@@ -281,6 +297,29 @@ impl CoreStore {
                 .map_err(|_| CoreError::InvalidSchemaVersion { value }),
             None => Ok(0),
         }
+    }
+
+    fn migrate_v1_to_v2(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        let request_indexes = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT sql FROM sqlite_master \
+                     WHERE type = 'index' AND tbl_name IN ('requests', 'idempotency_keys') AND sql IS NOT NULL",
+                )
+                .map_err(CoreError::migration)?;
+            let indexes = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(CoreError::migration)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CoreError::migration)?;
+            indexes
+        };
+
+        transaction.execute_batch(SCHEMA_V2).map_err(CoreError::migration)?;
+        for index_sql in request_indexes {
+            transaction.execute_batch(&index_sql).map_err(CoreError::migration)?;
+        }
+        Ok(())
     }
 }
 

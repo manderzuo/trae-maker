@@ -64,7 +64,7 @@ CREATE TABLE requests (
   endpoint TEXT NOT NULL,
   model TEXT NOT NULL,
   request_hash BLOB NOT NULL,
-  state TEXT NOT NULL CHECK(state IN ('received','validating','reserved','queued','dispatched','completing','succeeded','failed','unknown','settled')),
+  state TEXT NOT NULL,
   result_status INTEGER,
   error_code TEXT,
   created_at_ms INTEGER NOT NULL,
@@ -98,4 +98,39 @@ CREATE TABLE audit_events (
   metadata_json TEXT NOT NULL,
   created_at_ms INTEGER NOT NULL
 );
+"#;
+
+pub(crate) const SCHEMA_V2: &str = r#"
+CREATE TABLE requests_next (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+  protocol TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  model TEXT NOT NULL,
+  request_hash BLOB NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('received','validating','reserved','queued','dispatched','completing','succeeded','failed','unknown','settled')),
+  result_status INTEGER,
+  error_code TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+INSERT INTO requests_next
+  (id, user_id, api_key_id, protocol, endpoint, model, request_hash, state, result_status, error_code, created_at_ms, updated_at_ms)
+  SELECT id, user_id, api_key_id, protocol, endpoint, model, request_hash, state, result_status, error_code, created_at_ms, updated_at_ms
+  FROM requests;
+CREATE TABLE idempotency_keys_next (
+  scope TEXT NOT NULL,
+  client_key TEXT NOT NULL,
+  request_hash BLOB NOT NULL,
+  request_id TEXT NOT NULL REFERENCES requests_next(id),
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(scope, client_key)
+);
+INSERT INTO idempotency_keys_next (scope, client_key, request_hash, request_id, created_at_ms)
+  SELECT scope, client_key, request_hash, request_id, created_at_ms FROM idempotency_keys;
+DROP TABLE idempotency_keys;
+DROP TABLE requests;
+ALTER TABLE requests_next RENAME TO requests;
+ALTER TABLE idempotency_keys_next RENAME TO idempotency_keys;
 "#;
