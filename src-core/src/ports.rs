@@ -1,6 +1,67 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use serde_json::Value;
+
+/// Credential-free input used to request one upstream resource observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationRequest {
+    pub account_ref: String,
+    pub provider: String,
+    pub resource_kind: String,
+}
+
+/// A normalized, redacted upstream availability observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationSnapshot {
+    pub account_ref: String,
+    pub resource_kind: String,
+    pub available_units: Option<i64>,
+    pub value_scale: i64,
+    pub source: String,
+    pub observed_at_ms: i64,
+    pub stale_at_ms: i64,
+    pub capabilities: Vec<String>,
+    pub region: Option<String>,
+    pub summary: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ObservationError {
+    #[error("no observation fixture for the requested account resource")]
+    MissingFixture,
+    #[error("the observation reader could not produce a redacted snapshot")]
+    Unavailable,
+}
+
+/// Read-only boundary for provider-owned availability observations.
+pub trait ObservationReader: Send + Sync {
+    fn read(&self, request: ObservationRequest) -> Result<ObservationSnapshot, ObservationError>;
+}
+
+/// Deterministic fixture reader used by Core tests. It has no credential,
+/// filesystem, process, or network fallback.
+#[derive(Debug, Clone, Default)]
+pub struct MockObservationReader {
+    fixtures: HashMap<(String, String), ObservationSnapshot>,
+}
+
+impl MockObservationReader {
+    pub fn new(fixtures: HashMap<(String, String), ObservationSnapshot>) -> Self {
+        Self { fixtures }
+    }
+}
+
+impl ObservationReader for MockObservationReader {
+    fn read(&self, request: ObservationRequest) -> Result<ObservationSnapshot, ObservationError> {
+        self.fixtures
+            .get(&(request.account_ref, request.resource_kind))
+            .cloned()
+            .ok_or(ObservationError::MissingFixture)
+    }
+}
 
 /// A credential-free request handed from Core to an upstream adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -862,6 +862,42 @@ struct CreditStats {
     membership_next_billing: Option<i64>,
 }
 
+/// Read-only scheduler adapter over the existing entitlement calculation.
+/// The resolved JWT stays inside `calc_remaining_credits`; its snapshot is
+/// limited to normalized availability and redacted diagnostics.
+pub(crate) fn read_trae_observation(
+    state: &AppState,
+    account_id: &str,
+    resource_kind: &str,
+    observed_at_ms: i64,
+) -> Result<aiwork_core::ObservationSnapshot, String> {
+    let accounts = crate::vault::load_accounts(state);
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|account| account.user_id.as_deref() == Some(account_id))
+        .ok_or("账号不存在")?;
+    let stats = calc_remaining_credits(&account.jwt, &resolve_device(state, account_id))?;
+    let available = match resource_kind {
+        "chat.general" => stats.general,
+        "chat.work" => stats.work,
+        "chat.total" => stats.total,
+        _ => return Err("不支持的 Trae 观测资源类型".into()),
+    };
+    let expires_at_ms = stats
+        .earliest_expire
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .unwrap_or_else(|| observed_at_ms.saturating_add(300_000));
+    crate::api_server::upstream_observation::TauriObservationReader::snapshot_from_trae_values(
+        account_id,
+        resource_kind,
+        available,
+        expires_at_ms,
+        observed_at_ms,
+    )
+    .map_err(|_| "Trae 积分观测无效".into())
+}
+
 /// 调用 TRAE API 拉取积分包列表
 fn query_ent_packs(jwt: &str, dev: &DeviceEntry) -> Result<Vec<serde_json::Value>, String> {
     let body = ide_query_post(

@@ -13,6 +13,40 @@ use crate::state::AppState;
 
 use super::common::{as_str, auth_file_path_of, load_pool, save_pool, token_store_path};
 
+/// Read-only scheduler adapter over the existing WorkBuddy balance cache.
+/// Cache-derived observations are always stale diagnostics, never fresh input.
+pub(crate) fn read_workbuddy_cached_observation(
+    state: &AppState,
+    account_id: &str,
+    resource_kind: &str,
+    observed_at_ms: i64,
+) -> Result<aiwork_core::ObservationSnapshot, String> {
+    if resource_kind != "chat.work" {
+        return Err("不支持的 WorkBuddy 观测资源类型".into());
+    }
+    let pool = load_pool(state);
+    let account = pool
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .ok_or("WorkBuddy 账号不存在")?;
+    let cached_at_ms = account
+        .credits_fetched_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis())
+        .unwrap_or(observed_at_ms);
+    let region = None;
+    crate::api_server::upstream_observation::TauriObservationReader::snapshot_from_workbuddy_cache(
+        account_id,
+        resource_kind,
+        account.credits_balance,
+        cached_at_ms,
+        region,
+    )
+    .map_err(|_| "WorkBuddy 积分缓存无效".into())
+}
+
 // ── M5 积分（F-20/F-22，python 三件套 + 缓存）──────────────────────────────
 
 #[tauri::command(async)]

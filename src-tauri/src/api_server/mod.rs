@@ -18,6 +18,7 @@ pub mod routes;
 pub mod server;
 pub mod sse;
 pub mod unified_catalog;
+pub mod upstream_observation;
 pub mod usage;
 pub mod video;
 pub mod video_store;
