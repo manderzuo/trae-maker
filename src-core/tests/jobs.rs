@@ -301,6 +301,120 @@ fn queued_video_cancel_releases_user_hold_before_any_upstream_lease_exists() {
 }
 
 #[test]
+fn claimed_video_job_heartbeat_is_owner_bound_and_keeps_all_runtime_rows_alive() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "heartbeat-claim", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "heartbeat-claim-job".into(),
+                input_hash: vec![8; 32],
+            },
+        )
+        .unwrap();
+    let job_id = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job.id,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+    let claim = store
+        .claim_video_job_by_id("heartbeat-worker", &job_id, 1_800_000_000_100)
+        .unwrap()
+        .unwrap();
+
+    let heartbeated = store
+        .heartbeat_video_job("heartbeat-worker", &job_id, 1_800_000_000_200, 120_000)
+        .unwrap();
+    assert_eq!(heartbeated.last_heartbeat_ms, Some(1_800_000_000_200));
+    let attempt = store
+        .video_job_attempt_for_user(&principal, &job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.last_heartbeat_ms, Some(1_800_000_000_200));
+    let lease = store
+        .list_recoverable_leases()
+        .unwrap()
+        .into_iter()
+        .find(|lease| lease.id == claim.lease.id)
+        .unwrap();
+    assert_eq!(lease.lease_expires_at_ms, 1_800_000_120_200);
+
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let queue_owner: String = connection
+        .query_row(
+            "SELECT queue_claim_owner FROM jobs WHERE id = ?1",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queue_owner, "heartbeat-worker");
+    let queue_expiry: i64 = connection
+        .query_row(
+            "SELECT queue_claim_expires_at_ms FROM jobs WHERE id = ?1",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queue_expiry, 1_800_000_120_200);
+    drop(connection);
+
+    let wrong_owner = store.heartbeat_video_job("other-worker", &job_id, 1_800_000_000_300, 120_000);
+    assert!(matches!(
+        wrong_owner,
+        Err(aiwork_core::ScheduleError::Core(aiwork_core::CoreError::InvalidConfiguration { .. }))
+    ));
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn expired_claim_recovery_clears_worker_ownership_without_releasing_the_hold() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "recover-claim", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "recover-claim-job".into(),
+                input_hash: vec![9; 32],
+            },
+        )
+        .unwrap();
+    let job_id = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job.id,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+    let claim = store
+        .claim_video_job_by_id("recovery-worker", &job_id, 1_800_000_000_100)
+        .unwrap()
+        .unwrap();
+
+    let recovered = store
+        .recover_expired_upstream_leases(claim.lease.lease_expires_at_ms + 1)
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    let job = store.video_job_for_user(&principal, &job_id).unwrap().unwrap();
+    assert_eq!(job.state, aiwork_core::JobState::Unknown);
+    assert!(job.reconcile_required);
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let ownership: (Option<String>, Option<i64>) = connection
+        .query_row(
+            "SELECT queue_claim_owner, queue_claim_expires_at_ms FROM jobs WHERE id = ?1",
+            [&job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(ownership, (None, None));
+    drop(connection);
+    let balance = store.balance("video-user", "video_job").unwrap();
+    assert_eq!((balance.available, balance.held), (6, 4));
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn bootstrap_creates_authoritative_video_job_tables() {
     let (store, _admin, _principal, dir) = fixture();
     assert_eq!(CURRENT_SCHEMA_VERSION, 11);

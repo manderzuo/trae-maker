@@ -507,6 +507,134 @@ impl crate::CoreStore {
         Ok(Some(claim))
     }
 
+    pub fn heartbeat_video_job(
+        &self,
+        worker_id: &str,
+        job_id: &str,
+        now_ms: i64,
+        lease_ttl_ms: i64,
+    ) -> Result<CoreJob, ScheduleError> {
+        let worker_id = worker_id.trim();
+        if worker_id.is_empty() || worker_id.len() > 128 || worker_id.chars().any(char::is_control) {
+            return Err(ScheduleError::Core(CoreError::Validation {
+                field: "queue.worker_id".into(),
+                reason: "must be a bounded non-control identifier".into(),
+            }));
+        }
+        if lease_ttl_ms <= 0 {
+            return Err(ScheduleError::Core(CoreError::InvalidQuotaAmount));
+        }
+        let expires_at_ms = now_ms
+            .checked_add(lease_ttl_ms)
+            .ok_or(CoreError::InvalidQuotaAmount)?;
+
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let job = job_by_id_in_transaction(&transaction, job_id)?
+            .ok_or_else(|| CoreError::RequestNotFound { request_id: job_id.into() })?;
+        if !matches!(job.state, JobState::Running | JobState::CancelRequested) {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.state".into(),
+                value: "video job heartbeat requires a running or cancel-requested job".into(),
+            }));
+        }
+        let (queue_claim_owner, queue_claim_expires_at_ms) = transaction.query_row(
+            "SELECT queue_claim_owner, queue_claim_expires_at_ms FROM jobs WHERE id = ?1",
+            [job_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
+        if queue_claim_owner.as_deref() != Some(worker_id)
+            || queue_claim_expires_at_ms.map_or(true, |value| value <= now_ms)
+        {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.queue_claim".into(),
+                value: "video job heartbeat owner does not hold a live queue claim".into(),
+            }));
+        }
+        let attempt = attempt_by_job_in_transaction(&transaction, job_id)?.ok_or_else(|| {
+            CoreError::InvalidConfiguration {
+                key: "jobs.attempt".into(),
+                value: "running video job has no attempt".into(),
+            }
+        })?;
+        if !matches!(attempt.state, JobAttemptState::Running | JobAttemptState::CancelRequested) {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "job_attempts.state".into(),
+                value: "video job heartbeat requires an active attempt".into(),
+            }));
+        }
+        let lease = lease_in_transaction(&transaction, &attempt.lease_id)?.ok_or_else(|| {
+            CoreError::ReservationNotFound {
+                reservation_id: attempt.lease_id.clone(),
+            }
+        })?;
+        if lease.request_id != job.request_id
+            || lease.resource_kind != "video_job"
+            || lease.state != LeaseState::Active
+            || lease.lease_expires_at_ms <= now_ms
+        {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.lease".into(),
+                value: "video job heartbeat requires a live active lease".into(),
+            }));
+        }
+        if transaction.execute(
+            "UPDATE jobs
+             SET updated_at_ms = ?1, last_heartbeat_ms = ?1, queue_claim_expires_at_ms = ?2
+             WHERE id = ?3 AND queue_claim_owner = ?4
+               AND state IN ('running', 'cancel_requested')",
+            params![now_ms, expires_at_ms, job_id, worker_id],
+        )? != 1
+        {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.queue_claim".into(),
+                value: "video job heartbeat lost its queue claim".into(),
+            }));
+        }
+        if transaction.execute(
+            "UPDATE job_attempts
+             SET updated_at_ms = ?1, last_heartbeat_ms = ?1
+             WHERE id = ?2 AND state IN ('running', 'cancel_requested')",
+            params![now_ms, attempt.id],
+        )? != 1
+        {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "job_attempts.state".into(),
+                value: "video job heartbeat lost its attempt".into(),
+            }));
+        }
+        if transaction.execute(
+            "UPDATE upstream_leases
+             SET lease_expires_at_ms = ?1, updated_at_ms = ?2
+             WHERE id = ?3 AND state = 'active'",
+            params![expires_at_ms, now_ms, lease.id],
+        )? != 1
+        {
+            return Err(ScheduleError::Core(CoreError::InvalidConfiguration {
+                key: "jobs.lease".into(),
+                value: "video job heartbeat lost its active lease".into(),
+            }));
+        }
+        Self::insert_audit_event(
+            &transaction,
+            "system",
+            "video.job_heartbeat",
+            "job",
+            &audit_hash(job_id),
+            serde_json::json!({
+                "worker": audit_hash(worker_id),
+                "job": audit_hash(job_id),
+                "attempt": audit_hash(&attempt.id),
+                "lease": audit_hash(&lease.id),
+                "expires_at_ms": expires_at_ms,
+            }),
+            now_ms,
+        )?;
+        let updated = job_by_id_in_transaction(&transaction, job_id)?.expect("job remains in transaction");
+        transaction.commit()?;
+        Ok(updated)
+    }
+
     pub fn mark_video_job_running(
         &self,
         principal: &Principal,
@@ -813,7 +941,8 @@ impl crate::CoreStore {
         }
         transaction.execute(
             "UPDATE jobs SET state = ?1, error_code = ?2, reconcile_required = ?3, updated_at_ms = ?4,
-                    last_heartbeat_ms = ?4 WHERE id = ?5",
+                    last_heartbeat_ms = ?4, queue_claim_owner = NULL,
+                    queue_claim_expires_at_ms = NULL WHERE id = ?5",
             params![job_state.as_str(), error_code, if reconcile_required { 1 } else { 0 }, now_ms, job.id],
         )?;
         transaction.execute(
