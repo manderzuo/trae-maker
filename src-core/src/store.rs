@@ -13,7 +13,7 @@ pub const CORE_DB_FILE: &str = "core.sqlite3";
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 pub struct CoreStore {
-    connection: Mutex<Connection>,
+    pub(crate) connection: Mutex<Connection>,
 }
 
 impl CoreStore {
@@ -219,7 +219,7 @@ impl CoreStore {
         format!("aw_live_{}", URL_SAFE_NO_PAD.encode(material))
     }
 
-    fn new_id(kind: &str) -> String {
+    pub(crate) fn new_id(kind: &str) -> String {
         let mut material = [0_u8; 16];
         OsRng.fill_bytes(&mut material);
         format!("{kind}_{}", URL_SAFE_NO_PAD.encode(material))
@@ -229,7 +229,7 @@ impl CoreStore {
         Sha256::digest(plaintext.as_bytes()).to_vec()
     }
 
-    fn insert_audit_event(
+    pub(crate) fn insert_audit_event(
         transaction: &rusqlite::Transaction<'_>,
         actor: &str,
         action: &str,

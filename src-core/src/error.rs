@@ -24,4 +24,12 @@ pub enum CoreError {
         #[from]
         source: serde_json::Error,
     },
+    #[error("quota amount must be positive")]
+    InvalidQuotaAmount,
+    #[error("actual quota amount cannot exceed the reserved amount")]
+    ActualAmountExceedsReservation,
+    #[error("quota reservation {reservation_id} was not found")]
+    ReservationNotFound { reservation_id: String },
+    #[error("quota adjustment would overdraw the available balance")]
+    QuotaOverdrawn,
 }
