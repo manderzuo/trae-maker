@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, BTreeSet}, fs, path::PathBuf};
 
 use aiwork_core::{
     CoreError, CoreStore, LegacyMigrationAsset, LegacyMigrationBatch, LegacyMigrationJob,
-    LegacyMigrationKey, LegacyMigrationObservation, NewUser, QuotaGrant, UserRole,
+    LegacyMigrationKey, LegacyMigrationObservation, NewUser, Principal, QuotaGrant, UserRole,
 };
 use rusqlite::Connection;
 
@@ -12,7 +12,7 @@ fn test_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn store() -> (CoreStore, PathBuf) {
+fn store() -> (CoreStore, PathBuf, String) {
     let dir = test_dir("store");
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
@@ -28,13 +28,25 @@ fn store() -> (CoreStore, PathBuf) {
             "admin",
         )
         .unwrap();
-    (store, dir)
+    let admin_key = store
+        .issue_api_key(
+            "admin",
+            "admin",
+            BTreeSet::from(["admin:*".into()]),
+            "bootstrap",
+        )
+        .unwrap();
+    (store, dir, admin_key.id)
 }
 
-fn batch(id: &str) -> LegacyMigrationBatch {
+fn batch(id: &str, admin_key_id: &str) -> LegacyMigrationBatch {
     LegacyMigrationBatch {
         migration_id: id.into(),
-        actor_user_id: "admin".into(),
+        actor: Principal {
+            user_id: "admin".into(),
+            key_id: admin_key_id.into(),
+            scopes: BTreeSet::from(["admin:*".into()]),
+        },
         reason: "test migration".into(),
         scopes: BTreeSet::from(["videos:read".into()]),
         source_hashes: BTreeMap::from([
@@ -59,12 +71,14 @@ fn batch(id: &str) -> LegacyMigrationBatch {
             content_sha256: "content-hash".into(),
             created_at_ms: 1,
             expires_at_ms: 2,
+            storage_ref: "assets/asset-1.png".into(),
+            migration_status: "verified".into(),
         }],
         jobs: vec![LegacyMigrationJob {
             id: "job-1".into(),
             owner_key_id: "legacy-1".into(),
             user_id: "user".into(),
-            status: "processing".into(),
+            status: "completed".into(),
             created_at_ms: 1,
             updated_at_ms: 2,
         }],
@@ -72,7 +86,8 @@ fn batch(id: &str) -> LegacyMigrationBatch {
             id: "observation-1".into(),
             account_ref: "account-1".into(),
             resource_kind: "remaining_credit".into(),
-            value_json: "12.5".into(),
+            observed_value: None,
+            summary_json: "{\"credits\":12.5}".into(),
             observed_at_ms: 3,
         }],
     }
@@ -80,10 +95,15 @@ fn batch(id: &str) -> LegacyMigrationBatch {
 
 #[test]
 fn management_operations_fail_closed_for_unknown_or_non_admin_actors() {
-    let (store, _) = store();
+    let (store, _, admin_key_id) = store();
     assert!(matches!(store.authorize_admin("unknown"), Err(CoreError::AdminRequired)));
+    let forged_user_principal = Principal {
+        user_id: "user".into(),
+        key_id: admin_key_id.clone(),
+        scopes: BTreeSet::from(["admin:*".into()]),
+    };
     assert!(matches!(
-        store.issue_api_key_as_admin("user", "test", BTreeSet::new(), "user"),
+        store.issue_api_key_as_admin("user", "test", BTreeSet::new(), &forged_user_principal),
         Err(CoreError::AdminRequired)
     ));
     assert!(matches!(
@@ -93,12 +113,16 @@ fn management_operations_fail_closed_for_unknown_or_non_admin_actors() {
             amount: 1,
             actor_user_id: "user".into(),
             reason: "not allowed".into(),
-        }),
+        }, &forged_user_principal),
         Err(CoreError::AdminRequired)
     ));
 
-    let mut migration = batch("unauthorized-migration");
-    migration.actor_user_id = "user".into();
+    let mut migration = batch("unauthorized-migration", &admin_key_id);
+    migration.actor = Principal {
+        user_id: "user".into(),
+        key_id: "user-key".into(),
+        scopes: BTreeSet::new(),
+    };
     assert!(matches!(
         store.apply_legacy_migration(migration),
         Err(CoreError::AdminRequired)
@@ -107,8 +131,8 @@ fn management_operations_fail_closed_for_unknown_or_non_admin_actors() {
 
 #[test]
 fn legacy_batch_imports_records_atomically_and_disables_old_key() {
-    let (store, dir) = store();
-    let result = store.apply_legacy_migration(batch("migration-1")).unwrap();
+    let (store, dir, admin_key_id) = store();
+    let result = store.apply_legacy_migration(batch("migration-1", &admin_key_id)).unwrap();
     assert_eq!(result.issued_keys.len(), 1);
     assert!(store.authenticate_api_key(&result.issued_keys[0].plaintext).is_ok());
     assert!(CoreStore::legacy_key_is_disabled(&dir, "legacy-secret").unwrap());
@@ -117,18 +141,32 @@ fn legacy_batch_imports_records_atomically_and_disables_old_key() {
     let job: (String, i64) = connection
         .query_row("SELECT status, reconcile_required FROM legacy_jobs WHERE id = 'job-1'", [], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap();
-    assert_eq!(job, ("unknown".into(), 1));
+    assert_eq!(job, ("completed".into(), 0));
     assert_eq!(connection.query_row("SELECT source FROM legacy_observations WHERE id = 'observation-1'", [], |row| row.get::<_, String>(0)).unwrap(), "json_cache");
     assert!(!String::from_utf8_lossy(&fs::read(dir.join("data").join("core.sqlite3")).unwrap()).contains("legacy-secret"));
 }
 
 #[test]
+fn processing_legacy_job_is_rejected_before_any_batch_write() {
+    let (store, dir, admin_key_id) = store();
+    let mut migration = batch("processing-migration", &admin_key_id);
+    migration.jobs[0].status = "processing".into();
+    assert!(matches!(
+        store.apply_legacy_migration(migration),
+        Err(CoreError::MigrationValidation { .. })
+    ));
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM api_keys WHERE user_id = 'user'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM legacy_jobs", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
 fn a_late_batch_constraint_failure_rolls_back_earlier_key_writes() {
-    let (store, dir) = store();
-    let first = store.apply_legacy_migration(batch("migration-1")).unwrap();
+    let (store, dir, admin_key_id) = store();
+    let first = store.apply_legacy_migration(batch("migration-1", &admin_key_id)).unwrap();
     assert_eq!(first.issued_keys.len(), 1);
 
-    let mut second = batch("migration-2");
+    let mut second = batch("migration-2", &admin_key_id);
     second.keys.push(LegacyMigrationKey {
         legacy_key_id: "legacy-2".into(),
         legacy_key: "legacy-secret-2".into(),
@@ -140,6 +178,6 @@ fn a_late_batch_constraint_failure_rolls_back_earlier_key_writes() {
 
     let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
     assert_eq!(connection.query_row("SELECT COUNT(*) FROM legacy_key_registry", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-    assert_eq!(connection.query_row("SELECT COUNT(*) FROM api_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM api_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
     assert_eq!(connection.query_row("SELECT COUNT(*) FROM legacy_migration_records", [], |row| row.get::<_, i64>(0)).unwrap(), 4);
 }

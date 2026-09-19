@@ -194,3 +194,10 @@ CREATE TABLE legacy_observations (
   reason TEXT NOT NULL
 );
 "#;
+
+pub(crate) const SCHEMA_V4: &str = r#"
+ALTER TABLE legacy_assets ADD COLUMN storage_ref TEXT NOT NULL DEFAULT '';
+ALTER TABLE legacy_assets ADD COLUMN migration_status TEXT NOT NULL DEFAULT 'verified' CHECK(migration_status IN ('verified'));
+ALTER TABLE legacy_observations ADD COLUMN observed_value INTEGER;
+ALTER TABLE legacy_observations ADD COLUMN summary_json TEXT NOT NULL DEFAULT '{}';
+"#;

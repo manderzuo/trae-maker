@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, BTreeSet}, fmt, sync::Arc};
 
 use serde_json::Value;
 
-use crate::CoreStore;
+use crate::{CoreStore, Principal};
 
 pub type SharedCoreStore = Arc<CoreStore>;
 
@@ -51,6 +51,8 @@ pub struct LegacyMigrationAsset {
     pub content_sha256: String,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
+    pub storage_ref: String,
+    pub migration_status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,14 +70,15 @@ pub struct LegacyMigrationObservation {
     pub id: String,
     pub account_ref: String,
     pub resource_kind: String,
-    pub value_json: String,
+    pub observed_value: Option<i64>,
+    pub summary_json: String,
     pub observed_at_ms: i64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LegacyMigrationBatch {
     pub migration_id: String,
-    pub actor_user_id: String,
+    pub actor: Principal,
     pub reason: String,
     pub scopes: BTreeSet<String>,
     pub source_hashes: BTreeMap<String, String>,

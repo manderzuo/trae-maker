@@ -58,7 +58,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     connection
         .execute_batch(
             "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
-             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '4');",
+             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '5');",
         )
         .unwrap();
     drop(connection);
@@ -66,7 +66,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     let store = CoreStore::open(&future_dir).unwrap();
     assert!(matches!(
         store.migrate(),
-        Err(CoreError::UnsupportedSchemaVersion { version: 4 })
+        Err(CoreError::UnsupportedSchemaVersion { version: 5 })
     ));
     drop(store);
     fs::remove_dir_all(future_dir).unwrap();

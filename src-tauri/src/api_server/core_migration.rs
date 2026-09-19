@@ -1,6 +1,6 @@
 //! Legacy JSON inspection and explicitly mapped Core migration.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,6 +8,7 @@ use std::sync::Arc;
 use aiwork_core::{
     CoreError, CoreStore, IssuedApiKey, LegacyMigrationAsset, LegacyMigrationBatch,
     LegacyMigrationJob, LegacyMigrationKey, LegacyMigrationObservation,
+    Principal,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -97,7 +98,7 @@ struct LegacyApiKey {
     _daily_stats: Vec<LegacyKeyDailyStat>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct LegacyRemainingCredits {
     #[serde(default)]
     credits: std::collections::HashMap<String, f64>,
@@ -185,7 +186,7 @@ struct LegacyAsset {
 
 struct LegacySnapshot {
     keys: Vec<LegacyApiKey>,
-    credits: HashMap<String, f64>,
+    credits: LegacyRemainingCredits,
     videos: Vec<LegacyVideoTask>,
     assets: Vec<LegacyAsset>,
 }
@@ -312,7 +313,7 @@ fn scan_legacy(data_dir: &Path) -> Result<(MigrationReport, LegacySnapshot), Cor
         report,
         LegacySnapshot {
             keys: keys.keys,
-            credits: credits.credits,
+            credits,
             videos,
             assets: assets_file.assets,
         },
@@ -347,7 +348,6 @@ const MIGRATION_SCOPES: [&str; 7] = [
 fn prepare_legacy_apply(
     data_dir: &Path,
     mappings: &[LegacyMigrationMapping],
-    actor_user_id: &str,
 ) -> Result<(MigrationReport, LegacySnapshot), CoreError> {
     let (mut report, snapshot) = scan_legacy(data_dir)?;
     let mut mapping_by_key = BTreeMap::new();
@@ -381,22 +381,61 @@ fn prepare_legacy_apply(
             report.errors.push("video owner mapping is missing".into());
         }
     }
-    if actor_user_id.trim().is_empty() {
-        report.errors.push("actor_user_id is required".into());
-    }
     if !report.unmapped_keys.is_empty() {
         report.errors.push("legacy key mapping is incomplete".into());
     }
     if !data_dir.join("data").join(aiwork_core::CORE_DB_FILE).is_file() {
         report.errors.push("mapped Core owner or admin actor does not exist".into());
     }
+    validate_legacy_assets(data_dir, &snapshot.assets, &mut report);
     Ok((report, snapshot))
+}
+
+fn legacy_asset_storage_path(data_dir: &Path, asset: &LegacyAsset) -> Option<std::path::PathBuf> {
+    if asset.id.trim().is_empty()
+        || !asset.id.bytes().all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+    {
+        return None;
+    }
+    let extension = asset._extension.trim_start_matches('.');
+    if extension.is_empty() || !extension.bytes().all(|value| value.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let root = std::env::var_os("AIWORK_ASSET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("data").join("assets"));
+    Some(root.join(format!("{}.{}", asset.id, extension)))
+}
+
+fn validate_legacy_assets(data_dir: &Path, assets: &[LegacyAsset], report: &mut MigrationReport) {
+    for asset in assets {
+        let Some(path) = legacy_asset_storage_path(data_dir, asset) else {
+            report.errors.push("legacy asset storage reference is invalid".into());
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(&path) else {
+            report.errors.push("legacy asset file is missing".into());
+            continue;
+        };
+        if metadata.len() != asset._size {
+            report.errors.push("legacy asset size does not match metadata".into());
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            report.errors.push("legacy asset file cannot be read".into());
+            continue;
+        };
+        let actual_hash = format!("{:x}", Sha256::digest(bytes));
+        if actual_hash != asset._sha256 {
+            report.errors.push("legacy asset hash does not match metadata".into());
+        }
+    }
 }
 
 fn build_migration_batch(
     snapshot: &LegacySnapshot,
     mappings: &[LegacyMigrationMapping],
-    actor_user_id: &str,
+    principal: &Principal,
     report: &MigrationReport,
 ) -> Result<LegacyMigrationBatch, CoreError> {
     let mapping_by_key = mappings
@@ -426,6 +465,8 @@ fn build_migration_batch(
             content_sha256: asset._sha256.clone(),
             created_at_ms: asset._created_at as i64 * 1000,
             expires_at_ms: asset._expires_at as i64 * 1000,
+            storage_ref: format!("assets/{}.{}", asset.id, asset._extension.trim_start_matches('.')),
+            migration_status: "verified".into(),
         })
         .collect::<Vec<_>>();
     let jobs = snapshot
@@ -442,19 +483,29 @@ fn build_migration_batch(
         .collect::<Vec<_>>();
     let observations = snapshot
         .credits
+        .credits
         .iter()
         .enumerate()
-        .map(|(index, (account_ref, value))| Ok(LegacyMigrationObservation {
+        .map(|(index, (account_ref, _value))| Ok(LegacyMigrationObservation {
             id: format!("{}-credit-{index}", report.source_hashes.get("remaining_credits.json").unwrap_or(&String::new())),
             account_ref: account_ref.clone(),
             resource_kind: "remaining_credit".into(),
-            value_json: serde_json::to_string(value)?,
+            observed_value: None,
+            summary_json: serde_json::to_string(&serde_json::json!({
+                "credits": snapshot.credits.credits,
+                "expire_times": snapshot.credits._expire_times,
+                "general": snapshot.credits._general,
+                "work": snapshot.credits._work,
+                "membership_expire": snapshot.credits._membership_expire,
+                "membership_next_billing": snapshot.credits._membership_next_billing,
+                "updated_at": snapshot.credits._updated_at,
+            }))?,
             observed_at_ms: chrono::Utc::now().timestamp_millis(),
         }))
         .collect::<Result<Vec<_>, CoreError>>()?;
     Ok(LegacyMigrationBatch {
         migration_id: format!("legacy-migration-{:x}", rand::random::<u64>()),
-        actor_user_id: actor_user_id.to_owned(),
+        actor: principal.clone(),
         reason: "explicit legacy JSON migration".into(),
         scopes: MIGRATION_SCOPES
         .into_iter()
@@ -469,19 +520,16 @@ fn build_migration_batch(
 }
 
 fn is_blocking_report(report: &MigrationReport) -> bool {
-    report
-        .errors
-        .iter()
-        .any(|error| !error.starts_with("reconcile_required:"))
+    !report.errors.is_empty()
 }
 
 pub fn apply_legacy_with_store(
     data_dir: &Path,
     store: Arc<CoreStore>,
     mappings: &[LegacyMigrationMapping],
-    actor_user_id: &str,
+    principal: &Principal,
 ) -> Result<MigrationApplyResponse, CoreError> {
-    let (mut report, snapshot) = prepare_legacy_apply(data_dir, mappings, actor_user_id)?;
+    let (mut report, snapshot) = prepare_legacy_apply(data_dir, mappings)?;
     if is_blocking_report(&report) {
         return Ok(MigrationApplyResponse {
             report,
@@ -489,7 +537,7 @@ pub fn apply_legacy_with_store(
         });
     }
     store.migrate()?;
-    let batch = build_migration_batch(&snapshot, mappings, actor_user_id, &report)?;
+    let batch = build_migration_batch(&snapshot, mappings, principal, &report)?;
     match store.apply_legacy_migration(batch) {
         Ok(result) => Ok(MigrationApplyResponse {
             report,
@@ -505,19 +553,19 @@ pub fn apply_legacy_with_store(
 pub fn apply_legacy(
     data_dir: &Path,
     mappings: &[LegacyMigrationMapping],
-    actor_user_id: &str,
+    principal: &Principal,
 ) -> Result<MigrationReport, CoreError> {
-    let (report, _) = prepare_legacy_apply(data_dir, mappings, actor_user_id)?;
+    let (report, _) = prepare_legacy_apply(data_dir, mappings)?;
     if is_blocking_report(&report) {
         return Ok(report);
     }
     let store = Arc::new(CoreStore::open(data_dir)?);
-    Ok(apply_legacy_with_store(data_dir, store, mappings, actor_user_id)?.report)
+    Ok(apply_legacy_with_store(data_dir, store, mappings, principal)?.report)
 }
 
 fn safe_migration_error(error: &CoreError) -> String {
     match error {
-        CoreError::AdminRequired => "actor_user_id is not an active admin".into(),
+        CoreError::AdminRequired => "admin API key is not authorized".into(),
         CoreError::UserNotActive => "mapped Core owner does not exist or is disabled".into(),
         CoreError::MigrationValidation { reason } => format!("migration batch rejected: {reason}"),
         _ => "migration batch rejected by Core storage".into(),
@@ -526,8 +574,9 @@ fn safe_migration_error(error: &CoreError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -560,6 +609,15 @@ mod tests {
 
         fn path(&self, name: &str) -> PathBuf {
             self.dir.join("data").join(name)
+        }
+
+        fn write_asset(&self, id: &str, extension: &str, bytes: &[u8]) {
+            fs::create_dir_all(self.dir.join("data").join("assets")).unwrap();
+            fs::write(
+                self.dir.join("data").join("assets").join(format!("{id}.{extension}")),
+                bytes,
+            )
+            .unwrap();
         }
     }
 
@@ -615,7 +673,7 @@ mod tests {
             "mime_type": "image/png",
             "extension": "png",
             "size": 3,
-            "sha256": "asset-content-hash",
+            "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
             "created_at": 1,
             "expires_at": 2,
             "public_token": "asset-public-token"
@@ -624,6 +682,7 @@ mod tests {
 
     fn valid_fixture() -> (Fixture, [String; 4]) {
         let fixture = Fixture::new("valid");
+        fixture.write_asset("asset-1", "png", b"abc");
         let hashes = [
             fixture.write(
                 "api_keys.json",
@@ -654,6 +713,40 @@ mod tests {
             ),
         ];
         (fixture, hashes)
+    }
+
+    fn complete_fixture() -> Fixture {
+        let (fixture, _) = valid_fixture();
+        fixture.write(
+            "video_tasks.json",
+            &json!([video("video-1", "completed", "legacy-key-1")]),
+        );
+        fixture
+    }
+
+    fn admin_principal(data_dir: &Path) -> aiwork_core::Principal {
+        let store = aiwork_core::CoreStore::open(data_dir).unwrap();
+        store.migrate().unwrap();
+        store
+            .create_user(
+                aiwork_core::NewUser { id: "admin-1".into(), name: "Admin".into(), role: aiwork_core::UserRole::Admin },
+                "bootstrap",
+            )
+            .unwrap();
+        store
+            .create_user(
+                aiwork_core::NewUser { id: "user-1".into(), name: "User".into(), role: aiwork_core::UserRole::User },
+                "admin-1",
+            )
+            .unwrap();
+        let key = store
+            .issue_api_key("admin-1", "admin", BTreeSet::from(["admin:*".into()]), "bootstrap")
+            .unwrap();
+        aiwork_core::Principal {
+            user_id: "admin-1".into(),
+            key_id: key.id,
+            scopes: BTreeSet::from(["admin:*".into()]),
+        }
     }
 
     #[test]
@@ -719,7 +812,7 @@ mod tests {
     #[test]
     fn apply_without_complete_mapping_returns_report_and_writes_nothing() {
         let (fixture, _) = valid_fixture();
-        let report = apply_legacy(&fixture.dir, &[], "admin-1").unwrap();
+        let report = apply_legacy(&fixture.dir, &[], &dummy_principal()).unwrap();
 
         assert_eq!(report.unmapped_keys, vec!["legacy-key-1"]);
         assert!(!report.errors.is_empty());
@@ -735,7 +828,7 @@ mod tests {
                 legacy_key_id: "legacy-key-1".into(),
                 user_id: "missing-user".into(),
             }],
-            "admin-1",
+            &dummy_principal(),
         )
         .unwrap();
 
@@ -768,7 +861,7 @@ mod tests {
                 legacy_key_id: "legacy-key-1".into(),
                 user_id: "user-1".into(),
             }],
-            "admin-1",
+            &dummy_principal(),
         )
         .unwrap();
 
@@ -807,6 +900,19 @@ mod tests {
                 "admin-1",
             )
             .unwrap();
+        let admin_key = store
+            .issue_api_key(
+                "admin-1",
+                "admin",
+                std::collections::BTreeSet::from(["admin:*".into()]),
+                "bootstrap",
+            )
+            .unwrap();
+        let principal = aiwork_core::Principal {
+            user_id: "admin-1".into(),
+            key_id: admin_key.id,
+            scopes: std::collections::BTreeSet::from(["admin:*".into()]),
+        };
         drop(store);
 
         let report = apply_legacy(
@@ -815,7 +921,7 @@ mod tests {
                 legacy_key_id: "legacy-key-1".into(),
                 user_id: "user-1".into(),
             }],
-            "admin-1",
+            &principal,
         )
         .unwrap();
         let rendered = serde_json::to_string(&report).unwrap();
@@ -823,5 +929,79 @@ mod tests {
         assert!(report.errors.is_empty(), "{report:?}");
         assert!(!rendered.contains(secret));
         assert!(!String::from_utf8_lossy(&db).contains(secret));
+    }
+
+    #[test]
+    fn apply_rejects_processing_video_without_any_migration_rows() {
+        let (fixture, _) = valid_fixture();
+        let principal = admin_principal(&fixture.dir);
+        let report = apply_legacy(&fixture.dir, &[LegacyMigrationMapping {
+            legacy_key_id: "legacy-key-1".into(),
+            user_id: "user-1".into(),
+        }], &principal).unwrap();
+        assert!(report.processing_video_count > 0);
+        assert!(report.errors.iter().any(|error| error.contains("reconcile_required")));
+
+        let connection = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3")).unwrap();
+        for table in ["legacy_migration_records", "legacy_key_registry", "legacy_assets", "legacy_jobs", "legacy_observations"] {
+            assert_eq!(connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get::<_, i64>(0)).unwrap(), 0, "partial migration in {table}");
+        }
+    }
+
+    #[test]
+    fn apply_rejects_missing_legacy_asset_file_without_writing() {
+        let fixture = complete_fixture();
+        fs::remove_file(fixture.dir.join("data/assets/asset-1.png")).unwrap();
+        let principal = admin_principal(&fixture.dir);
+        let report = apply_legacy(&fixture.dir, &[LegacyMigrationMapping {
+            legacy_key_id: "legacy-key-1".into(),
+            user_id: "user-1".into(),
+        }], &principal).unwrap();
+        assert!(report.errors.iter().any(|error| error.contains("missing")));
+        let connection = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3")).unwrap();
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM legacy_assets", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM legacy_key_registry", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn apply_rejects_legacy_asset_hash_mismatch_without_writing() {
+        let fixture = complete_fixture();
+        fs::write(fixture.dir.join("data/assets/asset-1.png"), b"xyz").unwrap();
+        let principal = admin_principal(&fixture.dir);
+        let report = apply_legacy(&fixture.dir, &[LegacyMigrationMapping {
+            legacy_key_id: "legacy-key-1".into(),
+            user_id: "user-1".into(),
+        }], &principal).unwrap();
+        assert!(report.errors.iter().any(|error| error.contains("hash")));
+        let connection = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3")).unwrap();
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM legacy_assets", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM legacy_key_registry", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn remaining_credit_history_is_observation_only_and_preserves_summary_fields() {
+        let fixture = complete_fixture();
+        let principal = admin_principal(&fixture.dir);
+        let report = apply_legacy(&fixture.dir, &[LegacyMigrationMapping {
+            legacy_key_id: "legacy-key-1".into(),
+            user_id: "user-1".into(),
+        }], &principal).unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        let connection = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3")).unwrap();
+        let summary: String = connection.query_row("SELECT summary_json FROM legacy_observations WHERE account_ref = 'account-1'", [], |row| row.get(0)).unwrap();
+        assert!(summary.contains("general"));
+        assert!(summary.contains("work"));
+        assert!(summary.contains("membership_expire"));
+        assert!(summary.contains("membership_next_billing"));
+        assert!(summary.contains("updated_at"));
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM quota_ledger", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    fn dummy_principal() -> aiwork_core::Principal {
+        aiwork_core::Principal {
+            user_id: "admin-1".into(),
+            key_id: "admin-key".into(),
+            scopes: std::collections::BTreeSet::new(),
+        }
     }
 }

@@ -11,8 +11,13 @@ impl CoreStore {
         self.grant_inner(input, false)
     }
 
-    pub fn grant_as_admin(&self, input: QuotaGrant) -> Result<QuotaBalance, CoreError> {
-        self.grant_inner(input, true)
+    pub fn grant_as_admin(
+        &self,
+        mut input: QuotaGrant,
+        principal: &Principal,
+    ) -> Result<QuotaBalance, CoreError> {
+        input.actor_user_id = principal.user_id.clone();
+        self.grant_inner_with_principal(input, principal)
     }
 
     fn grant_inner(&self, input: QuotaGrant, require_admin: bool) -> Result<QuotaBalance, CoreError> {
@@ -60,6 +65,54 @@ impl CoreStore {
         )?;
         transaction.commit()?;
 
+        Ok(balance)
+    }
+
+    fn grant_inner_with_principal(
+        &self,
+        input: QuotaGrant,
+        principal: &Principal,
+    ) -> Result<QuotaBalance, CoreError> {
+        let amount = Self::absolute_amount(input.amount)?;
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        Self::ensure_active_user(&transaction, &input.user_id)?;
+        transaction.execute(
+            "INSERT INTO quota_ledger \
+             (entry_id, user_id, resource_kind, event_kind, amount, delta, actor_user_id, reason, created_at_ms) \
+             VALUES (?1, ?2, ?3, 'adjust', ?4, ?5, ?6, ?7, ?8)",
+            params![
+                Self::new_id("quota"),
+                input.user_id,
+                input.resource_kind,
+                amount,
+                input.amount,
+                principal.user_id,
+                input.reason,
+                now,
+            ],
+        )?;
+        let balance = Self::balance_in_transaction(&transaction, &input.user_id, &input.resource_kind)?;
+        if balance.available < 0 {
+            return Err(CoreError::QuotaOverdrawn);
+        }
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "quota.adjust",
+            "quota",
+            &format!("{}:{}", input.user_id, input.resource_kind),
+            serde_json::json!({
+                "user_id": input.user_id,
+                "resource_kind": input.resource_kind,
+                "amount": input.amount,
+                "reason": input.reason,
+            }),
+            now,
+        )?;
+        transaction.commit()?;
         Ok(balance)
     }
 

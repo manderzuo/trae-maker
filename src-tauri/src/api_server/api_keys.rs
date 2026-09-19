@@ -257,7 +257,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use aiwork_core::{
-        CoreStore, LegacyMigrationBatch, LegacyMigrationKey, NewUser, UserRole,
+        CoreStore, LegacyMigrationBatch, LegacyMigrationKey, NewUser, Principal, UserRole,
     };
 
     use super::*;
@@ -421,10 +421,17 @@ mod tests {
                 "admin",
             )
             .unwrap();
+        let admin_key = store
+            .issue_api_key("admin", "admin", BTreeSet::from(["admin:*".into()]), "bootstrap")
+            .unwrap();
         store
             .apply_legacy_migration(LegacyMigrationBatch {
                 migration_id: "migration-1".into(),
-                actor_user_id: "admin".into(),
+                actor: Principal {
+                    user_id: "admin".into(),
+                    key_id: admin_key.id,
+                    scopes: BTreeSet::from(["admin:*".into()]),
+                },
                 reason: "test migration".into(),
                 scopes: BTreeSet::new(),
                 source_hashes: BTreeMap::from([("api_keys.json".into(), "hash".into())]),

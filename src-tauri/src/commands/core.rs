@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
-use aiwork_core::{NewUser, QuotaGrant, UserRole};
+use aiwork_core::{CoreStore, NewUser, Principal, QuotaGrant, UserRole};
 use serde::Serialize;
 use tauri::State;
 
@@ -72,6 +72,19 @@ fn issued_response(key: aiwork_core::IssuedApiKey) -> IssuedApiKeyResponse {
     }
 }
 
+fn authenticate_admin(store: &CoreStore, admin_api_key: &str) -> Result<Principal, String> {
+    if admin_api_key.trim().is_empty() {
+        return Err("admin_api_key is required".into());
+    }
+    let principal = store
+        .authenticate_api_key(admin_api_key)
+        .map_err(|_| "admin_api_key is invalid".to_string())?;
+    store
+        .authorize_admin_principal(&principal)
+        .map_err(|_| "admin_api_key is not authorized".to_string())?;
+    Ok(principal)
+}
+
 #[tauri::command]
 pub fn core_status(
     state: State<'_, AppState>,
@@ -116,13 +129,15 @@ pub fn core_migration_apply(
     state: State<'_, AppState>,
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     mappings: Vec<LegacyMigrationMapping>,
-    actor_user_id: String,
+    admin_api_key: String,
 ) -> Result<MigrationApplyResponse, String> {
+    let store = core_store_for_admin(&state, &runtime)?;
+    let principal = authenticate_admin(&store, &admin_api_key)?;
     if mappings.is_empty() {
         let report = crate::core_migration::apply_legacy(
             &state.data_dir,
             &mappings,
-            &actor_user_id,
+            &principal,
         )
         .map_err(|error| error.to_string())?;
         return Ok(MigrationApplyResponse {
@@ -130,8 +145,7 @@ pub fn core_migration_apply(
             issued_keys: Vec::new(),
         });
     }
-    let store = core_store_for_admin(&state, &runtime)?;
-    apply_legacy_with_store(&state.data_dir, store, &mappings, &actor_user_id)
+    apply_legacy_with_store(&state.data_dir, store, &mappings, &principal)
         .map_err(|error| error.to_string())
 }
 
@@ -142,16 +156,14 @@ pub fn core_user_create(
     id: String,
     name: String,
     role: String,
-    actor_user_id: String,
+    admin_api_key: String,
 ) -> Result<CoreUserResponse, String> {
     let role_value = parse_role(&role)?;
     let store = core_store_for_admin(&state, &runtime)?;
+    let principal = authenticate_admin(&store, &admin_api_key)?;
     let input = NewUser { id, name, role: role_value };
-    let user = if actor_user_id == "bootstrap" {
-        store.create_bootstrap_admin(input, &actor_user_id)
-    } else {
-        store.create_user_as_admin(input, &actor_user_id)
-    }
+    let user = store
+        .create_user_as_admin(input, &principal)
     .map_err(|error| error.to_string())?;
     Ok(CoreUserResponse {
         id: user.id,
@@ -167,11 +179,12 @@ pub fn core_api_key_issue(
     user_id: String,
     name: String,
     scopes: Vec<String>,
-    actor_user_id: String,
+    admin_api_key: String,
 ) -> Result<IssuedApiKeyResponse, String> {
     let store = core_store_for_admin(&state, &runtime)?;
+    let principal = authenticate_admin(&store, &admin_api_key)?;
     let key = store
-        .issue_api_key_as_admin(&user_id, &name, normalize_scopes(scopes), &actor_user_id)
+        .issue_api_key_as_admin(&user_id, &name, normalize_scopes(scopes), &principal)
         .map_err(|error| error.to_string())?;
     Ok(issued_response(key))
 }
@@ -183,21 +196,22 @@ pub fn core_quota_grant(
     user_id: String,
     resource_kind: String,
     amount: i64,
-    actor_user_id: String,
+    admin_api_key: String,
     reason: String,
 ) -> Result<CoreQuotaBalanceResponse, String> {
     if reason.trim().is_empty() {
         return Err("reason is required".into());
     }
     let store = core_store_for_admin(&state, &runtime)?;
+    let principal = authenticate_admin(&store, &admin_api_key)?;
     let balance = store
         .grant_as_admin(QuotaGrant {
             user_id,
             resource_kind,
             amount,
-            actor_user_id,
+            actor_user_id: principal.user_id.clone(),
             reason,
-        })
+        }, &principal)
         .map_err(|error| error.to_string())?;
     Ok(CoreQuotaBalanceResponse {
         user_id: balance.user_id,
@@ -205,4 +219,43 @@ pub fn core_quota_grant(
         available: balance.available,
         held: balance.held,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeSet, fs};
+
+    use aiwork_core::{CoreStore, NewUser, UserRole};
+
+    use super::authenticate_admin;
+
+    #[test]
+    fn command_auth_rejects_non_admin_and_does_not_accept_an_admin_id() {
+        let dir = std::env::temp_dir().join(format!("aiwork-command-auth-{}", rand::random::<u64>()));
+        let store = CoreStore::open(&dir).unwrap();
+        store.migrate().unwrap();
+        store
+            .create_user(
+                NewUser { id: "admin".into(), name: "Admin".into(), role: UserRole::Admin },
+                "bootstrap",
+            )
+            .unwrap();
+        store
+            .create_user(
+                NewUser { id: "user".into(), name: "User".into(), role: UserRole::User },
+                "admin",
+            )
+            .unwrap();
+        let admin_key = store
+            .issue_api_key("admin", "admin", BTreeSet::from(["admin:*".into()]), "bootstrap")
+            .unwrap();
+        let user_key = store
+            .issue_api_key("user", "user", BTreeSet::new(), "bootstrap")
+            .unwrap();
+
+        assert!(authenticate_admin(&store, &user_key.plaintext).is_err());
+        assert!(authenticate_admin(&store, "admin").is_err());
+        assert_eq!(authenticate_admin(&store, &admin_key.plaintext).unwrap().user_id, "admin");
+        let _ = fs::remove_dir_all(dir);
+    }
 }
