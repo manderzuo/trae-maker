@@ -75,6 +75,7 @@ name = "ai-work-assistant"
 version = "3.4.5"
 dependencies = [
  "aes",
+ "aiwork-core",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -100,6 +101,21 @@ dependencies = [
  "url",
  "urlencoding",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "aiwork-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "rand 0.8.8",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

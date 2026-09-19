@@ -17,4 +17,6 @@ pub enum CoreError {
     },
     #[error("core schema version is invalid: {value}")]
     InvalidSchemaVersion { value: String },
+    #[error("core schema version {version} is newer than this binary supports")]
+    UnsupportedSchemaVersion { version: u32 },
 }

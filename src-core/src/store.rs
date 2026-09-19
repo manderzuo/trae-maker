@@ -1,6 +1,6 @@
 use std::{fs, path::Path, sync::Mutex, time::Duration};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{schema::SCHEMA_V1, CoreError};
 
@@ -28,14 +28,25 @@ impl CoreStore {
 
     pub fn migrate(&self) -> Result<(), CoreError> {
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
-        let transaction = connection.transaction().map_err(CoreError::migration)?;
-        transaction.execute_batch(SCHEMA_V1).map_err(CoreError::migration)?;
-        transaction
-            .execute(
-                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)",
-                params![CURRENT_SCHEMA_VERSION.to_string()],
-            )
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(CoreError::migration)?;
+        let version = Self::schema_version_in_transaction(&transaction)?;
+
+        match version {
+            0 => {
+                transaction.execute_batch(SCHEMA_V1).map_err(CoreError::migration)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)",
+                        params![CURRENT_SCHEMA_VERSION.to_string()],
+                    )
+                    .map_err(CoreError::migration)?;
+            }
+            CURRENT_SCHEMA_VERSION => {}
+            version => return Err(CoreError::UnsupportedSchemaVersion { version }),
+        }
+
         transaction.commit().map_err(CoreError::migration)
     }
 
@@ -71,6 +82,34 @@ impl CoreStore {
             |row| row.get::<_, u32>(0),
         )?;
         Ok(count)
+    }
+
+    fn schema_version_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+    ) -> Result<u32, CoreError> {
+        let schema_meta_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !schema_meta_exists {
+            return Ok(0);
+        }
+
+        let value = transaction
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        match value {
+            Some(value) => value
+                .parse()
+                .map_err(|_| CoreError::InvalidSchemaVersion { value }),
+            None => Ok(0),
+        }
     }
 }
 
