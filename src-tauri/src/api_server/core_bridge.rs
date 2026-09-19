@@ -639,6 +639,20 @@ impl CoreBridge {
         Ok(Some((claim.job, grant)))
     }
 
+    pub fn heartbeat_video_job_for_worker(
+        &self,
+        worker_id: &str,
+        job_id: &str,
+    ) -> Result<aiwork_core::CoreJob, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if self.scheduler.is_none() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        self.store
+            .heartbeat_video_job(worker_id, job_id, chrono::Utc::now().timestamp_millis(), 15 * 60 * 1000)
+            .map_err(CoreLeaseError::from)
+    }
+
     pub fn mark_video_job_running(
         &self,
         principal: &Principal,
@@ -718,6 +732,50 @@ impl CoreBridge {
                     artifact_ref,
                     now_ms,
                 )
+                .map_err(CoreLeaseError::Core)?;
+        }
+        Ok(settlement)
+    }
+
+    pub fn reconcile_video_job(
+        &self,
+        principal: &Principal,
+        job_id: &str,
+        lease_id: &str,
+        outcome: VideoAdapterOutcome,
+    ) -> Result<LeaseSettlement, CoreLeaseError> {
+        self.require_enforce().map_err(CoreLeaseError::Core)?;
+        if self.scheduler.is_none() {
+            return Err(CoreLeaseError::EndpointNotEnabled);
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let (output_ref, artifact_ref) = outcome.output_refs();
+        for (field, value) in [
+            ("jobs.output_ref", output_ref),
+            ("jobs.artifact_ref", artifact_ref),
+        ] {
+            if let Some(value) = value {
+                if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+                    return Err(CoreLeaseError::Core(CoreError::Validation {
+                        field: field.into(),
+                        reason: "must be a bounded non-control reference".into(),
+                    }));
+                }
+            }
+        }
+        let lease_outcome = outcome.lease_outcome(now_ms).ok_or_else(|| {
+            CoreLeaseError::Core(CoreError::InvalidConfiguration {
+                key: "video.reconcile_outcome".into(),
+                value: "reconciliation requires explicit terminal evidence".into(),
+            })
+        })?;
+        let settlement = self
+            .store
+            .reconcile_unknown_upstream_lease(principal, lease_id, lease_outcome)
+            .map_err(CoreLeaseError::from)?;
+        if settlement.applied && (output_ref.is_some() || artifact_ref.is_some()) {
+            self.store
+                .set_video_job_result_refs(principal, job_id, output_ref, artifact_ref, now_ms)
                 .map_err(CoreLeaseError::Core)?;
         }
         Ok(settlement)

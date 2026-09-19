@@ -2009,6 +2009,15 @@ async fn core_videos_generations(
         }
         Err(error) => return core_lease_error_response(error),
     };
+    let heartbeat_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_heartbeat = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let heartbeat_handle = spawn_core_video_heartbeat(
+        bridge.clone(),
+        "http-video-worker",
+        job.id.clone(),
+        heartbeat_failed.clone(),
+        stop_heartbeat.clone(),
+    );
     let request = VideoExecutionRequest {
         job_id: job.id.clone(),
         request_id: job.request_id.clone(),
@@ -2016,13 +2025,21 @@ async fn core_videos_generations(
         body: input,
     };
     let lease_for_adapter = lease.clone();
-    let outcome = match tokio::task::spawn_blocking(move || executor.submit_video(&lease_for_adapter, request)).await {
+    let mut outcome = match tokio::task::spawn_blocking(move || executor.submit_video(&lease_for_adapter, request)).await {
         Ok(outcome) => outcome,
         Err(_) => VideoAdapterOutcome::TransportUnknown {
             reason: "adapter_task_join_failed".into(),
             upstream_request_ref: None,
         },
     };
+    stop_heartbeat.store(true, std::sync::atomic::Ordering::Release);
+    heartbeat_handle.abort();
+    if heartbeat_failed.load(std::sync::atomic::Ordering::Acquire) {
+        outcome = VideoAdapterOutcome::TransportUnknown {
+            reason: "video_heartbeat_failed".into(),
+            upstream_request_ref: video_outcome_request_ref(&outcome),
+        };
+    }
     match &outcome {
         VideoAdapterOutcome::Accepted { upstream_request_ref } => {
             if let Err(error) = bridge.record_video_job_acceptance(
@@ -2079,6 +2096,42 @@ async fn core_videos_generations(
         false,
         &state.data_dir,
     )
+}
+
+fn spawn_core_video_heartbeat(
+    bridge: Arc<super::CoreBridge>,
+    worker_id: &'static str,
+    job_id: String,
+    heartbeat_failed: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            if bridge
+                .heartbeat_video_job_for_worker(worker_id, &job_id)
+                .is_err()
+            {
+                heartbeat_failed.store(true, std::sync::atomic::Ordering::Release);
+                break;
+            }
+        }
+    })
+}
+
+fn video_outcome_request_ref(outcome: &VideoAdapterOutcome) -> Option<String> {
+    match outcome {
+        VideoAdapterOutcome::Accepted { upstream_request_ref } => Some(upstream_request_ref.clone()),
+        VideoAdapterOutcome::Succeeded { upstream_request_ref, .. }
+        | VideoAdapterOutcome::Canceled { upstream_request_ref }
+        | VideoAdapterOutcome::TransportUnknown { upstream_request_ref, .. } => upstream_request_ref.clone(),
+        VideoAdapterOutcome::Rejected { .. } => None,
+    }
 }
 
 /// W-02 Seedance 文生视频入口。Work 积分账号异步转发到 Trae Work CN
@@ -5124,6 +5177,33 @@ mod tests {
         assert_eq!(
             store.video_job_for_user(&fixture.principal, body["task"]["id"].as_str().unwrap()).unwrap().unwrap().state,
             aiwork_core::JobState::Unknown
+        );
+    }
+
+    #[test]
+    fn heartbeat_failure_preserves_only_a_safe_upstream_reference() {
+        assert_eq!(
+            video_outcome_request_ref(&VideoAdapterOutcome::Accepted {
+                upstream_request_ref: "upstream-1".into(),
+            }),
+            Some("upstream-1".into())
+        );
+        assert_eq!(
+            video_outcome_request_ref(&VideoAdapterOutcome::Succeeded {
+                actual_units: Some(1),
+                upstream_request_ref: Some("upstream-2".into()),
+                output_ref: Some("jobs/output".into()),
+                artifact_ref: None,
+            }),
+            Some("upstream-2".into())
+        );
+        assert_eq!(
+            video_outcome_request_ref(&VideoAdapterOutcome::Rejected {
+                status: 502,
+                code: "upstream".into(),
+                accepted: false,
+            }),
+            None
         );
     }
 }
