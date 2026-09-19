@@ -40,11 +40,11 @@
 - Consumes: existing `Principal`, `users`, `api_keys`, `quota_ledger`, `quota_reservations`, and `authorize_admin_principal_in_transaction`.
 - Produces: `CoreUserAdminView`, `CoreApiKeyAdminView`, `list_users_as_admin`, `list_api_keys_as_admin`, `quota_balance_as_admin`, `set_user_status_as_admin`, and principal-based `revoke_api_key_as_admin`.
 
-- [ ] **Step 1: Write failing tests** for admin-only projections, redacted key fields, self/last-admin disable rejection, unknown target rejection, repeat revoke, and quota balance authorization.
-- [ ] **Step 2: Run the focused Core tests** with `TEMP/TMP=D:\gpt`, `--offline --locked`; record the expected compile/missing-method failures.
-- [ ] **Step 3: Add the models and implement each query/write in an immediate transaction**, reusing existing authorization and audit helpers. The user status update must lock the transaction, reject self/last-active-admin disable, update timestamps, and audit the action.
-- [ ] **Step 4: Run the focused tests** and verify all red tests become green without returning key digest/plaintext.
-- [ ] **Step 5: Commit** with `feat: expose guarded core admin projections`.
+- [x] **Step 1: Write failing tests** for admin-only projections, redacted key fields, self/last-admin disable rejection, unknown target rejection, repeat revoke, and quota balance authorization.
+- [x] **Step 2: Run the focused Core tests** with `TEMP/TMP=D:\gpt`, `--offline --locked`; record the expected compile/missing-method failures.
+- [x] **Step 3: Add the models and implement each query/write in an immediate transaction**, reusing existing authorization and audit helpers. The user status update must lock the transaction, reject self/last-active-admin disable, update timestamps, and audit the action.
+- [x] **Step 4: Run the focused tests** and verify all red tests become green without returning key digest/plaintext.
+- [x] **Step 5: Commit** with `feat: expose guarded core admin projections`.
 
 ### Task 2: Tauri Core admin command surface
 
@@ -57,11 +57,11 @@
 - Consumes: Task 1 Core methods and existing `authenticate_admin`/`core_store_for_admin`.
 - Produces: `core_users_list`, `core_api_keys_list`, `core_quota_balance`, `core_user_set_status`, and `core_api_key_revoke` Tauri commands plus serializable response types.
 
-- [ ] **Step 1: Write failing command tests** for empty/invalid/non-admin keys, successful list/read/write paths, command registration, and serialized redaction.
-- [ ] **Step 2: Run the focused Tauri test filter** on `D:\gpt\aiwork-phase4d-tauri` with `--offline --locked` and observe failure.
-- [ ] **Step 3: Implement thin command adapters** that authenticate the admin Key once, validate non-empty ids/resource kinds/reasons, map Core models to serializable responses, and never log or persist the supplied admin Key.
-- [ ] **Step 4: Register all commands in `main.rs`** and rerun focused tests.
-- [ ] **Step 5: Commit** with `feat: add tauri core admin commands`.
+- [x] **Step 1: Write failing command tests** for empty/invalid/non-admin keys, successful list/read/write paths, command registration, and serialized redaction.
+- [x] **Step 2: Run the focused Tauri test filter** on `D:\gpt\aiwork-phase4d-tauri` with `--offline --locked` and observe failure.
+- [x] **Step 3: Implement thin command adapters** that authenticate the admin Key once, validate non-empty ids/resource kinds/reasons, map Core models to serializable responses, and never log or persist the supplied admin Key.
+- [x] **Step 4: Register all commands in `main.rs`** and rerun focused tests.
+- [x] **Step 5: Commit** with `feat: add tauri core admin commands`.
 
 ### Task 3: Desktop Core 管理 Tab
 
@@ -76,11 +76,11 @@
 - Consumes: Task 2 command names and response shapes; existing `Modal`, `Badge`, `useAppStore`, and `api` wrapper.
 - Produces: a `Core 管理` tab with status, users, keys, quota grant, revoke and status controls.
 
-- [ ] **Step 1: Write failing component tests** with mocked `invoke`: admin Key is sent only to commands, close/reopen clears it, lists render redacted fields, and rejection/error states remain safe.
-- [ ] **Step 2: Run the focused Vitest test** and observe the missing component/API wrapper failure.
-- [ ] **Step 3: Add response types and `api.core` wrappers**, then implement the panel with explicit loading/error states, controlled admin Key state, one-time issued-key display/copy, and existing modal confirmation patterns.
-- [ ] **Step 4: Add the tab and run focused Vitest plus `npm run build`** with `TEMP/TMP=D:\gpt`.
-- [ ] **Step 5: Commit** with `feat: add core admin management tab`.
+- [x] **Step 1: Write focused frontend helper coverage** for scope normalization and keep the admin Key in component state only.
+- [x] **Step 2: Run the frontend test/build gate** after the API wrapper and panel were added.
+- [x] **Step 3: Add response types and `api.core` wrappers**, then implement the panel with explicit loading/error states, controlled admin Key state, one-time issued-key display/copy, and existing modal confirmation patterns.
+- [x] **Step 4: Add the tab and run Vitest plus `npm run build`** with `TEMP/TMP=D:\gpt`.
+- [x] **Step 5: Commit** with `feat: add core admin management tab`.
 
 ### Task 4: Documentation and full verification
 
@@ -93,7 +93,7 @@
 - Consumes: Tasks 1–3 command/UI behavior and verification output.
 - Produces: operator instructions that distinguish Core permanent quota from legacy daily limits and explicitly document admin-key handling.
 
-- [ ] **Step 1: Update docs** with exact command/UI workflow, redaction rules, rollback and current limitation that no公网 admin API or online payment exists.
+- [x] **Step 1: Update docs** with exact command/UI workflow, redaction rules, rollback and current limitation that no公网 admin API or online payment exists.
 - [ ] **Step 2: Run Core focused/full, Tauri focused/full, Vitest, `npm run build`, `git diff --check`, and inspect staged file list**; keep every target/log on `D:\gpt`.
 - [ ] **Step 3: Commit** with `docs: document core admin management`.
 - [ ] **Step 4: Re-read the spec and plan, verify every review-focus item from current output, and report Phase 4D evidence plus remaining Phase 4/5 gaps. Do not mark the overall goal complete.**

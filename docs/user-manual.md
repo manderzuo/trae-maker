@@ -288,6 +288,7 @@ AI Work 助手 是一款 Windows 桌面端多账号管理一站式工作台，**
 | 概览 | 服务启停与指标行（运行状态 / 总请求数 / 当前并发 / Key 数量）、目前资源（Trae / Buddy 双池摘要）、生态接入（CC Switch / Codex 统一条目注册） |
 | 接口配置 | 监听端口、默认模型、使用示例（端口改动下次启动服务后生效） |
 | API Keys 管理 | Key 新建 / 编辑 / 删除、日限额、调度配置（临期优先 / 专一） |
+| Core 管理 | Core 用户、永久逻辑额度、Core Key 签发/撤销、用户启停和管理员状态 |
 | 用量统计 | 7 / 14 / 30 天窗口、资源池筛选（全部 / Trae / Buddy）、模型分布 Top 5 |
 
 > 生态接入只注册一个统一网关条目「AI Work 助手网关」，同时覆盖 Trae 与 Buddy 全部模型；历史双条目可在 CC Switch 中手动清理。
@@ -315,6 +316,24 @@ scope、cost policy、grant 和 parity report，并先在 `shadow` 完成核对�
 本阶段的 `full_phase1` smoke 只注入内存 Mock executor；禁止使用真实 API Key、运行中的
 服务、真实 upstream 或真实余额作为测试数据。通过该 smoke 只能说明本地身份、幂等、
 预占/结算、unknown 恢复和审计闭环成立，不能宣称真实上游余额、计费或生成已验证。
+
+#### Core 管理 Tab（Phase 4D）
+
+在 **API 管理 → Core 管理** 中输入真实的 admin Core Key 后点击「加载管理数据」。该 Key
+只保留在当前弹窗会话的内存中，不会写入本地配置、Zustand 或浏览器存储；普通用户 Key、
+用户 ID 和字符串 `admin` 都不能代替管理员认证。
+
+- **用户**：可创建 `user`、`operator` 或 `admin`，并启用/禁用用户。禁用不会删除其额度、
+  预占、任务、素材或审计记录；最后一个管理员和当前管理员不能被禁用。
+- **Core Key**：按用户签发，列表只显示 prefix、scope 和状态；明文只在签发成功页面展示
+  一次，关闭后服务端不会再次返回。撤销是幂等操作，撤销后不能恢复。
+- **永久逻辑额度**：选择用户和 `resource_kind` 后发放额度并填写原因，再查询 `available` /
+  `held`。不同资源类型分别记账，Core 逻辑 grant 不是 Trae/WorkBuddy 上游余额，也不代表
+  已核验的真实上游计费；当前没有公网管理员 API 或在线支付入口。
+
+Core 管理命令只通过桌面 Tauri 命令提供，未开放成公网管理端点。Core 视频在未注册可信
+生产 adapter 时仍按 fail-closed 规则返回 `501/scheduler_endpoint_not_enabled`；本地 Mock
+测试不能替代真实上游协议、余额或扣费证明。
 
 ### 7.2 Trae · 资源调度
 

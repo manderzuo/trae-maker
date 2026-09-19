@@ -201,3 +201,30 @@ Phase 3C 的离线证据固定在 `D:\gpt`：Core 全套回归通过，Tauri foc
 拒绝、确认取消、不确定提交和缺 adapter fail-closed；它们不证明真实上游账号、余额、计费
 规则或视频协议可用。回滚时停止服务并备份 Core 数据库，改回 `core_mode=off` 或 `shadow`；
 不得删除 jobs、unknown lease、quota hold、审计事实或把它们伪造为成功。
+
+## 12. Phase 4D Core 管理与验证
+
+桌面端 **API 管理 → Core 管理** 是当前 Core 用户、Key 和逻辑额度的管理入口。它直接操作
+`<AIWORK_DATA_DIR>\data\core.sqlite3`，不修改 legacy `api_keys.json` 的日限额和调度配置，
+也不会把 legacy 上游余额转换为 Core grant。
+
+启用管理前应准备真实 admin Core Key，并通过管理员身份认证；不能使用用户 Key、用户 ID 或
+字面量 `admin`。页面只展示用户安全字段、Key prefix/scope/status 和额度聚合值，不展示 digest、
+凭据或其他用户任务/素材；Key 明文只在签发结果中展示一次。关闭页面即丢弃管理员 Key，
+不要把它复制进项目配置、日志或部署环境变量。
+
+管理员可以创建用户、启用/禁用用户、签发/撤销 Key、按 `resource_kind` 发放和查询永久逻辑
+额度。每种资源的 `available`、`held` 分开维护；禁用用户不删除 quota ledger、reservation、
+jobs、attempts、assets 或 audit。最后一个活动管理员和当前登录管理员不能被禁用，重复撤销
+不会重复扣额度或重复改变 Key 状态。
+
+当前没有公网管理员 HTTP API、在线支付或真实上游账单同步。Core grant 只是本地逻辑授权；真实
+上游余额、计费单位、视频协议和生产 adapter 在获得可核验契约前必须保持 fail-closed，不能
+从 Mock、注释或 legacy JSON 推断成功。视频 adapter 未就绪时，enforce 视频提交应返回
+`501/scheduler_endpoint_not_enabled`，且不创建 job、lease 或 quota hold。
+
+Phase 4D 的本地验证仍只使用 Mock/fixture，且所有 Cargo target、日志、TEMP/TMP 和临时数据
+放在 `D:\gpt`。推荐顺序：Core admin projection focused test、Tauri `core::tests::`、
+Vitest、`npm run build`，最后再跑 Core/Tauri 全量回归。命令需使用 `--offline --locked`，
+并在同一 PowerShell 进程清除和断言 `AIWORK_*` 环境变量为空；通过这些测试只能证明本地
+身份、隔离、幂等和 fail-closed 边界，不能宣称真实上游或真实计费已验证。

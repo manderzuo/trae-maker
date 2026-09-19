@@ -22,7 +22,8 @@ import type {
 
 type CoreAdminAction =
   | { kind: 'user'; user: CoreUserAdminView; active: boolean }
-  | { kind: 'key'; key: CoreApiKeyAdminView };
+  | { kind: 'key'; key: CoreApiKeyAdminView }
+  | { kind: 'grant'; userId: string; resourceKind: string; amount: number; reason: string };
 
 export function normalizeCoreScopes(value: string): string[] {
   return [...new Set(value.split(',').map((scope) => scope.trim()).filter(Boolean))];
@@ -52,6 +53,16 @@ export default function CoreAdminPanel({
   const toast = useAppStore((state) => state.pushToast);
   const [adminApiKey, setAdminApiKey] = useState('');
   const [status, setStatus] = useState<CoreStatus | null>(null);
+  const [scheduler, setScheduler] = useState<{
+    accounts: number;
+    enabled_accounts: number;
+    fresh_observations: number;
+    stale_observations: number;
+    active_leases: number;
+    unknown_leases: number;
+    slot_saturated: number;
+    reader_failures: number;
+  } | null>(null);
   const [users, setUsers] = useState<CoreUserAdminView[]>([]);
   const [keys, setKeys] = useState<CoreApiKeyAdminView[]>([]);
   const [selectedUserId, setSelectedUserId] = useState('');
@@ -96,8 +107,10 @@ export default function CoreAdminPanel({
         api.core.usersList(normalized),
         api.core.apiKeysList(normalized, keyFilterUserId || null),
       ]);
+      const nextScheduler = await api.core.schedulerStatus(normalized);
       setUsers(nextUsers);
       setKeys(nextKeys);
+      setScheduler(nextScheduler);
       if (!selectedUserId && nextUsers.length > 0) setSelectedUserId(nextUsers[0].id);
       toast('success', `Core 管理数据已刷新（${nextUsers.length} 个用户 / ${nextKeys.length} 个 Key）`);
     } catch (error) {
@@ -178,7 +191,7 @@ export default function CoreAdminPanel({
     }
   };
 
-  const grantQuota = async () => {
+  const grantQuota = () => {
     const amount = Number.parseInt(grantAmount, 10);
     const kind = resourceKind.trim();
     const reason = grantReason.trim();
@@ -186,13 +199,7 @@ export default function CoreAdminPanel({
       toast('error', '请填写用户、资源类型、正整数额度和原因');
       return;
     }
-    await runMutation(
-      () => api.core.quotaGrant(adminApiKey.trim(), selectedUserId, kind, amount, reason),
-      `已向 ${selectedUserId} 增加 ${amount} 点 ${kind} 额度`,
-    );
-    setGrantAmount('');
-    setGrantReason('');
-    await readBalance(selectedUserId, kind);
+    setConfirmAction({ kind: 'grant', userId: selectedUserId, resourceKind: kind, amount, reason });
   };
 
   const readBalance = async (userId = selectedUserId, kind = resourceKind) => {
@@ -213,11 +220,19 @@ export default function CoreAdminPanel({
         () => api.core.userSetStatus(adminApiKey.trim(), action.user.id, action.active),
         `用户「${action.user.name}」已${action.active ? '启用' : '禁用'}`,
       );
-    } else {
+    } else if (action.kind === 'key') {
       await runMutation(
         () => api.core.apiKeyRevoke(adminApiKey.trim(), action.key.id),
         `Key「${action.key.name}」已撤销`,
       );
+    } else {
+      await runMutation(
+        () => api.core.quotaGrant(adminApiKey.trim(), action.userId, action.resourceKind, action.amount, action.reason),
+        `已向 ${action.userId} 增加 ${action.amount} 点 ${action.resourceKind} 额度`,
+      );
+      setGrantAmount('');
+      setGrantReason('');
+      await readBalance(action.userId, action.resourceKind);
     }
   };
 
@@ -278,8 +293,10 @@ export default function CoreAdminPanel({
             <Badge tone="blue">Core schema v{status.schema_version}</Badge>
             <Badge tone={status.core_mode === 'enforce' ? 'violet' : 'slate'}>模式：{status.core_mode}</Badge>
             <span>外键：{status.foreign_keys_enabled ? '已启用' : '未启用'}</span>
+            <span className="max-w-72 truncate" title={status.database_path}>数据库：{status.database_path}</span>
           </div>
         )}
+        {scheduler && <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-500 dark:text-zinc-400"><Badge tone="blue">账号 {scheduler.enabled_accounts}/{scheduler.accounts}</Badge><Badge tone="green">Fresh {scheduler.fresh_observations}</Badge><Badge tone="amber">Stale {scheduler.stale_observations}</Badge><Badge tone={scheduler.unknown_leases > 0 ? 'amber' : 'slate'}>Unknown lease {scheduler.unknown_leases}</Badge><span className="self-center">活动 lease {scheduler.active_leases} · 槽位饱和 {scheduler.slot_saturated} · reader 失败 {scheduler.reader_failures}</span></div>}
         {error && <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">{error}</p>}
       </div>
 
@@ -353,12 +370,14 @@ export default function CoreAdminPanel({
       <Modal
         open={confirmAction != null}
         onClose={() => setConfirmAction(null)}
-        title={confirmAction?.kind === 'key' ? '确认撤销 Core Key' : '确认变更用户状态'}
+        title={confirmAction?.kind === 'key' ? '确认撤销 Core Key' : confirmAction?.kind === 'grant' ? '确认发放 Core 额度' : '确认变更用户状态'}
         footer={<><button className="btn-ghost" onClick={() => setConfirmAction(null)}>取消</button><button className="btn-danger" onClick={() => void confirmMutation()}>确认</button></>}
       >
         {confirmAction?.kind === 'key'
           ? <>将撤销「{confirmAction.key.name}」（{confirmAction.key.prefix}），撤销后不能恢复。</>
-          : <>将{confirmAction?.active ? '启用' : '禁用'}用户「{confirmAction?.user.name}」。最后一个管理员或当前管理员不能被禁用。</>}
+          : confirmAction?.kind === 'grant'
+            ? <>将向用户「{confirmAction.userId}」发放 {confirmAction.amount} 点「{confirmAction.resourceKind}」额度。原因：{confirmAction.reason}</>
+            : <>将{confirmAction?.active ? '启用' : '禁用'}用户「{confirmAction?.user.name}」。最后一个管理员或当前管理员不能被禁用。</>}
       </Modal>
 
       <Modal

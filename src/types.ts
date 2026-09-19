@@ -489,6 +489,18 @@ export interface CoreStatus {
   running: boolean;
 }
 
+export interface CoreSchedulerStatus {
+  schema_version: number;
+  accounts: number;
+  enabled_accounts: number;
+  fresh_observations: number;
+  stale_observations: number;
+  active_leases: number;
+  unknown_leases: number;
+  slot_saturated: number;
+  reader_failures: number;
+}
+
 export interface CoreUserAdminView {
   id: string;
   name: string;

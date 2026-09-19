@@ -449,3 +449,22 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 - `videos:read` 只返回 owner-scoped 安全投影；`videos:cancel` 先记录取消意图，只有 adapter 明确确认取消才释放 hold。内容分发只接受受信任的 `video-store:` artifact 引用和本地安全路径，enforce 不回退任意 legacy 内容。
 - Phase 3C 验证只使用 D 盘 Mock/fixture：Core 全套回归通过，Tauri focused 4 项通过，Tauri 全量 `440 passed; 0 failed; 4 ignored`；这证明本地生命周期、隔离、幂等和不确定结果处理，不证明真实上游账号、余额、计费或视频协议可用。
 - 绑定、reader、健康数据或真实适配器不可信时，保持 fail-closed 或回退到 `off`；回退不得删除 `unknown` job、quota hold、lease、审计或历史事实。Phase 4 管理、部署和真实 adapter 接入完成前，不得宣称总目标完成。
+
+## 20. Phase 4D Core 管理界面与管理员凭据
+
+- `API 管理 → Core 管理` 只操作 Core SQLite 的用户、Core Key、永久逻辑额度和用户状态；旧版
+  `api_keys.json` 的 legacy Key、日限额和账号调度配置保持独立，不能把两套身份/额度账本合并。
+- Core 管理命令必须在同一 Immediate transaction 内用真实 admin `Principal` 授权。普通用户 Key、
+  用户 ID、字面量 `admin` 和空 Key 均不得获得管理员投影；最后一个活动管理员与当前管理员不能
+  被禁用。列表只返回 prefix/metadata/scope/status，不返回 plaintext、digest、credentials 或
+  其他用户任务/素材。
+- React 管理 Tab 只在当前组件状态保存 admin Key，不进入 Zustand、localStorage、配置文件、URL
+  或日志。Core Key 明文只在签发结果中返回/展示一次；撤销必须使用自定义 Modal，禁止
+  `window.confirm()`；用户禁用不删除 quota ledger、reservation、job、attempt、asset 或 audit。
+- Core grant 是本地逻辑授权，不是 Trae/WorkBuddy 余额、支付或真实上游账单；每个
+  `resource_kind` 的 `available`/`held` 独立计账。当前无公网管理员 API 或在线支付；未核验真实
+  upstream 契约前，生产视频 adapter 继续 fail-closed，不能把 Mock/legacy 文档当作真实扣费证明。
+- Phase 4D 测试只用 D 盘 Mock/fixture：`TEMP`、`TMP`、Cargo target、日志和临时数据统一放在
+  `D:\gpt`，命令使用 `--offline --locked`，并先清空、断言 `AIWORK_*` 环境变量为空。Core/Tauri
+  命令测试中的 `std::env::temp_dir()` 只有在上述环境变量已指向 D 盘时才允许运行。前端测试和
+  构建也不得把临时读写转回 C 盘。

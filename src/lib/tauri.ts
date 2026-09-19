@@ -84,6 +84,7 @@ import type {
   CoreApiKeyAdminView,
   CoreIssuedApiKeyResponse,
   CoreQuotaBalanceResponse,
+  CoreSchedulerStatus,
   CoreStatus,
   CoreUserAdminView,
   CoreUserResponse,
@@ -264,6 +265,8 @@ export const api = {
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
   core: {
     status: () => invoke<CoreStatus>('core_status'),
+    schedulerStatus: (adminApiKey: string) =>
+      invoke<CoreSchedulerStatus>('scheduler_status_for_admin', { schedulerAdminKey: adminApiKey }),
     usersList: (adminApiKey: string) =>
       invoke<CoreUserAdminView[]>('core_users_list', { adminApiKey }),
     apiKeysList: (adminApiKey: string, userId?: string | null) =>
