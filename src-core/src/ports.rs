@@ -43,19 +43,40 @@ pub trait ObservationReader: Send + Sync {
 
 /// Deterministic fixture reader used by Core tests. It has no credential,
 /// filesystem, process, or network fallback.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct MockObservationReader {
     fixtures: HashMap<(String, String), ObservationSnapshot>,
+    read_probe: Arc<dyn Fn(&ObservationRequest) + Send + Sync>,
 }
 
 impl MockObservationReader {
     pub fn new(fixtures: HashMap<(String, String), ObservationSnapshot>) -> Self {
-        Self { fixtures }
+        Self::with_read_probe(fixtures, |_| {})
+    }
+
+    /// Invokes `probe` at the mock's only source-selection boundary before it
+    /// performs the in-memory fixture lookup. This lets tests install a
+    /// fail-fast sentinel without giving the mock a network fallback.
+    pub fn with_read_probe(
+        fixtures: HashMap<(String, String), ObservationSnapshot>,
+        probe: impl Fn(&ObservationRequest) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            fixtures,
+            read_probe: Arc::new(probe),
+        }
+    }
+}
+
+impl Default for MockObservationReader {
+    fn default() -> Self {
+        Self::new(HashMap::new())
     }
 }
 
 impl ObservationReader for MockObservationReader {
     fn read(&self, request: ObservationRequest) -> Result<ObservationSnapshot, ObservationError> {
+        (self.read_probe)(&request);
         self.fixtures
             .get(&(request.account_ref, request.resource_kind))
             .cloned()

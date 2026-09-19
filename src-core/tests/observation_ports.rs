@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     path::PathBuf,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use aiwork_core::{
@@ -77,17 +80,33 @@ fn snapshot(resource_kind: &str, available_units: Option<i64>) -> ObservationSna
 
 #[test]
 fn mock_observer_returns_scaled_value_and_never_reads_network() {
-    // A regression here would have to add a network fallback to the Core mock.
-    // The only fixture preparation is this in-memory closure; neither counter is
-    // passed to a transport or URL client.
-    let agent_host_touches = AtomicUsize::new(0);
-    let workbuddy_url_touches = AtomicUsize::new(0);
-    let fixture = || snapshot("chat.general", Some(1_250));
-    let expected = fixture();
-    let reader = MockObservationReader::new(HashMap::from([(
+    const AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
+    const WORKBUDDY_BILLING_URL: &str = "https://www.workbuddy.cn/v2/billing/meter";
+    let fixture_reads = Arc::new(AtomicUsize::new(0));
+    let agent_host_touches = Arc::new(AtomicUsize::new(0));
+    let workbuddy_url_touches = Arc::new(AtomicUsize::new(0));
+    let expected = snapshot("chat.general", Some(1_250));
+    let reader = MockObservationReader::with_read_probe(HashMap::from([(
         ("trae-account".into(), "chat.general".into()),
         expected.clone(),
-    )]));
+    )]), {
+        let fixture_reads = Arc::clone(&fixture_reads);
+        let agent_host_touches = Arc::clone(&agent_host_touches);
+        let workbuddy_url_touches = Arc::clone(&workbuddy_url_touches);
+        move |request| {
+            fixture_reads.fetch_add(1, Ordering::SeqCst);
+            for value in [&request.account_ref, &request.provider, &request.resource_kind] {
+                if value == AGENT_HOST {
+                    agent_host_touches.fetch_add(1, Ordering::SeqCst);
+                    panic!("MockObservationReader attempted AGENT_HOST instead of its fixture");
+                }
+                if value == WORKBUDDY_BILLING_URL {
+                    workbuddy_url_touches.fetch_add(1, Ordering::SeqCst);
+                    panic!("MockObservationReader attempted a WorkBuddy billing URL instead of its fixture");
+                }
+            }
+        }
+    });
 
     let actual = reader
         .read(ObservationRequest {
@@ -100,6 +119,15 @@ fn mock_observer_returns_scaled_value_and_never_reads_network() {
     assert_eq!(actual, expected);
     assert_eq!(actual.available_units, Some(1_250));
     assert_eq!(actual.value_scale, 100);
+    assert!(matches!(
+        reader.read(ObservationRequest {
+            account_ref: "trae-account".into(),
+            provider: "trae".into(),
+            resource_kind: "chat.work".into(),
+        }),
+        Err(aiwork_core::ObservationError::MissingFixture)
+    ));
+    assert_eq!(fixture_reads.load(Ordering::SeqCst), 2);
     assert_eq!(agent_host_touches.load(Ordering::SeqCst), 0);
     assert_eq!(workbuddy_url_touches.load(Ordering::SeqCst), 0);
 }
