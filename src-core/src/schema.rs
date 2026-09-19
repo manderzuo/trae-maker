@@ -435,3 +435,57 @@ ALTER TABLE jobs ADD COLUMN queue_claim_owner TEXT;
 ALTER TABLE jobs ADD COLUMN queue_claim_expires_at_ms INTEGER;
 CREATE INDEX jobs_by_queue_owner ON jobs(queue_claim_owner, queue_claim_expires_at_ms);
 "#;
+
+pub(crate) const SCHEMA_V12: &str = r#"
+CREATE TABLE IF NOT EXISTS quota_budget_accounts (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL CHECK(scope IN ('user_cap','key')),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  api_key_id TEXT REFERENCES api_keys(id),
+  resource_kind TEXT NOT NULL,
+  enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+  version INTEGER NOT NULL CHECK(version > 0),
+  migration_state TEXT NOT NULL CHECK(migration_state IN ('ready','legacy_unassigned','reconcile_required')),
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  CHECK((scope = 'user_cap' AND api_key_id IS NULL) OR
+        (scope = 'key' AND api_key_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS quota_budget_accounts_user_cap_uq
+  ON quota_budget_accounts(user_id, resource_kind)
+  WHERE scope = 'user_cap';
+CREATE UNIQUE INDEX IF NOT EXISTS quota_budget_accounts_key_uq
+  ON quota_budget_accounts(user_id, api_key_id, resource_kind)
+  WHERE scope = 'key';
+CREATE TABLE IF NOT EXISTS quota_ledger (
+  entry_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  resource_kind TEXT NOT NULL,
+  event_kind TEXT NOT NULL,
+  amount INTEGER NOT NULL CHECK(amount >= 0),
+  delta INTEGER NOT NULL,
+  request_id TEXT,
+  actor_user_id TEXT,
+  reason TEXT,
+  created_at_ms INTEGER NOT NULL,
+  budget_account_id TEXT REFERENCES quota_budget_accounts(id),
+  event_group_id TEXT,
+  api_key_id TEXT REFERENCES api_keys(id),
+  budget_version INTEGER
+);
+CREATE TABLE IF NOT EXISTS quota_reservations (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  request_id TEXT NOT NULL UNIQUE,
+  resource_kind TEXT NOT NULL,
+  amount INTEGER NOT NULL CHECK(amount > 0),
+  state TEXT NOT NULL CHECK(state IN ('held','committed','released','unknown')),
+  expires_at_ms INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  settled_at_ms INTEGER,
+  api_key_id TEXT REFERENCES api_keys(id),
+  key_budget_account_id TEXT REFERENCES quota_budget_accounts(id),
+  user_cap_account_id TEXT REFERENCES quota_budget_accounts(id),
+  event_group_id TEXT
+);
+"#;

@@ -694,6 +694,88 @@ pub struct QuotaGrant {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuotaBudgetScope {
+    UserCap,
+    Key,
+}
+
+impl QuotaBudgetScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UserCap => "user_cap",
+            Self::Key => "key",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuotaMigrationState {
+    Ready,
+    LegacyUnassigned,
+    ReconcileRequired,
+}
+
+impl QuotaMigrationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::LegacyUnassigned => "legacy_unassigned",
+            Self::ReconcileRequired => "reconcile_required",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaBudgetAccount {
+    pub id: String,
+    pub scope: QuotaBudgetScope,
+    pub user_id: String,
+    pub api_key_id: Option<String>,
+    pub resource_kind: String,
+    pub enabled: bool,
+    pub version: i64,
+    pub migration_state: QuotaMigrationState,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaBudgetBalance {
+    pub account_id: String,
+    pub scope: QuotaBudgetScope,
+    pub user_id: String,
+    pub api_key_id: Option<String>,
+    pub resource_kind: String,
+    pub available: i64,
+    pub held: i64,
+    pub settled: i64,
+    pub version: i64,
+    pub enabled: bool,
+    pub migration_state: QuotaMigrationState,
+    pub key_quota_configured: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyQuotaGrant {
+    pub api_key_id: String,
+    pub resource_kind: String,
+    pub amount: i64,
+    pub actor_user_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyQuotaAllocation {
+    pub source_user_id: String,
+    pub api_key_id: String,
+    pub resource_kind: String,
+    pub amount: i64,
+    pub actor_user_id: String,
+    pub reason: String,
+    pub migration_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaReserve {
     pub user_id: String,

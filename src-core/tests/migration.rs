@@ -39,6 +39,172 @@ fn store() -> (CoreStore, PathBuf, String) {
     (store, dir, admin_key.id)
 }
 
+fn prepare_v11_quota_database(prefix: &str, mismatched_reservation_key: bool) -> (CoreStore, PathBuf) {
+    let dir = test_dir(prefix);
+    let store = CoreStore::open(&dir).unwrap();
+    store.migrate().unwrap();
+    drop(store);
+
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP INDEX IF EXISTS quota_budget_accounts_user_cap_uq;
+             DROP INDEX IF EXISTS quota_budget_accounts_key_uq;
+             DROP TABLE IF EXISTS quota_budget_accounts;
+             DROP TABLE quota_ledger;
+             CREATE TABLE quota_ledger (
+               entry_id TEXT PRIMARY KEY,
+               user_id TEXT NOT NULL REFERENCES users(id),
+               resource_kind TEXT NOT NULL,
+               event_kind TEXT NOT NULL,
+               amount INTEGER NOT NULL CHECK(amount >= 0),
+               delta INTEGER NOT NULL,
+               request_id TEXT,
+               actor_user_id TEXT,
+               reason TEXT,
+               created_at_ms INTEGER NOT NULL
+             );
+             DROP TABLE quota_reservations;
+             CREATE TABLE quota_reservations (
+               id TEXT PRIMARY KEY,
+               user_id TEXT NOT NULL REFERENCES users(id),
+               request_id TEXT NOT NULL UNIQUE,
+               resource_kind TEXT NOT NULL,
+               amount INTEGER NOT NULL CHECK(amount > 0),
+               state TEXT NOT NULL CHECK(state IN ('held','committed','released','unknown')),
+               expires_at_ms INTEGER NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               settled_at_ms INTEGER
+             );
+             UPDATE schema_meta SET value = '11' WHERE key = 'schema_version';
+             INSERT INTO users (id, name, role, status, created_at_ms, updated_at_ms)
+               VALUES ('quota-user-1', 'Quota User 1', 'user', 'active', 1, 1),
+                      ('quota-user-2', 'Quota User 2', 'user', 'active', 1, 1);
+             INSERT INTO api_keys
+               (id, user_id, name, prefix, key_digest, scopes_json, status, created_at_ms)
+               VALUES ('quota-key-1', 'quota-user-1', 'key-1', 'ak-test', X'01', '[]', 'active', 1),
+                      ('quota-key-2', 'quota-user-2', 'key-2', 'ak-test-2', X'02', '[]', 'active', 1);
+             INSERT INTO quota_ledger
+               (entry_id, user_id, resource_kind, event_kind, amount, delta, request_id, actor_user_id, reason, created_at_ms)
+               VALUES ('quota-entry-1', 'quota-user-1', 'chat_request', 'adjust', 10, 10, NULL, 'admin', 'legacy grant', 1),
+                      ('quota-entry-2', 'quota-user-2', 'chat_request', 'adjust', 7, 7, NULL, 'admin', 'legacy grant', 1);
+             INSERT INTO quota_reservations
+               (id, user_id, request_id, resource_kind, amount, state, expires_at_ms, created_at_ms)
+               VALUES ('quota-reservation-1', 'quota-user-1', 'quota-request-1', 'chat_request', 3, 'held', 100, 1);",
+        )
+        .unwrap();
+    let request_key = if mismatched_reservation_key {
+        "quota-key-2"
+    } else {
+        "quota-key-1"
+    };
+    connection
+        .execute(
+            "INSERT INTO requests
+               (id, user_id, api_key_id, protocol, endpoint, model, request_hash, state, created_at_ms, updated_at_ms)
+               VALUES ('quota-request-1', 'quota-user-1', ?1, 'openai', '/v1/chat/completions', 'mock', X'01', 'reserved', 1, 1)",
+            [request_key],
+        )
+        .unwrap();
+    drop(connection);
+
+    (CoreStore::open(&dir).unwrap(), dir)
+}
+
+#[test]
+fn v11_user_ledger_is_backfilled_once_without_key_copy() {
+    let (store, dir) = prepare_v11_quota_database("v11-quota-backfill", false);
+    store.migrate().unwrap();
+    assert_eq!(store.schema_version().unwrap(), 12);
+
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let user_cap_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM quota_budget_accounts WHERE scope = 'user_cap'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let key_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM quota_budget_accounts WHERE scope = 'key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(user_cap_count, 2);
+    assert_eq!(key_count, 0);
+
+    let ledger_account_id: Option<String> = connection
+        .query_row(
+            "SELECT budget_account_id FROM quota_ledger WHERE entry_id = 'quota-entry-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(ledger_account_id.is_some());
+
+    let reservation_key: Option<String> = connection
+        .query_row(
+            "SELECT key_budget_account_id FROM quota_reservations WHERE id = 'quota-reservation-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(reservation_key.is_none());
+
+    let migration_state: String = connection
+        .query_row(
+            "SELECT migration_state FROM quota_budget_accounts WHERE scope = 'user_cap' AND user_id = 'quota-user-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(migration_state, "reconcile_required");
+
+    drop(connection);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn v12_migration_failure_rolls_back_budget_tables_and_columns() {
+    let (store, dir) = prepare_v11_quota_database("v11-quota-rollback", true);
+    assert!(store.migrate().is_err());
+    assert_eq!(store.schema_version().unwrap(), 11);
+    drop(store);
+
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let budget_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'quota_budget_accounts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let budget_column_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('quota_ledger') WHERE name = 'budget_account_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let ledger_account: Option<String> = connection
+        .query_row(
+            "SELECT budget_account_id FROM quota_ledger WHERE entry_id = 'quota-entry-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+    assert_eq!(budget_table_count, 0);
+    assert_eq!(budget_column_count, 0);
+    assert!(ledger_account.is_none());
+
+    drop(connection);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 fn batch(id: &str, admin_key_id: &str) -> LegacyMigrationBatch {
     LegacyMigrationBatch {
         migration_id: id.into(),

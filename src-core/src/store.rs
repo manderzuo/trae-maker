@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 use crate::{
     schema::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
-        SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
+        SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
@@ -20,12 +20,12 @@ use crate::{
     },
     AuthError, CoreApiKeyAdminView, CoreError, CoreUserAdminView, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
     AssetState, CoreAsset, CreateAssetInput, NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
-    UpstreamAccountState,
+    UpstreamAccountState, QuotaMigrationState,
     UpstreamLease, UpstreamObservation, User,
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 
 pub struct CoreStore {
     pub(crate) connection: Mutex<Connection>,
@@ -248,8 +248,19 @@ impl CoreStore {
                     )
                     .map_err(CoreError::migration)?;
             }
+            11 => {}
             CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
                 version => return Err(CoreError::UnsupportedSchemaVersion { version }),
+            }
+
+            if version < CURRENT_SCHEMA_VERSION {
+                Self::migrate_v11_to_v12(&transaction)?;
+                transaction
+                    .execute(
+                        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![CURRENT_SCHEMA_VERSION.to_string()],
+                    )
+                    .map_err(CoreError::migration)?;
             }
 
             transaction.commit().map_err(CoreError::migration)
@@ -1946,6 +1957,219 @@ impl CoreStore {
 
     fn migrate_v10_to_v11(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
         transaction.execute_batch(SCHEMA_V11).map_err(CoreError::migration)
+    }
+
+    fn migrate_v11_to_v12(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        transaction.execute_batch(SCHEMA_V12).map_err(CoreError::migration)?;
+
+        // A few early installations created placeholder quota tables before
+        // the quota schema was finalized. Make those empty placeholders
+        // query-compatible, but never silently reinterpret rows whose owner
+        // or resource cannot be established.
+        for (table, required_columns) in [
+            (
+                "quota_ledger",
+                &[
+                    ("user_id", "user_id TEXT"),
+                    ("resource_kind", "resource_kind TEXT"),
+                    ("event_kind", "event_kind TEXT"),
+                    ("amount", "amount INTEGER"),
+                    ("delta", "delta INTEGER"),
+                    ("request_id", "request_id TEXT"),
+                    ("actor_user_id", "actor_user_id TEXT"),
+                    ("reason", "reason TEXT"),
+                    ("created_at_ms", "created_at_ms INTEGER"),
+                ][..],
+            ),
+            (
+                "quota_reservations",
+                &[
+                    ("user_id", "user_id TEXT"),
+                    ("request_id", "request_id TEXT"),
+                    ("resource_kind", "resource_kind TEXT"),
+                    ("amount", "amount INTEGER"),
+                    ("state", "state TEXT"),
+                    ("expires_at_ms", "expires_at_ms INTEGER"),
+                    ("created_at_ms", "created_at_ms INTEGER"),
+                    ("settled_at_ms", "settled_at_ms INTEGER"),
+                ][..],
+            ),
+        ] {
+            let mut missing = Vec::new();
+            for &(column, declaration) in required_columns {
+                let exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                    params![table, column],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    missing.push((column, declaration));
+                }
+            }
+            if missing.is_empty() {
+                continue;
+            }
+
+            let row_count: i64 = transaction.query_row(
+                &format!("SELECT COUNT(*) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )?;
+            if row_count > 0 {
+                return Err(CoreError::MigrationValidation {
+                    reason: format!(
+                        "cannot migrate non-empty sparse {table} table without its owner/resource columns"
+                    ),
+                });
+            }
+            for (_, declaration) in missing {
+                transaction.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {declaration}"),
+                    [],
+                )?;
+            }
+        }
+
+        for (table, column, declaration) in [
+            ("quota_ledger", "budget_account_id", "ALTER TABLE quota_ledger ADD COLUMN budget_account_id TEXT REFERENCES quota_budget_accounts(id)"),
+            ("quota_ledger", "event_group_id", "ALTER TABLE quota_ledger ADD COLUMN event_group_id TEXT"),
+            ("quota_ledger", "api_key_id", "ALTER TABLE quota_ledger ADD COLUMN api_key_id TEXT REFERENCES api_keys(id)"),
+            ("quota_ledger", "budget_version", "ALTER TABLE quota_ledger ADD COLUMN budget_version INTEGER"),
+            ("quota_reservations", "api_key_id", "ALTER TABLE quota_reservations ADD COLUMN api_key_id TEXT REFERENCES api_keys(id)"),
+            ("quota_reservations", "key_budget_account_id", "ALTER TABLE quota_reservations ADD COLUMN key_budget_account_id TEXT REFERENCES quota_budget_accounts(id)"),
+            ("quota_reservations", "user_cap_account_id", "ALTER TABLE quota_reservations ADD COLUMN user_cap_account_id TEXT REFERENCES quota_budget_accounts(id)"),
+            ("quota_reservations", "event_group_id", "ALTER TABLE quota_reservations ADD COLUMN event_group_id TEXT"),
+        ] {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                params![table, column],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                transaction.execute(declaration, [])?;
+            }
+        }
+
+        let mut account_statement = transaction.prepare(
+            "SELECT user_id, resource_kind FROM quota_ledger
+             WHERE user_id IS NOT NULL AND resource_kind IS NOT NULL
+             UNION
+             SELECT user_id, resource_kind FROM quota_reservations
+             WHERE user_id IS NOT NULL AND resource_kind IS NOT NULL
+             ORDER BY user_id, resource_kind",
+        )?;
+        let mut account_keys = account_statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(account_statement);
+        for (user_id, resource_kind) in account_keys.drain(..) {
+            let account_id = transaction
+                .query_row(
+                    "SELECT id FROM quota_budget_accounts
+                     WHERE scope = 'user_cap' AND user_id = ?1 AND resource_kind = ?2",
+                    params![&user_id, &resource_kind],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let unresolved: bool = transaction.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM quota_reservations
+                   WHERE user_id = ?1 AND resource_kind = ?2 AND state IN ('held', 'unknown')
+                 )",
+                params![&user_id, &resource_kind],
+                |row| row.get(0),
+            )?;
+            let account_id = match account_id {
+                Some(account_id) => account_id,
+                None => {
+                    let id = Self::new_id("budget");
+                    let now = Utc::now().timestamp_millis();
+                    transaction.execute(
+                        "INSERT INTO quota_budget_accounts
+                         (id, scope, user_id, api_key_id, resource_kind, enabled, version,
+                          migration_state, created_at_ms, updated_at_ms)
+                         VALUES (?1, 'user_cap', ?2, NULL, ?3, 1, 1, ?4, ?5, ?5)",
+                        params![
+                            &id,
+                            &user_id,
+                            &resource_kind,
+                            if unresolved {
+                                QuotaMigrationState::ReconcileRequired.as_str()
+                            } else {
+                                QuotaMigrationState::LegacyUnassigned.as_str()
+                            },
+                            now,
+                        ],
+                    )?;
+                    id
+                }
+            };
+
+            transaction.execute(
+                "UPDATE quota_ledger
+                 SET budget_account_id = ?1,
+                     event_group_id = COALESCE(event_group_id, 'legacy-' || entry_id),
+                     budget_version = COALESCE(budget_version, 1)
+                 WHERE user_id = ?2 AND resource_kind = ?3",
+                params![&account_id, &user_id, &resource_kind],
+            )?;
+
+            let reservations = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, request_id FROM quota_reservations
+                     WHERE user_id = ?1 AND resource_kind = ?2",
+                )?;
+                let rows = statement
+                    .query_map(params![&user_id, &resource_kind], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            for (reservation_id, request_id) in reservations {
+                let request_key = transaction
+                    .query_row(
+                        "SELECT api_key_id FROM requests WHERE id = ?1",
+                        [&request_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if let Some(api_key_id) = request_key {
+                    let owner_matches: bool = transaction.query_row(
+                        "SELECT EXISTS(
+                           SELECT 1 FROM api_keys
+                           WHERE id = ?1 AND user_id = ?2
+                         )",
+                        params![&api_key_id, &user_id],
+                        |row| row.get(0),
+                    )?;
+                    if !owner_matches {
+                        return Err(CoreError::MigrationValidation {
+                            reason: format!(
+                                "quota reservation {reservation_id} references a Key owned by another user"
+                            ),
+                        });
+                    }
+                    transaction.execute(
+                        "UPDATE quota_reservations
+                         SET api_key_id = ?1,
+                             user_cap_account_id = ?2,
+                             event_group_id = COALESCE(event_group_id, 'legacy-reservation-' || id)
+                         WHERE id = ?3",
+                        params![&api_key_id, &account_id, &reservation_id],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "UPDATE quota_reservations
+                         SET user_cap_account_id = ?1,
+                             event_group_id = COALESCE(event_group_id, 'legacy-reservation-' || id)
+                         WHERE id = ?2",
+                        params![&account_id, &reservation_id],
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn migrate_v5_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {

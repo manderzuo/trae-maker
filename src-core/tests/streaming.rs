@@ -250,7 +250,7 @@ fn downgrade_request_tables_to_v6(dir: &PathBuf) {
 fn v11_preserves_request_rows_and_allows_cancel_state_transitions() {
     let (store, key_id, admin_key_id, dir) = test_store();
     configure_account(&store, &admin_key_id);
-    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(store.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
 
     let grant = acquired(store.preflight_reserve_with_lease(
         &principal(&key_id),
@@ -262,7 +262,7 @@ fn v11_preserves_request_rows_and_allows_cancel_state_transitions() {
     downgrade_request_tables_to_v6(&dir);
     let store = Arc::new(CoreStore::open(&dir).unwrap());
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(store.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
     assert_eq!(store.request_state(&request_id).unwrap(), RequestState::Reserved);
 
     store
@@ -321,7 +321,7 @@ fn v11_preserves_request_rows_and_allows_cancel_state_transitions() {
     drop(store);
     let reopened = CoreStore::open(&dir).unwrap();
     reopened.migrate().unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
+    assert_eq!(reopened.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
     assert_eq!(reopened.request_state(&request_id).unwrap(), RequestState::Settled);
 }
 

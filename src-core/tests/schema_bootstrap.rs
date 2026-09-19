@@ -46,6 +46,52 @@ fn bootstrap_creates_authoritative_schema() {
 }
 
 #[test]
+fn schema_v12_creates_budget_account_directory_and_indexes() {
+    let dir = test_dir("schema-v12-budget");
+    let store = CoreStore::open(&dir).unwrap();
+    store.migrate().unwrap();
+
+    assert_eq!(store.schema_version().unwrap(), 12);
+    assert_eq!(store.table_count("quota_budget_accounts").unwrap(), 1);
+    assert!(store.foreign_keys_enabled().unwrap());
+
+    let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
+    for (table, column) in [
+        ("quota_ledger", "budget_account_id"),
+        ("quota_ledger", "event_group_id"),
+        ("quota_ledger", "api_key_id"),
+        ("quota_ledger", "budget_version"),
+        ("quota_reservations", "api_key_id"),
+        ("quota_reservations", "key_budget_account_id"),
+        ("quota_reservations", "user_cap_account_id"),
+        ("quota_reservations", "event_group_id"),
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                rusqlite::params![table, column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "missing {table}.{column}");
+    }
+    for index in ["quota_budget_accounts_user_cap_uq", "quota_budget_accounts_key_uq"] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "missing index {index}");
+    }
+
+    drop(connection);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     let dir = test_dir("idempotent");
     let store = CoreStore::open(&dir).unwrap();
@@ -62,7 +108,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     connection
         .execute_batch(
             "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
-             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '12');",
+             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '13');",
         )
         .unwrap();
     drop(connection);
@@ -70,7 +116,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     let store = CoreStore::open(&future_dir).unwrap();
     assert!(matches!(
         store.migrate(),
-        Err(CoreError::UnsupportedSchemaVersion { version: 12 })
+        Err(CoreError::UnsupportedSchemaVersion { version: 13 })
     ));
     drop(store);
     fs::remove_dir_all(future_dir).unwrap();

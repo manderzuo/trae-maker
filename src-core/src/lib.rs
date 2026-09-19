@@ -16,7 +16,9 @@ pub use identity::{require_scope, AuthError, Principal};
 pub use models::{
     AssetState, BeginRequest, BeginRequestInput, CoreAsset, CreateAssetInput, CreateVideoJobInput, CoreJob,
     CoreJobAttempt, CoreApiKeyAdminView, CoreQuotaBalanceView, CoreQuotaLedgerView, CoreQuotaUsageView,
-    CoreUserAdminView, CoreVideoJobAdminView, IssuedApiKey, JobAttemptState, JobState, NewUser, QuotaBalance, QuotaGrant,
+    CoreUserAdminView, CoreVideoJobAdminView, IssuedApiKey, JobAttemptState, JobState, NewUser,
+    QuotaBalance, QuotaBudgetAccount, QuotaBudgetBalance, QuotaBudgetScope, QuotaGrant,
+    QuotaMigrationState, KeyQuotaGrant, LegacyQuotaAllocation,
     LegacyMigrationAsset, LegacyMigrationBatch, LegacyMigrationJob, LegacyMigrationKey,
     LegacyMigrationObservation, LegacyMigrationResult,
     PreflightReserveInput, PreflightReserveResult, QuotaReserve, RequestHandle, RequestResult,
