@@ -765,6 +765,20 @@ export interface UsageDayView {
   key_tokens: UsageKeyTokenView[];
 }
 
+/** Key 能力；旧 Key 缺失 capabilities 时由 Rust 端补齐为三种能力。 */
+export type KeyCapability = 'chat' | 'video' | 'assets';
+export type KeyCapabilities = KeyCapability[];
+
+/** Key 级限流与每日额度；null 表示跟随全局默认，daily_* 为 0 表示不限。 */
+export interface KeyLimits {
+  max_inflight: number | null;
+  asset_uploads_per_minute: number | null;
+  asset_bytes_per_hour: number | null;
+  video_submissions_per_minute: number | null;
+  daily_requests: number;
+  daily_tokens: number;
+}
+
 /** API Key 条目（data/api_keys.json；daily_limit=0 表示不限，T2；F-35 子 Key 体系批次3） */
 export interface ApiKeyEntry {
   id: string;
@@ -783,6 +797,10 @@ export interface ApiKeyEntry {
   dedicated_account: string;
   /** 按日请求统计（升序，保留最近 90 天） */
   daily_stats: ApiKeyDailyStat[];
+  /** Key 级限流与每日额度覆盖 */
+  limits?: KeyLimits;
+  /** 允许的能力 */
+  capabilities?: KeyCapabilities;
 }
 
 /** 子 Key 按日统计项（F-35） */

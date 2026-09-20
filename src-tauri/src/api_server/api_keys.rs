@@ -39,8 +39,142 @@ pub enum KeyCheck {
     QuotaExceeded { limit: u64 },
 }
 
+/// Key 可用能力。空 capability 字段表示没有可用能力；字段缺失由 serde 默认成全能力。
+pub type KeyCapabilities = Vec<String>;
+
+pub const CAPABILITY_CHAT: &str = "chat";
+pub const CAPABILITY_VIDEO: &str = "video";
+pub const CAPABILITY_ASSETS: &str = "assets";
+
+const ALL_CAPABILITIES: [&str; 3] = [CAPABILITY_CHAT, CAPABILITY_VIDEO, CAPABILITY_ASSETS];
+
+/// 与全局网关限流器保持一致的 Key 级安全上限。
+pub const MAX_KEY_INFLIGHT: usize = 256;
+pub const MAX_KEY_ASSET_UPLOADS_PER_MINUTE: usize = 10_000;
+pub const MAX_KEY_ASSET_BYTES_PER_HOUR: u64 = 10 * 1024 * 1024 * 1024;
+pub const MAX_KEY_VIDEO_SUBMISSIONS_PER_MINUTE: usize = 1_000;
+pub const MAX_KEY_DAILY_REQUESTS: u64 = 1_000_000;
+pub const MAX_KEY_DAILY_TOKENS: u64 = 10_000_000_000;
+
+fn default_capabilities() -> KeyCapabilities {
+    ALL_CAPABILITIES.iter().map(|capability| (*capability).to_string()).collect()
+}
+
+fn normalize_capabilities(values: KeyCapabilities) -> KeyCapabilities {
+    values
+        .into_iter()
+        .filter(|value| ALL_CAPABILITIES.contains(&value.as_str()))
+        .fold(Vec::new(), |mut normalized, value| {
+            if !normalized.contains(&value) {
+                normalized.push(value);
+            }
+            normalized
+        })
+}
+
+fn deserialize_capabilities<'de, D>(deserializer: D) -> Result<KeyCapabilities, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    Ok(normalize_capabilities(values))
+}
+
+/// Key 级限流与每日额度覆盖。Option 字段为 None 时继承全局默认值；
+/// daily_* 使用 0 表示不限。
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct KeyLimits {
+    #[serde(default)]
+    pub max_inflight: Option<usize>,
+    #[serde(default)]
+    pub asset_uploads_per_minute: Option<usize>,
+    #[serde(default)]
+    pub asset_bytes_per_hour: Option<u64>,
+    #[serde(default)]
+    pub video_submissions_per_minute: Option<usize>,
+    #[serde(default)]
+    pub daily_requests: u64,
+    #[serde(default)]
+    pub daily_tokens: u64,
+}
+
+impl Default for KeyLimits {
+    fn default() -> Self {
+        Self {
+            max_inflight: None,
+            asset_uploads_per_minute: None,
+            asset_bytes_per_hour: None,
+            video_submissions_per_minute: None,
+            daily_requests: 0,
+            daily_tokens: 0,
+        }
+    }
+}
+
+impl KeyLimits {
+    /// 将输入限制到安全范围；继承型 Option 字段的 0 会钳制为最小安全值 1。
+    pub fn normalize(&mut self) {
+        self.max_inflight = normalize_optional(self.max_inflight, MAX_KEY_INFLIGHT);
+        self.asset_uploads_per_minute =
+            normalize_optional(self.asset_uploads_per_minute, MAX_KEY_ASSET_UPLOADS_PER_MINUTE);
+        self.asset_bytes_per_hour = normalize_optional(self.asset_bytes_per_hour, MAX_KEY_ASSET_BYTES_PER_HOUR);
+        self.video_submissions_per_minute = normalize_optional(
+            self.video_submissions_per_minute,
+            MAX_KEY_VIDEO_SUBMISSIONS_PER_MINUTE,
+        );
+        self.daily_requests = self.daily_requests.min(MAX_KEY_DAILY_REQUESTS);
+        self.daily_tokens = self.daily_tokens.min(MAX_KEY_DAILY_TOKENS);
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.normalize();
+        self
+    }
+}
+
+fn normalize_optional<T>(value: Option<T>, max: T) -> Option<T>
+where
+    T: Ord + From<u8>,
+{
+    value.map(|value| value.max(T::from(1)).min(max))
+}
+
+#[derive(Deserialize)]
+struct KeyLimitsWire {
+    #[serde(default)]
+    max_inflight: Option<usize>,
+    #[serde(default)]
+    asset_uploads_per_minute: Option<usize>,
+    #[serde(default)]
+    asset_bytes_per_hour: Option<u64>,
+    #[serde(default)]
+    video_submissions_per_minute: Option<usize>,
+    #[serde(default)]
+    daily_requests: u64,
+    #[serde(default)]
+    daily_tokens: u64,
+}
+
+impl<'de> Deserialize<'de> for KeyLimits {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = KeyLimitsWire::deserialize(deserializer)?;
+        Ok(Self {
+            max_inflight: wire.max_inflight,
+            asset_uploads_per_minute: wire.asset_uploads_per_minute,
+            asset_bytes_per_hour: wire.asset_bytes_per_hour,
+            video_submissions_per_minute: wire.video_submissions_per_minute,
+            daily_requests: wire.daily_requests,
+            daily_tokens: wire.daily_tokens,
+        }
+        .normalized())
+    }
+}
+
 /// 鉴权通过后的 Key 约束快照（F-35）
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ResolvedKey {
     pub id: String,
     /// 限定上游账号 uid 白名单；空 = 不限
@@ -49,6 +183,8 @@ pub struct ResolvedKey {
     pub schedule_mode: String,
     /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）
     pub dedicated_account: String,
+    pub limits: KeyLimits,
+    pub capabilities: KeyCapabilities,
 }
 
 /// 子 Key 按日统计项
@@ -94,6 +230,12 @@ pub struct ApiKeyEntry {
     /// 按日请求统计（升序，保留最近 90 天）
     #[serde(default)]
     pub daily_stats: Vec<KeyDailyStat>,
+    /// Key 级限流与每日额度覆盖；缺失时继承全局默认。
+    #[serde(default)]
+    pub limits: KeyLimits,
+    /// 允许的能力；缺失时兼容旧 Key，默认允许 chat/video/assets。
+    #[serde(default = "default_capabilities", deserialize_with = "deserialize_capabilities")]
+    pub capabilities: KeyCapabilities,
 }
 
 fn default_true() -> bool {
@@ -123,6 +265,11 @@ impl ApiKeyEntry {
         } else {
             &self.schedule_mode
         }
+    }
+
+    fn normalize_policy(&mut self) {
+        self.limits.normalize();
+        self.capabilities = normalize_capabilities(std::mem::take(&mut self.capabilities));
     }
 }
 
@@ -178,6 +325,7 @@ impl ApiKeysFile {
         else {
             return KeyCheck::Invalid;
         };
+        e.normalize_policy();
         if let Err(limit) = quota_left(e, today) {
             return KeyCheck::QuotaExceeded { limit };
         }
@@ -188,6 +336,8 @@ impl ApiKeysFile {
             allowed_accounts: e.allowed_accounts.clone(),
             schedule_mode: e.schedule_mode().to_string(),
             dedicated_account: e.dedicated_account.clone(),
+            limits: e.limits.clone(),
+            capabilities: e.capabilities.clone(),
         })
     }
 
@@ -205,6 +355,8 @@ pub fn constraints_for(data_dir: &Path, key_id: &str) -> Option<ResolvedKey> {
         allowed_accounts: e.allowed_accounts.clone(),
         schedule_mode: e.schedule_mode().to_string(),
         dedicated_account: e.dedicated_account.clone(),
+        limits: e.limits.clone(),
+        capabilities: e.capabilities.clone(),
     })
 }
 
@@ -259,6 +411,7 @@ mod tests {
     use aiwork_core::{
         CoreStore, LegacyMigrationBatch, LegacyMigrationKey, NewUser, Principal, UserRole,
     };
+    use serde_json::json;
 
     use super::*;
 
@@ -276,7 +429,96 @@ mod tests {
             schedule_mode: String::new(),
             dedicated_account: String::new(),
             daily_stats: vec![],
+            limits: KeyLimits::default(),
+            capabilities: default_capabilities(),
         }
+    }
+
+    #[test]
+    fn legacy_key_json_defaults_to_all_capabilities_and_inherited_limits() {
+        let legacy = json!({
+            "keys": [{
+                "id": "legacy-id",
+                "name": "legacy",
+                "key": "",
+                "enabled": true,
+                "daily_limit": 0,
+                "created_at": 0,
+                "used_date": "",
+                "used_today": 0,
+                "allowed_accounts": [],
+                "schedule_mode": "",
+                "dedicated_account": "",
+                "daily_stats": []
+            }],
+            "auth_disabled": false
+        });
+
+        let file: ApiKeysFile = serde_json::from_value(legacy).unwrap();
+        let key = &file.keys[0];
+        assert_eq!(key.capabilities, default_capabilities());
+        assert!(key.limits.max_inflight.is_none());
+        assert!(key.limits.asset_uploads_per_minute.is_none());
+        assert!(key.limits.asset_bytes_per_hour.is_none());
+        assert!(key.limits.video_submissions_per_minute.is_none());
+        assert_eq!(key.limits.daily_requests, 0);
+        assert_eq!(key.limits.daily_tokens, 0);
+    }
+
+    #[test]
+    fn key_limits_normalize_negative_or_oversized_values() {
+        assert!(serde_json::from_value::<KeyLimits>(json!({
+            "max_inflight": -1
+        }))
+        .is_err());
+
+        let mut limits = KeyLimits {
+            max_inflight: Some(usize::MAX),
+            asset_uploads_per_minute: Some(usize::MAX),
+            asset_bytes_per_hour: Some(u64::MAX),
+            video_submissions_per_minute: Some(usize::MAX),
+            daily_requests: u64::MAX,
+            daily_tokens: u64::MAX,
+        };
+        limits.normalize();
+        assert_eq!(limits.max_inflight, Some(MAX_KEY_INFLIGHT));
+        assert_eq!(
+            limits.asset_uploads_per_minute,
+            Some(MAX_KEY_ASSET_UPLOADS_PER_MINUTE)
+        );
+        assert_eq!(limits.asset_bytes_per_hour, Some(MAX_KEY_ASSET_BYTES_PER_HOUR));
+        assert_eq!(
+            limits.video_submissions_per_minute,
+            Some(MAX_KEY_VIDEO_SUBMISSIONS_PER_MINUTE)
+        );
+        assert_eq!(limits.daily_requests, MAX_KEY_DAILY_REQUESTS);
+        assert_eq!(limits.daily_tokens, MAX_KEY_DAILY_TOKENS);
+    }
+
+    #[test]
+    fn resolved_key_carries_limits_and_capabilities_without_key_material() {
+        let mut f = ApiKeysFile {
+            keys: vec![entry("k1", "fixture-key", true, 0)],
+            auth_disabled: false,
+        };
+        f.keys[0].limits = KeyLimits {
+            max_inflight: Some(2),
+            asset_uploads_per_minute: None,
+            asset_bytes_per_hour: Some(4096),
+            video_submissions_per_minute: Some(3),
+            daily_requests: 100,
+            daily_tokens: 10_000,
+        };
+        f.keys[0].capabilities = vec!["chat".into(), "assets".into()];
+
+        let KeyCheck::Ok(resolved) = f.verify_and_consume("fixture-key", "2026-09-20") else {
+            panic!("expected key verification to succeed");
+        };
+        assert_eq!(resolved.id, "k1");
+        assert_eq!(resolved.limits, f.keys[0].limits);
+        assert_eq!(resolved.capabilities, f.keys[0].capabilities);
+        let serialized = serde_json::to_string(&resolved).unwrap();
+        assert!(!serialized.contains("\"key\""));
     }
 
     #[test]
