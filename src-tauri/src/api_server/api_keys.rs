@@ -41,6 +41,36 @@ pub enum KeyCheck {
     CapabilityNotAllowed { capability: String },
 }
 
+/// 日配额的兼容错误分类；请求和 Token 共用既有 `daily_quota_exceeded` code，
+/// 仅消息按实际额度类型说明单位。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuotaKind {
+    Requests,
+    Tokens,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyTokenReservation {
+    pub id: String,
+    pub date: String,
+    pub amount: u64,
+}
+
+/// 请求 guard 持有的 reservation 句柄。句柄本身不携带 Key 明文。
+#[derive(Clone, Debug)]
+pub struct TokenReservationLease {
+    pub(crate) data_dir: PathBuf,
+    pub(crate) key_id: String,
+    pub(crate) id: String,
+    pub amount: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenQuotaError {
+    KeyUnavailable,
+    Exceeded { limit: u64 },
+}
+
 /// Key 可用能力。空 capability 字段表示没有可用能力；字段缺失由 serde 默认成全能力。
 pub type KeyCapabilities = Vec<String>;
 
@@ -245,6 +275,9 @@ pub struct ApiKeyEntry {
     /// 按日请求统计（升序，保留最近 90 天）
     #[serde(default)]
     pub daily_stats: Vec<KeyDailyStat>,
+    /// 当日尚未结算的保守 Token 预留；仅在 Key 锁内读改写。
+    #[serde(default)]
+    pub token_reservations: Vec<KeyTokenReservation>,
     /// Key 级限流与每日额度覆盖；缺失时继承全局默认。
     #[serde(default)]
     pub limits: KeyLimits,
@@ -513,6 +546,99 @@ pub fn record_token_usage_locked(
     save(data_dir, &file);
 }
 
+/// 为一个 legacy text request 保守预留当日剩余 Token 容量。
+///
+/// 认证阶段无法可靠知道上游最终 usage，因此有限 Token Key 每次只允许一个
+/// 尚未结算的请求占用“全部剩余容量”。已知 usage 结算时释放未使用部分；失败、
+/// 未知 usage 则由 guard 释放，避免把未知用量伪造为已知 Token。
+pub fn reserve_token_quota(
+    data_dir: &Path,
+    key_id: &str,
+    today: &str,
+    daily_tokens: u64,
+) -> Result<Option<TokenReservationLease>, TokenQuotaError> {
+    if key_id == "anonymous" || daily_tokens == 0 {
+        return Ok(None);
+    }
+    let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = load(data_dir);
+    let Some(entry) = file.keys.iter_mut().find(|entry| entry.id == key_id) else {
+        return Err(TokenQuotaError::KeyUnavailable);
+    };
+    entry
+        .token_reservations
+        .retain(|reservation| reservation.date == today);
+    let used_tokens = entry
+        .daily_stats
+        .iter()
+        .find(|stat| stat.date == today)
+        .map(|stat| stat.prompt_tokens.saturating_add(stat.completion_tokens))
+        .unwrap_or(0);
+    let reserved_tokens = entry
+        .token_reservations
+        .iter()
+        .map(|reservation| reservation.amount)
+        .sum::<u64>();
+    let occupied = used_tokens.saturating_add(reserved_tokens);
+    if occupied >= daily_tokens {
+        return Err(TokenQuotaError::Exceeded { limit: daily_tokens });
+    }
+    let amount = daily_tokens.saturating_sub(occupied);
+    let id = format!("key-token-reservation-{:032x}", rand::random::<u128>());
+    entry.token_reservations.push(KeyTokenReservation {
+        id: id.clone(),
+        date: today.to_string(),
+        amount,
+    });
+    save(data_dir, &file);
+    Ok(Some(TokenReservationLease {
+        data_dir: data_dir.to_path_buf(),
+        key_id: key_id.to_string(),
+        id,
+        amount,
+    }))
+}
+
+/// 结算一个 reservation；Token 统计和 reservation 删除在同一 Key 锁内完成。
+pub fn settle_token_reservation(
+    lease: &TokenReservationLease,
+    today: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) {
+    let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = load(&lease.data_dir);
+    let Some(entry) = file.keys.iter_mut().find(|entry| entry.id == lease.key_id) else {
+        return;
+    };
+    let Some(index) = entry
+        .token_reservations
+        .iter()
+        .position(|reservation| reservation.id == lease.id)
+    else {
+        return;
+    };
+    entry.token_reservations.remove(index);
+    add_daily_tokens(entry, today, prompt_tokens, completion_tokens);
+    save(&lease.data_dir, &file);
+}
+
+/// 失败/未知 usage 的保守策略：仅删除本句柄，释放容量供下一请求使用。
+pub fn release_token_reservation(lease: &TokenReservationLease) {
+    let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = load(&lease.data_dir);
+    let Some(entry) = file.keys.iter_mut().find(|entry| entry.id == lease.key_id) else {
+        return;
+    };
+    let before = entry.token_reservations.len();
+    entry
+        .token_reservations
+        .retain(|reservation| reservation.id != lease.id);
+    if entry.token_reservations.len() != before {
+        save(&lease.data_dir, &file);
+    }
+}
+
 /// 序列化对比：verify 后文件是否发生变化（P1 修复5a）。
 /// 无变化（Invalid 等只读路径）跳过写盘，消除鉴权热路径的无效磁盘写
 fn keys_file_changed(before: &[u8], f: &ApiKeysFile) -> bool {
@@ -571,6 +697,7 @@ mod tests {
             schedule_mode: String::new(),
             dedicated_account: String::new(),
             daily_stats: vec![],
+            token_reservations: vec![],
             limits: KeyLimits::default(),
             capabilities: default_capabilities(),
         }
@@ -805,6 +932,127 @@ mod tests {
         // 按日统计：两天各一项
         assert_eq!(f.keys[0].daily_stats.len(), 2);
         assert_eq!(f.keys[0].daily_stats[1].requests, 1);
+    }
+
+    #[test]
+    fn token_reservation_blocks_a_second_request_and_settles_known_usage() {
+        let dir = std::path::PathBuf::from(r"D:\gpt").join(format!(
+            "twa-keys-token-reservation-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut key = entry("k1", "fixture-token-reservation", true, 0);
+        key.limits.daily_tokens = 10;
+        save(
+            &dir,
+            &ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+
+        let first = reserve_token_quota(&dir, "k1", "day-1", 10)
+            .expect("first reservation should be accepted")
+            .expect("a finite token limit should create a reservation");
+        assert_eq!(first.amount, 10);
+        assert!(matches!(
+            reserve_token_quota(&dir, "k1", "day-1", 10),
+            Err(TokenQuotaError::Exceeded { limit: 10 })
+        ));
+
+        settle_token_reservation(&first, "day-1", 6, 4);
+        let loaded = load(&dir);
+        assert!(loaded.keys[0].token_reservations.is_empty());
+        assert_eq!(
+            loaded.keys[0].daily_stats[0].prompt_tokens
+                + loaded.keys[0].daily_stats[0].completion_tokens,
+            10
+        );
+        assert!(matches!(
+            reserve_token_quota(&dir, "k1", "day-1", 10),
+            Err(TokenQuotaError::Exceeded { limit: 10 })
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn token_reservation_releases_unknown_usage_without_leaking_capacity() {
+        let dir = std::path::PathBuf::from(r"D:\gpt").join(format!(
+            "twa-keys-token-release-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut key = entry("k1", "fixture-token-release", true, 0);
+        key.limits.daily_tokens = 10;
+        save(
+            &dir,
+            &ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+
+        let first = reserve_token_quota(&dir, "k1", "day-1", 10)
+            .unwrap()
+            .unwrap();
+        release_token_reservation(&first);
+        let second = reserve_token_quota(&dir, "k1", "day-1", 10)
+            .expect("released reservation should make capacity available")
+            .expect("the second request should reserve the full remaining budget");
+        assert_ne!(first.id, second.id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_token_reservations_allow_only_one_request_for_remaining_budget() {
+        let dir = std::path::PathBuf::from(r"D:\gpt").join(format!(
+            "twa-keys-token-reservation-concurrent-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut key = entry("k1", "fixture-token-reservation-concurrent", true, 0);
+        key.limits.daily_tokens = 10;
+        save(
+            &dir,
+            &ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reserve_token_quota(&dir, "k1", "day-1", 10)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("reservation worker should not panic"))
+            .collect();
+
+        let mut accepted = Vec::new();
+        let mut rejected = 0;
+        for result in results {
+            match result {
+                Ok(Some(lease)) => accepted.push(lease),
+                Ok(None) => panic!("a finite token limit should create a reservation"),
+                Err(TokenQuotaError::Exceeded { limit }) => {
+                    assert_eq!(limit, 10);
+                    rejected += 1;
+                }
+                Err(error) => panic!("reservation should only be rejected by the token quota: {error:?}"),
+            }
+        }
+        assert_eq!(accepted.len(), 1, "only one request may reserve the remaining budget");
+        assert_eq!(rejected, 1, "the other request must hit the token quota");
+        release_token_reservation(&accepted[0]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

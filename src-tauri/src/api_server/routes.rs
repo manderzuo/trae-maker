@@ -155,6 +155,42 @@ fn legacy_request_guard(
         .map_err(limit_error_response)
 }
 
+/// 获取 legacy 文字请求的 request permit，并在同一请求生命周期内持有
+/// 保守 Token reservation。视频/assets 继续使用 `legacy_request_guard`，
+/// 因为它们不消费每日 Token 额度。
+fn legacy_text_request_guard(
+    state: &ApiSharedState,
+    key_id: &str,
+    key_limits: &KeyLimits,
+) -> Result<InflightGuard, Response> {
+    let permit = state
+        .acquire_request(key_id, key_limits)
+        .map_err(limit_error_response)?;
+    let reservation = match api_keys::reserve_token_quota(
+        &state.data_dir,
+        key_id,
+        &super::usage::key_quota_day(),
+        key_limits.daily_tokens,
+    ) {
+        Ok(reservation) => reservation,
+        Err(api_keys::TokenQuotaError::Exceeded { limit }) => {
+            drop(permit);
+            return Err(super::auth::quota_exceeded(
+                limit,
+                api_keys::QuotaKind::Tokens,
+            ));
+        }
+        Err(api_keys::TokenQuotaError::KeyUnavailable) => {
+            drop(permit);
+            return Err(super::auth::quota_exceeded(
+                key_limits.daily_tokens,
+                api_keys::QuotaKind::Tokens,
+            ));
+        }
+    };
+    Ok(state.inflight_guard_with_permit_and_reservation(permit, reservation))
+}
+
 fn core_error_response(error: CoreError) -> Response {
     match error {
         CoreError::MissingScope { scope } => core_scope_error(&scope),
@@ -1142,7 +1178,7 @@ pub async fn chat_completions(
     // 统一调度分流点（§4.1 ③~⑥）：resolve_target 决定资源池/会话池粘性/跨池回退/
     // 错误矩阵，替代原 resolve_wb_target 单向判定；默认策略下行为与改造前一致（§9.1）。
     // inflight guard 随执行路径持有至请求结束（流式含整个后台任务）
-    let guard = match legacy_request_guard(&state, &key_str, &key_limits) {
+    let guard = match legacy_text_request_guard(&state, &key_str, &key_limits) {
         Ok(guard) => guard,
         Err(response) => return response,
     };
@@ -1279,7 +1315,7 @@ pub async fn responses_api(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     // inflight guard：随执行路径持有至请求结束（§4.5）
-    let guard = match legacy_request_guard(&state, &key_str, &key_limits) {
+    let guard = match legacy_text_request_guard(&state, &key_str, &key_limits) {
         Ok(guard) => guard,
         Err(response) => return response,
     };
@@ -1439,7 +1475,7 @@ pub async fn messages(
 
     // 统一调度分流点（§4.1）：resolve_target 决定资源池/回退/错误矩阵；
     // guard 随执行路径持有至请求结束（流式含整个后台任务）
-    let guard = match legacy_request_guard(&state, &key_str, &key_limits) {
+    let guard = match legacy_text_request_guard(&state, &key_str, &key_limits) {
         Ok(guard) => guard,
         Err(response) => return response,
     };
@@ -1569,7 +1605,7 @@ pub async fn completions(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // 统一调度分流点（§4.1）；guard 随执行路径持有至请求结束
-    let guard = match legacy_request_guard(&state, &key_str, &key_limits) {
+    let guard = match legacy_text_request_guard(&state, &key_str, &key_limits) {
         Ok(guard) => guard,
         Err(response) => return response,
     };
@@ -2921,7 +2957,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
     tokio::task::spawn_blocking(move || {
         // inflight guard 随后台任务存续至流结束（§4.5：客户端断连/流终止由
         // 任务结束 Drop 兜底释放）
-        let _inflight = guard;
+        let mut guard = guard;
         // 主任务结束（含 panic 展开）→ 通知 keep-alive ticker 退出（P1 修复3）
         let _done = DoneSignal(done_tx);
         let chat_id = match proto {
@@ -3018,14 +3054,23 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             let us = ttfb_us.load(std::sync::atomic::Ordering::Relaxed);
                             if us == 0 { None } else { Some(us / 1000) }
                         };
-                        // 用量记账（流式结束即落盘）
-                        {
-                            let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
-                            state.record_usage(
-                                false, &model, &picked.uid, &key_id, error_info.is_none(), true,
-                                duration_ms, pt, ct,
-                            );
-                        }
+                        // 用量记账（流式结束即落盘）；首字节前失败可换号，
+                        // 因而只有已经向客户端发送内容的错误才是本次终态。
+                        let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
+                        let terminal = error_info.is_none() || sent_any;
+                        state.record_usage_with_guard(
+                            &mut guard,
+                            false,
+                            &model,
+                            &picked.uid,
+                            &key_id,
+                            error_info.is_none(),
+                            true,
+                            duration_ms,
+                            pt,
+                            ct,
+                            terminal && error_info.is_none(),
+                        );
                         let stream_succeeded = error_info.is_none();
                         if stream_succeeded {
                             if let (Some(cid), Some(assistant)) =
@@ -3118,6 +3163,19 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                     state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&msg));
                                 }
                                 send_stream_error(&tx, proto, status as i64, &msg);
+                                state.record_usage_with_guard(
+                                    &mut guard,
+                                    false,
+                                    &model,
+                                    &picked.uid,
+                                    &key_id,
+                                    false,
+                                    true,
+                                    start_ts.elapsed().as_millis() as u64,
+                                    0,
+                                    0,
+                                    false,
+                                );
                                 return;
                             }
                         }
@@ -3128,7 +3186,19 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
         // 所有账号不可用
         let duration_ms = start_ts.elapsed().as_millis() as u64;
-        state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
+        state.record_usage_with_guard(
+            &mut guard,
+            false,
+            &model,
+            "none",
+            &key_id,
+            false,
+            true,
+            duration_ms,
+            0,
+            0,
+            false,
+        );
         let diag = state.pool.diagnose();
         let diag_summary: Vec<String> = diag
             .iter()
@@ -3221,7 +3291,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard, conversation_id: Option<String>) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         // inflight guard 随后台任务存续至聚合完成（§4.5）
-        let _inflight = guard;
+        let mut guard = guard;
         let mut tried = HashSet::new();
 
         let max_rotate = state.pool.count().max(1);
@@ -3267,9 +3337,18 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 }
                                 // 用量记账（成功：token 数从聚合响应 usage 提取）
                                 let (pt, ct) = r.get("usage").map(extract_tokens).unwrap_or((0, 0));
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, true, stream,
-                                    duration_ms, pt, ct,
+                                state.record_usage_with_guard(
+                                    &mut guard,
+                                    false,
+                                    &model,
+                                    &picked.uid,
+                                    &key_id,
+                                    true,
+                                    stream,
+                                    duration_ms,
+                                    pt,
+                                    ct,
+                                    true,
                                 );
                                 state.pool.note_success(&picked.uid);
                                 state.logger.log_request(
@@ -3294,9 +3373,18 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 state.pool.note_error(&picked.uid, kind);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    duration_ms, 0, 0,
+                                state.record_usage_with_guard(
+                                    &mut guard,
+                                    false,
+                                    &model,
+                                    &picked.uid,
+                                    &key_id,
+                                    false,
+                                    stream,
+                                    duration_ms,
+                                    0,
+                                    0,
+                                    false,
                                 );
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
@@ -3309,9 +3397,18 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             }
                             _ => {
                                 state.pool.note_error(&picked.uid, ErrKind::Server);
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    duration_ms, 0, 0,
+                                state.record_usage_with_guard(
+                                    &mut guard,
+                                    false,
+                                    &model,
+                                    &picked.uid,
+                                    &key_id,
+                                    false,
+                                    stream,
+                                    duration_ms,
+                                    0,
+                                    0,
+                                    false,
                                 );
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
@@ -3338,9 +3435,18 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 state.pool.note_error(&picked.uid, kind);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} status={}", picked.uid, status));
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                state.record_usage_with_guard(
+                                    &mut guard,
+                                    false,
+                                    &model,
+                                    &picked.uid,
+                                    &key_id,
+                                    false,
+                                    stream,
+                                    start_ts.elapsed().as_millis() as u64,
+                                    0,
+                                    0,
+                                    false,
                                 );
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
@@ -3363,6 +3469,19 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                                     state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&msg));
                                 }
+                                state.record_usage_with_guard(
+                                    &mut guard,
+                                    false,
+                                    &model,
+                                    &picked.uid,
+                                    &key_id,
+                                    false,
+                                    stream,
+                                    start_ts.elapsed().as_millis() as u64,
+                                    0,
+                                    0,
+                                    false,
+                                );
                                 return Err(AggregateFail::Upstream(status, msg));
                             }
                         }
@@ -3374,7 +3493,19 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         let diag = state.pool.diagnose();
         // 用量记账（所有账号不可用）
-        state.record_usage(false, &model, "none", &key_id, false, stream, duration_ms, 0, 0);
+        state.record_usage_with_guard(
+            &mut guard,
+            false,
+            &model,
+            "none",
+            &key_id,
+            false,
+            stream,
+            duration_ms,
+            0,
+            0,
+            false,
+        );
         let diag_summary: Vec<String> = diag
             .iter()
             .map(|d| {
@@ -3973,6 +4104,7 @@ mod tests {
             schedule_mode: String::new(),
             dedicated_account: String::new(),
             daily_stats: Vec::new(),
+            token_reservations: Vec::new(),
             limits: super::super::api_keys::KeyLimits::default(),
             capabilities: capabilities.iter().map(|value| (*value).to_string()).collect(),
         };
@@ -5910,5 +6042,134 @@ mod tests {
 
         let available = public_seedance_model_value(true);
         assert_eq!(available["sources"][0]["enabled"], true);
+    }
+
+    #[test]
+    fn legacy_handlers_use_the_persisted_policy_without_defaulting_authenticated_keys() {
+        let limits = KeyLimits {
+            max_inflight: Some(2),
+            max_video_jobs: None,
+            asset_uploads_per_minute: None,
+            asset_bytes_per_hour: None,
+            video_submissions_per_minute: None,
+            daily_requests: 3,
+            daily_tokens: 7,
+        };
+        let (state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_CHAT]);
+        let mut file = api_keys::load(&dir);
+        file.keys[0].limits = limits.clone();
+        api_keys::save(&dir, &file);
+
+        assert_eq!(
+            require_legacy_capability(
+                &state,
+                &key_id,
+                api_keys::CAPABILITY_CHAT,
+            )
+            .unwrap(),
+            limits
+        );
+        let missing = require_legacy_capability(
+            &state,
+            &key_id,
+            api_keys::CAPABILITY_VIDEO,
+        )
+        .unwrap_err();
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            require_legacy_capability(
+                &state,
+                "anonymous",
+                api_keys::CAPABILITY_CHAT,
+            )
+            .unwrap(),
+            KeyLimits::default()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_counts_one_authenticated_request_without_duplicate_increment() {
+        let (state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_CHAT]);
+        let body = Bytes::from(
+            json!({
+                "model": "mock-1",
+                "messages": [{"role": "user", "content": "hello"}]
+            })
+            .to_string(),
+        );
+
+        let _response = chat_completions(
+            State(state.clone()),
+            Some(Extension(KeyId(key_id))),
+            None,
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+
+        assert_eq!(
+            state
+                .total_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_text_quota_rejection_releases_the_request_permit() {
+        let (state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_CHAT]);
+        let limits = KeyLimits {
+            max_inflight: Some(2),
+            daily_tokens: 10,
+            ..KeyLimits::default()
+        };
+        let first = legacy_text_request_guard(&state, &key_id, &limits)
+            .expect("first text request should reserve the token budget");
+        let rejected = match legacy_text_request_guard(&state, &key_id, &limits) {
+            Ok(_) => panic!("the second concurrent request must hit the token quota"),
+            Err(response) => response,
+        };
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        let rejected_body = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .expect("quota response body should be readable");
+        let rejected_body: Value = serde_json::from_slice(&rejected_body).unwrap();
+        assert_eq!(rejected_body["error"]["type"], "quota_exceeded");
+        assert_eq!(rejected_body["error"]["code"], "daily_quota_exceeded");
+        assert_eq!(rejected_body["error"]["param"], "daily_tokens");
+
+        let permit_after_rejection = state
+            .acquire_request(&key_id, &limits)
+            .expect("failed reservation must release the request permit");
+        drop(permit_after_rejection);
+        drop(first);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_text_guard_skips_reservation_for_anonymous_and_unlimited_keys() {
+        let (state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_CHAT]);
+        let finite_limits = KeyLimits {
+            max_inflight: Some(2),
+            daily_tokens: 10,
+            ..KeyLimits::default()
+        };
+        let anonymous_guard = legacy_text_request_guard(&state, "anonymous", &finite_limits)
+            .expect("anonymous requests should not create token reservations");
+        drop(anonymous_guard);
+
+        let unlimited_limits = KeyLimits {
+            max_inflight: Some(2),
+            daily_tokens: 0,
+            ..KeyLimits::default()
+        };
+        let unlimited_guard = legacy_text_request_guard(&state, &key_id, &unlimited_limits)
+            .expect("daily_tokens=0 should not create token reservations");
+        drop(unlimited_guard);
+
+        assert!(api_keys::load(&dir).keys[0].token_reservations.is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 }

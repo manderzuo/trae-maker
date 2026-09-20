@@ -126,6 +126,14 @@ impl ApiSharedState {
         InflightGuard::acquire_with_permit(&self.inflight, permit)
     }
 
+    pub fn inflight_guard_with_permit_and_reservation(
+        &self,
+        permit: limits::Permit,
+        reservation: Option<api_keys::TokenReservationLease>,
+    ) -> InflightGuard {
+        InflightGuard::acquire_with_permit_and_reservation(&self.inflight, permit, reservation)
+    }
+
     /// 获取按 Key 生效的请求并发许可；Key 级覆盖由 RateLimiter 与全局上限取小值。
     pub fn acquire_request(
         &self,
@@ -170,6 +178,116 @@ impl ApiSharedState {
         prompt_tokens: u64,
         completion_tokens: u64,
     ) {
+        self.record_usage_stats(
+            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+        );
+        api_keys::record_token_usage_locked(
+            &self.data_dir,
+            key_id,
+            &usage::key_quota_day(),
+            prompt_tokens,
+            completion_tokens,
+        );
+    }
+
+    /// 记录携带 legacy text reservation 的请求尝试。
+    /// `settle=true` 只应在请求终态传入；中间重试会累计已知 usage，最后一次
+    /// 终态统一结算。没有 usage 的失败/未知请求由 InflightGuard Drop 释放。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_with_guard(
+        &self,
+        guard: &mut InflightGuard,
+        is_wb: bool,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        settle: bool,
+    ) {
+        self.record_usage_stats(
+            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+        );
+        if guard.has_token_reservation() {
+            guard.observe_token_usage(prompt_tokens, completion_tokens);
+            if settle {
+                guard.settle_token_usage(&usage::key_quota_day());
+            }
+        } else {
+            api_keys::record_token_usage_locked(
+                &self.data_dir,
+                key_id,
+                &usage::key_quota_day(),
+                prompt_tokens,
+                completion_tokens,
+            );
+        }
+    }
+
+    /// Custom-model variant of `record_usage_with_guard`; it keeps custom
+    /// requests in the dedicated usage bucket while sharing the same Token
+    /// reservation lifecycle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_custom_with_guard(
+        &self,
+        guard: &mut InflightGuard,
+        model: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        settle: bool,
+    ) {
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        usage.record_in(
+            usage::UsageBucket::Custom,
+            model,
+            "custom",
+            key_id,
+            ok,
+            is_stream,
+            duration_ms,
+            prompt_tokens,
+            completion_tokens,
+        );
+        usage::save(&self.data_dir, &usage);
+        if guard.has_token_reservation() {
+            guard.observe_token_usage(prompt_tokens, completion_tokens);
+            if settle {
+                guard.settle_token_usage(&usage::key_quota_day());
+            }
+        } else {
+            api_keys::record_token_usage_locked(
+                &self.data_dir,
+                key_id,
+                &usage::key_quota_day(),
+                prompt_tokens,
+                completion_tokens,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_usage_stats(
+        &self,
+        is_wb: bool,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
         {
             let mut guard = self
                 .usage
@@ -180,13 +298,6 @@ impl ApiSharedState {
             );
             usage::save(&self.data_dir, &guard);
         }
-        api_keys::record_token_usage_locked(
-            &self.data_dir,
-            key_id,
-            &usage::today_key(),
-            prompt_tokens,
-            completion_tokens,
-        );
     }
 
     /// 记录一次自定义模型请求用量（独立 custom_days 桶，与 Trae/WB 侧分账）；
@@ -214,7 +325,7 @@ impl ApiSharedState {
         api_keys::record_token_usage_locked(
             &self.data_dir,
             key_id,
-            &usage::today_key(),
+            &usage::key_quota_day(),
             prompt_tokens,
             completion_tokens,
         );
@@ -227,6 +338,9 @@ impl ApiSharedState {
 pub struct InflightGuard {
     counter: Arc<AtomicU64>,
     permit: Option<limits::Permit>,
+    token_reservation: Option<api_keys::TokenReservationLease>,
+    observed_prompt_tokens: u64,
+    observed_completion_tokens: u64,
 }
 
 impl InflightGuard {
@@ -235,6 +349,9 @@ impl InflightGuard {
         InflightGuard {
             counter: counter.clone(),
             permit: None,
+            token_reservation: None,
+            observed_prompt_tokens: 0,
+            observed_completion_tokens: 0,
         }
     }
 
@@ -246,12 +363,58 @@ impl InflightGuard {
         InflightGuard {
             counter: counter.clone(),
             permit: Some(permit),
+            token_reservation: None,
+            observed_prompt_tokens: 0,
+            observed_completion_tokens: 0,
+        }
+    }
+
+    pub fn acquire_with_permit_and_reservation(
+        counter: &Arc<AtomicU64>,
+        permit: limits::Permit,
+        token_reservation: Option<api_keys::TokenReservationLease>,
+    ) -> InflightGuard {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        InflightGuard {
+            counter: counter.clone(),
+            permit: Some(permit),
+            token_reservation,
+            observed_prompt_tokens: 0,
+            observed_completion_tokens: 0,
+        }
+    }
+
+    fn has_token_reservation(&self) -> bool {
+        self.token_reservation.is_some()
+    }
+
+    fn observe_token_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+        self.observed_prompt_tokens = self.observed_prompt_tokens.saturating_add(prompt_tokens);
+        self.observed_completion_tokens = self
+            .observed_completion_tokens
+            .saturating_add(completion_tokens);
+    }
+
+    fn settle_token_usage(&mut self, today: &str) {
+        if self.observed_prompt_tokens == 0 && self.observed_completion_tokens == 0 {
+            return;
+        }
+        if let Some(lease) = self.token_reservation.take() {
+            api_keys::settle_token_reservation(
+                &lease,
+                today,
+                self.observed_prompt_tokens,
+                self.observed_completion_tokens,
+            );
         }
     }
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
+        if let Some(lease) = self.token_reservation.take() {
+            api_keys::release_token_reservation(&lease);
+        }
         self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -434,6 +597,42 @@ mod error_classification_tests {
 mod inflight_tests {
     use super::*;
 
+    fn reservation_test_state(dir: &std::path::Path) -> ApiSharedState {
+        ApiSharedState {
+            core: None,
+            pool: pool::ApiPool::new(),
+            wb_pool: pool::ApiPool::new(),
+            wb_enabled: std::sync::atomic::AtomicBool::new(true),
+            wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+            wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+            wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+            wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_sticky: wb_sticky::StickyStore::default(),
+            pool_sticky: Mutex::new(std::collections::HashMap::new()),
+            model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+            default_model: String::new(),
+            data_dir: dir.to_path_buf(),
+            video_payloads: video_payload::VideoPayloadStore::new(dir),
+            cors_origins: String::new(),
+            total_requests: AtomicU64::new(0),
+            inflight: Arc::new(AtomicU64::new(0)),
+            limiter: limits::RateLimiter::with_config(limits::LimitConfig {
+                max_inflight: 2,
+                max_video_jobs: 1,
+                asset_uploads_per_minute: 10,
+                asset_bytes_per_hour: 1024,
+                video_submissions_per_minute: 10,
+            }),
+            active_uid: Mutex::new(None),
+            last_error: Mutex::new(None),
+            logger: ApiLogger::new(dir.join("logs")),
+            debug_enabled: std::sync::atomic::AtomicBool::new(false),
+            usage: Mutex::new(usage::UsageFile::default()),
+            wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        }
+    }
+
     /// 正常路径：acquire/drop 配对，计数归零
     #[test]
     fn t01_guard_drop_decrements() {
@@ -500,5 +699,153 @@ mod inflight_tests {
         }
         assert_eq!(state.inflight.load(std::sync::atomic::Ordering::Relaxed), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t04_guard_settles_known_token_usage_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_token_guard_settle-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut key = api_keys::ApiKeyEntry {
+            id: "settle-key".into(),
+            name: "settle-key".into(),
+            key: "settle-secret".into(),
+            enabled: true,
+            daily_limit: 0,
+            created_at: 0,
+            used_date: String::new(),
+            used_today: 0,
+            allowed_accounts: Vec::new(),
+            schedule_mode: String::new(),
+            dedicated_account: String::new(),
+            daily_stats: Vec::new(),
+            token_reservations: Vec::new(),
+            limits: api_keys::KeyLimits::default(),
+            capabilities: vec![api_keys::CAPABILITY_CHAT.into()],
+        };
+        key.limits.daily_tokens = 10;
+        api_keys::save(
+            &dir,
+            &api_keys::ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+        let state = reservation_test_state(&dir);
+        let limits = api_keys::KeyLimits {
+            max_inflight: Some(2),
+            daily_tokens: 10,
+            ..api_keys::KeyLimits::default()
+        };
+        let permit = state.acquire_request("settle-key", &limits).unwrap();
+        let lease = api_keys::reserve_token_quota(
+            &dir,
+            "settle-key",
+            &usage::key_quota_day(),
+            limits.daily_tokens,
+        )
+        .unwrap()
+        .unwrap();
+        let mut guard = state.inflight_guard_with_permit_and_reservation(permit, Some(lease));
+
+        state.record_usage_with_guard(
+            &mut guard,
+            false,
+            "model",
+            "uid",
+            "settle-key",
+            true,
+            false,
+            1,
+            3,
+            4,
+            true,
+        );
+        drop(guard);
+
+        let loaded = api_keys::load(&dir);
+        let entry = &loaded.keys[0];
+        assert!(entry.token_reservations.is_empty());
+        assert_eq!(entry.daily_stats[0].prompt_tokens, 3);
+        assert_eq!(entry.daily_stats[0].completion_tokens, 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn t05_guard_drop_releases_unknown_token_usage() {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_token_guard_release-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut key = api_keys::ApiKeyEntry {
+            id: "release-key".into(),
+            name: "release-key".into(),
+            key: "release-secret".into(),
+            enabled: true,
+            daily_limit: 0,
+            created_at: 0,
+            used_date: String::new(),
+            used_today: 0,
+            allowed_accounts: Vec::new(),
+            schedule_mode: String::new(),
+            dedicated_account: String::new(),
+            daily_stats: Vec::new(),
+            token_reservations: Vec::new(),
+            limits: api_keys::KeyLimits::default(),
+            capabilities: vec![api_keys::CAPABILITY_CHAT.into()],
+        };
+        key.limits.daily_tokens = 10;
+        api_keys::save(
+            &dir,
+            &api_keys::ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+        let state = reservation_test_state(&dir);
+        let limits = api_keys::KeyLimits {
+            max_inflight: Some(2),
+            daily_tokens: 10,
+            ..api_keys::KeyLimits::default()
+        };
+        let permit = state.acquire_request("release-key", &limits).unwrap();
+        let lease = api_keys::reserve_token_quota(
+            &dir,
+            "release-key",
+            &usage::key_quota_day(),
+            limits.daily_tokens,
+        )
+        .unwrap()
+        .unwrap();
+        let mut guard = state.inflight_guard_with_permit_and_reservation(permit, Some(lease));
+        state.record_usage_with_guard(
+            &mut guard,
+            false,
+            "model",
+            "uid",
+            "release-key",
+            false,
+            false,
+            1,
+            0,
+            0,
+            false,
+        );
+        drop(guard);
+
+        let next = api_keys::reserve_token_quota(
+            &dir,
+            "release-key",
+            &usage::key_quota_day(),
+            limits.daily_tokens,
+        )
+        .unwrap()
+        .unwrap();
+        api_keys::release_token_reservation(&next);
+        assert!(api_keys::load(&dir).keys[0].token_reservations.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

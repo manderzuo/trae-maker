@@ -109,3 +109,66 @@ cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo
 1. 在完成按 Key reservation/settlement 前，daily token quota 只能视为非原子软检查，不能承诺严格上限或严格 429。
 2. 完成 snapshot 改造时必须覆盖 `routes.rs`、`wb_route.rs` 等所有 legacy 入口，不能只改一个 helper。
 3. 下一轮若实现严格 reservation，应明确未知 usage 的释放/结算语义，并补并发、失败、未知 usage 和跨 UTC 日边界测试。
+
+---
+
+# Task 3 修复轮次 2：A2.1 legacy 文字 Token reservation 接入
+
+日期：2026-09-20
+范围：legacy chat/completions、responses、messages、Anthropic/OpenAI Text、WB/custom 文字请求的 Token reservation 生命周期
+状态：完成（A2.1）
+
+## 实现
+
+- `routes.rs` 新增文字专用 guard：先取得普通 request permit，再按当前 `KeyLimits.daily_tokens` 调用 `reserve_token_quota`；reservation 失败返回既有 `quota_exceeded` 429，并显式释放 request permit。anonymous 与 `daily_tokens=0` 不创建 reservation；视频/assets 仍使用原 request guard。
+- Trae、WB、custom 文字成功路径统一通过 `record_usage_with_guard`（custom 使用对应变体）提交已知 token 并结算；失败、未知或 0 usage 保持由 `InflightGuard::Drop` 释放 reservation。
+- 新增并发 reservation、guard 成功结算、失败释放、quota rejection 释放 permit，以及 anonymous/无限额度不建 reservation 的 focused 测试。
+- 修正 routes 测试中对当前 `require_legacy_capability`、`chat_completions` 生产签名的调用点；不改视频、Core 或 Chat 计数生产逻辑。
+
+## focused 测试
+
+以下命令均使用 `D:\gpt\aiwork-key-limits-cargo-target`、`C:\Users\StarLink\.cargo`、Rust toolchain PATH 和 `--offline`，每次只使用一个 Cargo 过滤器：
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml legacy_text_quota_rejection_releases_the_request_permit --offline
+```
+
+结果：通过，1 passed，0 failed。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml legacy_handlers_use_the_persisted_policy_without_defaulting_authenticated_keys --offline
+```
+
+结果：通过，1 passed，0 failed。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml legacy_text_guard_skips_reservation_for_anonymous_and_unlimited_keys --offline
+```
+
+结果：通过，1 passed，0 failed。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml concurrent_token_reservations_allow_only_one_request_for_remaining_budget --offline
+```
+
+结果：通过，1 passed，0 failed。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml t04_guard_settles_known_token_usage_once --offline
+```
+
+结果：通过，1 passed，0 failed。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml t05_guard_drop_releases_unknown_token_usage --offline
+```
+
+结果：通过，1 passed，0 failed。
+
+`cargo check --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --offline` 通过。格式检查未执行：当前 toolchain 未安装 rustfmt。
+
+## Concern
+
+`chat_completions_counts_one_authenticated_request_without_duplicate_increment` 的调用点已按当前 handler 签名修正，但单独运行时仍断言失败（实际计数为 0）；该测试对应 Chat 计数子任务，按本轮边界未修改生产计数逻辑。
+
+除已有 Rust unused/dead-code 和 Windows linker PDB/default-library 警告外，A2.1 focused 测试无失败。

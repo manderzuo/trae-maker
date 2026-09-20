@@ -138,7 +138,7 @@ pub fn custom_stream_chat(
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::task::spawn_blocking(move || {
-        let _inflight = guard; // 随后台任务存续至流结束（§4.5）
+        let mut guard = guard; // 随后台任务存续至流结束（§4.5）
         let chat_id = chat_id_for(proto);
 
         // SSE keep-alive 15s：防中间层回收长流（与 WB/solo 路径同策略）
@@ -172,13 +172,18 @@ pub fn custom_stream_chat(
                     let (error_info, sent_any, up_usage) =
                         wb_sse::stream_forward(lines, &tx, proto, &chat_id, &model);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    {
-                        let (pt, ct) = up_usage.as_ref().map(usage_pair).unwrap_or((0, 0));
-                        state.record_usage_custom(
-                            &model, &key_id, error_info.is_none(), true,
-                            duration_ms, pt, ct,
-                        );
-                    }
+                    let (pt, ct) = up_usage.as_ref().map(usage_pair).unwrap_or((0, 0));
+                    state.record_usage_custom_with_guard(
+                        &mut guard,
+                        &model,
+                        &key_id,
+                        error_info.is_none(),
+                        true,
+                        duration_ms,
+                        pt,
+                        ct,
+                        error_info.is_none(),
+                    );
                     if let Some((code, msg)) = error_info {
                         if !sent_any {
                             send_stream_error(&tx, proto, code, &msg);
@@ -198,7 +203,17 @@ pub fn custom_stream_chat(
                 Err(()) => {
                     // 首字超时（F-34 语义）：10s 内上游未产出任何字节
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_custom(&model, &key_id, false, true, duration_ms, 0, 0);
+                    state.record_usage_custom_with_guard(
+                        &mut guard,
+                        &model,
+                        &key_id,
+                        false,
+                        true,
+                        duration_ms,
+                        0,
+                        0,
+                        false,
+                    );
                     state.logger.log_request(
                         "custom", "POST", proto.log_path(), &model, true, 504, "custom",
                         duration_ms, Some("first byte timeout"),
@@ -208,7 +223,17 @@ pub fn custom_stream_chat(
             },
             Err((status, resp_body)) => {
                 let duration_ms = start_ts.elapsed().as_millis() as u64;
-                state.record_usage_custom(&model, &key_id, false, true, duration_ms, 0, 0);
+                state.record_usage_custom_with_guard(
+                    &mut guard,
+                    &model,
+                    &key_id,
+                    false,
+                    true,
+                    duration_ms,
+                    0,
+                    0,
+                    false,
+                );
                 let preview: String = resp_body.chars().take(200).collect();
                 set_last_error(&state, format!("custom model={} status={} body={}", model, status, preview));
                 state.logger.log_request(
@@ -253,13 +278,23 @@ pub async fn custom_aggregate_chat(
     // 闭包 move 后外层协议转换仍需模型名，提前克隆
     let model_outer = model.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let _inflight = guard; // 随聚合完成释放（§4.5）
+        let mut guard = guard; // 随聚合完成释放（§4.5）
         let prepared = prep_body(&body_vec, &cm);
         let reader = match make_custom_request(&cm, &prepared) {
             Ok(r) => r,
             Err((status, resp_body)) => {
                 let duration_ms = start_ts.elapsed().as_millis() as u64;
-                state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                state.record_usage_custom_with_guard(
+                    &mut guard,
+                    &model,
+                    &key_id,
+                    false,
+                    stream,
+                    duration_ms,
+                    0,
+                    0,
+                    false,
+                );
                 let preview: String = resp_body.chars().take(200).collect();
                 set_last_error(&state, format!("custom model={} status={} body={}", model, status, preview));
                 state.logger.log_request(
@@ -273,7 +308,17 @@ pub async fn custom_aggregate_chat(
             Ok(l) => l,
             Err(()) => {
                 let duration_ms = start_ts.elapsed().as_millis() as u64;
-                state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                state.record_usage_custom_with_guard(
+                    &mut guard,
+                    &model,
+                    &key_id,
+                    false,
+                    stream,
+                    duration_ms,
+                    0,
+                    0,
+                    false,
+                );
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 504, "custom",
                     duration_ms, Some("first byte timeout"),
@@ -287,14 +332,34 @@ pub async fn custom_aggregate_chat(
             (Some(mut r), None) => {
                 r["model"] = json!(model);
                 let (pt, ct) = r.get("usage").map(usage_pair).unwrap_or((0, 0));
-                state.record_usage_custom(&model, &key_id, true, stream, duration_ms, pt, ct);
+                state.record_usage_custom_with_guard(
+                    &mut guard,
+                    &model,
+                    &key_id,
+                    true,
+                    stream,
+                    duration_ms,
+                    pt,
+                    ct,
+                    true,
+                );
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 200, "custom", duration_ms, None,
                 );
                 Ok(r)
             }
             (None, Some((code, msg))) => {
-                state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                state.record_usage_custom_with_guard(
+                    &mut guard,
+                    &model,
+                    &key_id,
+                    false,
+                    stream,
+                    duration_ms,
+                    0,
+                    0,
+                    false,
+                );
                 set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 200, "custom",
@@ -303,7 +368,17 @@ pub async fn custom_aggregate_chat(
                 Err(msg)
             }
             _ => {
-                state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                state.record_usage_custom_with_guard(
+                    &mut guard,
+                    &model,
+                    &key_id,
+                    false,
+                    stream,
+                    duration_ms,
+                    0,
+                    0,
+                    false,
+                );
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 502, "custom",
                     duration_ms, Some("empty response"),
