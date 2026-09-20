@@ -21,6 +21,7 @@ import BuddyCheckin from './pages/buddy/BuddyCheckin';
 import BuddyCredits from './pages/buddy/BuddyCredits';
 import BuddyApiService from './pages/buddy/BuddyApiService';
 import BuddySettings from './pages/buddy/BuddySettings';
+import CoreConsole from './pages/CoreConsole';
 import ApiManagerModal from './components/api/ApiManagerModal';
 
 function renderView(view: string) {
@@ -39,6 +40,8 @@ function renderView(view: string) {
       return <ApiService />;
     case 'settings':
       return <Settings />;
+    case 'core-console':
+      return <CoreConsole />;
     case 'doubao-overview':
       return <DoubaoOverview />;
     case 'doubao-accounts':

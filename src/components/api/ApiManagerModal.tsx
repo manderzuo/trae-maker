@@ -34,6 +34,7 @@ const TABS: { key: TabKey; label: string }[] = [
 export default function ApiManagerModal() {
   const open = useAppStore((s) => s.showApiManager);
   const setOpen = useAppStore((s) => s.setShowApiManager);
+  const setView = useAppStore((s) => s.setView);
   const activeApp = useAppStore((s) => s.activeApp);
   const [tab, setTab] = useState<TabKey>('overview');
   // 子弹框打开期间屏蔽主弹窗 ESC 关闭：Modal 的 keydown 监听按挂载序触发，
@@ -90,7 +91,15 @@ export default function ApiManagerModal() {
           <ApiKeysManager onSubModalChange={(v) => { subOpenRef.current = v; }} />
         )}
         {tab === 'core' && (
-          <CoreAdminPanel onSubModalChange={(v) => { subOpenRef.current = v; }} />
+          <>
+            <button
+              className="mb-3 btn-secondary"
+              onClick={() => { setOpen(false); setView('core-console'); }}
+            >
+              进入独立 CORE 管理工作台
+            </button>
+            <CoreAdminPanel onSubModalChange={(v) => { subOpenRef.current = v; }} />
+          </>
         )}
         {tab === 'usage' && <UsageStatsPanel />}
         {tab === 'custom' && (

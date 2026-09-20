@@ -8,6 +8,7 @@ export type ViewKey =
   | 'credits'
   | 'logs'
   | 'api-service'
+  | 'core-console'
   | 'settings'
   // 豆包应用页面（侧边栏应用切换 Tab → 豆包）
   | 'doubao-overview'
@@ -591,6 +592,27 @@ export interface CoreKeyQuotaBalanceResponse {
   enabled: boolean;
   migration_state: 'ready' | 'legacy_unassigned' | 'reconcile_required' | string;
   key_quota_configured: boolean;
+}
+
+export interface CoreMigrationMapping {
+  legacy_key_id: string;
+  user_id: string;
+}
+
+export interface CoreMigrationReport {
+  source_hashes: Record<string, string>;
+  key_count: number;
+  unmapped_keys: string[];
+  asset_count: number;
+  video_count: number;
+  processing_video_count: number;
+  cached_credit_count: number;
+  errors: string[];
+}
+
+export interface CoreMigrationApplyResponse {
+  report: CoreMigrationReport;
+  issued_keys: CoreIssuedApiKeyResponse[];
 }
 
 export interface ConversationSummary {

@@ -84,6 +84,9 @@ import type {
   CoreApiKeyAdminView,
   CoreIssuedApiKeyResponse,
   CoreKeyQuotaBalanceResponse,
+  CoreMigrationApplyResponse,
+  CoreMigrationMapping,
+  CoreMigrationReport,
   CoreQuotaBalanceResponse,
   CoreSchedulerStatus,
   CoreStatus,
@@ -267,6 +270,12 @@ export const api = {
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
   core: {
     status: () => invoke<CoreStatus>('core_status'),
+    migrationInspect: () => invoke<CoreMigrationReport>('core_migration_inspect'),
+    migrationApply: (adminApiKey: string, mappings: CoreMigrationMapping[]) =>
+      invoke<CoreMigrationApplyResponse>('core_migration_apply', {
+        adminApiKey,
+        mappings,
+      }),
     schedulerStatus: (adminApiKey: string) =>
       invoke<CoreSchedulerStatus>('scheduler_status_for_admin', { schedulerAdminKey: adminApiKey }),
     usersList: (adminApiKey: string) =>

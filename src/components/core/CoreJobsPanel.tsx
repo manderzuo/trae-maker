@@ -1,0 +1,11 @@
+import { useMemo, useState } from 'react';
+import { RefreshCw } from 'lucide-react';
+import { Badge } from '../ui';
+import type { CoreVideoJobAdminView } from '../../types';
+import { coreJobTone } from './coreModel';
+
+export default function CoreJobsPanel({ jobs, onRefresh }: { jobs: CoreVideoJobAdminView[]; onRefresh: () => void }) {
+  const [filter, setFilter] = useState('');
+  const visible = useMemo(() => jobs.filter((job) => !filter || job.state === filter), [filter, jobs]);
+  return <div className="space-y-3"><div className="flex flex-wrap items-center gap-2"><select className="input max-w-xs" value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">全部状态</option><option value="queued">queued</option><option value="running">running</option><option value="succeeded">succeeded</option><option value="failed">failed</option><option value="unknown">unknown</option></select><button className="btn-secondary flex items-center gap-2" onClick={onRefresh}><RefreshCw size={14} />刷新任务</button></div><div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-zinc-800"><table className="w-full min-w-[900px] text-left text-xs"><thead className="bg-slate-50 dark:bg-zinc-900"><tr><th className="p-3">任务 ID</th><th className="p-3">用户 / 模型</th><th className="p-3">状态</th><th className="p-3">租约</th><th className="p-3">额度</th><th className="p-3">操作</th></tr></thead><tbody>{visible.map((job) => <tr key={job.id} className="border-t border-slate-100 dark:border-zinc-800"><td className="p-3 font-mono">{job.id}</td><td className="p-3">{job.user_id}<div className="text-slate-400">{job.model}</div></td><td className="p-3"><Badge tone={coreJobTone(job.state)}>{job.state}</Badge>{job.reconcile_required && <Badge className="ml-1" tone="amber">待对账</Badge>}</td><td className="p-3">{job.lease_state ?? '—'}<div className="text-slate-400">{job.upstream_request_ref_present ? '已绑定引用' : '无上游引用'}</div></td><td className="p-3">{job.quota_amount ?? '—'} · {job.quota_state ?? '—'}</td><td className="p-3">{job.state === 'unknown' || job.reconcile_required ? <span className="text-amber-600">禁止重放</span> : <span className="text-slate-400">只读</span>}</td></tr>)}</tbody></table></div></div>;
+}

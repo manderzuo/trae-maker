@@ -13,6 +13,7 @@ import {
   Sparkles,
   Bot,
   LayoutGrid,
+  Database,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
@@ -138,6 +139,14 @@ export default function Sidebar({
       </div>
       <div className="flex items-center justify-center gap-1 border-t border-slate-200 p-3 dark:border-zinc-800">
         {/* API 管理入口（统一网关 §5.1，原 Github 图标位置） */}
+        <button
+          onClick={() => { useAppStore.getState().setShowApiManager(false); onNav('core-console'); }}
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+          aria-label="CORE 管理"
+          title="CORE 管理工作台"
+        >
+          <Database size={17} />
+        </button>
         <button
           onClick={() => setShowApiManager(true)}
           className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
