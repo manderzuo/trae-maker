@@ -1,0 +1,111 @@
+# Task 3 修复轮次 1：子任务 A 收尾报告
+
+日期：2026-09-20  
+范围：额度日期、认证策略快照、文字请求额度一致性  
+状态：未完成（保留已有改动，停止继续扩展）
+
+## 结论
+
+本轮保留工作区中已有的 UTC 日期切换、认证阶段 `ResolvedKey` 注入，以及 Key 额度记录入口的 UTC 日期改动；未继续实现 token reservation/settlement、legacy handler 快照消费、统一 quota 错误和 Chat Completions 计数修复。因此不能把子任务 A 标记为完成，也没有声称严格 429 上限。
+
+没有修改视频幂等、视频 permit 或 Core 并发逻辑。工作区已有的相关改动保持原样，未作 reset、checkout 或 clean。
+
+## 按审查发现逐条映射
+
+### 1. Key Token quota 日期必须使用 UTC（审查发现 2）
+
+状态：部分完成，已有改动保留。
+
+- `src-tauri/src/api_server/usage.rs:225` 的 `today_key()` 继续保留本地日期语义，供旧报表/历史展示使用。
+- `src-tauri/src/api_server/usage.rs:230` 新增 `key_quota_day()`，使用 UTC 日期作为 Key quota 统计日期。
+- `src-tauri/src/api_server/auth.rs:108`、`src-tauri/src/api_server/mod.rs:193`、`src-tauri/src/api_server/mod.rs:224` 已切换到 `key_quota_day()`。
+- 现有 UTC focused 测试通过，但测试是“当前 UTC 时间对当前 UTC 时间”的比较，没有固定时钟覆盖跨本地日/UTC 日边界；这是后续仍应补强的测试 concern。
+
+### 2. 认证产生的 policy snapshot 必须被 legacy handler 使用（审查发现 7）
+
+状态：未完成；这是明确的源码错误。
+
+- `src-tauri/src/api_server/auth.rs:120-123` 已把认证得到的 `ResolvedKey` 放入 request extensions，这部分改动保留。
+- `src-tauri/src/api_server/routes.rs:121-145` 的 `legacy_policy`/`require_legacy_capability` 仍按 `key_id` 调用 `api_keys::constraints_for` 重新读文件；找不到时回退 `KeyLimits::default()`。
+- 另外仍有重新读取入口：`src-tauri/src/api_server/routes.rs:2817`，以及 `src-tauri/src/api_server/wb_route.rs:227`、`473`、`754`。
+
+这意味着认证成功后的策略快照可能被文件重读、删除或改坏的结果覆盖，且可能错误回退默认限额。
+
+### 3. Token quota 检查、计数、结算必须一致（审查发现 4）
+
+状态：未完成；这是明确的源码错误。
+
+- `src-tauri/src/api_server/api_keys.rs:292` 的 `quota_left` 只检查已持久化的完成 token 统计，没有 pending reservation。
+- `src-tauri/src/api_server/api_keys.rs:385-430` 的请求消耗与 `src-tauri/src/api_server/api_keys.rs:496-514` 的 token 记录是分离操作。
+- `src-tauri/src/api_server/mod.rs:171-224` 仍直接把 usage 写入统计，当前没有按 Key 的 reservation/settlement 状态或失败回收路径。
+
+因此并发请求可能同时通过 daily token 检查并越过上限。未知 usage 当前没有伪造为已知 token，但也没有对应的 reservation 生命周期；在失败/未知路径上无法证明 reservation 不泄漏。由于本轮没有实现该机制，代码也没有把它描述成严格上限。
+
+### 4. quota 错误字段/消息和 Chat Completions 一次计数（审查发现 8、9）
+
+状态：未完成；以下是明确源码错误位置。
+
+- `src-tauri/src/api_server/auth.rs:268-280` 的 `quota_exceeded` 使用 `type: "quota_exceeded"`、`code: "daily_quota_exceeded"`，消息固定写“次数/日”，不能准确表达 token quota，也没有与其他 quota 路径统一字段/消息。
+- `src-tauri/src/api_server/routes.rs:928` 的 `chat_completions` 当前没有与其他文字 handler 对等的 `state.total_requests.fetch_add(1, ...)`；该处理会漏记请求，而不是保证一次请求一次计数。
+
+本轮没有继续改动这些位置，因此不宣称 quota 错误或文字请求计数已经修复。
+
+## RED / GREEN 记录
+
+### RED（回归测试草稿，随后按收尾要求移除）
+
+使用离线依赖、独立 Cargo target 和单一测试过滤器运行：
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml token_quota_reservation_blocks_a_second_inflight_request --offline
+```
+
+结果：预期编译失败。草稿测试要求尚不存在的 `reserved_tokens`、`settle_token_reservation_locked`、固定 UTC 日期 helper，以及 legacy snapshot 参数；因此证明当前源码尚未具备 reservation/settlement 和 snapshot 消费实现。草稿测试已移除，没有把不可编译测试留在工作区。
+
+### GREEN（现有 focused 回归）
+
+以下每次均使用 `D:\gpt\aiwork-key-limits-cargo-target`、`C:\Users\StarLink\.cargo`、Rust toolchain bin PATH 和 `--offline`，每次只有一个测试过滤器：
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml key_quota_day_uses_utc_date --offline
+```
+
+结果：通过，1 passed，0 failed。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml daily_token_quota_blocks_after_recorded_usage_reaches_limit --offline
+```
+
+结果：通过，1 passed，0 failed。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml quota_blocks_at_limit_and_resets_next_day --offline
+```
+
+结果：通过，1 passed，0 failed。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml locked_verify_skips_write_when_unchanged --offline
+```
+
+结果：通过，1 passed，0 failed。
+
+测试过程只有已有的 Rust unused/dead-code 警告和 Windows linker PDB/default-library 警告，没有测试失败；没有在 C: 写持续测试输出，也没有输出 Key 明文。
+
+## 文件理由与变更边界
+
+- `src-tauri/src/api_server/usage.rs`：保留 UTC quota 日期 helper，同时保留旧报表本地日期 helper；已有 focused UTC 测试通过。
+- `src-tauri/src/api_server/auth.rs`：保留认证阶段 `ResolvedKey` 注入和 UTC quota 日期调用；quota 错误统一尚未完成，错误位置已列出。
+- `src-tauri/src/api_server/mod.rs`：保留 usage 记录入口使用 UTC quota 日期；reservation/settlement 尚未实现。
+- `src-tauri/src/api_server/api_keys.rs`：本轮没有新增生产改动；现有非原子 quota 路径是待修复错误位置。
+- `src-tauri/src/api_server/routes.rs`、`wb_route.rs`：本轮没有继续扩展；现有 handler 重读策略和 Chat Completions 漏计数是待修复错误位置。
+
+## Git 状态
+
+没有提交本轮未完成的生产实现；本次只提交这份报告（docs-only commit）。工作区其他既有修改均未清理、未回退、未混入本子任务提交。
+
+## Concerns
+
+1. 在完成按 Key reservation/settlement 前，daily token quota 只能视为非原子软检查，不能承诺严格上限或严格 429。
+2. 完成 snapshot 改造时必须覆盖 `routes.rs`、`wb_route.rs` 等所有 legacy 入口，不能只改一个 helper。
+3. 下一轮若实现严格 reservation，应明确未知 usage 的释放/结算语义，并补并发、失败、未知 usage 和跨 UTC 日边界测试。
