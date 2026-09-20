@@ -10,6 +10,9 @@ import type {
   ApiKeyEntry,
   CcSwitchStatus,
   ApiKeysFileView,
+  BridgeKeyStatusView,
+  IssuedBridgeKeyView,
+  ApiKeyRuntimeUsage,
   AppLocate,
   CheckinDone,
   CheckinOpts,
@@ -661,9 +664,14 @@ export const api = {
     metaClear: (model: string) => invoke<boolean>('trae_model_meta_clear', { model }),
     // T2：多 API Key 管理（统一列表，无主/子之分）
     keysList: () => invoke<ApiKeysFileView>('api_keys_list'),
+    keysUsage: () => invoke<ApiKeyRuntimeUsage[]>('api_keys_usage'),
     // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）
     keysSave: (keys: ApiKeyEntry[], authDisabled?: boolean) =>
       invoke('api_keys_save', { keys, authDisabled: authDisabled ?? null }),
+    bridgeKeyStatus: () => invoke<BridgeKeyStatusView>('bridge_key_status'),
+    bridgeKeyIssue: (name?: string) =>
+      invoke<IssuedBridgeKeyView>('bridge_key_issue', { name: name ?? null }),
+    bridgeKeyRevoke: () => invoke<boolean>('bridge_key_revoke'),
   },
   traeRelay: {
     /** 读取 Trae 最近项目并落盘不含凭证的接力包 */

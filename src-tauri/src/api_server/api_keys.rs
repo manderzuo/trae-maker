@@ -78,6 +78,49 @@ pub const CAPABILITY_CHAT: &str = "chat";
 pub const CAPABILITY_VIDEO: &str = "video";
 pub const CAPABILITY_ASSETS: &str = "assets";
 
+/// AI Work 在独立分流模式下只允许 Core 使用的桥接凭据类别。
+/// 旧 `api_keys.json` 不增加字段，类别通过旁车策略文件兼容标记，避免破坏旧 Key。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BridgeKeyKind {
+    Legacy,
+    Bridge,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct BridgePolicy {
+    #[serde(default)]
+    pub bridge_only: bool,
+    #[serde(default)]
+    pub active_key_id: Option<String>,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BridgeKeyStatus {
+    pub kind: BridgeKeyKindView,
+    pub id: String,
+    pub enabled: bool,
+    pub revoked: bool,
+    pub created_at: u64,
+    pub key_prefix: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeKeyKindView {
+    Legacy,
+    Bridge,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct IssuedBridgeKey {
+    pub id: String,
+    pub plaintext: String,
+    pub created_at: u64,
+    pub previous_key_id: Option<String>,
+}
+
 const ALL_CAPABILITIES: [&str; 3] = [CAPABILITY_CHAT, CAPABILITY_VIDEO, CAPABILITY_ASSETS];
 
 /// 与全局网关限流器保持一致的 Key 级安全上限。
@@ -190,7 +233,7 @@ struct KeyLimitsWire {
     video_submissions_per_minute: Option<usize>,
     #[serde(default)]
     daily_requests: u64,
-    #[serde(default)]
+    #[serde(default, alias = "daily_token_limit")]
     daily_tokens: u64,
 }
 
@@ -331,8 +374,16 @@ fn quota_left(e: &mut ApiKeyEntry, today: &str) -> Result<(), (u64, QuotaKind)> 
         e.used_date = today.to_string();
         e.used_today = 0;
     }
-    if e.daily_limit > 0 && e.used_today >= e.daily_limit {
-        return Err((e.daily_limit, QuotaKind::Requests));
+    // `daily_limit` remains the persisted legacy field.  The newer policy
+    // field is accepted as an override so policy edits take effect without
+    // invalidating older api_keys.json files.
+    let daily_request_limit = if e.limits.daily_requests > 0 {
+        e.limits.daily_requests
+    } else {
+        e.daily_limit
+    };
+    if daily_request_limit > 0 && e.used_today >= daily_request_limit {
+        return Err((daily_request_limit, QuotaKind::Requests));
     }
     if e.limits.daily_tokens > 0 {
         let used_tokens = e
@@ -551,6 +602,123 @@ pub fn save(data_dir: &Path, f: &ApiKeysFile) {
     let _ = fs_utils::write_json(&keys_path(data_dir), &normalized);
 }
 
+fn bridge_policy_path(data_dir: &Path) -> PathBuf {
+    let dir = data_dir.join("data");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("bridge_policy.json")
+}
+
+pub fn load_bridge_policy(data_dir: &Path) -> BridgePolicy {
+    fs_utils::read_json(&bridge_policy_path(data_dir))
+}
+
+fn save_bridge_policy(data_dir: &Path, policy: &BridgePolicy) {
+    let _ = fs_utils::write_json(&bridge_policy_path(data_dir), policy);
+}
+
+pub fn bridge_only(data_dir: &Path) -> bool {
+    load_bridge_policy(data_dir).bridge_only
+}
+
+pub fn set_bridge_only(data_dir: &Path, enabled: bool) {
+    let mut policy = load_bridge_policy(data_dir);
+    policy.bridge_only = enabled;
+    policy.updated_at = chrono::Utc::now().timestamp() as u64;
+    save_bridge_policy(data_dir, &policy);
+}
+
+pub fn bridge_key_kind(data_dir: &Path, key_id: &str) -> BridgeKeyKind {
+    let policy = load_bridge_policy(data_dir);
+    if policy.active_key_id.as_deref() == Some(key_id) {
+        BridgeKeyKind::Bridge
+    } else {
+        BridgeKeyKind::Legacy
+    }
+}
+
+pub fn is_active_bridge_key_id(data_dir: &Path, key_id: &str) -> bool {
+    load_bridge_policy(data_dir).active_key_id.as_deref() == Some(key_id)
+}
+
+fn key_prefix(key: &str) -> String {
+    key.chars().take(12).collect::<String>()
+}
+
+/// 轮换桥接 Key：旧桥接 Key 立即禁用，任何时刻最多一个启用的桥接 Key。
+pub fn issue_bridge_key(data_dir: &Path, name: &str) -> Result<IssuedBridgeKey, String> {
+    let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = load(data_dir);
+    let mut policy = load_bridge_policy(data_dir);
+    let previous_key_id = policy.active_key_id.clone();
+    if let Some(previous) = previous_key_id.as_deref() {
+        if let Some(entry) = file.keys.iter_mut().find(|entry| entry.id == previous) {
+            entry.enabled = false;
+        }
+    }
+    let created_at = chrono::Utc::now().timestamp() as u64;
+    let id = format!("bridge-{:032x}", rand::random::<u128>());
+    let plaintext = format!(
+        "sk-bridge-{:032x}{:032x}",
+        rand::random::<u128>(),
+        rand::random::<u128>()
+    );
+    let entry = ApiKeyEntry {
+        id: id.clone(),
+        name: if name.trim().is_empty() { "Core 桥接 Key".to_string() } else { name.trim().to_string() },
+        key: plaintext.clone(),
+        enabled: true,
+        daily_limit: 0,
+        created_at,
+        used_date: String::new(),
+        used_today: 0,
+        allowed_accounts: Vec::new(),
+        schedule_mode: MODE_EXPIRE_FIRST.to_string(),
+        dedicated_account: String::new(),
+        daily_stats: Vec::new(),
+        token_reservations: Vec::new(),
+        limits: KeyLimits::default(),
+        capabilities: default_capabilities(),
+    };
+    file.keys.push(entry);
+    save(data_dir, &file);
+    policy.bridge_only = true;
+    policy.active_key_id = Some(id.clone());
+    policy.updated_at = created_at;
+    save_bridge_policy(data_dir, &policy);
+    Ok(IssuedBridgeKey { id, plaintext, created_at, previous_key_id })
+}
+
+pub fn active_bridge_key(data_dir: &Path) -> Option<BridgeKeyStatus> {
+    let policy = load_bridge_policy(data_dir);
+    let id = policy.active_key_id?;
+    let file = load(data_dir);
+    let entry = file.keys.iter().find(|entry| entry.id == id)?;
+    Some(BridgeKeyStatus {
+        kind: BridgeKeyKindView::Bridge,
+        id: entry.id.clone(),
+        enabled: entry.enabled,
+        revoked: !entry.enabled,
+        created_at: entry.created_at,
+        key_prefix: key_prefix(&entry.key),
+    })
+}
+
+pub fn revoke_bridge_key(data_dir: &Path) -> Result<bool, String> {
+    let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = load(data_dir);
+    let mut policy = load_bridge_policy(data_dir);
+    let Some(id) = policy.active_key_id.take() else { return Ok(false); };
+    let mut changed = false;
+    if let Some(entry) = file.keys.iter_mut().find(|entry| entry.id == id) {
+        changed = entry.enabled;
+        entry.enabled = false;
+    }
+    save(data_dir, &file);
+    policy.updated_at = chrono::Utc::now().timestamp() as u64;
+    save_bridge_policy(data_dir, &policy);
+    Ok(changed)
+}
+
 /// 进程级写锁（审查 P1-2）：api_keys.json 的「读-改-写」（verify 记账 + save）必须
 /// 原子完成，否则并发请求互相覆盖 used_today/daily_stats——配额可被穿透、统计少记。
 static KEYS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -743,6 +911,41 @@ pub fn verify_and_consume_locked_for_capability(
 }
 
 #[cfg(test)]
+mod bridge_key_tests {
+    use super::{active_bridge_key, bridge_only, issue_bridge_key, load, revoke_bridge_key};
+
+    #[test]
+    fn bridge_key_rotation_leaves_only_one_active_bridge_key() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-bridge-key-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let first = issue_bridge_key(&data_dir, "bootstrap").unwrap();
+        let second = issue_bridge_key(&data_dir, "rotate").unwrap();
+        let keys = load(&data_dir);
+        assert!(!keys.keys.iter().find(|key| key.id == first.id).unwrap().enabled);
+        assert!(keys.keys.iter().find(|key| key.id == second.id).unwrap().enabled);
+        assert_eq!(active_bridge_key(&data_dir).unwrap().id, second.id);
+        assert!(bridge_only(&data_dir));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn revoking_bridge_key_removes_active_reference() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-bridge-revoke-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        issue_bridge_key(&data_dir, "bootstrap").unwrap();
+        assert!(revoke_bridge_key(&data_dir).unwrap());
+        assert!(active_bridge_key(&data_dir).is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -832,6 +1035,39 @@ mod tests {
         assert_eq!(resolved.id, "legacy-id");
         assert_eq!(resolved.capabilities, default_capabilities());
         assert!(resolved.limits.max_video_jobs.is_none());
+    }
+
+    #[test]
+    fn daily_requests_policy_is_enforced_and_spec_token_alias_is_accepted() {
+        let mut f = ApiKeysFile {
+            keys: vec![entry("k1", "fixture-daily-policy", true, 0)],
+            auth_disabled: false,
+        };
+        f.keys[0].limits.daily_requests = 1;
+
+        assert!(matches!(
+            f.verify_and_consume("fixture-daily-policy", "2026-09-20"),
+            KeyCheck::Ok(_)
+        ));
+        assert!(matches!(
+            f.verify_and_consume("fixture-daily-policy", "2026-09-20"),
+            KeyCheck::QuotaExceeded {
+                limit: 1,
+                kind: QuotaKind::Requests
+            }
+        ));
+
+        let parsed: ApiKeysFile = serde_json::from_value(json!({
+            "keys": [{
+                "id": "token-alias",
+                "name": "token-alias",
+                "key": "fixture-token-alias",
+                "enabled": true,
+                "limits": {"daily_token_limit": 123}
+            }]
+        }))
+        .unwrap();
+        assert_eq!(parsed.keys[0].limits.daily_tokens, 123);
     }
 
     #[test]

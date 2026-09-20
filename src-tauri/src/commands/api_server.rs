@@ -856,6 +856,39 @@ pub fn api_keys_list(
     crate::api_server::api_keys::load(&state.data_dir)
 }
 
+/// 读取运行中的每个 API Key 当前并发/视频任务占用；Key 明文不出现在返回值中。
+#[derive(serde::Serialize)]
+pub struct ApiKeyRuntimeUsage {
+    pub key_id: String,
+    pub inflight: usize,
+    pub video_jobs: usize,
+}
+
+#[tauri::command]
+pub fn api_keys_usage(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Vec<ApiKeyRuntimeUsage> {
+    let limiter = safe_lock(&runtime)
+        .as_ref()
+        .map(|runtime| runtime.shared.limiter.clone());
+    crate::api_server::api_keys::load(&state.data_dir)
+        .keys
+        .into_iter()
+        .map(|key| {
+            let (inflight, video_jobs) = limiter
+                .as_ref()
+                .map(|limiter| limiter.usage_for_key(&key.id))
+                .unwrap_or((0, 0));
+            ApiKeyRuntimeUsage {
+                key_id: key.id,
+                inflight,
+                video_jobs,
+            }
+        })
+        .collect()
+}
+
 /// 保存 API Key 列表（锁内合并当前运行态 reservation，改动立即生效）。
 /// `auth_disabled` 不传时保留现值。
 #[tauri::command]
@@ -866,6 +899,52 @@ pub fn api_keys_save(
 ) -> Result<(), String> {
     crate::api_server::api_keys::save_from_admin(&state.data_dir, keys, auth_disabled);
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct BridgeKeyStatusView {
+    pub bridge_only: bool,
+    pub active: Option<crate::api_server::api_keys::BridgeKeyStatus>,
+}
+
+#[derive(serde::Serialize)]
+pub struct IssuedBridgeKeyView {
+    pub id: String,
+    pub plaintext: String,
+    pub created_at: u64,
+    pub previous_key_id: Option<String>,
+}
+
+/// AI Work 仅生成供“星链维度分流系统”使用的管理员桥接 Key。
+/// 明文只随本次调用返回，界面负责提示管理员立即复制并保存。
+#[tauri::command]
+pub fn bridge_key_status(state: State<'_, AppState>) -> BridgeKeyStatusView {
+    BridgeKeyStatusView {
+        bridge_only: crate::api_server::gateway_settings::bridge_only(&state.data_dir),
+        active: crate::api_server::api_keys::active_bridge_key(&state.data_dir),
+    }
+}
+
+#[tauri::command]
+pub fn bridge_key_issue(
+    state: State<'_, AppState>,
+    name: Option<String>,
+) -> Result<IssuedBridgeKeyView, String> {
+    let issued = crate::api_server::api_keys::issue_bridge_key(
+        &state.data_dir,
+        name.as_deref().unwrap_or("Core 桥接 Key"),
+    )?;
+    Ok(IssuedBridgeKeyView {
+        id: issued.id,
+        plaintext: issued.plaintext,
+        created_at: issued.created_at,
+        previous_key_id: issued.previous_key_id,
+    })
+}
+
+#[tauri::command]
+pub fn bridge_key_revoke(state: State<'_, AppState>) -> Result<bool, String> {
+    crate::api_server::api_keys::revoke_bridge_key(&state.data_dir)
 }
 
 // ==================== 统一网关命令（Phase 1 §8.1） ====================

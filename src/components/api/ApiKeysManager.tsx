@@ -13,6 +13,7 @@ import { useAppStore } from '../../store';
 import { maskApiKey, fmtTokens } from '../../lib/format';
 import type {
   ApiKeyEntry,
+  ApiKeyRuntimeUsage,
   GatewayLimitDefaults,
   KeyCapabilities,
   KeyCapability,
@@ -129,6 +130,10 @@ export function buildKeyPolicyUpdate(
 ): ApiKeyEntry {
   return {
     ...key,
+    // `daily_limit` is the persisted request-quota field. Keep the policy
+    // mirror in sync so both the old list editor and the new modal enforce
+    // the same value.
+    daily_limit: normalizeDailyLimit(limits.daily_requests),
     limits: normalizeKeyLimits(limits),
     capabilities: normalizeKeyCapabilities(capabilities),
   };
@@ -183,6 +188,9 @@ export default function ApiKeysManager({
   // 今日按 Key 的 token 用量（「今日已用」列展示）
   const [usage, setUsage] = useState<UsageDayView[]>([]);
   const [globalLimits, setGlobalLimits] = useState<GatewayLimitDefaults>(DEFAULT_GATEWAY_LIMITS);
+  const [runtimeUsage, setRuntimeUsage] = useState<Record<string, ApiKeyRuntimeUsage>>({});
+  const [bridgeStatus, setBridgeStatus] = useState<import('../../types').BridgeKeyStatusView | null>(null);
+  const [issuedBridgeKey, setIssuedBridgeKey] = useState<import('../../types').IssuedBridgeKeyView | null>(null);
 
   // ---- 多 API Key 管理（原 ApiService.tsx 逻辑原样搬移） ----
   const loadKeys = useCallback(async () => {
@@ -194,6 +202,45 @@ export default function ApiKeysManager({
       /* 保留空列表 */
     }
   }, []);
+
+  const loadRuntimeUsage = useCallback(async () => {
+    try {
+      const entries = await api.apiServer.keysUsage();
+      setRuntimeUsage(Object.fromEntries(entries.map((entry) => [entry.key_id, entry])));
+    } catch {
+      /* 服务未运行时保留 0 占用 */
+    }
+  }, []);
+
+  const loadBridgeStatus = useCallback(async () => {
+    try {
+      setBridgeStatus(await api.apiServer.bridgeKeyStatus());
+    } catch {
+      /* 旧版本或服务未初始化时保持默认提示 */
+    }
+  }, []);
+
+  const issueBridgeKey = async () => {
+    try {
+      const issued = await api.apiServer.bridgeKeyIssue('星链维度分流系统桥接 Key');
+      setIssuedBridgeKey(issued);
+      await loadBridgeStatus();
+      toast('success', '桥接 Key 已生成；明文只显示这一次，请立即复制到 Core');
+    } catch (e) {
+      toast('error', `生成桥接 Key 失败：${String(e).slice(0, 120)}`);
+    }
+  };
+
+  const revokeBridgeKey = async () => {
+    try {
+      await api.apiServer.bridgeKeyRevoke();
+      setIssuedBridgeKey(null);
+      await loadBridgeStatus();
+      toast('success', '桥接 Key 已撤销');
+    } catch (e) {
+      toast('error', `撤销桥接 Key 失败：${String(e).slice(0, 120)}`);
+    }
+  };
 
   /** 生成 sk- 前缀随机 Key（前端 crypto 随机源） */
   const generateKeyValue = useCallback(() => {
@@ -207,8 +254,14 @@ export default function ApiKeysManager({
     setKeysSaving(true);
     try {
       await api.apiServer.keysSave(next, nextAuthDisabled);
-      setApiKeys(next);
-      if (nextAuthDisabled !== undefined) setAuthDisabled(nextAuthDisabled);
+      try {
+        const view = await api.apiServer.keysList();
+        setApiKeys(view.keys);
+        setAuthDisabled(view.auth_disabled);
+      } catch {
+        setApiKeys(next);
+        if (nextAuthDisabled !== undefined) setAuthDisabled(nextAuthDisabled);
+      }
       toast('success', msg);
     } catch (e) {
       toast('error', `保存 Key 失败：${String(e).slice(0, 120)}`);
@@ -355,7 +408,14 @@ export default function ApiKeysManager({
     const v = Math.max(0, Math.floor(limit) || 0);
     const cur = apiKeys.find((k) => k.id === id);
     if (!cur || cur.daily_limit === v) return;
-    void saveKeys(apiKeys.map((k) => (k.id === id ? { ...k, daily_limit: v } : k)), '限额已更新');
+    void saveKeys(
+      apiKeys.map((k) =>
+        k.id === id
+          ? { ...k, daily_limit: v, limits: { ...normalizeKeyLimits(k.limits), daily_requests: v } }
+          : k,
+      ),
+      '限额已更新',
+    );
   };
 
   const copyKeyValue = async (k: ApiKeyEntry) => {
@@ -369,6 +429,9 @@ export default function ApiKeysManager({
 
   useEffect(() => {
     void loadKeys();
+    void loadRuntimeUsage();
+    void loadBridgeStatus();
+    const usageTimer = window.setInterval(() => void loadRuntimeUsage(), 3000);
     generateKeyValue();
     // 上游账号候选（服务未运行时为空列表）
     api.apiServer
@@ -390,7 +453,8 @@ export default function ApiKeysManager({
       .catch(() => {
         /* 未读取到全局设置时使用后端默认值 */
       });
-  }, [loadKeys, generateKeyValue]);
+    return () => window.clearInterval(usageTimer);
+  }, [loadKeys, loadRuntimeUsage, loadBridgeStatus, generateKeyValue]);
 
   // 子弹框开关状态上报（供主弹窗屏蔽 ESC 双关）
   useEffect(() => {
@@ -417,76 +481,49 @@ export default function ApiKeysManager({
         </span>
       </div>
 
-      {/* 新增表单 */}
-      <div className="mb-3 flex flex-wrap items-end gap-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
-        <div className="w-36">
-          <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">名称</label>
-          <input
-            className="input"
-            placeholder="如：cli / 小工具"
-            value={newKeyName}
-            onChange={(e) => setNewKeyName(e.target.value)}
-          />
+      {/* 独立 Core 的唯一桥接凭据；普通用户 Key 由「星链维度分流系统」创建。 */}
+      <div className="mb-3 rounded-lg border border-brand-200 bg-brand-50 p-3 text-xs dark:border-brand-900/50 dark:bg-brand-950/20">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p className="font-medium text-slate-800 dark:text-zinc-100">星链维度分流系统桥接 Key</p>
+            <p className="mt-1 text-slate-500 dark:text-zinc-400">
+              AI Work 只负责执行和上游能力；普通用户、积分与额度由独立 Core 管理。
+              {bridgeStatus?.bridge_only ? ' 当前已启用仅桥接模式。' : ' 生成后将自动切换为仅桥接模式。'}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            {bridgeStatus?.active && !bridgeStatus.active.revoked ? (
+              <button className="btn-outline flex items-center gap-1 !px-3 text-xs" onClick={() => void revokeBridgeKey()}>
+                <Power size={13} /> 撤销并停止桥接
+              </button>
+            ) : (
+              <button className="btn-primary flex items-center gap-1 !px-3 text-xs" onClick={() => void issueBridgeKey()}>
+                <KeyRound size={13} /> 生成桥接 Key
+              </button>
+            )}
+          </div>
         </div>
-        <div className="min-w-64 flex-1">
-          <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">Key 值</label>
-          <input
-            className="input font-mono text-xs"
-            value={newKeyValue}
-            onChange={(e) => setNewKeyValue(e.target.value)}
-          />
-        </div>
-        <button
-          className="btn-ghost flex items-center gap-1 !p-2 text-xs"
-          onClick={generateKeyValue}
-          title="重新生成 Key 值"
-        >
-          <RefreshCw size={13} />
-          重新生成
-        </button>
-        <div className="w-36">
-          <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
-            日限额/次（0=不限）
-          </label>
-          <input
-            type="number"
-            min={0}
-            className="input"
-            value={newKeyLimit}
-            onChange={(e) => setNewKeyLimit(parseInt(e.target.value) || 0)}
-          />
-        </div>
-        <button
-          className="btn-outline flex items-center gap-1 !px-3 text-xs"
-          onClick={addKey}
-          disabled={keysSaving}
-        >
-          <Plus size={14} />
-          添加 Key
-        </button>
+        {bridgeStatus?.active && (
+          <p className="mt-2 font-mono text-[11px] text-slate-500 dark:text-zinc-400">
+            当前状态：{bridgeStatus.active.enabled ? '启用' : '已撤销'} · {bridgeStatus.active.key_prefix}… · ID {bridgeStatus.active.id}
+          </p>
+        )}
+        {issuedBridgeKey && (
+          <div className="mt-3 rounded border border-amber-300 bg-amber-50 p-2 dark:border-amber-800 dark:bg-amber-950/30">
+            <p className="font-medium text-amber-800 dark:text-amber-200">请立即复制：此明文只显示本次</p>
+            <div className="mt-1 flex items-center gap-2">
+              <code className="min-w-0 flex-1 break-all rounded bg-white px-2 py-1 font-mono text-[11px] dark:bg-zinc-900">{issuedBridgeKey.plaintext}</code>
+              <button className="btn-ghost shrink-0 !p-1" onClick={() => void navigator.clipboard.writeText(issuedBridgeKey.plaintext)} title="复制桥接 Key">
+                <Copy size={13} />
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* 鉴权开关：无启用 Key 时的行为（默认拒绝；显式关闭后才放行） */}
-      <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-800/50">
-        <div>
-          <p className="font-medium text-slate-700 dark:text-zinc-200">鉴权开关</p>
-          <p className="text-slate-400 dark:text-zinc-500">
-            {authDisabled
-              ? '已关闭：未配置启用 Key 时任何本机程序均可调用（不推荐）'
-              : '已开启：未配置启用 Key 时请求将被拒绝并提示创建 Key'}
-          </p>
-        </div>
-        <button
-          className={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
-            authDisabled
-              ? 'bg-emerald-500/90 text-white hover:bg-emerald-500'
-              : 'bg-amber-500/90 text-white hover:bg-amber-500'
-          }`}
-          onClick={toggleAuthDisabled}
-          disabled={keysSaving}
-        >
-          {authDisabled ? '开启鉴权' : '关闭鉴权'}
-        </button>
+      <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-800/50">
+        <p className="font-medium text-slate-700 dark:text-zinc-200">旧 API Key 仅作为迁移信息保留</p>
+        <p className="text-slate-400 dark:text-zinc-500">不再从 AI Work 新建普通用户 Key；请在独立 Core 的用户与 Key 管理页操作。</p>
       </div>
 
       {apiKeys.length === 0 ? (
@@ -515,6 +552,7 @@ export default function ApiKeysManager({
                 const kt = todayKeyTokens.get(k.id);
                 const ktTotal = kt ? kt.prompt + kt.completion : 0;
                 const effective = effectiveKeyLimitSummary(k.limits, globalLimits);
+                const live = runtimeUsage[k.id] ?? { inflight: 0, video_jobs: 0 };
                 return (
                   <tr
                     key={k.id}
@@ -569,7 +607,7 @@ export default function ApiKeysManager({
                         </span>
                       )}
                       <div className="mt-1 max-w-[21rem] text-[10px] leading-4 text-slate-400 dark:text-zinc-500">
-                        并发 {effective.max_inflight} · 视频 {effective.max_video_jobs} · 视频提交{' '}
+                        并发 {live.inflight}/{effective.max_inflight} · 视频任务 {live.video_jobs}/{effective.max_video_jobs} · 视频提交{' '}
                         {effective.video_submissions_per_minute}/分 · 素材 {effective.asset_uploads_per_minute}/分 ·{' '}
                         {formatBytes(effective.asset_bytes_per_hour)}/时
                       </div>

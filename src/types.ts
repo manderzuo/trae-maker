@@ -434,7 +434,7 @@ export interface ApiServiceStatus {
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
 /** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
 export interface UnifiedModelSource {
-  pool: 'trae' | 'buddy' | 'custom';
+  pool: 'trae' | 'buddy' | 'custom' | 'trae_work';
   rate: number | null;
   enabled: boolean;
 }
@@ -486,6 +486,10 @@ export interface GatewaySettings {
   cors_origins: string;
   /** Trae 云端回取参考素材的公开基址；空值表示不生成公开素材链接 */
   asset_public_base_url: string;
+  /** Core bridge rollout mode returned by the Rust gateway DTO. */
+  core_mode: string;
+  /** Scheduler rollout mode returned by the Rust gateway DTO. */
+  scheduler_mode: string;
   /** Rust 端始终返回规范化值；optional 保持旧版设置页面提交兼容 */
   limit_defaults?: GatewayLimitDefaults;
   updated_at: number;
@@ -1027,6 +1031,33 @@ export interface ApiKeysFileView {
   keys: ApiKeyEntry[];
   // 显式关闭鉴权：仅当无启用 Key 时生效（true=放行，默认 false=拒绝）
   auth_disabled: boolean;
+}
+
+export interface ApiKeyRuntimeUsage {
+  key_id: string;
+  inflight: number;
+  video_jobs: number;
+}
+
+export interface BridgeKeyStatus {
+  kind: 'legacy' | 'bridge';
+  id: string;
+  enabled: boolean;
+  revoked: boolean;
+  created_at: number;
+  key_prefix: string;
+}
+
+export interface BridgeKeyStatusView {
+  bridge_only: boolean;
+  active: BridgeKeyStatus | null;
+}
+
+export interface IssuedBridgeKeyView {
+  id: string;
+  plaintext: string;
+  created_at: number;
+  previous_key_id: string | null;
 }
 
 export interface UpdateDownloadProgress {

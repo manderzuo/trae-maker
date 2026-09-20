@@ -179,6 +179,16 @@ pub fn load(data_dir: &Path) -> GatewaySettings {
     s
 }
 
+/// AI Work 是否已切换为仅接受星链维度分流系统桥接 Key 的执行模式。
+/// 该标记由 bridge_policy.json 独立保存，避免给旧网关配置增加必填字段。
+pub fn bridge_only(data_dir: &Path) -> bool {
+    super::api_keys::bridge_only(data_dir)
+}
+
+pub fn set_bridge_only(data_dir: &Path, enabled: bool) {
+    super::api_keys::set_bridge_only(data_dir, enabled);
+}
+
 /// 保存网关设置（端口/模型合法性由调用方校验后传入；这里兜底端口范围）
 pub fn save(data_dir: &Path, s: GatewaySettings) -> Result<(), String> {
     validate_modes(&s)?;

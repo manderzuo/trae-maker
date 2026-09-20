@@ -9,7 +9,7 @@ use serde_json::json;
 
 use aiwork_core::Principal;
 
-use super::api_keys::{self, ApiKeysFile, KeyCheck, QuotaKind};
+use super::api_keys::{self, ApiKeysFile, KeyCheck, QuotaKind, ResolvedKey};
 use super::core_bridge::{CoreBridge, CoreMode};
 use super::usage::KeyId;
 use super::ApiSharedState;
@@ -69,6 +69,7 @@ pub async fn bearer_auth(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let presented = bearer.or(xkey);
+    let bridge_required = is_bridge_required(&state.data_dir, request.uri().path());
 
     match state
         .core
@@ -119,6 +120,9 @@ pub async fn bearer_auth(
 
     match check {
         Some(KeyCheck::Ok(rk)) => {
+            if bridge_required && !api_keys::is_active_bridge_key_id(&data_dir_for_auth(&state), &rk.id) {
+                return bridge_only_rejected();
+            }
             let id = rk.id.clone();
             request.extensions_mut().insert(rk);
             request.extensions_mut().insert(KeyId(id));
@@ -147,6 +151,38 @@ pub async fn bearer_auth(
     }
 
     (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
+}
+
+fn data_dir_for_auth(state: &ApiSharedState) -> std::path::PathBuf {
+    state.data_dir.clone()
+}
+
+fn is_bridge_required(data_dir: &std::path::Path, path: &str) -> bool {
+    path.starts_with("/internal/bridge/")
+        || (api_keys::bridge_only(data_dir) && path.starts_with("/v1/"))
+}
+
+fn bridge_only_rejected() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(json!({
+            "error": {
+                "message": "AI Work 当前仅接受星链维度分流系统的桥接 API Key",
+                "type": "permission_error",
+                "code": "bridge_key_required",
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// 供测试与本地路由守卫复用的桥接决策；不返回任何密钥内容。
+pub(crate) fn authenticate_bridge_only(resolved: Option<&ResolvedKey>, is_active_bridge: bool) -> Result<(), Response> {
+    if resolved.is_some() && is_active_bridge {
+        Ok(())
+    } else {
+        Err(bridge_only_rejected())
+    }
 }
 
 fn capability_for_path(path: &str) -> Option<&'static str> {
@@ -500,6 +536,19 @@ mod tests {
         assert_eq!(payload["error"]["legacy_code"], "daily_quota_exceeded");
         assert_eq!(payload["error"]["param"], "daily_tokens");
         assert!(payload["error"]["message"].as_str().unwrap().contains("Token"));
+    }
+}
+
+#[cfg(test)]
+mod bridge_only_tests {
+    use axum::http::StatusCode;
+
+    use super::authenticate_bridge_only;
+
+    #[test]
+    fn bridge_only_rejects_a_legacy_user_key_before_dispatch() {
+        let response = authenticate_bridge_only(None, false).unwrap_err();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
 
