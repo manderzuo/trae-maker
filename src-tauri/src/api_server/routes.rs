@@ -1573,7 +1573,7 @@ pub async fn assets_upload(
     let bytes = parsed.bytes;
     let _limit_permit = match state
         .limiter
-        .acquire(&owner, LimitKind::AssetUpload, bytes.len() as u64)
+        .acquire_legacy(&owner, LimitKind::AssetUpload, bytes.len() as u64)
     {
         Ok(permit) => permit,
         Err(error) => return limit_error_response(error),
@@ -1761,7 +1761,7 @@ async fn core_assets_upload(
     let _guard = state.inflight_guard();
     let _limit_permit = match state
         .limiter
-        .acquire(&principal.user_id, LimitKind::AssetUpload, parsed.bytes.len() as u64)
+        .acquire_legacy(&principal.user_id, LimitKind::AssetUpload, parsed.bytes.len() as u64)
     {
         Ok(permit) => permit,
         Err(error) => return limit_error_response(error),
@@ -2250,7 +2250,7 @@ pub async fn videos_generations(
     }
     let _limit_permit = match state
         .limiter
-        .acquire(&key_str, LimitKind::VideoSubmission, body.len() as u64)
+        .acquire_legacy(&key_str, LimitKind::VideoSubmission, body.len() as u64)
     {
         Ok(permit) => permit,
         Err(error) => return limit_error_response(error),
@@ -4193,6 +4193,7 @@ mod tests {
                 asset_public_base_url: "https://assets.example.test/v1".into(),
                 core_mode: "enforce".into(),
                 scheduler_mode: "enforce".into(),
+                limit_defaults: Default::default(),
                 updated_at: 0,
             },
         )

@@ -470,6 +470,14 @@ export interface DispatchPolicy {
 }
 
 /** 网关设置（data/api_gateway_settings.json；gateway_settings_get/set） */
+export interface GatewayLimitDefaults {
+  max_inflight: number;
+  max_video_jobs: number;
+  asset_uploads_per_minute: number;
+  asset_bytes_per_hour: number;
+  video_submissions_per_minute: number;
+}
+
 export interface GatewaySettings {
   port: number;
   default_model: string;
@@ -477,6 +485,8 @@ export interface GatewaySettings {
   cors_origins: string;
   /** Trae 云端回取参考素材的公开基址；空值表示不生成公开素材链接 */
   asset_public_base_url: string;
+  /** Rust 端始终返回规范化值；optional 保持旧版设置页面提交兼容 */
+  limit_defaults?: GatewayLimitDefaults;
   updated_at: number;
 }
 

@@ -119,6 +119,35 @@ impl ApiSharedState {
         InflightGuard::acquire(&self.inflight)
     }
 
+    /// 获取按 Key 生效的请求并发许可；Key 级覆盖由 RateLimiter 与全局上限取小值。
+    pub fn acquire_request(
+        &self,
+        key_id: &str,
+        key_limits: &api_keys::KeyLimits,
+    ) -> Result<limits::Permit, limits::LimitError> {
+        self.limiter.acquire_request(key_id, key_limits)
+    }
+
+    /// 获取跨异步视频任务生命周期持有的视频任务许可。
+    pub fn acquire_video_job(
+        &self,
+        key_id: &str,
+        key_limits: &api_keys::KeyLimits,
+    ) -> Result<limits::Permit, limits::LimitError> {
+        self.limiter.acquire_video_job(key_id, key_limits)
+    }
+
+    /// 获取素材/视频提交窗口许可，同时应用 Key 级覆盖。
+    pub fn acquire_limit(
+        &self,
+        key_id: &str,
+        kind: limits::LimitKind,
+        bytes: u64,
+        key_limits: &api_keys::KeyLimits,
+    ) -> Result<limits::Permit, limits::LimitError> {
+        self.limiter.acquire(key_id, kind, bytes, key_limits)
+    }
+
     /// 记录一次请求用量并原子落盘；写盘失败静默忽略，不影响主流程。
     /// `is_wb`：WB 上游路由的请求记入独立 wb_days 桶（与 Trae 侧分账，页面互不串数）
     #[allow(clippy::too_many_arguments)]

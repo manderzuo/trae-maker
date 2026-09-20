@@ -597,6 +597,7 @@ mod tests {
                 cors_origins: String::new(),
                 asset_public_base_url: "https://example.test/v1/".into(),
                 core_mode: "off".into(),
+                limit_defaults: Default::default(),
                 updated_at: 0,
             },
         )

@@ -627,8 +627,9 @@ export const api = {
     // 返回规范化后的生效值（前端展示以返回值为准）；落盘即时生效无需重启网关
     dispatchPolicySet: (policy: DispatchPolicy) =>
       invoke<DispatchPolicy>('dispatch_policy_set', { policy }),
+    // 返回规范化后的生效值（含全局限流默认值）；端口/限流改动下次启动 API 服务后生效
     gatewaySettingsGet: () => invoke<GatewaySettings>('gateway_settings_get'),
-    // 返回规范化后的生效值（前端展示以返回值为准）；端口改动下次启动 API 服务后生效
+    // 返回规范化后的生效值；环境变量覆盖优先于界面保存值
     gatewaySettingsSet: (settings: GatewaySettings) =>
       invoke<GatewaySettings>('gateway_settings_set', { settings }),
     tunnelGet: () => invoke<TunnelConfig>('gateway_tunnel_get'),

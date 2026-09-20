@@ -15,6 +15,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use super::limits::LimitConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewaySettings {
     /// 网关监听端口（默认 7864，与既有约定一致）
@@ -39,6 +41,9 @@ pub struct GatewaySettings {
     /// Scheduler rollout is opt-in and bounded by core_mode.
     #[serde(default = "default_core_mode")]
     pub scheduler_mode: String,
+    /// 全局限流默认值；Key 的 null 覆盖字段继承这里的值。
+    #[serde(default)]
+    pub limit_defaults: LimitConfig,
     #[serde(default)]
     pub updated_at: i64,
 }
@@ -69,6 +74,7 @@ impl Default for GatewaySettings {
             asset_public_base_url: String::new(),
             core_mode: default_core_mode(),
             scheduler_mode: default_core_mode(),
+            limit_defaults: LimitConfig::default(),
             updated_at: 0,
         }
     }
@@ -101,6 +107,7 @@ fn normalized(mut s: GatewaySettings) -> GatewaySettings {
         .collect::<Vec<_>>()
         .join(",");
     s.asset_public_base_url = s.asset_public_base_url.trim().trim_end_matches('/').to_string();
+    s.limit_defaults.normalize();
     s
 }
 
@@ -130,6 +137,7 @@ fn apply_env(mut s: GatewaySettings) -> GatewaySettings {
     if let Ok(value) = std::env::var("AIWORK_ASSET_PUBLIC_BASE_URL") {
         s.asset_public_base_url = value;
     }
+    s.limit_defaults = s.limit_defaults.with_env_overrides();
     normalized(s)
 }
 
@@ -163,6 +171,7 @@ pub fn load(data_dir: &Path) -> GatewaySettings {
         asset_public_base_url: String::new(),
         core_mode: default_core_mode(),
         scheduler_mode: default_core_mode(),
+        limit_defaults: LimitConfig::default(),
         updated_at: 0,
     });
     // 迁移落盘失败不阻塞启动（下次启动重试），内存值仍生效
@@ -207,6 +216,9 @@ pub fn validate_modes(settings: &GatewaySettings) -> Result<crate::api_server::s
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn scheduler_mode_defaults_to_off_and_round_trips_unknown_as_error() {
@@ -236,6 +248,77 @@ mod tests {
         for mode in ["off", "shadow"] {
             let settings = GatewaySettings { core_mode: "enforce".into(), scheduler_mode: mode.into(), ..Default::default() };
             assert!(save(&f.dir, settings).is_err());
+        }
+    }
+
+    #[test]
+    fn gateway_limit_defaults_round_trip_and_environment_override_wins() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env = LimitEnvGuard::capture_and_clear();
+        let f = fixture(None);
+        let persisted = crate::api_server::limits::LimitConfig {
+            max_inflight: 7,
+            max_video_jobs: 5,
+            asset_uploads_per_minute: 11,
+            asset_bytes_per_hour: 12 * 1024 * 1024,
+            video_submissions_per_minute: 13,
+        };
+        save(
+            &f.dir,
+            GatewaySettings {
+                limit_defaults: persisted,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let round_trip = load(&f.dir);
+        assert_eq!(round_trip.limit_defaults, persisted);
+
+        std::env::set_var("AIWORK_MAX_INFLIGHT", "3");
+        std::env::set_var("AIWORK_VIDEO_SUBMISSIONS_PER_MINUTE", "2");
+        let overridden = load(&f.dir);
+        assert_eq!(overridden.limit_defaults.max_inflight, 3);
+        assert_eq!(overridden.limit_defaults.video_submissions_per_minute, 2);
+        assert_eq!(overridden.limit_defaults.max_video_jobs, persisted.max_video_jobs);
+        assert_eq!(
+            overridden.limit_defaults.asset_uploads_per_minute,
+            persisted.asset_uploads_per_minute
+        );
+    }
+
+    struct LimitEnvGuard {
+        previous: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl LimitEnvGuard {
+        fn capture_and_clear() -> Self {
+            let names = [
+                "AIWORK_MAX_INFLIGHT",
+                "AIWORK_VIDEO_SUBMISSIONS_PER_MINUTE",
+                "AIWORK_ASSET_UPLOADS_PER_MINUTE",
+                "AIWORK_ASSET_BYTES_PER_HOUR",
+            ];
+            let previous = names
+                .into_iter()
+                .map(|name| {
+                    let value = std::env::var(name).ok();
+                    std::env::remove_var(name);
+                    (name, value)
+                })
+                .collect();
+            Self { previous }
+        }
+    }
+
+    impl Drop for LimitEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
         }
     }
 
@@ -316,6 +399,7 @@ mod tests {
                 asset_public_base_url: String::new(),
                 core_mode: default_core_mode(),
                 scheduler_mode: default_core_mode(),
+                limit_defaults: LimitConfig::default(),
                 updated_at: 0,
             },
         )
@@ -335,6 +419,7 @@ mod tests {
                 asset_public_base_url: String::new(),
                 core_mode: default_core_mode(),
                 scheduler_mode: default_core_mode(),
+                limit_defaults: LimitConfig::default(),
                 updated_at: 0,
             },
         )
@@ -351,6 +436,7 @@ mod tests {
                 asset_public_base_url: String::new(),
                 core_mode: default_core_mode(),
                 scheduler_mode: default_core_mode(),
+                limit_defaults: LimitConfig::default(),
                 updated_at: 0
             },
         )
@@ -370,6 +456,7 @@ mod tests {
                 asset_public_base_url: "  https://example.test/v1///  ".into(),
                 core_mode: default_core_mode(),
                 scheduler_mode: default_core_mode(),
+                limit_defaults: LimitConfig::default(),
                 updated_at: 0,
             },
         )

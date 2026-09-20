@@ -402,7 +402,7 @@ async fn do_start_with_scheduler_key(
         cors_origins,
         total_requests: std::sync::atomic::AtomicU64::new(0),
         inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        limiter: crate::api_server::limits::RateLimiter::from_env(),
+        limiter: crate::api_server::limits::RateLimiter::with_config(gw.limit_defaults),
         active_uid: Mutex::new(None),
         last_error: Mutex::new(None),
         logger: ApiLogger::new(state.logs_dir()),
