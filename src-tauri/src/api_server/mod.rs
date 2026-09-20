@@ -191,8 +191,8 @@ impl ApiSharedState {
     }
 
     /// 记录携带 legacy text reservation 的请求尝试。
-    /// `settle=true` 只应在请求终态传入；中间重试会累计已知 usage，最后一次
-    /// 终态统一结算。没有 usage 的失败/未知请求由 InflightGuard Drop 释放。
+    /// `settle=true` 只应在最终成功终态传入；失败/中间重试的 usage 不进入
+    /// reservation 的 observed Token，最终由 InflightGuard Drop 释放 reservation。
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage_with_guard(
         &self,
@@ -212,9 +212,9 @@ impl ApiSharedState {
             is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
         );
         if guard.has_token_reservation() {
-            guard.observe_token_usage(prompt_tokens, completion_tokens);
             if settle {
-                guard.settle_token_usage(&usage::key_quota_day());
+                guard.observe_token_usage(prompt_tokens, completion_tokens);
+                guard.settle_token_usage();
             }
         } else {
             api_keys::record_token_usage_locked(
@@ -260,9 +260,9 @@ impl ApiSharedState {
         );
         usage::save(&self.data_dir, &usage);
         if guard.has_token_reservation() {
-            guard.observe_token_usage(prompt_tokens, completion_tokens);
             if settle {
-                guard.settle_token_usage(&usage::key_quota_day());
+                guard.observe_token_usage(prompt_tokens, completion_tokens);
+                guard.settle_token_usage();
             }
         } else {
             api_keys::record_token_usage_locked(
@@ -395,14 +395,14 @@ impl InflightGuard {
             .saturating_add(completion_tokens);
     }
 
-    fn settle_token_usage(&mut self, today: &str) {
+    fn settle_token_usage(&mut self) {
         if self.observed_prompt_tokens == 0 && self.observed_completion_tokens == 0 {
             return;
         }
         if let Some(lease) = self.token_reservation.take() {
             api_keys::settle_token_reservation(
                 &lease,
-                today,
+                &usage::key_quota_day(),
                 self.observed_prompt_tokens,
                 self.observed_completion_tokens,
             );
@@ -770,6 +770,94 @@ mod inflight_tests {
         assert!(entry.token_reservations.is_empty());
         assert_eq!(entry.daily_stats[0].prompt_tokens, 3);
         assert_eq!(entry.daily_stats[0].completion_tokens, 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn t05_failed_known_usage_is_not_merged_into_later_successful_settlement() {
+        let dir = std::path::PathBuf::from(r"D:\gpt").join(format!(
+            "twa-token-guard-failed-known-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut key = api_keys::ApiKeyEntry {
+            id: "retry-key".into(),
+            name: "retry-key".into(),
+            key: "retry-secret".into(),
+            enabled: true,
+            daily_limit: 0,
+            created_at: 0,
+            used_date: String::new(),
+            used_today: 0,
+            allowed_accounts: Vec::new(),
+            schedule_mode: String::new(),
+            dedicated_account: String::new(),
+            daily_stats: Vec::new(),
+            token_reservations: Vec::new(),
+            limits: api_keys::KeyLimits::default(),
+            capabilities: vec![api_keys::CAPABILITY_CHAT.into()],
+        };
+        key.limits.daily_tokens = 10;
+        api_keys::save(
+            &dir,
+            &api_keys::ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+        let state = reservation_test_state(&dir);
+        let limits = api_keys::KeyLimits {
+            max_inflight: Some(2),
+            daily_tokens: 10,
+            ..api_keys::KeyLimits::default()
+        };
+        let permit = state.acquire_request("retry-key", &limits).unwrap();
+        let lease = api_keys::reserve_token_quota(
+            &dir,
+            "retry-key",
+            &usage::key_quota_day(),
+            limits.daily_tokens,
+        )
+        .unwrap()
+        .unwrap();
+        let mut guard = state.inflight_guard_with_permit_and_reservation(permit, Some(lease));
+
+        // The first upstream attempt failed after reporting usage. Its usage
+        // must not become part of the later successful settlement.
+        state.record_usage_with_guard(
+            &mut guard,
+            false,
+            "model",
+            "failed-upstream",
+            "retry-key",
+            false,
+            false,
+            1,
+            3,
+            4,
+            false,
+        );
+        state.record_usage_with_guard(
+            &mut guard,
+            false,
+            "model",
+            "successful-upstream",
+            "retry-key",
+            true,
+            false,
+            1,
+            1,
+            2,
+            true,
+        );
+        drop(guard);
+
+        let loaded = api_keys::load(&dir);
+        let entry = &loaded.keys[0];
+        assert!(entry.token_reservations.is_empty());
+        assert_eq!(entry.daily_stats.len(), 1);
+        assert_eq!(entry.daily_stats[0].prompt_tokens, 1);
+        assert_eq!(entry.daily_stats[0].completion_tokens, 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

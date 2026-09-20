@@ -565,6 +565,10 @@ pub fn reserve_token_quota(
     let Some(entry) = file.keys.iter_mut().find(|entry| entry.id == key_id) else {
         return Err(TokenQuotaError::KeyUnavailable);
     };
+    let removed_stale_reservations = entry
+        .token_reservations
+        .iter()
+        .any(|reservation| reservation.date != today);
     entry
         .token_reservations
         .retain(|reservation| reservation.date == today);
@@ -581,6 +585,9 @@ pub fn reserve_token_quota(
         .sum::<u64>();
     let occupied = used_tokens.saturating_add(reserved_tokens);
     if occupied >= daily_tokens {
+        if removed_stale_reservations {
+            save(data_dir, &file);
+        }
         return Err(TokenQuotaError::Exceeded { limit: daily_tokens });
     }
     let amount = daily_tokens.saturating_sub(occupied);
@@ -600,9 +607,13 @@ pub fn reserve_token_quota(
 }
 
 /// 结算一个 reservation；Token 统计和 reservation 删除在同一 Key 锁内完成。
+///
+/// 结算策略固定为 reservation-date：usage 记入 reservation 保存的 UTC 日期，
+/// 不按请求最终完成时的 UTC 日期漂移。`_terminal_day` 保留以兼容现有调用方，
+/// 但不会参与记账。
 pub fn settle_token_reservation(
     lease: &TokenReservationLease,
-    today: &str,
+    _terminal_day: &str,
     prompt_tokens: u64,
     completion_tokens: u64,
 ) {
@@ -618,8 +629,9 @@ pub fn settle_token_reservation(
     else {
         return;
     };
+    let reservation_date = entry.token_reservations[index].date.clone();
     entry.token_reservations.remove(index);
-    add_daily_tokens(entry, today, prompt_tokens, completion_tokens);
+    add_daily_tokens(entry, &reservation_date, prompt_tokens, completion_tokens);
     save(&lease.data_dir, &file);
 }
 
@@ -972,6 +984,83 @@ mod tests {
             reserve_token_quota(&dir, "k1", "day-1", 10),
             Err(TokenQuotaError::Exceeded { limit: 10 })
         ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn token_reservation_cleanup_persists_when_new_fixed_utc_day_is_exhausted() {
+        let dir = std::path::PathBuf::from(r"D:\gpt").join(format!(
+            "twa-keys-token-reservation-cross-day-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut key = entry("k1", "fixture-token-cross-day", true, 0);
+        key.limits.daily_tokens = 10;
+        save(
+            &dir,
+            &ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+
+        let old_day = "2026-09-19";
+        let new_day = "2026-09-20";
+        let _old = reserve_token_quota(&dir, "k1", old_day, 10)
+            .unwrap()
+            .unwrap();
+        // Exhaust the new UTC day so reserve_token_quota takes its rejection
+        // path after removing the stale old-day reservation.
+        record_token_usage_locked(&dir, "k1", new_day, 10, 0);
+
+        assert!(matches!(
+            reserve_token_quota(&dir, "k1", new_day, 10),
+            Err(TokenQuotaError::Exceeded { limit: 10 })
+        ));
+
+        let loaded = load(&dir);
+        assert!(loaded.keys[0].token_reservations.is_empty());
+        assert_eq!(
+            loaded.keys[0]
+                .daily_stats
+                .iter()
+                .find(|stat| stat.date == new_day)
+                .map(|stat| stat.prompt_tokens + stat.completion_tokens),
+            Some(10)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn token_reservation_settles_on_reservation_date_not_terminal_date() {
+        let dir = std::path::PathBuf::from(r"D:\gpt").join(format!(
+            "twa-keys-token-reservation-settlement-date-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut key = entry("k1", "fixture-token-settlement-date", true, 0);
+        key.limits.daily_tokens = 10;
+        save(
+            &dir,
+            &ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+
+        let reservation_day = "2026-09-19";
+        let terminal_day = "2026-09-20";
+        let lease = reserve_token_quota(&dir, "k1", reservation_day, 10)
+            .unwrap()
+            .unwrap();
+        settle_token_reservation(&lease, terminal_day, 3, 4);
+
+        let loaded = load(&dir);
+        assert!(loaded.keys[0].token_reservations.is_empty());
+        assert_eq!(loaded.keys[0].daily_stats.len(), 1);
+        assert_eq!(loaded.keys[0].daily_stats[0].date, reservation_day);
+        assert_eq!(loaded.keys[0].daily_stats[0].prompt_tokens, 3);
+        assert_eq!(loaded.keys[0].daily_stats[0].completion_tokens, 4);
         let _ = std::fs::remove_dir_all(dir);
     }
 

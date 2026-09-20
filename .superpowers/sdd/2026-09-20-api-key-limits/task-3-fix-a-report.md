@@ -172,3 +172,85 @@ cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo
 `chat_completions_counts_one_authenticated_request_without_duplicate_increment` 的调用点已按当前 handler 签名修正，但单独运行时仍断言失败（实际计数为 0）；该测试对应 Chat 计数子任务，按本轮边界未修改生产计数逻辑。
 
 除已有 Rust unused/dead-code 和 Windows linker PDB/default-library 警告外，A2.1 focused 测试无失败。
+
+---
+
+# Task 3 修复轮次 3：A2.1 review findings fix round 1
+
+日期：2026-09-20
+范围：失败尝试 Token 结算隔离、固定 UTC 日期 reservation 清理与结算归属
+状态：本轮两项修复完成；全 Rust suite 保留 4 个前置无关失败
+
+## 修复说明
+
+1. `ApiSharedState::record_usage_with_guard` 及 custom 变体现在只有 `settle=true` 的最终成功路径才把 usage 放入 `InflightGuard` 的 observed Token 并结算。失败/中间重试即使带有已知 usage，也只记录普通请求用量；guard Drop 释放 reservation，不会把失败 Token 合并到后续成功请求。
+2. `reserve_token_quota` 在新固定 UTC 日清理旧 reservation 后，即使新日额度已满而拒绝预留，也会把清理结果持久化。
+3. 结算策略明确为 reservation-date：Token 记入 reservation 保存的 UTC 日期，不随终态 UTC 日期漂移。现有终态日期参数保留兼容，但不参与记账；新增固定 `2026-09-19` reservation / `2026-09-20` terminal 测试。
+
+没有修改认证 snapshot、Chat 计数、quota 错误、Core、视频或视频 permit 逻辑。
+
+## RED 记录
+
+测试环境统一使用 `D:\gpt\aiwork-key-limits-cargo-target`、`C:\Users\StarLink\.cargo`、Rust toolchain PATH 和 `--offline`；每条 Cargo 命令只有一个测试过滤器。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml t05_failed_known_usage_is_not_merged_into_later_successful_settlement --offline
+```
+
+结果：失败，实际 prompt 为 4，预期 1；证明失败尝试 usage 被合并。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml token_reservation_cleanup_persists_when_new_fixed_utc_day_is_exhausted --offline
+```
+
+结果：失败，旧日期 reservation 仍存在于持久化文件；证明拒绝路径没有保存清理。
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml token_reservation_settles_on_reservation_date_not_terminal_date --offline
+```
+
+结果：失败，实际日期为 `2026-09-20`，预期 reservation 日期 `2026-09-19`；证明结算归属未明确实现。
+
+## GREEN / 回归结果
+
+以下三条修复回归均通过，分别为 1 passed，0 failed：
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml t05_failed_known_usage_is_not_merged_into_later_successful_settlement --offline
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml token_reservation_cleanup_persists_when_new_fixed_utc_day_is_exhausted --offline
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml token_reservation_settles_on_reservation_date_not_terminal_date --offline
+```
+
+同一环境下复核的既有 reservation/A2.1 focused 过滤器也全部通过：
+
+```text
+t04_guard_settles_known_token_usage_once
+t05_guard_drop_releases_unknown_token_usage
+token_reservation_blocks_a_second_request_and_settles_known_usage
+token_reservation_releases_unknown_usage_without_leaking_capacity
+concurrent_token_reservations_allow_only_one_request_for_remaining_budget
+legacy_text_quota_rejection_releases_the_request_permit
+legacy_text_guard_skips_reservation_for_anonymous_and_unlimited_keys
+legacy_handlers_use_the_persisted_policy_without_defaulting_authenticated_keys
+```
+
+每个过滤器均为 1 passed，0 failed。完整 Rust 测试命令：
+
+```text
+cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --offline
+```
+
+结果：487 passed，4 failed，4 ignored。失败均为前置工作区已有范围：
+
+- `api_server::routes::tests::chat_completions_counts_one_authenticated_request_without_duplicate_increment`：实际计数仍为 0，属于报告中已知的 Chat 计数子任务。
+- `core_migration::tests::apply_does_not_copy_legacy_plaintext_to_core_or_report`：`legacy asset file is missing`。
+- `core_migration::tests::apply_rejects_legacy_asset_hash_mismatch_without_writing`：未得到 hash 错误。
+- `core_migration::tests::remaining_credit_history_is_observation_only_and_preserves_summary_fields`：`legacy asset file is missing`。
+
+这些失败不在本轮允许范围，未修改对应逻辑。测试输出只有已有 unused/dead-code 和 Windows linker 警告。
+
+## 本轮 concerns
+
+1. 完整 suite 仍受上述 4 个前置失败影响，不能宣称全量测试全绿；本轮相关 focused 测试全绿。
+2. reservation-date 策略要求 reservation 在结算时仍存在；若进程重启或跨日清理已移除旧 reservation，现有旧 lease 仍按既有 no-op 语义处理，不在本轮扩展恢复/对账生命周期。
+3. 当前工作区仍有前置 UTC、认证策略、Core 等未提交改动；提交时只暂存本轮两个实现、三条回归测试及本报告追加内容。
