@@ -22,6 +22,7 @@ pub mod retry;
 pub mod routes;
 pub mod server;
 pub mod scheduler;
+pub(crate) mod seedance_chat;
 pub mod sse;
 pub mod trae_resource_upload;
 pub mod unified_catalog;
