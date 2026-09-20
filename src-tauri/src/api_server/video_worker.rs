@@ -9,10 +9,11 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::thread;
 use std::time::Duration;
 
-use aiwork_core::UpstreamLease;
+use aiwork_core::{JobState, Principal, UpstreamLease};
 
 use super::core_bridge::CoreLeaseError;
 use super::core_video::{VideoAdapterOutcome, VideoExecutionRequest};
@@ -122,15 +123,17 @@ impl VideoQueueWorker {
             heartbeat_failed.clone(),
             stop_heartbeat.clone(),
         );
-        let outcome = executor.submit_video(
-            &lease,
-            VideoExecutionRequest {
-                job_id: job.id.clone(),
-                request_id: job.request_id.clone(),
-                model: job.model.clone(),
-                body,
-            },
-        );
+        let outcome = submit_video_catching_panic(|| {
+            executor.submit_video(
+                &lease,
+                VideoExecutionRequest {
+                    job_id: job.id.clone(),
+                    request_id: job.request_id.clone(),
+                    model: job.model.clone(),
+                    body,
+                },
+            )
+        });
         stop_heartbeat.store(true, Ordering::Release);
         drop(heartbeat);
 
@@ -147,9 +150,23 @@ impl VideoQueueWorker {
             VideoAdapterOutcome::Accepted {
                 upstream_request_ref,
             } => {
-                bridge
-                    .record_video_job_acceptance(&principal, &job.id, upstream_request_ref)
-                    .map_err(|error| error.to_string())?;
+                if let Err(error) = bridge.record_video_job_acceptance(
+                    &principal,
+                    &job.id,
+                    upstream_request_ref,
+                ) {
+                    let _ = bridge.settle_video_job(
+                        &principal,
+                        &job.id,
+                        &lease.lease_id,
+                        VideoAdapterOutcome::TransportUnknown {
+                            reason: "acceptance_persistence_failed".into(),
+                            upstream_request_ref: Some(upstream_request_ref.clone()),
+                        },
+                    );
+                    release_permit_if_terminal(&bridge, &principal, &job.id);
+                    return Err(error.to_string());
+                }
                 Ok(VideoWorkerStep::Accepted {
                     job_id: job.id,
                     upstream_request_ref: upstream_request_ref.clone(),
@@ -157,9 +174,19 @@ impl VideoQueueWorker {
             }
             _ => {
                 let state = terminal_state(&outcome);
-                bridge
-                    .settle_video_job(&principal, &job.id, &lease.lease_id, outcome.clone())
-                    .map_err(|error| error.to_string())?;
+                if let Err(error) = bridge.settle_video_job(
+                    &principal,
+                    &job.id,
+                    &lease.lease_id,
+                    outcome.clone(),
+                ) {
+                    // Settlement may have committed the terminal lease/job and
+                    // failed only while persisting optional result references.
+                    // Release only after re-reading a confirmed terminal job;
+                    // unknown/running jobs stay occupied for reconciliation.
+                    release_permit_if_terminal(&bridge, &principal, &job.id);
+                    return Err(error.to_string());
+                }
                 if releases_payload(&outcome) {
                     let _ = self.state.video_payloads.remove(&job.id);
                     video::release_job_permit(&job.id);
@@ -208,6 +235,29 @@ impl VideoQueueWorker {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+}
+
+fn release_permit_if_terminal(
+    bridge: &CoreBridge,
+    principal: &Principal,
+    job_id: &str,
+) {
+    let Ok(Some(job)) = bridge.store.video_job_for_user(principal, job_id) else {
+        return;
+    };
+    if matches!(job.state, JobState::Succeeded | JobState::Failed | JobState::Canceled) {
+        video::release_job_permit(job_id);
+    }
+}
+
+fn submit_video_catching_panic<F>(submit: F) -> VideoAdapterOutcome
+where
+    F: FnOnce() -> VideoAdapterOutcome,
+{
+    catch_unwind(AssertUnwindSafe(submit)).unwrap_or(VideoAdapterOutcome::TransportUnknown {
+        reason: "adapter_panic".into(),
+        upstream_request_ref: None,
+    })
 }
 
 fn spawn_heartbeat(
@@ -306,5 +356,19 @@ mod tests {
             reason: "timeout".into(),
             upstream_request_ref: None,
         }));
+    }
+
+    #[test]
+    fn adapter_panic_becomes_transport_unknown() {
+        let outcome = submit_video_catching_panic(|| panic!("adapter panic"));
+        assert_eq!(
+            outcome,
+            VideoAdapterOutcome::TransportUnknown {
+                reason: "adapter_panic".into(),
+                upstream_request_ref: None,
+            }
+        );
+        assert_eq!(terminal_state(&outcome), "unknown");
+        assert!(!releases_payload(&outcome));
     }
 }

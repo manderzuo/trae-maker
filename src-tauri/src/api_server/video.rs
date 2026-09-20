@@ -130,6 +130,40 @@ fn has_job_permit(task_id: &str) -> bool {
         .contains_key(task_id)
 }
 
+fn mark_native_worker_unknown(task_id: &str, reason: impl Into<String>) {
+    let reason = reason.into();
+    update_task(task_id, |task| {
+        if !is_terminal_status(&task.status) {
+            task.status = "unknown".into();
+            task.error = Some(reason.clone());
+        }
+    });
+}
+
+struct NativeWorkerGuard {
+    task_id: String,
+}
+
+impl NativeWorkerGuard {
+    fn new(task_id: String) -> Self {
+        Self { task_id }
+    }
+}
+
+impl Drop for NativeWorkerGuard {
+    fn drop(&mut self) {
+        if get(&self.task_id)
+            .map(|task| !is_terminal_status(&task.status) && task.status != "unknown")
+            .unwrap_or(false)
+        {
+            mark_native_worker_unknown(
+                &self.task_id,
+                "视频 worker 异常退出，等待恢复/核查",
+            );
+        }
+    }
+}
+
 fn restore_key_limits(data_dir: &std::path::Path, owner_key_id: &str) -> super::api_keys::KeyLimits {
     let owner_key_id = owner_key_id.trim();
     if owner_key_id.is_empty() || owner_key_id == "anonymous" {
@@ -295,6 +329,15 @@ pub fn load_persisted(data_dir: &std::path::Path) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    let old_task_ids = tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for task_id in old_task_ids {
+        release_job_permit(&task_id);
+    }
     let mut map = tasks().lock().unwrap_or_else(|e| e.into_inner());
     map.clear();
     for item in list {
@@ -986,6 +1029,7 @@ pub fn start_native_task(
         return;
     }
     thread::spawn(move || {
+        let _worker_guard = NativeWorkerGuard::new(task_id.clone());
         // HTTP 层尚未收到 SSE 前允许切到下一个 Work 账号；一旦进入 SSE，
         // 账号切换时必须用新账号重新上传参考素材，不能复用上一个账号的 TOS URI。
         let mut account = account;
@@ -1094,10 +1138,10 @@ pub fn start_native_task(
                 }
                 Err(error) => {
                     state.pool.note_error(&account.uid, ErrKind::Server);
-                    update_task(&task_id, |task| {
-                        task.status = "failed".into();
-                        task.error = Some(format!("Seedance 上游连接失败: {error}"));
-                    });
+                    mark_native_worker_unknown(
+                        &task_id,
+                        format!("Seedance 上游连接结果未知: {error}"),
+                    );
                     return;
                 }
             }
@@ -1120,10 +1164,7 @@ pub fn start_native_task(
                         Ok(true) => terminal = true,
                         Ok(false) => {}
                         Err(error) => {
-                            update_task(&task_id, |task| {
-                                task.status = "failed".into();
-                                task.error = Some(error);
-                            });
+                            mark_native_worker_unknown(&task_id, error);
                             terminal = true;
                         }
                     }
@@ -1145,10 +1186,7 @@ pub fn start_native_task(
             }
             match parse_sse_event(&event_name, &event_data, &task_id) {
                 Ok(_) => {}
-                Err(error) => update_task(&task_id, |task| {
-                    task.status = "failed".into();
-                    task.error = Some(error);
-                }),
+                Err(error) => mark_native_worker_unknown(&task_id, error),
             }
         }
         let task_status = get(&task_id).map(|task| task.status).unwrap_or_default();
@@ -1173,10 +1211,10 @@ pub fn start_native_task(
             }
             state.pool.note_success(&account.uid);
         } else if task_status == "processing" {
-            update_task(&task_id, |task| {
-                task.status = "failed".into();
-                task.error = Some("Seedance SSE 在 done 事件前结束".into());
-            });
+            mark_native_worker_unknown(
+                &task_id,
+                "Seedance SSE 在 done 事件前结束，等待上游核查",
+            );
             state.pool.note_error(&account.uid, super::ErrKind::Server);
         }
     });

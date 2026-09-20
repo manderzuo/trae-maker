@@ -439,3 +439,35 @@ cargo.exe test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\s
 - Core 视频幂等、Core settle 错误深层恢复、legacy SSE worker cleanup。
 - 未运行全量 Rust suite；既有 `core_migration` 失败与其它用户 dirty 文件均未处理。
 - 未修改 `limits.rs`，本轮恢复复用了现有 per-Key/global limiter。
+
+---
+
+# Task 3 修复轮次 8：A2.2b-2b worker 异常与 Core 终态回收
+
+日期：2026-09-20
+范围：legacy 视频 worker 的异常/未知状态语义，以及 Core video adapter/settlement 异常时的 fail-closed permit 处理
+状态：完成本轮范围
+
+## 改动
+
+1. legacy `start_native_task` 增加 RAII worker guard：线程 panic、早退或 SSE 在终态前结束时，将任务标记为 `unknown` 并保留 permit，等待后续恢复/核查；已明确为 `unknown` 的任务不会被 guard 覆盖错误信息，也不会伪造 `completed`。
+2. `load_persisted` 清理同进程旧任务索引前先释放旧 permit，避免重复加载把内存中的视频许可孤儿化。
+3. Core video worker 捕获 adapter panic 并转成 `TransportUnknown`；接受结果持久化失败时尝试记录 unknown；settlement 返回错误时只有重新读取到明确终态才释放 permit，unknown/running 仍保留。
+4. Core HTTP video 路径沿用同一终态复核，补充接受持久化和结算错误后的 permit 回收；accepted 的上游 request ref 一并进入 unknown 记录，便于后续核查。
+
+## focused 测试
+
+以下命令使用 `D:\gpt\aiwork-key-limits-cargo-target`、`--offline`：
+
+```text
+cargo.exe test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --bin ai-work-assistant api_server::video_worker -- --nocapture
+结果：2 passed，0 failed（adapter panic 测试的 panic 文本由 catch_unwind 捕获，测试结果仍为通过）
+
+cargo.exe test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --bin ai-work-assistant api_server::video::tests
+结果：20 passed，0 failed
+
+cargo.exe test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --bin ai-work-assistant api_server::routes::tests::core_nonstream_rejects_before_execution_when_request_limiter_is_full -- --exact --nocapture
+结果：1 passed，0 failed
+```
+
+仍未调用真实视频上游。完整 Rust suite 和发布验收留到 Task 5 统一执行；既有 `core_migration` 失败继续单独记录。

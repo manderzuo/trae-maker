@@ -2112,6 +2112,19 @@ fn core_video_response(
     response
 }
 
+fn release_core_video_permit_if_terminal(
+    bridge: &super::CoreBridge,
+    principal: &Principal,
+    job_id: &str,
+) {
+    let Ok(Some(job)) = bridge.store.video_job_for_user(principal, job_id) else {
+        return;
+    };
+    if matches!(job.state, JobState::Succeeded | JobState::Failed | JobState::Canceled) {
+        video::release_job_permit(job_id);
+    }
+}
+
 async fn core_videos_generations(
     state: Arc<ApiSharedState>,
     principal: Principal,
@@ -2294,9 +2307,10 @@ async fn core_videos_generations(
                     &lease.lease_id,
                     VideoAdapterOutcome::TransportUnknown {
                         reason: "acceptance_persistence_failed".into(),
-                        upstream_request_ref: None,
+                        upstream_request_ref: Some(upstream_request_ref.clone()),
                     },
                 );
+                release_core_video_permit_if_terminal(&bridge, &principal, &job.id);
                 return core_lease_error_response(error);
             }
         }
@@ -2310,6 +2324,7 @@ async fn core_videos_generations(
                 &lease.lease_id,
                 outcome.clone(),
             ) {
+                release_core_video_permit_if_terminal(&bridge, &principal, &job.id);
                 return core_lease_error_response(error);
             }
             if video_outcome_releases_payload(&outcome) {
