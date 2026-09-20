@@ -226,6 +226,20 @@ pub fn today_key() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
+/// Key 配额日期键必须使用 UTC；它不能随本机展示时区变化。
+pub fn key_quota_day() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+#[cfg(test)]
+#[test]
+fn key_quota_day_uses_utc_date() {
+    assert_eq!(
+        key_quota_day(),
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
+    );
+}
+
 /// 用量文件路径：data_dir/data/api_usage.json
 pub fn usage_path(data_dir: &Path) -> PathBuf {
     let dir = data_dir.join("data");
@@ -515,7 +529,7 @@ mod tests {
         let mut loaded = crate::api_server::api_keys::load(&dir);
         assert!(matches!(
             loaded.verify_and_consume("fixture-token-key", "day-1"),
-            KeyCheck::QuotaExceeded { limit: 10 }
+            KeyCheck::QuotaExceeded { limit: 10, .. }
         ));
 
         assert!(matches!(

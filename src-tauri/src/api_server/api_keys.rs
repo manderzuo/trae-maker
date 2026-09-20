@@ -36,13 +36,13 @@ pub enum KeyCheck {
     /// Key 无效或已禁用
     Invalid,
     /// 超出当日配额
-    QuotaExceeded { limit: u64 },
+    QuotaExceeded { limit: u64, kind: QuotaKind },
     /// Key 已认证，但未被授予当前路由能力。
     CapabilityNotAllowed { capability: String },
 }
 
-/// 日配额的兼容错误分类；请求和 Token 共用既有 `daily_quota_exceeded` code，
-/// 仅消息按实际额度类型说明单位。
+/// 日配额的兼容错误分类；请求和 Token 共用 canonical `quota_exceeded` code，
+/// 响应另带旧的 `daily_quota_exceeded` alias，并按实际额度类型说明单位。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuotaKind {
     Requests,
@@ -321,14 +321,18 @@ impl ApiKeyEntry {
     }
 }
 
-/// 当日是否仍有配额；跨天自动重置计数
-fn quota_left(e: &mut ApiKeyEntry, today: &str) -> Result<(), u64> {
+/// 当日是否仍有配额；跨天自动重置计数。
+///
+/// Token reservation 按其保存的 UTC 日期隔离；运行中的旧日 reservation
+/// 不应影响新日额度。
+fn quota_left(e: &mut ApiKeyEntry, today: &str) -> Result<(), (u64, QuotaKind)> {
+    normalize_daily_stats(e);
     if e.used_date != today {
         e.used_date = today.to_string();
         e.used_today = 0;
     }
     if e.daily_limit > 0 && e.used_today >= e.daily_limit {
-        return Err(e.daily_limit);
+        return Err((e.daily_limit, QuotaKind::Requests));
     }
     if e.limits.daily_tokens > 0 {
         let used_tokens = e
@@ -337,56 +341,77 @@ fn quota_left(e: &mut ApiKeyEntry, today: &str) -> Result<(), u64> {
             .find(|stat| stat.date == today)
             .map(|stat| stat.prompt_tokens.saturating_add(stat.completion_tokens))
             .unwrap_or(0);
-        if used_tokens >= e.limits.daily_tokens {
-            return Err(e.limits.daily_tokens);
+        let reserved_tokens = e
+            .token_reservations
+            .iter()
+            .filter(|reservation| reservation.date == today)
+            .map(|reservation| reservation.amount)
+            .sum::<u64>();
+        if used_tokens.saturating_add(reserved_tokens) >= e.limits.daily_tokens {
+            return Err((e.limits.daily_tokens, QuotaKind::Tokens));
         }
     }
     Ok(())
 }
 
-/// 按日统计记账：当日项 find-or-insert +1，cap 90 天
-fn bump_daily_stats(e: &mut ApiKeyEntry, today: &str) {
-    let need_new = e
+/// 将历史按日统计规范化为升序且每个日期至多一条。
+///
+/// reservation 结算可能在 reservation UTC 日期之后发生，因此不能只更新
+/// `daily_stats.last_mut()`：那会把旧日期追加到新日期之后，甚至产生重复日期。
+fn normalize_daily_stats(e: &mut ApiKeyEntry) {
+    e.daily_stats.sort_by(|left, right| left.date.cmp(&right.date));
+    let mut normalized: Vec<KeyDailyStat> = Vec::with_capacity(e.daily_stats.len());
+    for stat in e.daily_stats.drain(..) {
+        if let Some(previous) = normalized.last_mut() {
+            if previous.date == stat.date {
+                previous.requests = previous.requests.saturating_add(stat.requests);
+                previous.prompt_tokens = previous.prompt_tokens.saturating_add(stat.prompt_tokens);
+                previous.completion_tokens =
+                    previous.completion_tokens.saturating_add(stat.completion_tokens);
+                continue;
+            }
+        }
+        normalized.push(stat);
+    }
+    if normalized.len() > DAILY_STATS_CAP {
+        let drop = normalized.len() - DAILY_STATS_CAP;
+        normalized.drain(0..drop);
+    }
+    e.daily_stats = normalized;
+}
+
+fn daily_stat_mut<'a>(e: &'a mut ApiKeyEntry, date: &str) -> Option<&'a mut KeyDailyStat> {
+    normalize_daily_stats(e);
+    if let Err(index) = e
         .daily_stats
-        .last()
-        .map(|s| s.date.as_str() != today)
-        .unwrap_or(true);
-    if need_new {
-        e.daily_stats.push(KeyDailyStat {
-            date: today.to_string(),
-            requests: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        });
+        .binary_search_by(|stat| stat.date.as_str().cmp(date))
+    {
+        e.daily_stats.insert(
+            index,
+            KeyDailyStat {
+                date: date.to_string(),
+                requests: 0,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            },
+        );
         if e.daily_stats.len() > DAILY_STATS_CAP {
             let drop = e.daily_stats.len() - DAILY_STATS_CAP;
             e.daily_stats.drain(0..drop);
         }
     }
-    if let Some(s) = e.daily_stats.last_mut() {
-        s.requests = s.requests.saturating_add(1);
+    e.daily_stats.iter_mut().find(|stat| stat.date == date)
+}
+
+/// 按日统计记账：当日项 find-or-insert +1，cap 90 天。
+fn bump_daily_stats(e: &mut ApiKeyEntry, today: &str) {
+    if let Some(stat) = daily_stat_mut(e, today) {
+        stat.requests = stat.requests.saturating_add(1);
     }
 }
 
 fn add_daily_tokens(e: &mut ApiKeyEntry, today: &str, prompt_tokens: u64, completion_tokens: u64) {
-    let need_new = e
-        .daily_stats
-        .last()
-        .map(|s| s.date.as_str() != today)
-        .unwrap_or(true);
-    if need_new {
-        e.daily_stats.push(KeyDailyStat {
-            date: today.to_string(),
-            requests: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        });
-        if e.daily_stats.len() > DAILY_STATS_CAP {
-            let drop = e.daily_stats.len() - DAILY_STATS_CAP;
-            e.daily_stats.drain(0..drop);
-        }
-    }
-    if let Some(stat) = e.daily_stats.last_mut() {
+    if let Some(stat) = daily_stat_mut(e, today) {
         stat.prompt_tokens = stat.prompt_tokens.saturating_add(prompt_tokens);
         stat.completion_tokens = stat.completion_tokens.saturating_add(completion_tokens);
     }
@@ -444,8 +469,8 @@ impl ApiKeysFile {
                 };
             }
         }
-        if let Err(limit) = quota_left(e, today) {
-            return KeyCheck::QuotaExceeded { limit };
+        if let Err((limit, kind)) = quota_left(e, today) {
+            return KeyCheck::QuotaExceeded { limit, kind };
         }
         e.used_today += 1;
         bump_daily_stats(e, today);
@@ -494,7 +519,13 @@ pub fn daily_token_quota(data_dir: &Path, key_id: &str, today: &str) -> Result<(
         .find(|stat| stat.date == today)
         .map(|stat| stat.prompt_tokens.saturating_add(stat.completion_tokens))
         .unwrap_or(0);
-    if used_tokens >= entry.limits.daily_tokens {
+    let reserved_tokens = entry
+        .token_reservations
+        .iter()
+        .filter(|reservation| reservation.date == today)
+        .map(|reservation| reservation.amount)
+        .sum::<u64>();
+    if used_tokens.saturating_add(reserved_tokens) >= entry.limits.daily_tokens {
         Err(entry.limits.daily_tokens)
     } else {
         Ok(())
@@ -524,6 +555,39 @@ pub fn save(data_dir: &Path, f: &ApiKeysFile) {
 /// 原子完成，否则并发请求互相覆盖 used_today/daily_stats——配额可被穿透、统计少记。
 static KEYS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 管理端整表保存：在 Key 锁内合并前端配置与当前运行态。
+///
+/// 前端 payload 中的 `token_reservations` 只是列表快照，不能覆盖运行中的
+/// reservation；已有 Key 按 id 保留当前文件中的 reservation，新 Key 不接受
+/// 前端带入的 reservation。`auth_disabled` 由调用方显式传入时生效，省略时
+/// 保留当前值。
+pub fn save_from_admin(
+    data_dir: &Path,
+    keys: Vec<ApiKeyEntry>,
+    auth_disabled: Option<bool>,
+) {
+    let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let current = load(data_dir);
+    let current_auth_disabled = current.auth_disabled;
+    let merged_keys = keys
+        .into_iter()
+        .map(|mut key| {
+            key.token_reservations = current
+                .keys
+                .iter()
+                .find(|current_key| current_key.id == key.id)
+                .map(|current_key| current_key.token_reservations.clone())
+                .unwrap_or_default();
+            key
+        })
+        .collect();
+    let file = ApiKeysFile {
+        keys: merged_keys,
+        auth_disabled: auth_disabled.unwrap_or(current_auth_disabled),
+    };
+    save(data_dir, &file);
+}
+
 /// 在已有 Key 锁内更新已知 token 用量；请求数由鉴权路径单独记账。
 /// token_usage 缺失时调用方传入 0，因而不会伪造 token。
 pub fn record_token_usage_locked(
@@ -549,8 +613,10 @@ pub fn record_token_usage_locked(
 /// 为一个 legacy text request 保守预留当日剩余 Token 容量。
 ///
 /// 认证阶段无法可靠知道上游最终 usage，因此有限 Token Key 每次只允许一个
-/// 尚未结算的请求占用“全部剩余容量”。已知 usage 结算时释放未使用部分；失败、
-/// 未知 usage 则由 guard 释放，避免把未知用量伪造为已知 Token。
+/// 尚未结算的请求占用“全部剩余容量”。reservation 按 UTC 日期持久化；跨日时
+/// 仍运行的 reservation 保留到显式 settle/release，只有当前 UTC 日的 reservation
+/// 参与当前日额度计算。已知 usage 结算时释放未使用部分；失败、未知 usage 则由
+/// guard 释放，避免把未知用量伪造为已知 Token。
 pub fn reserve_token_quota(
     data_dir: &Path,
     key_id: &str,
@@ -565,13 +631,7 @@ pub fn reserve_token_quota(
     let Some(entry) = file.keys.iter_mut().find(|entry| entry.id == key_id) else {
         return Err(TokenQuotaError::KeyUnavailable);
     };
-    let removed_stale_reservations = entry
-        .token_reservations
-        .iter()
-        .any(|reservation| reservation.date != today);
-    entry
-        .token_reservations
-        .retain(|reservation| reservation.date == today);
+    normalize_daily_stats(entry);
     let used_tokens = entry
         .daily_stats
         .iter()
@@ -581,13 +641,11 @@ pub fn reserve_token_quota(
     let reserved_tokens = entry
         .token_reservations
         .iter()
+        .filter(|reservation| reservation.date == today)
         .map(|reservation| reservation.amount)
         .sum::<u64>();
     let occupied = used_tokens.saturating_add(reserved_tokens);
     if occupied >= daily_tokens {
-        if removed_stale_reservations {
-            save(data_dir, &file);
-        }
         return Err(TokenQuotaError::Exceeded { limit: daily_tokens });
     }
     let amount = daily_tokens.saturating_sub(occupied);
@@ -936,7 +994,7 @@ mod tests {
         assert!(matches!(f.verify_and_consume("ck-a", "d1"), KeyCheck::Ok(_)));
         assert!(matches!(
             f.verify_and_consume("ck-a", "d1"),
-            KeyCheck::QuotaExceeded { limit: 2 }
+            KeyCheck::QuotaExceeded { limit: 2, .. }
         ));
         // 跨天重置
         assert!(matches!(f.verify_and_consume("ck-a", "d2"), KeyCheck::Ok(_)));
@@ -988,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn token_reservation_cleanup_persists_when_new_fixed_utc_day_is_exhausted() {
+    fn token_reservation_retains_active_old_day_when_new_day_is_exhausted() {
         let dir = std::path::PathBuf::from(r"D:\gpt").join(format!(
             "twa-keys-token-reservation-cross-day-{}-{}",
             std::process::id(),
@@ -1006,11 +1064,11 @@ mod tests {
 
         let old_day = "2026-09-19";
         let new_day = "2026-09-20";
-        let _old = reserve_token_quota(&dir, "k1", old_day, 10)
+        let old = reserve_token_quota(&dir, "k1", old_day, 10)
             .unwrap()
             .unwrap();
-        // Exhaust the new UTC day so reserve_token_quota takes its rejection
-        // path after removing the stale old-day reservation.
+        // Exhaust the new UTC day; the active old-day reservation must remain
+        // persisted while the new-day request is rejected.
         record_token_usage_locked(&dir, "k1", new_day, 10, 0);
 
         assert!(matches!(
@@ -1019,7 +1077,14 @@ mod tests {
         ));
 
         let loaded = load(&dir);
-        assert!(loaded.keys[0].token_reservations.is_empty());
+        assert_eq!(
+            loaded.keys[0]
+                .token_reservations
+                .iter()
+                .map(|reservation| reservation.date.as_str())
+                .collect::<Vec<_>>(),
+            vec![old_day]
+        );
         assert_eq!(
             loaded.keys[0]
                 .daily_stats
@@ -1028,6 +1093,104 @@ mod tests {
                 .map(|stat| stat.prompt_tokens + stat.completion_tokens),
             Some(10)
         );
+        release_token_reservation(&old);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn token_reservation_survives_utc_day_rollover_until_explicit_settlement() {
+        let dir = std::path::PathBuf::from(r"D:\gpt").join(format!(
+            "twa-keys-token-reservation-live-rollover-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut key = entry("k1", "fixture-token-live-rollover", true, 0);
+        key.limits.daily_tokens = 10;
+        save(
+            &dir,
+            &ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+
+        let old_day = "2026-09-19";
+        let new_day = "2026-09-20";
+        let old_lease = reserve_token_quota(&dir, "k1", old_day, 10)
+            .unwrap()
+            .unwrap();
+        let new_lease = reserve_token_quota(&dir, "k1", new_day, 10)
+            .expect("the new UTC day has an independent token budget")
+            .expect("the new day should create a reservation");
+
+        let loaded = load(&dir);
+        assert_eq!(
+            loaded.keys[0]
+                .token_reservations
+                .iter()
+                .map(|reservation| reservation.date.as_str())
+                .collect::<Vec<_>>(),
+            vec![old_day, new_day],
+            "an active old-day reservation must not be cleaned up by a new-day request"
+        );
+
+        settle_token_reservation(&old_lease, new_day, 3, 4);
+        release_token_reservation(&new_lease);
+        let loaded = load(&dir);
+        assert!(loaded.keys[0].token_reservations.is_empty());
+        assert_eq!(
+            loaded.keys[0]
+                .daily_stats
+                .iter()
+                .find(|stat| stat.date == old_day)
+                .map(|stat| (stat.prompt_tokens, stat.completion_tokens)),
+            Some((3, 4)),
+            "settlement remains attributed to the reservation UTC date"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn token_reservation_settlement_merges_same_date_and_keeps_daily_stats_sorted() {
+        let dir = std::path::PathBuf::from(r"D:\gpt").join(format!(
+            "twa-keys-token-reservation-stats-order-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let old_day = "2026-09-19";
+        let new_day = "2026-09-20";
+        let mut key = entry("k1", "fixture-token-stats-order", true, 0);
+        key.limits.daily_tokens = 10;
+        key.daily_stats = vec![KeyDailyStat {
+            date: old_day.to_string(),
+            requests: 2,
+            prompt_tokens: 1,
+            completion_tokens: 2,
+        }];
+        save(
+            &dir,
+            &ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+
+        let lease = reserve_token_quota(&dir, "k1", old_day, 10)
+            .unwrap()
+            .unwrap();
+        record_token_usage_locked(&dir, "k1", new_day, 5, 0);
+        settle_token_reservation(&lease, new_day, 3, 4);
+
+        let loaded = load(&dir);
+        let stats = &loaded.keys[0].daily_stats;
+        assert_eq!(
+            stats.iter().map(|stat| stat.date.as_str()).collect::<Vec<_>>(),
+            vec![old_day, new_day],
+            "settling an older reservation must not append an out-of-order duplicate"
+        );
+        assert_eq!(stats[0].requests, 2);
+        assert_eq!((stats[0].prompt_tokens, stats[0].completion_tokens), (4, 6));
+        assert_eq!((stats[1].prompt_tokens, stats[1].completion_tokens), (5, 0));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1151,11 +1314,11 @@ mod tests {
             auth_disabled: false,
         };
         for i in 0..120 {
-            let date = format!("d{i}");
+            let date = format!("2026-{:02}-{:02}", i / 30 + 1, i % 30 + 1);
             let _ = f.verify_and_consume("ck-a", &date);
         }
         assert_eq!(f.keys[0].daily_stats.len(), 90);
-        assert_eq!(f.keys[0].daily_stats[0].date, "d30");
+        assert_eq!(f.keys[0].daily_stats[0].date, "2026-02-01");
     }
 
     #[test]
@@ -1183,6 +1346,79 @@ mod tests {
         assert_eq!(loaded.keys[0].daily_limit, 5);
         assert_eq!(loaded.keys[0].allowed_accounts, vec!["wb-9"]);
         assert_eq!(loaded.keys[0].schedule_mode(), MODE_DEDICATED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admin_save_preserves_runtime_reservations_and_key_list_changes() {
+        let dir = std::path::PathBuf::from(r"D:\gpt").join(format!(
+            "twa-keys-admin-save-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut current = entry("k1", "fixture-admin-save", true, 0);
+        current.limits.daily_tokens = 10;
+        save(
+            &dir,
+            &ApiKeysFile {
+                keys: vec![current],
+                auth_disabled: false,
+            },
+        );
+
+        let lease = reserve_token_quota(&dir, "k1", "day-1", 10)
+            .unwrap()
+            .expect("a finite token limit should create a reservation");
+
+        let mut edited = entry("k1", "fixture-admin-save-updated", true, 0);
+        edited.name = "edited".into();
+        edited.limits.daily_tokens = 20;
+        edited.token_reservations = vec![KeyTokenReservation {
+            id: "frontend-must-not-win".into(),
+            date: "day-2".into(),
+            amount: 1,
+        }];
+        let mut added = entry("k2", "fixture-admin-save-added", true, 0);
+        added.token_reservations = vec![KeyTokenReservation {
+            id: "frontend-new-key-reservation-must-not-win".into(),
+            date: "day-2".into(),
+            amount: 1,
+        }];
+
+        save_from_admin(&dir, vec![edited, added.clone()], Some(true));
+
+        let loaded = load(&dir);
+        assert!(loaded.auth_disabled);
+        assert_eq!(loaded.keys.len(), 2, "the new Key row should still be added");
+        let edited = loaded.keys.iter().find(|key| key.id == "k1").unwrap();
+        assert_eq!(edited.name, "edited");
+        assert_eq!(edited.limits.daily_tokens, 20);
+        assert_eq!(
+            edited.token_reservations,
+            vec![KeyTokenReservation {
+                id: lease.id.clone(),
+                date: "day-1".into(),
+                amount: 10,
+            }],
+            "the admin payload must not replace the running reservation"
+        );
+        assert!(
+            loaded
+                .keys
+                .iter()
+                .find(|key| key.id == "k2")
+                .unwrap()
+                .token_reservations
+                .is_empty(),
+            "a new Key cannot import a frontend reservation"
+        );
+
+        save_from_admin(&dir, vec![added], Some(false));
+
+        let loaded = load(&dir);
+        assert!(!loaded.auth_disabled);
+        assert_eq!(loaded.keys.len(), 1, "deleting a Key row should still work");
+        assert_eq!(loaded.keys[0].id, "k2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

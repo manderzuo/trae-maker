@@ -254,3 +254,103 @@ cargo test --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo
 1. 完整 suite 仍受上述 4 个前置失败影响，不能宣称全量测试全绿；本轮相关 focused 测试全绿。
 2. reservation-date 策略要求 reservation 在结算时仍存在；若进程重启或跨日清理已移除旧 reservation，现有旧 lease 仍按既有 no-op 语义处理，不在本轮扩展恢复/对账生命周期。
 3. 当前工作区仍有前置 UTC、认证策略、Core 等未提交改动；提交时只暂存本轮两个实现、三条回归测试及本报告追加内容。
+---
+
+# Task 3 修复轮次 4：A2.2a 最小收尾
+
+日期：2026-09-20
+范围：Token reservation 跨 UTC 日生命周期、legacy auth policy snapshot/quota error、Chat Completions 单次请求计数
+状态：本轮范围完成；Core request permit、视频幂等原子性、视频 permit 回收未处理
+
+## 改动
+
+1. reservation 按创建时 UTC 日期持久化，跨日运行中的 reservation 保留到显式 settle/release；只有当前 UTC 日 reservation 参与当前日额度占用。daily_stats 在写入前统一排序、同日合并并限制 90 天，旧日期结算不会追加重复或乱序记录。
+2. legacy handler 直接消费鉴权阶段注入的 `ResolvedKey` 快照；匿名请求明确使用默认策略；非匿名请求缺失或不匹配快照返回 `500 auth_snapshot_missing`，不会回读持久化 store 或静默放宽策略。WB legacy 三条路径和图片/素材/视频 legacy 路径均传递同一快照。
+3. quota 超限响应统一为 `error.type/code = quota_exceeded`，保留 `legacy_code = daily_quota_exceeded`、`param` 和原有 message/status 兼容字段。
+4. Chat Completions 在 legacy/Core 分流前统一递增一次 `total_requests`；未新增其它文字路径计数。
+
+## 改动文件
+
+- `src-tauri/src/api_server/api_keys.rs`
+- `src-tauri/src/api_server/auth.rs`
+- `src-tauri/src/api_server/routes.rs`
+- `src-tauri/src/api_server/wb_route.rs`
+- `src-tauri/src/api_server/phase3_streaming_smoke.rs`（仅为新增可选 auth snapshot 参数更新既有 Core 测试调用）
+- 本报告文件
+
+## 测试环境与结果
+
+命令使用 `CARGO_HOME=C:\Users\StarLink\.cargo`、`CARGO_TARGET_DIR=D:\gpt\aiwork-key-limits-cargo-target`、stable toolchain PATH、`--offline`；没有把 Cargo/test 产物写入 C 盘。
+
+已完成的聚焦命令均返回成功：
+
+```text
+cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml token_reservation_ --offline -- --nocapture
+结果：6 passed，0 failed
+
+cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml quota_error_keeps_compatible_fields_and_identifies_token_limit --offline -- --nocapture
+结果：1 passed，0 failed
+
+cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml legacy_text_quota_rejection_releases_the_request_permit --offline -- --nocapture
+结果：1 passed，0 failed
+
+cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml legacy_handlers_use_the_persisted_policy_without_defaulting_authenticated_keys --offline -- --nocapture
+结果：1 passed，0 failed
+
+cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml legacy_handlers_use_auth_snapshot_and_fail_closed_when_snapshot_is_missing --offline -- --nocapture
+结果：1 passed，0 failed
+
+cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml chat_completions_counts_one_authenticated_request_without_duplicate_increment --offline -- --nocapture
+结果：1 passed，0 failed
+```
+
+未运行全量测试；上述构建与聚焦测试均通过。仅有工作区已有 unused/dead-code 与 Windows linker 警告。
+
+## 未处理事项
+
+- 按用户边界未处理 Core request permit、视频幂等原子性、视频 permit 回收/回收语义。
+- 未运行全量 Rust suite。
+- reservation 若进程重启导致外部 lease 句柄丢失，仍按既有 no-op 结算/释放语义，不扩展跨进程恢复或对账。
+
+## A2.2a 复核修复：管理端保存保护运行态 reservation
+
+- `api_keys::save_from_admin` 在 `KEYS_LOCK` 内合并管理端 Key 配置；已有 Key 保留当前运行中的 `token_reservations`，新 Key 不接受前端带入的 reservation，避免整表保存清掉正在执行的请求额度。
+- `api_keys_save` 改用该原子 helper；新增 `admin_save_preserves_runtime_reservations_and_key_list_changes` 回归测试，覆盖配置更新、增删 Key、鉴权开关和恶意/陈旧 reservation payload。
+- D 盘 focused 验证：`admin_save_preserves_runtime_reservations_and_key_list_changes` 1 passed；`token_reservation_` 6 passed；认证快照、quota error、Chat 单次计数测试各 1 passed。
+- 仍未处理 Core request permit、视频幂等原子性、视频 permit 回收/恢复语义；quota canonical code 继续使用 `quota_exceeded`，并保留 `legacy_code=daily_quota_exceeded`。
+
+---
+
+# Task 3 修复轮次 5：管理端保存不覆盖运行态 Token reservation
+
+日期：2026-09-20
+范围：仅修复管理端 `api_keys_save` 的锁内整表保存合并；未扩展到 Core、video 或 quota error 字段。
+
+## 本轮修复
+
+1. `src-tauri/src/api_server/api_keys.rs` 新增 `save_from_admin`：在 `KEYS_LOCK` 内 load 当前文件，按 Key id 应用前端配置；已有 Key 保留当前运行中的 `token_reservations`，新 Key 丢弃前端带入的 reservation，避免前端快照覆盖运行态。
+2. `src-tauri/src/commands/api_server.rs` 的 `api_keys_save` 改为只调用该 helper，不再执行无锁 `load` + `save`。`auth_disabled` 的 `Some` 值按调用方传入值生效，`None` 在同一锁内保留当前值。
+3. 新增 Rust 回归测试，覆盖已有 reservation 保留、前端 reservation 不生效、Key 新增/删除不变以及 `auth_disabled` 显式更新。
+
+## RED / GREEN 与 focused 测试
+
+测试环境统一使用 `CARGO_HOME=C:\Users\StarLink\.cargo`、`CARGO_TARGET_DIR=D:\gpt\aiwork-key-limits-cargo-target`、stable toolchain PATH 和 `--offline`；没有把 Cargo/test 产物写入 C 盘。
+
+```text
+cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml admin_save_preserves_runtime_reservations_and_key_list_changes --offline -- --nocapture
+RED：失败于缺少待实现的 `save_from_admin`；实现后 GREEN：1 passed，0 failed
+
+cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml token_reservation_ --offline -- --nocapture
+结果：6 passed，0 failed
+
+cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml api_keys --offline -- --nocapture
+结果：23 passed，1 failed；失败为已有 A2.2a 测试 `daily_stats_capped_at_90`（实际 `d18`，期望 `d30`），与本轮管理端保存修复无关，未改动统计排序逻辑。
+```
+
+`cargo fmt --check` 未能执行：已安装的 stable toolchain 缺少 `rustfmt` 组件；未安装组件或修改文件。`git diff --check` 未发现空白错误。
+
+## 未处理事项
+
+- 保留 `daily_stats_capped_at_90` 的既有失败，不扩大到本轮无关的 A2.2a 统计排序逻辑。
+- 未运行全量 Rust suite；完整 suite 的既有失败和其它未提交改动继续按前述报告处理。
+- 未修改 Core/video、quota error 字段或任何其它用户改动；提交时仅暂存本轮修复 hunks 与本报告追加内容。

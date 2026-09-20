@@ -118,22 +118,28 @@ fn core_principal_or_unauthorized(principal: Option<&Extension<Principal>>) -> R
         .ok_or_else(|| openai_error(StatusCode::UNAUTHORIZED, "unauthorized", "Core Principal required"))
 }
 
-fn legacy_policy(state: &ApiSharedState, key_id: &str) -> Option<ResolvedKey> {
-    if key_id == "anonymous" {
-        None
-    } else {
-        api_keys::constraints_for(&state.data_dir, key_id)
-    }
-}
-
 fn require_legacy_capability(
-    state: &ApiSharedState,
     key_id: &str,
+    resolved_key: Option<&ResolvedKey>,
     capability: &str,
 ) -> Result<KeyLimits, Response> {
-    let Some(policy) = legacy_policy(state, key_id) else {
+    if key_id == "anonymous" {
         return Ok(KeyLimits::default());
+    }
+    let Some(policy) = resolved_key else {
+        return Err(openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "auth_snapshot_missing",
+            "authenticated API Key policy snapshot is missing",
+        ));
     };
+    if policy.id != key_id {
+        return Err(openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "auth_snapshot_missing",
+            "authenticated API Key policy snapshot does not match the request key",
+        ));
+    }
     if !policy.capabilities.iter().any(|value| value == capability) {
         return Err(openai_error(
             StatusCode::FORBIDDEN,
@@ -141,7 +147,7 @@ fn require_legacy_capability(
             &format!("API Key 未启用能力: {capability}"),
         ));
     }
-    Ok(policy.limits)
+    Ok(policy.limits.clone())
 }
 
 fn legacy_request_guard(
@@ -964,6 +970,7 @@ fn public_seedance_model_value(work_available: bool) -> Value {
 pub async fn chat_completions(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
     principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -1012,14 +1019,18 @@ pub async fn chat_completions(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+    let resolved_key = resolved_key.map(|Extension(key)| key);
     let key_limits = if core_enforcing(&state) {
         KeyLimits::default()
     } else {
-        match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_CHAT) {
+        match require_legacy_capability(&key_str, resolved_key.as_ref(), api_keys::CAPABILITY_CHAT) {
             Ok(limits) => limits,
             Err(response) => return response,
         }
     };
+    state
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if core_enforcing(&state) {
         let principal = match core_principal_or_unauthorized(principal.as_ref()) {
             Ok(principal) => principal,
@@ -1191,9 +1202,9 @@ pub async fn chat_completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard)
+                    wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, resolved_key.clone(), guard)
                 } else {
-                    wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await
+                    wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, resolved_key.clone(), guard).await
                 }
             }
             TargetPool::Trae => {
@@ -1230,6 +1241,7 @@ pub async fn chat_completions(
 pub async fn responses_api(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
     principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -1277,10 +1289,11 @@ pub async fn responses_api(
     }
 
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+    let resolved_key = resolved_key.map(|Extension(key)| key);
     let key_limits = if core_enforcing(&state) {
         KeyLimits::default()
     } else {
-        match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_CHAT) {
+        match require_legacy_capability(&key_str, resolved_key.as_ref(), api_keys::CAPABILITY_CHAT) {
             Ok(limits) => limits,
             Err(response) => return response,
         }
@@ -1336,14 +1349,14 @@ pub async fn responses_api(
                 && super::wb_toolexec::responses_declares_web_search(&peek)
             {
                 return wb_route::wb_tool_exec_chat(
-                    state_clone, chat_body, route.model, stream, start_ts, key_str, guard,
+                    state_clone, chat_body, route.model, stream, start_ts, key_str, resolved_key.clone(), guard,
                 )
                 .await;
             }
             if stream {
-                wb_route::wb_stream_chat(state_clone, body_vec, route.model, start_ts, Protocol::Responses, key_str, guard)
+                wb_route::wb_stream_chat(state_clone, body_vec, route.model, start_ts, Protocol::Responses, key_str, resolved_key.clone(), guard)
             } else {
-                wb_route::wb_aggregate_chat(state_clone, body_vec, route.model, stream, start_ts, Protocol::Responses, key_str, guard).await
+                wb_route::wb_aggregate_chat(state_clone, body_vec, route.model, stream, start_ts, Protocol::Responses, key_str, resolved_key.clone(), guard).await
             }
         }
         TargetPool::Trae => {
@@ -1375,6 +1388,7 @@ pub async fn responses_api(
 pub async fn messages(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
     principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -1437,10 +1451,11 @@ pub async fn messages(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+    let resolved_key = resolved_key.map(|Extension(key)| key);
     let key_limits = if core_enforcing(&state) {
         KeyLimits::default()
     } else {
-        match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_CHAT) {
+        match require_legacy_capability(&key_str, resolved_key.as_ref(), api_keys::CAPABILITY_CHAT) {
             Ok(limits) => limits,
             Err(response) => return response,
         }
@@ -1488,9 +1503,9 @@ pub async fn messages(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, resolved_key.clone(), guard);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, resolved_key.clone(), guard).await;
             }
             TargetPool::Trae => {
                 if stream {
@@ -1521,6 +1536,7 @@ pub async fn messages(
 pub async fn completions(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
     body: axum::body::Bytes,
 ) -> Response {
     if body.len() > MAX_BODY_BYTES {
@@ -1596,7 +1612,8 @@ pub async fn completions(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
-    let key_limits = match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_CHAT) {
+    let resolved_key = resolved_key.map(|Extension(key)| key);
+    let key_limits = match require_legacy_capability(&key_str, resolved_key.as_ref(), api_keys::CAPABILITY_CHAT) {
         Ok(limits) => limits,
         Err(response) => return response,
     };
@@ -1617,9 +1634,9 @@ pub async fn completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, false);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, resolved_key.clone(), guard);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, resolved_key.clone(), guard).await;
             }
             TargetPool::Trae => {
                 if stream {
@@ -1657,9 +1674,17 @@ pub async fn embeddings() -> Response {
 pub async fn images_generations(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
     body: axum::body::Bytes,
 ) -> Response {
-    images_entry(state, key_id, body, false).await
+    images_entry(
+        state,
+        key_id,
+        resolved_key.map(|Extension(key)| key),
+        body,
+        false,
+    )
+    .await
 }
 
 /// /v1/images/edits 图生图（T5.4/F-63）：接受 JSON（image 为 base64/data URL）。
@@ -1668,9 +1693,17 @@ pub async fn images_generations(
 pub async fn images_edits(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
     body: axum::body::Bytes,
 ) -> Response {
-    images_entry(state, key_id, body, true).await
+    images_entry(
+        state,
+        key_id,
+        resolved_key.map(|Extension(key)| key),
+        body,
+        true,
+    )
+    .await
 }
 
 /// 参考图/参考视频素材上传。素材只绑定当前 API Key，落盘后等待 Trae
@@ -1680,6 +1713,7 @@ pub async fn images_edits(
 pub async fn assets_upload(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
     principal: Option<Extension<Principal>>,
     body: axum::body::Bytes,
 ) -> Response {
@@ -1693,7 +1727,8 @@ pub async fn assets_upload(
     let owner = key_id
         .map(|Extension(k)| k.0)
         .unwrap_or_else(|| "anonymous".to_string());
-    let key_limits = match require_legacy_capability(&state, &owner, api_keys::CAPABILITY_ASSETS) {
+    let resolved_key = resolved_key.map(|Extension(key)| key);
+    let key_limits = match require_legacy_capability(&owner, resolved_key.as_ref(), api_keys::CAPABILITY_ASSETS) {
         Ok(limits) => limits,
         Err(response) => return response,
     };
@@ -2117,6 +2152,10 @@ async fn core_videos_generations(
         Ok(executor) => executor,
         Err(error) => return core_lease_error_response(error),
     };
+    let _request_guard = match state.core_request_guard(&principal.key_id) {
+        Ok(guard) => guard,
+        Err(error) => return limit_error_response(error),
+    };
     let video_job_permit = match state.acquire_video_job(&principal.key_id, &KeyLimits::default()) {
         Ok(permit) => permit,
         Err(error) => return limit_error_response(error),
@@ -2345,6 +2384,7 @@ fn video_outcome_releases_payload(outcome: &VideoAdapterOutcome) -> bool {
 pub async fn videos_generations(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
     principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -2359,7 +2399,8 @@ pub async fn videos_generations(
     let key_str = key_id
         .map(|Extension(k)| k.0)
         .unwrap_or_else(|| "anonymous".to_string());
-    let key_limits = match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_VIDEO) {
+    let resolved_key = resolved_key.map(|Extension(key)| key);
+    let key_limits = match require_legacy_capability(&key_str, resolved_key.as_ref(), api_keys::CAPABILITY_VIDEO) {
         Ok(limits) => limits,
         Err(response) => return response,
     };
@@ -2467,6 +2508,7 @@ pub async fn videos_generations(
 pub async fn video_task(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
     principal: Option<Extension<Principal>>,
     Path(task_id): Path<String>,
 ) -> Response {
@@ -2495,7 +2537,8 @@ pub async fn video_task(
     let owner_key_id = key_id
         .map(|Extension(k)| k.0)
         .unwrap_or_else(|| "anonymous".to_string());
-    let key_limits = match require_legacy_capability(&state, &owner_key_id, api_keys::CAPABILITY_VIDEO) {
+    let resolved_key = resolved_key.map(|Extension(key)| key);
+    let key_limits = match require_legacy_capability(&owner_key_id, resolved_key.as_ref(), api_keys::CAPABILITY_VIDEO) {
         Ok(limits) => limits,
         Err(response) => return response,
     };
@@ -2528,6 +2571,7 @@ pub async fn video_task(
 pub async fn video_content(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
     principal: Option<Extension<Principal>>,
     Path(task_id): Path<String>,
 ) -> Response {
@@ -2597,7 +2641,8 @@ pub async fn video_content(
     let owner_key_id = key_id
         .map(|Extension(k)| k.0)
         .unwrap_or_else(|| "anonymous".to_string());
-    let key_limits = match require_legacy_capability(&state, &owner_key_id, api_keys::CAPABILITY_VIDEO) {
+    let resolved_key = resolved_key.map(|Extension(key)| key);
+    let key_limits = match require_legacy_capability(&owner_key_id, resolved_key.as_ref(), api_keys::CAPABILITY_VIDEO) {
         Ok(limits) => limits,
         Err(response) => return response,
     };
@@ -2791,6 +2836,7 @@ pub async fn video_cancel(
 async fn images_entry(
     state: Arc<ApiSharedState>,
     key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<ResolvedKey>,
     body: axum::body::Bytes,
     is_edit: bool,
 ) -> Response {
@@ -2798,7 +2844,7 @@ async fn images_entry(
         return scheduler_endpoint_not_enabled_response();
     }
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
-    let key_limits = match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_CHAT) {
+    let key_limits = match require_legacy_capability(&key_str, resolved_key.as_ref(), api_keys::CAPABILITY_CHAT) {
         Ok(limits) => limits,
         Err(response) => return response,
     };
@@ -2846,7 +2892,7 @@ async fn images_entry(
     // 约束（P1 修复4c）：白名单 allowed_accounts 过滤 + dedicated 专一锁定，
     // 与 wb_route 同款解析；Key 无约束/匿名（constraints_for 为 None）时不限制
     let (allowed_set, dedicated) = {
-        let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_str);
+        let key_constraints = resolved_key.as_ref();
         let allowed: Option<HashSet<String>> = key_constraints
             .as_ref()
             .map(|k| k.allowed_accounts.iter().cloned().collect())
@@ -3696,7 +3742,7 @@ pub(crate) fn openai_error(status: StatusCode, code: &str, msg: &str) -> Respons
         })
 }
 
-fn limit_error_response(error: LimitError) -> Response {
+pub(super) fn limit_error_response(error: LimitError) -> Response {
     let mut response = openai_error(StatusCode::TOO_MANY_REQUESTS, error.code(), error.message());
     if let Ok(value) = HeaderValue::from_str(&error.retry_after_secs().to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -4153,6 +4199,16 @@ mod tests {
         (state, dir, key_id)
     }
 
+    fn legacy_snapshot(
+        state: &ApiSharedState,
+        key_id: &str,
+    ) -> Option<Extension<ResolvedKey>> {
+        Some(Extension(
+            api_keys::constraints_for(&state.data_dir, key_id)
+                .expect("legacy fixture must provide an auth snapshot"),
+        ))
+    }
+
     #[tokio::test]
     async fn disabled_capability_returns_403_without_consuming_usage() {
         let (state, dir, key_id) = legacy_fixture_with_capabilities(&[]);
@@ -4167,6 +4223,7 @@ mod tests {
         let chat = chat_completions(
             State(state.clone()),
             Some(Extension(KeyId(key_id.clone()))),
+            legacy_snapshot(&state, &key_id),
             None,
             HeaderMap::new(),
             body.clone(),
@@ -4185,6 +4242,7 @@ mod tests {
         let video = videos_generations(
             State(state.clone()),
             Some(Extension(KeyId(key_id.clone()))),
+            legacy_snapshot(&state, &key_id),
             None,
             HeaderMap::new(),
             Bytes::from(json!({"model": "seedance", "prompt": "hello"}).to_string()),
@@ -4203,6 +4261,7 @@ mod tests {
         let assets = assets_upload(
             State(state.clone()),
             Some(Extension(KeyId(key_id.clone()))),
+            legacy_snapshot(&state, &key_id),
             None,
             Bytes::from("{}"),
         )
@@ -4245,6 +4304,7 @@ mod tests {
         for _ in 0..2 {
             let response = chat_completions(State(fixture.state.clone()),
                 Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+                None,
                 Some(Extension(fixture.principal.clone())), headers.clone(), chat_body(false)).await;
             assert_eq!(response.status(), StatusCode::OK);
         }
@@ -4268,6 +4328,7 @@ mod tests {
         let first = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers.clone(),
             chat_body(false),
@@ -4284,6 +4345,7 @@ mod tests {
         let conflict = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             changed,
@@ -4313,6 +4375,7 @@ mod tests {
             "credentials_ref":"vault://attacker", "provider":"attacker", "allowed_accounts":["attacker"], "dedicated_account":"attacker"});
         let response = chat_completions(State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())), headers, Bytes::from(body.to_string())).await;
         clear_core_test_executor();
         assert_eq!(response.status(), StatusCode::OK);
@@ -4338,6 +4401,7 @@ mod tests {
         headers.insert("idempotency-key", "stale".parse().unwrap());
         let response = chat_completions(State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())), headers, chat_body(false)).await;
         clear_core_test_executor();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -4374,6 +4438,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(false),
@@ -4408,6 +4473,7 @@ mod tests {
         headers.insert("idempotency-key", "no-runtime".parse().unwrap());
         let response = chat_completions(State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())), headers, chat_body(false)).await;
         clear_core_test_executor();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
@@ -4428,6 +4494,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(false),
@@ -4461,6 +4528,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(false),
@@ -4536,14 +4604,16 @@ mod tests {
         stream_headers.insert("idempotency-key", "legacy-stream-test".parse().unwrap());
         let response = chat_completions(State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())), stream_headers, chat_body(true)).await;
         let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
-        let response = responses_api(State(fixture.state.clone()), None, None, HeaderMap::new(), Bytes::from("{}")).await;
+        let response = responses_api(State(fixture.state.clone()), None, None, None, HeaderMap::new(), Bytes::from("{}")).await;
         let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
         let response = messages(
             State(fixture.state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -4555,7 +4625,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
-        let response = completions(State(fixture.state.clone()), None, Bytes::from("{}")).await;
+        let response = completions(State(fixture.state.clone()), None, None, Bytes::from("{}")).await;
         let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
     }
@@ -4565,6 +4635,7 @@ mod tests {
         let fixture = core_fixture(1, &["chat:invoke"]);
         let response = assets_upload(
             State(fixture.state.clone()),
+            None,
             None,
             Some(Extension(fixture.principal.clone())),
             Bytes::from("{}"),
@@ -4591,6 +4662,7 @@ mod tests {
         let response = videos_generations(
             State(fixture.state.clone()),
             None,
+            None,
             Some(Extension(fixture.principal.clone())),
             HeaderMap::new(),
             Bytes::from("{}"),
@@ -4605,6 +4677,7 @@ mod tests {
         let response = video_task(
             State(fixture.state.clone()),
             None,
+            None,
             Some(Extension(fixture.principal.clone())),
             Path("unintegrated-video".into()),
         )
@@ -4617,6 +4690,7 @@ mod tests {
 
         let response = video_content(
             State(fixture.state.clone()),
+            None,
             None,
             Some(Extension(fixture.principal.clone())),
             Path("unintegrated-video".into()),
@@ -4659,6 +4733,7 @@ mod tests {
         let response = assets_upload(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             Bytes::from(body.to_string()),
         )
@@ -4733,6 +4808,7 @@ mod tests {
         let response = images_generations(
             State(fixture.state.clone()),
             None,
+            None,
             Bytes::from("{}"),
         )
         .await;
@@ -4746,6 +4822,7 @@ mod tests {
 
         let response = images_edits(
             State(fixture.state.clone()),
+            None,
             None,
             Bytes::from("{}"),
         )
@@ -4801,6 +4878,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(true),
@@ -4823,6 +4901,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(false),
@@ -4838,6 +4917,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(false),
@@ -4870,6 +4950,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(false),
@@ -4894,6 +4975,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(false),
@@ -4911,6 +4993,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body_for_model("unpriced-model", false),
@@ -4931,6 +5014,7 @@ mod tests {
         let first = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers.clone(),
             chat_body(false),
@@ -4938,6 +5022,7 @@ mod tests {
         let second = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(false),
@@ -5020,6 +5105,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(false),
@@ -5071,6 +5157,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(false),
@@ -5342,6 +5429,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(true),
@@ -5382,6 +5470,7 @@ mod tests {
         let stream_response = chat_completions(
             State(stream_fixture.state.clone()),
             Some(Extension(KeyId(stream_fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(stream_fixture.principal.clone())),
             stream_headers,
             chat_body(true),
@@ -5437,6 +5526,7 @@ mod tests {
         let submitted = videos_generations(
             State(video_fixture.state.clone()),
             Some(Extension(KeyId(video_fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(video_fixture.principal.clone())),
             video_headers,
             Bytes::from(json!({"model":"mock-video","prompt":"event group"}).to_string()),
@@ -5503,6 +5593,7 @@ mod tests {
         let anthropic = messages(
             State(anthropic_fixture.state.clone()),
             Some(Extension(KeyId(anthropic_fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(anthropic_fixture.principal.clone())),
             anthropic_headers,
             Bytes::from(
@@ -5535,6 +5626,7 @@ mod tests {
         let responses = responses_api(
             State(responses_fixture.state.clone()),
             Some(Extension(KeyId(responses_fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(responses_fixture.principal.clone())),
             responses_headers,
             Bytes::from(
@@ -5564,6 +5656,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(true),
@@ -5608,6 +5701,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(true),
@@ -5637,6 +5731,7 @@ mod tests {
         let response = videos_generations(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             Bytes::from(json!({"model":"mock-video","prompt":"hello"}).to_string()),
@@ -5673,6 +5768,7 @@ mod tests {
         let first = videos_generations(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers.clone(),
             body.clone(),
@@ -5690,6 +5786,7 @@ mod tests {
         let replay = videos_generations(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             body,
@@ -5743,6 +5840,7 @@ mod tests {
         let submitted = videos_generations(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             body,
@@ -5803,6 +5901,7 @@ mod tests {
         let response = videos_generations(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             Bytes::from(json!({"model":"mock-video","prompt":"reject me"}).to_string()),
@@ -5842,6 +5941,7 @@ mod tests {
         let response = videos_generations(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             Bytes::from(json!({"model":"mock-video","prompt":"uncertain"}).to_string()),
@@ -6055,36 +6155,79 @@ mod tests {
             daily_requests: 3,
             daily_tokens: 7,
         };
-        let (state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_CHAT]);
+        let (_state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_CHAT]);
         let mut file = api_keys::load(&dir);
         file.keys[0].limits = limits.clone();
         api_keys::save(&dir, &file);
 
         assert_eq!(
             require_legacy_capability(
-                &state,
                 &key_id,
+                Some(&api_keys::constraints_for(&dir, &key_id).unwrap()),
                 api_keys::CAPABILITY_CHAT,
             )
             .unwrap(),
             limits
         );
         let missing = require_legacy_capability(
-            &state,
             &key_id,
+            Some(&api_keys::constraints_for(&dir, &key_id).unwrap()),
             api_keys::CAPABILITY_VIDEO,
         )
         .unwrap_err();
         assert_eq!(missing.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             require_legacy_capability(
-                &state,
                 "anonymous",
+                None,
                 api_keys::CAPABILITY_CHAT,
             )
             .unwrap(),
             KeyLimits::default()
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_handlers_use_auth_snapshot_and_fail_closed_when_snapshot_is_missing() {
+        let (_state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_CHAT]);
+        let mut file = api_keys::load(&dir);
+        file.keys[0].limits = KeyLimits {
+            max_inflight: Some(2),
+            daily_requests: 3,
+            daily_tokens: 7,
+            ..KeyLimits::default()
+        };
+        api_keys::save(&dir, &file);
+        let snapshot = api_keys::constraints_for(&dir, &key_id).unwrap();
+
+        let mut changed = api_keys::load(&dir);
+        changed.keys[0].limits = KeyLimits {
+            max_inflight: Some(99),
+            daily_requests: 99,
+            daily_tokens: 99,
+            ..KeyLimits::default()
+        };
+        api_keys::save(&dir, &changed);
+
+        assert_eq!(
+            require_legacy_capability(
+                &key_id,
+                Some(&snapshot),
+                api_keys::CAPABILITY_CHAT,
+            )
+                .unwrap(),
+            snapshot.limits,
+            "legacy policy must use the snapshot captured during authentication"
+        );
+        let missing = require_legacy_capability(&key_id, None, api_keys::CAPABILITY_CHAT)
+            .expect_err("authenticated requests must fail closed without a snapshot");
+        assert_eq!(missing.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let missing_body = axum::body::to_bytes(missing.into_body(), usize::MAX)
+        .await
+        .expect("missing snapshot body should be readable");
+        let missing_body: Value = serde_json::from_slice(&missing_body).unwrap();
+        assert_eq!(missing_body["error"]["code"], "auth_snapshot_missing");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -6102,6 +6245,7 @@ mod tests {
         let _response = chat_completions(
             State(state.clone()),
             Some(Extension(KeyId(key_id))),
+            legacy_snapshot(&state, "legacy-route-key"),
             None,
             HeaderMap::new(),
             body,
@@ -6137,7 +6281,8 @@ mod tests {
             .expect("quota response body should be readable");
         let rejected_body: Value = serde_json::from_slice(&rejected_body).unwrap();
         assert_eq!(rejected_body["error"]["type"], "quota_exceeded");
-        assert_eq!(rejected_body["error"]["code"], "daily_quota_exceeded");
+        assert_eq!(rejected_body["error"]["code"], "quota_exceeded");
+        assert_eq!(rejected_body["error"]["legacy_code"], "daily_quota_exceeded");
         assert_eq!(rejected_body["error"]["param"], "daily_tokens");
 
         let permit_after_rejection = state

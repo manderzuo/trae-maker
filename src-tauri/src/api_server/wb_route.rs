@@ -150,6 +150,7 @@ pub fn wb_stream_chat(
     start_ts: Instant,
     proto: Protocol,
     key_id: String,
+    resolved_key: Option<super::api_keys::ResolvedKey>,
     guard: InflightGuard,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -198,6 +199,7 @@ pub fn wb_stream_chat(
             &chat_id,
             &tx,
             start_ts,
+            resolved_key.as_ref(),
             &mut guard,
         );
         done.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -227,6 +229,7 @@ fn run_wb_stream(
     chat_id: &str,
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     start_ts: Instant,
+    resolved_key: Option<&super::api_keys::ResolvedKey>,
     guard: &mut InflightGuard,
 ) {
     let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
@@ -235,7 +238,7 @@ fn run_wb_stream(
     let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
     // F-35 子 Key 约束：限定上游 + 专一/临期优先（匿名/无约束 Key 全空 → 走默认调度）
-    let key_constraints = super::api_keys::constraints_for(&state.data_dir, key_id);
+    let key_constraints = resolved_key;
     let allowed_set: Option<HashSet<String>> = key_constraints
         .as_ref()
         .map(|k| k.allowed_accounts.iter().cloned().collect())
@@ -507,6 +510,7 @@ pub async fn wb_aggregate_chat(
     start_ts: Instant,
     proto: Protocol,
     key_id: String,
+    resolved_key: Option<super::api_keys::ResolvedKey>,
     guard: InflightGuard,
 ) -> Response {
     let model_out = model.clone();
@@ -519,7 +523,7 @@ pub async fn wb_aggregate_chat(
         let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
         // F-35 子 Key 约束（与非流式同款）
-        let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_id);
+        let key_constraints = resolved_key.as_ref();
         let allowed_set: Option<HashSet<String>> = key_constraints
             .as_ref()
             .map(|k| k.allowed_accounts.iter().cloned().collect())
@@ -859,6 +863,7 @@ pub async fn wb_tool_exec_chat(
     stream: bool,
     start_ts: Instant,
     key_id: String,
+    resolved_key: Option<super::api_keys::ResolvedKey>,
     guard: InflightGuard,
 ) -> Response {
     let model_inner = model.clone();
@@ -871,7 +876,7 @@ pub async fn wb_tool_exec_chat(
         super::wb_toolexec::inject_proxy_tools(&mut chat_body);
 
         // F-35 子 Key 约束（与非流式同款）
-        let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_id);
+        let key_constraints = resolved_key.as_ref();
         let allowed_set: Option<HashSet<String>> = key_constraints
             .as_ref()
             .map(|k| k.allowed_accounts.iter().cloned().collect())

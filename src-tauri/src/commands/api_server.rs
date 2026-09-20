@@ -11,7 +11,7 @@ use crate::models::{
 use crate::state::AppState;
 
 use crate::api_server::models_sync;
-use crate::api_server::pool::ApiPool;
+use crate::api_server::pool::{ApiPool, ResourceKind};
 use crate::api_server::server::{start_api_server, ApiServerHandle};
 use crate::api_server::{ApiLogger, ApiSharedState};
 use crate::api_server::scheduler::{self, AccountDirectory, SchedulerError, SchedulerMode, SchedulerRuntime};
@@ -852,20 +852,15 @@ pub fn api_keys_list(
     crate::api_server::api_keys::load(&state.data_dir)
 }
 
-/// 保存 API Key 列表（整表写盘；每次请求重读文件，改动立即生效）。
-/// `auth_disabled` 不传时保留现值（避免整表保存覆盖鉴权开关）。
+/// 保存 API Key 列表（锁内合并当前运行态 reservation，改动立即生效）。
+/// `auth_disabled` 不传时保留现值。
 #[tauri::command]
 pub fn api_keys_save(
     state: State<'_, AppState>,
     keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
     auth_disabled: Option<bool>,
 ) -> Result<(), String> {
-    let prev = crate::api_server::api_keys::load(&state.data_dir);
-    let file = crate::api_server::api_keys::ApiKeysFile {
-        keys,
-        auth_disabled: auth_disabled.unwrap_or(prev.auth_disabled),
-    };
-    crate::api_server::api_keys::save(&state.data_dir, &file);
+    crate::api_server::api_keys::save_from_admin(&state.data_dir, keys, auth_disabled);
     Ok(())
 }
 
@@ -881,7 +876,7 @@ pub fn api_unified_models(
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     available_only: Option<bool>,
 ) -> Vec<crate::api_server::unified_catalog::UnifiedModel> {
-    let (wb_enabled, trae_ok, buddy_ok) = match safe_lock(&runtime).as_ref() {
+    let (wb_enabled, trae_ok, buddy_ok, work_ok) = match safe_lock(&runtime).as_ref() {
         Some(rt) => {
             let s = &rt.shared;
             (
@@ -889,11 +884,12 @@ pub fn api_unified_models(
                     .load(std::sync::atomic::Ordering::Relaxed),
                 s.pool.has_selectable(),
                 s.wb_pool.has_selectable(),
+                s.pool.has_selectable_for(ResourceKind::Work),
             )
         }
         None => {
             let pf: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
-            (pf.wb_enabled, true, true)
+            (pf.wb_enabled, true, true, true)
         }
     };
     let data_dir = state.data_dir.clone();
@@ -903,6 +899,7 @@ pub fn api_unified_models(
         trae_ok,
         buddy_ok,
     );
+    list.push(crate::api_server::unified_catalog::seedance_model(work_ok));
     if available_only.unwrap_or(false) {
         list.retain(|m| m.sources.iter().any(|s| s.enabled));
     }

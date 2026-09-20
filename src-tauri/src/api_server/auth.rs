@@ -8,7 +8,7 @@ use serde_json::json;
 
 use aiwork_core::Principal;
 
-use super::api_keys::{self, ApiKeysFile, KeyCheck};
+use super::api_keys::{self, ApiKeysFile, KeyCheck, QuotaKind};
 use super::core_bridge::{CoreBridge, CoreMode};
 use super::usage::KeyId;
 use super::ApiSharedState;
@@ -105,7 +105,7 @@ pub async fn bearer_auth(
                 api_keys::verify_and_consume_locked_for_capability(
                     &data_dir,
                     &p,
-                    &super::usage::today_key(),
+                    &super::usage::key_quota_day(),
                     capability,
                 )
             });
@@ -123,8 +123,8 @@ pub async fn bearer_auth(
             request.extensions_mut().insert(KeyId(id));
             return next.run(request).await;
         }
-        Some(KeyCheck::QuotaExceeded { limit }) => {
-            return quota_exceeded(limit);
+        Some(KeyCheck::QuotaExceeded { limit, kind }) => {
+            return quota_exceeded(limit, kind);
         }
         Some(KeyCheck::CapabilityNotAllowed { capability }) => {
             return capability_not_allowed(&capability);
@@ -264,13 +264,22 @@ fn auth_required_rejected() -> axum::response::Response {
         .into_response()
 }
 
-/// 429 配额超限响应（JSON 错误体，OpenAI/Anthropic 客户端均可解析 message）
-fn quota_exceeded(limit: u64) -> Response {
+/// 429 配额超限响应（JSON 错误体，OpenAI/Anthropic 客户端均可解析 message）。
+///
+/// `quota_exceeded` 是统一的 canonical code；`legacy_code` 保留旧客户端按
+/// `daily_quota_exceeded` 判断错误的兼容入口。
+pub(super) fn quota_exceeded(limit: u64, kind: QuotaKind) -> Response {
+    let (unit, field) = match kind {
+        QuotaKind::Requests => ("次/日", "daily_requests"),
+        QuotaKind::Tokens => ("Token/日", "daily_tokens"),
+    };
     let body = json!({
         "error": {
-            "message": format!("API Key 已达今日配额上限（{limit} 次/日），请明天再试或调整限额"),
+            "message": format!("API Key 已达今日配额上限（{limit} {unit}），请明天再试或调整限额"),
             "type": "quota_exceeded",
-            "code": "daily_quota_exceeded",
+            "code": "quota_exceeded",
+            "legacy_code": "daily_quota_exceeded",
+            "param": field,
         }
     });
     (
@@ -426,6 +435,21 @@ mod tests {
         assert!(require_request_scope(&request, "models:read").is_ok());
         let response = require_request_scope(&request, "chat:invoke").unwrap_err();
         assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn quota_error_keeps_compatible_fields_and_identifies_token_limit() {
+        let response = super::quota_exceeded(10, super::api_keys::QuotaKind::Tokens);
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["type"], "quota_exceeded");
+        assert_eq!(payload["error"]["code"], "quota_exceeded");
+        assert_eq!(payload["error"]["legacy_code"], "daily_quota_exceeded");
+        assert_eq!(payload["error"]["param"], "daily_tokens");
+        assert!(payload["error"]["message"].as_str().unwrap().contains("Token"));
     }
 }
 

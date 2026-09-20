@@ -248,6 +248,7 @@ mod tests {
         let first = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers.clone(),
             chat_body(true),
@@ -269,6 +270,7 @@ mod tests {
         let replay = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(true),
@@ -323,6 +325,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(true),
@@ -368,6 +371,7 @@ mod tests {
         let response = chat_completions(
             State(fixture.state.clone()),
             Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
             Some(Extension(fixture.principal.clone())),
             headers,
             chat_body(true),

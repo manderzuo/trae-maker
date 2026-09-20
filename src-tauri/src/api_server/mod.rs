@@ -143,6 +143,16 @@ impl ApiSharedState {
         self.limiter.acquire_request(key_id, key_limits)
     }
 
+    /// Core 业务请求使用真实 limiter permit；默认 Key 限制只代表全局配置，
+    /// 不读取 legacy Key 配额，避免 Core 与 legacy 计数重复扣费。
+    pub fn core_request_guard(
+        &self,
+        key_id: &str,
+    ) -> Result<InflightGuard, limits::LimitError> {
+        let permit = self.acquire_request(key_id, &api_keys::KeyLimits::default())?;
+        Ok(self.inflight_guard_with_permit(permit))
+    }
+
     /// 获取跨异步视频任务生命周期持有的视频任务许可。
     pub fn acquire_video_job(
         &self,
@@ -684,7 +694,13 @@ mod inflight_tests {
             cors_origins: String::new(),
             total_requests: AtomicU64::new(0),
             inflight: Arc::new(AtomicU64::new(0)),
-            limiter: limits::RateLimiter::from_env(),
+            limiter: limits::RateLimiter::with_config(limits::LimitConfig {
+                max_inflight: 1,
+                max_video_jobs: 1,
+                asset_uploads_per_minute: 10,
+                asset_bytes_per_hour: 1024,
+                video_submissions_per_minute: 10,
+            }),
             active_uid: Mutex::new(None),
             last_error: Mutex::new(None),
             logger: ApiLogger::new(dir.join("logs")),
@@ -693,6 +709,13 @@ mod inflight_tests {
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
         };
+        {
+            let _g = state.core_request_guard("core-key").unwrap();
+            assert!(matches!(
+                state.core_request_guard("core-key"),
+                Err(limits::LimitError::Concurrent)
+            ));
+        }
         {
             let _g = state.inflight_guard();
             assert_eq!(state.inflight.load(std::sync::atomic::Ordering::Relaxed), 1);
