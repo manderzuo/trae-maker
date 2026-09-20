@@ -201,3 +201,22 @@ Nginx、FRP 和三个域名只承担传输/反向代理。任何域名能力隔�
 3. 扩展 `/v1/usage` 与管理员 Tauri 命令/类型/UI，保留旧用户级接口的兼容语义并增加显式迁移入口。
 4. 更新统一网关设计、Phase 4E 运维说明和用户手册，写明 enforce 前置条件与 fail-closed 行为。
 5. 运行 Core/Tauri/frontend 全量验证，检查用户已有脏文件未被暂存，再决定是否进入下一阶段。
+
+## 10. 方案 1 实现状态与验证记录
+
+Task 1–5 已完成实现并提交，Task 6 补充本节及运维文档后作为方案 1 的最小闭环记录：
+
+- 数据库已从 v11 迁移到 schema v12。预算目录使用 `quota_budget_accounts`，迁移在同一 SQLite 事务中完成；失败整体回滚，不留下半套账户或流水。
+- 旧用户额度只进入 `user_cap` 或明确标记为 `legacy_unassigned`，不会静默复制到该用户的每个 Key。管理员必须按指定数量、Key、资源类型和原因执行显式迁移。
+- enforce 前必须完成 Key 预算准备、legacy 分配和未结束 reservation 核对；缺 Key 预算、版本不可用或迁移未完成时返回稳定的 `key_quota_not_configured`（409），不回退为 legacy 用户余额。
+- 请求生命周期使用同一个 `event_group_id` 关联 User cap 与 Key budget 约束；Key、User cap、上游账号 observation/lease 三种余额保持分离。`unknown` 只进入 `reconcile_required`，不能自动退款、补扣或换 Key 重放。
+- `/v1/usage`、Tauri 管理命令和 Core Admin Panel 均以当前 Principal 的 Key 视角工作；公网、LAN、本机共用同一 Core 认证和预算事务。Nginx/FRP 只负责传输，不能决定权限或额度。
++ 测试使用 Mock，不把真实上游余额、价格、计费协议或生成结果当作验收证据；临时日志和 Rust target 使用 `D:\gpt`，不在 C 盘进行读写测试。
+
+本轮最终验证记录（2026-09-20）：
+
+- 文档契约检查：5 份目标文档、9 个标记全部通过；输出位于 `D:\gpt`。
+- Core：fresh `D:\gpt\aiwork-final-core-target`，18 个测试套件共 107 passed、0 failed、0 ignored。
+- Tauri：fresh `D:\gpt\aiwork-final-tauri-target`，458 passed、0 failed、4 ignored。
+- 前端：5 个测试文件、29 passed、0 failed；测试缓存使用 `D:\gpt\npm-cache`。
+- `git diff --check` 通过；用户已有脏文件保持未暂存，未把真实上游生成、余额或计费接口作为测试依赖。

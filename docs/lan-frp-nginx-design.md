@@ -137,6 +137,12 @@ LAN 环境可将 `PUBLIC_BASE_URL` 设置为中转机的 HTTPS 地址；单机�
 - 可按域名、网段或额外 Basic/mTLS 做第二层限制，API Key 作为应用层认证。
 - `/health` 与 `/healthz` 只返回存活字段；不要把账号池/积分诊断放到免鉴权路径。
 
+## 5.3 Core 预算与授权边界
+
+公网、LAN、本机请求最终都进入同一个 Core；API Key、scope、schema v12 预算状态和 `quota_budget_accounts` 决定是否放行，不能用域名、Host、FRP proxy 名称或客户端传入的用户 ID 推断权限。Nginx/FRP 只承担传输，不创建额度、不绕过 `key_quota_not_configured`，也不改变 `event_group_id` 的 recovery 语义。
+
+Key budget、可选 User cap 和上游 observation/lease 必须分开记录。`legacy_unassigned`、`unknown` 和 `reconcile_required` 期间保持 fail-closed；上游余额不转换为用户额度。联调时的测试 target、缓存和日志放在 `D:\gpt`，不把 C 盘作为持续读写测试盘。
+
 ## 6. 网络可行性判断
 
 当前多路由器场景满足下面条件时可行：

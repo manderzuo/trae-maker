@@ -335,6 +335,18 @@ Core 管理命令只通过桌面 Tauri 命令提供，未开放成公网管理�
 生产 adapter 时仍按 fail-closed 规则返回 `501/scheduler_endpoint_not_enabled`；本地 Mock
 测试不能替代真实上游协议、余额或扣费证明。
 
+#### Core Key 级额度与用量（方案 1）
+
+方案 1 使用 schema v12 的双层预算：Key budget 是当前 API Key 的永久额度，可选 User cap 是同一用户多个 Key 的总上限。两层只约束同一笔请求，不重复扣费；上游账号余额只是 observation/lease，上游余额不转换为用户额度。
+
+- 旧用户额度不会自动复制到多个 Key。迁移后未明确分配的额度保持 `legacy_unassigned`；管理员在 Core 管理 Tab 中按用户、Key、`resource_kind`、数量和原因执行显式迁移。
+- `/v1/usage?limit=1..100` 在 `enforce` 且拥有 `usage:read` 时只返回当前 Key 的脱敏投影。`balances.available` 是双层有效可用量，`held`/`settled` 和 ledger 只属于当前 Key；没有 Key 预算、预算版本无效或迁移未完成时返回 409 `key_quota_not_configured`，不会冒充 legacy 用户余额。
+- Core Admin Panel 提供「发放 Key 额度」「迁移 legacy 额度」「查看 Key 余额」；管理员认证必须是真实 admin Core Key，页面不显示明文 Key、digest 或上游账号。重复迁移使用同一迁移标识时保持幂等。
+- 公网、LAN 和本机使用同一 Core 身份、scope 和预算事务。Nginx/FRP 只做反向代理和传输，不根据域名、Host 或客户端字段授权。
+- `unknown` 任务保留 held 并进入 `reconcile_required`，不能自动退款、换号或重放。需要回滚时先停服务并备份 v12 SQLite/WAL，切到 `core_mode=off`，完成对账后再恢复 `shadow`/`enforce`。
+
+Tauri/Rust 验证的临时 target、日志和测试缓存统一放在 `D:\gpt`；这些 Mock 验证不代表真实上游价格、余额或计费规则已经核验。
+
 ### 7.2 Trae · 资源调度
 
 - **资源类目**：页面分为「文字处理」「视频生成」「图片生成」三类；文字处理沿用现有 Trae 模型目录，视频生成展示 Trae Work CN 内置 Seedance 接入状态，图片生成预留 GPT Image 2.5 本地转发配置位

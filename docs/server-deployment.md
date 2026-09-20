@@ -50,6 +50,16 @@ report。旧 JSON 继续保留，不会被当作 Core grant 或真实上游余�
 Mock executor；不得以真实 upstream、真实余额、真实计费或真实生成结果作为本阶段部署
 验证证据。
 
+## Core schema v12 迁移与双层预算运维
+
+本版本的 v11→v12 是单事务迁移：新增 `quota_budget_accounts` 并把旧用户流水归入 `user_cap`；不会把旧额度复制到每一个 Key。没有明确 Key 目标的余额标为 `legacy_unassigned`，管理员必须在切换 `enforce` 前使用真实 admin Core Key 显式迁移，迁移未完成时保持 fail-closed。
+
+启用 `enforce` 前逐项确认：备份 SQLite/WAL/SHM；迁移报告无未处理项；Key 已启用且 scope 正确；Key budget 版本为 ready；可选 User cap 已配置；未结束 reservation 和 `unknown` 任务已有 `event_group_id` 对账方案。Key、User cap 和上游账号 observation/lease 分开查看，不能把上游余额换算为用户额度。
+
+worker 启动、重连或 lease 超时后先做 recovery。缺失一侧预算事件、状态不一致或上游结果未知都进入 `reconcile_required`，保留 held，不自动退款、补扣或换 Key 重放。Key 预算缺失、版本失效或迁移未完成时，`/v1/usage` 返回 409 `key_quota_not_configured`。
+
+公网、LAN、本机都进入同一个 Core 鉴权和预算事务；Nginx/FRP 只负责 HTTPS、转发和长连接，不承担 API Key、scope 或额度授权。部署联调的临时 Rust target、日志和 npm 缓存统一使用 `D:\gpt`，避免占用 C 盘。
+
 ## 局域网
 
 1. 网关监听 `0.0.0.0` 或指定内网网卡地址。

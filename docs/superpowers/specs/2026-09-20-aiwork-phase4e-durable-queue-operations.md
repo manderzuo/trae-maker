@@ -33,3 +33,24 @@
 ## 验证边界
 
 本阶段使用离线 Mock 验证领取、心跳、缺失载荷、终态清理、管理员投影和用户隔离；不宣称真实视频协议、真实费用单位、真实余额、异步轮询、结果下载或公网部署已经验收。
+
+## 双层预算 recovery/runbook（schema v12）
+
+### 启动前检查
+
+1. 停止 API 写入和 worker 新任务领取，确认 Core SQLite、WAL/SHM 与迁移报告均已备份。
+2. 检查 `quota_budget_accounts` 的 Key 账户和可选 User cap 账户是否为 ready、版本有效、Key 仍归属当前用户且已启用。
+3. 检查未完成迁移的 `legacy_unassigned`、held reservation、`unknown` 任务和最近的 `event_group_id`；任一映射缺失时维持 fail-closed。
+
+### recovery 与 reconcile
+
+1. worker 启动、重连或 lease 超时后，先恢复 durable queue，再按 `event_group_id` 对照 Key budget、User cap 和上游 lease。
+2. 两层事件缺一、状态不一致、重复终态或上游结果不确定，统一标记 `reconcile_required`；`unknown` 保留 held，不按租约 TTL 自动退款。
+3. 只有可信的上游终态和受限证据齐全时才允许幂等 reconcile。reconcile 不创建新的请求、不更换 Key 重放，也不把上游 observation 变成用户额度。
+4. Key 预算未配置或迁移尚未 ready 时，用户用量接口返回 `key_quota_not_configured`；管理员先完成显式 legacy 分配，再恢复 enforce。
+
+### 观测与回滚
+
+运维界面和日志只显示脱敏的 Key prefix、scope、resource_kind、available、held、settled、预算版本、迁移状态和 reconcile 结果，不显示明文 Key、digest、prompt 或上游凭据。公网、LAN、本机都经过同一 Core；Nginx/FRP 不提供授权。
+
+若需回滚，停止服务并恢复到 `core_mode=off`，保留 v12 数据、reservation、lease 和 unknown hold，禁止手工删除账本。恢复 `shadow`/`enforce` 前重新检查备份、迁移报告、Key、scope、版本和 adapter 能力。测试临时输出统一放在 `D:\gpt`。
