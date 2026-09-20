@@ -1380,7 +1380,7 @@ pub fn run_phase2_mock_chat(outcome: UpstreamOutcome) -> Phase2MockChatReport {
 
     use aiwork_core::{
         BeginRequestInput, CoreStore, CostPolicy, NewUser, PreflightReserveInput, Principal,
-        QuotaGrant, RegisterUpstreamAccount, SchedulerLeaseRequest, SchedulerLeaseResult,
+        KeyQuotaGrant, RegisterUpstreamAccount, SchedulerLeaseRequest, SchedulerLeaseResult,
         SelectionStrategy, UserRole, UpstreamObservation,
     };
     use chrono::Utc;
@@ -1468,11 +1468,11 @@ pub fn run_phase2_mock_chat(outcome: UpstreamOutcome) -> Phase2MockChatReport {
         })
         .unwrap();
     store
-        .grant(QuotaGrant {
-            user_id: "phase2-user".into(),
+        .key_quota_grant_as_admin(&admin, KeyQuotaGrant {
+            api_key_id: principal.key_id.clone(),
             resource_kind: "chat_request".into(),
             amount: 1,
-            actor_user_id: "phase2-user".into(),
+            actor_user_id: "phase2-admin".into(),
             reason: "phase2 fixture".into(),
         })
         .unwrap();
@@ -1601,8 +1601,14 @@ pub fn run_phase2_mock_chat(outcome: UpstreamOutcome) -> Phase2MockChatReport {
         replay_request_id: replay_request.id.clone(),
         replay_request_state: replay_request.state,
         replay_result: replay_request.result,
-        balance_available: store.balance("phase2-user", "chat_request").unwrap().available,
-        balance_held: store.balance("phase2-user", "chat_request").unwrap().held,
+        balance_available: store
+            .key_quota_balance_for_principal(&principal, "chat_request")
+            .unwrap()
+            .available,
+        balance_held: store
+            .key_quota_balance_for_principal(&principal, "chat_request")
+            .unwrap()
+            .held,
         mock_calls: executor.calls().len(),
     };
     assert_eq!(report.request_state, report.replay_request_state);

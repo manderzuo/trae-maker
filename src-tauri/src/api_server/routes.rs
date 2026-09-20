@@ -130,6 +130,16 @@ fn core_error_response(error: CoreError) -> Response {
             "insufficient_quota",
             "Core quota is insufficient",
         ),
+        CoreError::KeyQuotaNotConfigured { .. } => openai_error(
+            StatusCode::CONFLICT,
+            "key_quota_not_configured",
+            "Core key quota is not configured",
+        ),
+        CoreError::QuotaMigrationPending { .. } => openai_error(
+            StatusCode::CONFLICT,
+            "quota_migration_pending",
+            "Core quota requires reconciliation before use",
+        ),
         CoreError::IdempotencyConflict => openai_error(
             StatusCode::CONFLICT,
             "idempotency_conflict",
@@ -977,7 +987,7 @@ pub async fn chat_completions(
             Err(error) => {
                 let balance = match bridge
                     .store
-                    .balance(&principal.user_id, &estimate.resource_kind)
+                    .key_quota_balance_for_principal(&principal, &estimate.resource_kind)
                 {
                     Ok(balance) => balance,
                     Err(error) => return core_error_response(error),
@@ -3504,7 +3514,7 @@ mod tests {
     use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
 
     use super::*;
-    use aiwork_core::{CoreStore, CostPolicy, NewUser, Principal, QuotaGrant, UserRole};
+    use aiwork_core::{CoreStore, CostPolicy, KeyQuotaGrant, NewUser, Principal, UserRole};
     use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::HeaderMap;
@@ -3522,6 +3532,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    fn ensure_zero_key_budget(dir: &std::path::Path, user_id: &str, api_key_id: &str, resource_kind: &str) {
+        let connection = rusqlite::Connection::open(
+            dir.join("data").join(aiwork_core::CORE_DB_FILE),
+        )
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_budget_accounts
+                 (id, scope, user_id, api_key_id, resource_kind, enabled, version, migration_state, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'key', ?2, ?3, ?4, 1, 1, 'ready', 0, 0)",
+                rusqlite::params![
+                    format!("budget-zero-{}", rand::random::<u64>()),
+                    user_id,
+                    api_key_id,
+                    resource_kind,
+                ],
+            )
+            .unwrap();
     }
 
     fn core_fixture(grant: i64, scopes: &[&str]) -> CoreFixture {
@@ -3585,14 +3615,16 @@ mod tests {
             .unwrap();
         if grant > 0 {
             store
-                .grant(QuotaGrant {
-                    user_id: "route-user".into(),
+                .key_quota_grant_as_admin(&admin, KeyQuotaGrant {
+                    api_key_id: key.id.clone(),
                     resource_kind: "chat_request".into(),
                     amount: grant,
-                    actor_user_id: "route-user".into(),
+                    actor_user_id: "admin".into(),
                     reason: "route test grant".into(),
                 })
                 .unwrap();
+        } else {
+            ensure_zero_key_budget(&dir, "route-user", &key.id, "chat_request");
         }
         let principal = Principal {
             user_id: "route-user".into(),
@@ -3627,6 +3659,21 @@ mod tests {
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
         });
         CoreFixture { dir, state, principal, admin }
+    }
+
+    fn key_balance(fixture: &CoreFixture, resource_kind: &str) -> aiwork_core::QuotaBudgetBalance {
+        fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .store
+            .key_quota_balance_as_admin(
+                &fixture.admin,
+                &fixture.principal.key_id,
+                resource_kind,
+            )
+            .unwrap()
     }
 
     fn chat_body(stream: bool) -> Bytes {
@@ -3675,14 +3722,16 @@ mod tests {
             .unwrap();
         if grant > 0 {
             store
-                .grant(QuotaGrant {
-                    user_id: "route-user".into(),
+                .key_quota_grant_as_admin(&fixture.admin, KeyQuotaGrant {
+                    api_key_id: fixture.principal.key_id.clone(),
                     resource_kind: "video_job".into(),
                     amount: grant,
-                    actor_user_id: "route-user".into(),
+                    actor_user_id: "admin".into(),
                     reason: "video route test grant".into(),
                 })
                 .unwrap();
+        } else {
+            ensure_zero_key_budget(&fixture.dir, "route-user", &fixture.principal.key_id, "video_job");
         }
         let mut account = aiwork_core::RegisterUpstreamAccount::new(
             "mock-video-account".into(),
@@ -3754,7 +3803,7 @@ mod tests {
         let (count, state, account): (i64, String, String) = db.query_row(
             "SELECT count(*), state, account_ref FROM upstream_leases", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
         assert_eq!((count, state.as_str(), account.as_str()), (1, "succeeded", "mock-account"));
-        let balance = fixture.state.core.as_ref().unwrap().balance("route-user", "chat_request").unwrap();
+        let balance = key_balance(&fixture, "chat_request");
         assert_eq!((balance.available, balance.held), (1, 0));
     }
 
@@ -3798,13 +3847,7 @@ mod tests {
         .unwrap();
         assert_eq!(payload["error"]["code"], "idempotency_conflict");
         assert_eq!(executor.calls().len(), 1);
-        let balance = fixture
-            .state
-            .core
-            .as_ref()
-            .unwrap()
-            .balance("route-user", "chat_request")
-            .unwrap();
+        let balance = key_balance(&fixture, "chat_request");
         assert_eq!((balance.available, balance.held), (1, 0));
     }
 
@@ -3850,7 +3893,7 @@ mod tests {
         let payload: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(payload["error"]["code"], "no_fresh_observation");
         assert_eq!(executor.calls().len(), 0);
-        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 0);
+        assert_eq!(key_balance(&fixture, "chat_request").held, 0);
         assert!(store.list_recoverable_leases().unwrap().is_empty());
     }
 
@@ -3893,7 +3936,7 @@ mod tests {
         .unwrap();
         assert_eq!(payload["error"]["code"], "no_upstream_capacity");
         assert!(executor.calls().is_empty());
-        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 0);
+        assert_eq!(key_balance(&fixture, "chat_request").held, 0);
         assert!(store.list_recoverable_leases().unwrap().is_empty());
     }
 
@@ -3923,7 +3966,7 @@ mod tests {
         .unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
         assert_eq!(executor.calls().len(), 0);
-        assert_eq!(fixture.state.core.as_ref().unwrap().balance("route-user", "chat_request").unwrap().held, 0);
+        assert_eq!(key_balance(&fixture, "chat_request").held, 0);
     }
 
     #[tokio::test]
@@ -3946,7 +3989,7 @@ mod tests {
         .unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
         let store = &fixture.state.core.as_ref().unwrap().store;
-        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 0);
+        assert_eq!(key_balance(&fixture, "chat_request").held, 0);
         assert!(store.list_recoverable_leases().unwrap().is_empty());
     }
 
@@ -3976,7 +4019,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(executor.calls().len(), 1);
         let store = &fixture.state.core.as_ref().unwrap().store;
-        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 1);
+        assert_eq!(key_balance(&fixture, "chat_request").held, 1);
         let leases = store.list_recoverable_leases().unwrap();
         assert_eq!(leases.len(), 1);
         assert!(leases
@@ -4302,13 +4345,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(payload["error"]["code"], "scheduler_endpoint_not_enabled");
-        let balance = fixture
-            .state
-            .core
-            .as_ref()
-            .unwrap()
-            .balance("route-user", "chat_request")
-            .unwrap();
+        let balance = key_balance(&fixture, "chat_request");
         assert_eq!(balance.held, 0);
     }
 
@@ -4343,6 +4380,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn core_chat_key_quota_rejects_before_mock_dispatch() {
+        let fixture = phase2_fixture(1);
+        let connection = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3")).unwrap();
+            connection
+            .execute(
+                "DELETE FROM quota_ledger WHERE budget_account_id IN (
+                    SELECT id FROM quota_budget_accounts WHERE scope = 'key' AND api_key_id = ?1 AND resource_kind = 'chat_request'
+                )",
+                [&fixture.principal.key_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM quota_budget_accounts WHERE scope = 'key' AND api_key_id = ?1 AND resource_kind = 'chat_request'",
+                [&fixture.principal.key_id],
+            )
+            .unwrap();
+        let executor = Arc::new(super::super::core_bridge::core_executor::MockUpstreamExecutor::ok());
+        install_core_test_executor(executor.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "key-quota-missing".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        )
+        .await;
+        clear_core_test_executor();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["error"]["code"], "key_quota_not_configured");
+        assert!(executor.calls().is_empty());
+        assert_eq!(fixture.state.core.as_ref().unwrap().store.count_rows("quota_reservations").unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn core_chat_rejects_missing_scope_before_preflight() {
         let fixture = core_fixture(1, &[]);
         let mut headers = HeaderMap::new();
@@ -4355,13 +4433,7 @@ mod tests {
             chat_body(false),
         ).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let balance = fixture
-            .state
-            .core
-            .as_ref()
-            .unwrap()
-            .balance("route-user", "chat_request")
-            .unwrap();
+        let balance = key_balance(&fixture, "chat_request");
         assert_eq!(balance.held, 0);
     }
 
@@ -4378,13 +4450,7 @@ mod tests {
             chat_body_for_model("unpriced-model", false),
         ).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let balance = fixture
-            .state
-            .core
-            .as_ref()
-            .unwrap()
-            .balance("route-user", "chat_request")
-            .unwrap();
+        let balance = key_balance(&fixture, "chat_request");
         assert_eq!(balance.available, 1);
         assert_eq!(balance.held, 0);
     }
@@ -4435,13 +4501,7 @@ mod tests {
             Some(LeaseState::Succeeded)
         );
         assert!(persisted.execution.is_none());
-        let balance = fixture
-            .state
-            .core
-            .as_ref()
-            .unwrap()
-            .balance("route-user", "chat_request")
-            .unwrap();
+        let balance = key_balance(&fixture, "chat_request");
         assert_eq!(balance.available, 1);
         assert_eq!(balance.held, 0);
         let first_request_id = first.headers().get("x-request-id").cloned();
@@ -4646,9 +4706,9 @@ mod tests {
             .body(Body::from(json!({"usage": {"total_tokens": 0}}).to_string()))
             .unwrap();
         settle_core_response(&context, response);
-        let balance = bridge.balance("route-user", "chat_request").unwrap();
+        let balance = key_balance(&fixture, "chat_request");
         assert_eq!(balance.available, 0);
-        assert_eq!(balance.held, 0);
+        assert_eq!(balance.held, 1);
     }
 
     #[test]
@@ -4838,7 +4898,128 @@ mod tests {
             .query_row("SELECT state FROM upstream_leases", [], |row| row.get(0))
             .unwrap();
         assert_eq!(lease_state, "succeeded");
-        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 0);
+        assert_eq!(key_balance(&fixture, "chat_request").held, 1);
+    }
+
+    #[tokio::test]
+    async fn core_stream_and_video_repeated_settlement_keeps_one_event_group() {
+        let (stream_fixture, _) = phase3_stream_fixture(
+            StreamTerminalOutcome::Success {
+                actual_units: Some(1),
+                upstream_request_ref: None,
+            },
+            CancelSupport::Unsupported,
+            true,
+        );
+        let mut stream_headers = HeaderMap::new();
+        stream_headers.insert("idempotency-key", "event-group-stream".parse().unwrap());
+        let stream_response = chat_completions(
+            State(stream_fixture.state.clone()),
+            Some(Extension(KeyId(stream_fixture.principal.key_id.clone()))),
+            Some(Extension(stream_fixture.principal.clone())),
+            stream_headers,
+            chat_body(true),
+        )
+        .await;
+        assert_eq!(stream_response.status(), StatusCode::OK);
+        let _ = response_body_text(stream_response).await;
+        let stream_bridge = stream_fixture.state.core.as_ref().unwrap().clone();
+        let stream_body: Value = serde_json::from_slice(&chat_body(true)).unwrap();
+        let stream_replay = stream_bridge
+            .lookup_chat_replay(
+                &stream_fixture.principal,
+                &stream_fixture.principal.key_id,
+                "event-group-stream",
+                &stream_body,
+            )
+            .unwrap()
+            .unwrap();
+        let stream_lease_id = stream_replay.replay_lease.as_ref().unwrap().id.clone();
+        let repeated_stream = stream_bridge
+            .settle_chat_lease(
+                &stream_fixture.principal,
+                &stream_lease_id,
+                UpstreamOutcome::Success {
+                    body: json!({"choices": []}),
+                    actual_units: Some(1),
+                    upstream_request_ref: None,
+                }
+                .lease_outcome(chrono::Utc::now().timestamp_millis()),
+            )
+            .unwrap();
+        assert!(!repeated_stream.applied);
+        let stream_db = rusqlite::Connection::open(stream_fixture.dir.join("data/core.sqlite3")).unwrap();
+        let stream_group: String = stream_db
+            .query_row("SELECT event_group_id FROM quota_reservations WHERE resource_kind = 'chat_request'", [], |row| row.get(0))
+            .unwrap();
+        let stream_events: i64 = stream_db
+            .query_row("SELECT count(*) FROM quota_ledger WHERE event_group_id = ?1", [&stream_group], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stream_events, 2);
+
+        let (video_fixture, _) = phase3_video_fixture(
+            1,
+            vec![VideoAdapterOutcome::Accepted {
+                upstream_request_ref: "event-group-video".into(),
+            }],
+            vec![VideoCancelOutcome::Confirmed {
+                upstream_request_ref: Some("event-group-video".into()),
+            }],
+        );
+        let mut video_headers = HeaderMap::new();
+        video_headers.insert("idempotency-key", "event-group-video".parse().unwrap());
+        let submitted = videos_generations(
+            State(video_fixture.state.clone()),
+            Some(Extension(KeyId(video_fixture.principal.key_id.clone()))),
+            Some(Extension(video_fixture.principal.clone())),
+            video_headers,
+            Bytes::from(json!({"model":"mock-video","prompt":"event group"}).to_string()),
+        )
+        .await;
+        let submitted_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(submitted.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        let video_job_id = submitted_body["task"]["id"].as_str().unwrap().to_owned();
+        let canceled = video_cancel(
+            State(video_fixture.state.clone()),
+            Some(Extension(video_fixture.principal.clone())),
+            Path(video_job_id.clone()),
+        )
+        .await;
+        assert_eq!(canceled.status(), StatusCode::ACCEPTED);
+        let video_store = &video_fixture.state.core.as_ref().unwrap().store;
+        let video_job = video_store
+            .video_job_for_user(&video_fixture.principal, &video_job_id)
+            .unwrap()
+            .unwrap();
+        let video_lease = video_store
+            .upstream_lease_for_request(&video_job.request_id, "video_job")
+            .unwrap()
+            .unwrap();
+        let repeated_video = video_fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .settle_video_job(
+                &video_fixture.principal,
+                &video_job_id,
+                &video_lease.id,
+                VideoAdapterOutcome::Canceled {
+                    upstream_request_ref: Some("event-group-video".into()),
+                },
+            )
+            .unwrap();
+        assert!(!repeated_video.applied);
+        let video_db = rusqlite::Connection::open(video_fixture.dir.join("data/core.sqlite3")).unwrap();
+        let video_group: String = video_db
+            .query_row("SELECT event_group_id FROM quota_reservations WHERE resource_kind = 'video_job'", [], |row| row.get(0))
+            .unwrap();
+        let video_events: i64 = video_db
+            .query_row("SELECT count(*) FROM quota_ledger WHERE event_group_id = ?1", [&video_group], |row| row.get(0))
+            .unwrap();
+        assert_eq!(video_events, 2);
     }
 
     #[tokio::test]
@@ -4943,7 +5124,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.request_state(&request_id).unwrap(), RequestState::Unknown);
         assert_eq!(store.reservation_for_request(&request_id).unwrap().unwrap().state, aiwork_core::ReservationState::Unknown);
-        assert_eq!(store.balance("route-user", "chat_request").unwrap().held, 1);
+        assert_eq!(key_balance(&fixture, "chat_request").held, 1);
     }
 
     #[tokio::test]
@@ -5065,7 +5246,7 @@ mod tests {
         assert_eq!(store.count_rows("upstream_leases").unwrap(), 1);
         assert_eq!(store.count_rows("jobs").unwrap(), 1);
         assert_eq!(store.count_rows("job_attempts").unwrap(), 1);
-        assert_eq!(store.balance("route-user", "video_job").unwrap().held, 1);
+        assert_eq!(key_balance(&fixture, "video_job").held, 1);
         let job_id = replay_body["task"]["id"].as_str().unwrap();
         let job = store
             .video_job_for_user(&fixture.principal, job_id)
@@ -5125,8 +5306,8 @@ mod tests {
         assert_eq!(canceled_status, StatusCode::ACCEPTED);
         assert_eq!(canceled_body["status"], "canceled");
         let store = &fixture.state.core.as_ref().unwrap().store;
-        assert_eq!(store.balance("route-user", "video_job").unwrap().held, 0);
-        assert_eq!(store.balance("route-user", "video_job").unwrap().available, 1);
+        assert_eq!(key_balance(&fixture, "video_job").held, 0);
+        assert_eq!(key_balance(&fixture, "video_job").available, 1);
         assert_eq!(
             store.video_job_for_user(&fixture.principal, &job_id).unwrap().unwrap().state,
             aiwork_core::JobState::Canceled
@@ -5172,8 +5353,8 @@ mod tests {
         assert_eq!(adapter.calls().len(), 1);
         let job_id = adapter.calls()[0].clone();
         let store = &fixture.state.core.as_ref().unwrap().store;
-        assert_eq!(store.balance("route-user", "video_job").unwrap().held, 0);
-        assert_eq!(store.balance("route-user", "video_job").unwrap().available, 1);
+        assert_eq!(key_balance(&fixture, "video_job").held, 0);
+        assert_eq!(key_balance(&fixture, "video_job").available, 1);
         assert_eq!(
             store.video_job_for_user(&fixture.principal, &job_id).unwrap().unwrap().state,
             aiwork_core::JobState::Failed
@@ -5210,7 +5391,7 @@ mod tests {
         assert_eq!(body["task"]["status"], "unknown");
         assert_eq!(body["task"]["reconcile_required"], true);
         let store = &fixture.state.core.as_ref().unwrap().store;
-        assert_eq!(store.balance("route-user", "video_job").unwrap().held, 1);
+        assert_eq!(key_balance(&fixture, "video_job").held, 1);
         assert_eq!(
             store.video_job_for_user(&fixture.principal, body["task"]["id"].as_str().unwrap()).unwrap().unwrap().state,
             aiwork_core::JobState::Unknown
@@ -5267,7 +5448,7 @@ mod tests {
             store.video_job_for_user(&fixture.principal, job_id).unwrap().unwrap().state,
             aiwork_core::JobState::Succeeded
         );
-        assert_eq!(store.balance("route-user", "video_job").unwrap().held, 0);
+        assert_eq!(key_balance(&fixture, "video_job").held, 0);
         assert_eq!(
             fixture
                 .state
@@ -5318,7 +5499,7 @@ mod tests {
             }
         );
         assert!(adapter.calls().is_empty());
-        assert_eq!(bridge.store.balance("route-user", "video_job").unwrap().held, 1);
+        assert_eq!(key_balance(&fixture, "video_job").held, 1);
         assert_eq!(
             bridge
                 .store

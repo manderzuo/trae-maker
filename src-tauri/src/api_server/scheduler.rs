@@ -111,8 +111,15 @@ impl SchedulerRuntime {
             let already_unknown: BTreeSet<_> = store.list_recoverable_leases()
                 .map_err(|_| SchedulerError::RecoveryFailed)?.into_iter()
                 .filter(|lease| lease.state == LeaseState::Unknown).map(|lease| lease.id).collect();
-            store.recover_expired_upstream_leases(now_ms).map_err(|_| SchedulerError::RecoveryFailed)?
-                .iter().filter(|lease| lease.state == LeaseState::Unknown && !already_unknown.contains(&lease.id)).count() as u64
+            let recovered = store.recover_expired_upstream_leases(now_ms).map_err(|_| SchedulerError::RecoveryFailed)?;
+            // Reconcile only validates the durable dual-ledger event group. It
+            // never synthesizes a release/commit and therefore preserves every
+            // hold whose upstream outcome is not known.
+            store.reconcile_quota_event_groups(now_ms).map_err(|_| SchedulerError::RecoveryFailed)?;
+            recovered
+                .iter()
+                .filter(|lease| lease.state == LeaseState::Unknown && !already_unknown.contains(&lease.id))
+                .count() as u64
         } else { 0 };
         Ok(Self {
             store, mode, readers, executors, data_dir,
@@ -618,6 +625,13 @@ mod tests {
         }
     }
 
+    fn key_balance(fixture: &Fixture, resource_kind: &str) -> aiwork_core::QuotaBudgetBalance {
+        fixture
+            .store
+            .key_quota_balance_as_admin(&fixture.admin, &fixture.admin.key_id, resource_kind)
+            .unwrap()
+    }
+
     fn directory() -> AccountDirectory {
         let trae: crate::models::RawAccount = serde_json::from_value(json!({
             "UserID":"fixture-user-sensitive", "name":"private name", "jwt":"fixture-jwt-secret", "refresh_token":"fixture-refresh-secret"
@@ -769,12 +783,12 @@ mod tests {
 
     #[test]
     fn scheduler_startup_recovers_expired_lease_without_releasing_quota() {
-        use aiwork_core::{BeginRequestInput, CostPolicy, PreflightReserveInput, QuotaGrant, SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, LeaseState};
+        use aiwork_core::{BeginRequestInput, CostPolicy, KeyQuotaGrant, PreflightReserveInput, SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, LeaseState};
         let f = Fixture::new();
         let directory = directory();
         sync_upstream_accounts(&f.store, &f.dir, &f.admin, &directory).unwrap();
         f.store.upsert_cost_policy(CostPolicy { id: "fixture-policy".into(), endpoint: "chat".into(), model_pattern: "mock-*".into(), resource_kind: "chat.general".into(), reserve_amount: 1, max_actual_amount: Some(1), version: 1, enabled: true }).unwrap();
-        f.store.grant(QuotaGrant { user_id: "admin".into(), resource_kind: "chat.general".into(), amount: 5, actor_user_id: "admin".into(), reason: "local fixture grant".into() }).unwrap();
+        f.store.key_quota_grant_as_admin(&f.admin, KeyQuotaGrant { api_key_id: f.admin.key_id.clone(), resource_kind: "chat.general".into(), amount: 5, actor_user_id: "admin".into(), reason: "local fixture grant".into() }).unwrap();
         f.store.record_observation_snapshot(ObservationSnapshot {
             account_ref: directory.accounts[0].id.clone(), resource_kind: "chat.general".into(), available_units: Some(1000), value_scale: 100,
             source: "reader".into(), observed_at_ms: NOW, stale_at_ms: NOW + 60000, capabilities: vec!["chat".into()], region: Some("cn".into()), summary: json!({"available":1000}),
@@ -791,11 +805,129 @@ mod tests {
         let runtime = SchedulerRuntime::new(reopened.clone(), f.dir.clone(), SchedulerMode::Enforce, BTreeMap::new(), BTreeMap::new(), NOW + 11).unwrap();
         assert_eq!(runtime.scheduler_status().recovered_leases, 1);
         assert_eq!(runtime.scheduler_status().unknown_leases, 1);
-        assert_eq!(f.store.balance("admin", "chat.general").unwrap().held, 1);
+        assert_eq!(key_balance(&f, "chat.general").held, 1);
         let again = SchedulerRuntime::new(reopened, f.dir.clone(), SchedulerMode::Enforce, BTreeMap::new(), BTreeMap::new(), NOW + 60001).unwrap();
         assert_eq!(again.scheduler_status().recovered_leases, 0);
-        assert_eq!(f.store.balance("admin", "chat.general").unwrap().held, 1);
+        assert_eq!(key_balance(&f, "chat.general").held, 1);
         assert_eq!(runtime.require_endpoint("chat").unwrap_err().code(), "scheduler_endpoint_not_enabled");
+    }
+
+    #[test]
+    fn scheduler_recovery_marks_mismatched_quota_event_group_reconcile_required() {
+        use aiwork_core::{BeginRequestInput, CostPolicy, KeyQuotaGrant, PreflightReserveInput, SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy};
+        let f = Fixture::new();
+        let directory = directory();
+        sync_upstream_accounts(&f.store, &f.dir, &f.admin, &directory).unwrap();
+        f.store
+            .upsert_cost_policy(CostPolicy {
+                id: "fixture-reconcile-policy".into(),
+                endpoint: "chat".into(),
+                model_pattern: "mock-*".into(),
+                resource_kind: "chat.general".into(),
+                reserve_amount: 1,
+                max_actual_amount: Some(1),
+                version: 1,
+                enabled: true,
+            })
+            .unwrap();
+        f.store
+            .key_quota_grant_as_admin(
+                &f.admin,
+                KeyQuotaGrant {
+                    api_key_id: f.admin.key_id.clone(),
+                    resource_kind: "chat.general".into(),
+                    amount: 2,
+                    actor_user_id: "admin".into(),
+                    reason: "reconcile fixture".into(),
+                },
+            )
+            .unwrap();
+        f.store
+            .record_observation_snapshot(ObservationSnapshot {
+                account_ref: directory.accounts[0].id.clone(),
+                resource_kind: "chat.general".into(),
+                available_units: Some(1000),
+                value_scale: 100,
+                source: "reader".into(),
+                observed_at_ms: NOW,
+                stale_at_ms: NOW + 60000,
+                capabilities: vec!["chat".into()],
+                region: Some("cn".into()),
+                summary: json!({"available": 1000}),
+            })
+            .unwrap();
+        let acquired = f
+            .store
+            .preflight_reserve_with_lease(
+                &f.admin,
+                SchedulerLeaseRequest {
+                    preflight: PreflightReserveInput {
+                        request: BeginRequestInput {
+                            user_id: "admin".into(),
+                            api_key_id: f.admin.key_id.clone(),
+                            protocol: "openai".into(),
+                            endpoint: "chat".into(),
+                            model: "mock-1".into(),
+                            idempotency_key: "reconcile-mismatch".into(),
+                            body: json!({"model": "mock-1"}),
+                        },
+                        resource_kind: "chat.general".into(),
+                        amount: 1,
+                        ttl_ms: 30000,
+                    },
+                    provider_hint: Some("trae".into()),
+                    required_capabilities: vec!["chat".into()],
+                    region: Some("cn".into()),
+                    predicted_units: 1,
+                    safety_margin_units: 0,
+                    observation_max_age_ms: 60000,
+                    allowed_accounts: None,
+                    dedicated_account: None,
+                    selection_strategy: SelectionStrategy::LeastActiveSlots,
+                    now_ms: NOW,
+                    lease_ttl_ms: 30000,
+                    reconcile_ttl_ms: 60000,
+                },
+            )
+            .unwrap();
+        match acquired {
+            SchedulerLeaseResult::Acquired(_) => {}
+            SchedulerLeaseResult::Replay { .. } => panic!("unexpected replay"),
+        }
+        let connection = rusqlite::Connection::open(f.dir.join("data").join(aiwork_core::CORE_DB_FILE)).unwrap();
+        let request_id: String = connection
+            .query_row(
+                "SELECT request_id FROM idempotency_keys WHERE client_key = 'reconcile-mismatch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let reservation = f.store.reservation_for_request(&request_id).unwrap().unwrap();
+        let event_group_id = reservation.event_group_id.clone().unwrap();
+        connection
+            .execute(
+                "DELETE FROM quota_ledger WHERE event_group_id = ?1 AND event_kind = 'reserve'",
+                [&event_group_id],
+            )
+            .unwrap();
+
+        let reopened = Arc::new(CoreStore::open(&f.dir).unwrap());
+        let runtime = SchedulerRuntime::new(
+            reopened.clone(),
+            f.dir.clone(),
+            SchedulerMode::Enforce,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            NOW + 1,
+        )
+        .unwrap();
+        assert!(runtime.scheduler_status().ready);
+        let balance = reopened
+            .key_quota_balance_as_admin(&f.admin, &f.admin.key_id, "chat.general")
+            .unwrap();
+        assert_eq!(balance.migration_state, aiwork_core::QuotaMigrationState::ReconcileRequired);
+        assert_eq!(balance.held, 1);
+        assert!(reopened.count_rows("audit_events").unwrap() >= 1);
     }
 
     #[test]

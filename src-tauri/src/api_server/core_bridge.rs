@@ -1016,7 +1016,7 @@ mod tests {
 
     use aiwork_core::{
         ChatExecutor, CoreError, CoreStore, CostPolicy, MockChatExecutor, NewUser, Principal,
-        QuotaGrant, RequestState, UserRole, UpstreamError,
+        KeyQuotaGrant, LegacyQuotaAllocation, QuotaGrant, RequestState, UserRole, UpstreamError,
     };
     use serde_json::json;
 
@@ -1047,14 +1047,32 @@ mod tests {
         }
     }
 
-    fn bridge_with_grant(grant: i64) -> (CoreBridge, Principal, TestDir) {
+    fn bridge_with_grant(grant: i64) -> (CoreBridge, Principal, Principal, TestDir) {
         bridge_with_grant_mode(grant, CoreMode::Enforce)
     }
 
-    fn bridge_with_grant_mode(grant: i64, mode: CoreMode) -> (CoreBridge, Principal, TestDir) {
+    fn bridge_with_grant_mode(grant: i64, mode: CoreMode) -> (CoreBridge, Principal, Principal, TestDir) {
         let dir = TestDir::new("bridge");
         let store = Arc::new(CoreStore::open(dir.path()).unwrap());
         store.migrate().unwrap();
+        store
+            .create_bootstrap_admin(
+                NewUser {
+                    id: "admin".into(),
+                    name: "Test admin".into(),
+                    role: UserRole::Admin,
+                },
+                "bootstrap",
+            )
+            .unwrap();
+        let admin_key = store
+            .issue_api_key("admin", "admin", BTreeSet::new(), "bootstrap")
+            .unwrap();
+        let admin = Principal {
+            user_id: "admin".into(),
+            key_id: admin_key.id,
+            scopes: BTreeSet::new(),
+        };
         store
             .create_user(
                 NewUser {
@@ -1062,7 +1080,7 @@ mod tests {
                     name: "Test user".into(),
                     role: UserRole::User,
                 },
-                "bootstrap",
+                "admin",
             )
             .unwrap();
         let key = store
@@ -1070,7 +1088,7 @@ mod tests {
                 "u1",
                 "test",
                 BTreeSet::from(["chat:invoke".to_owned()]),
-                "bootstrap",
+                "admin",
             )
             .unwrap();
         store
@@ -1087,13 +1105,23 @@ mod tests {
             .unwrap();
         if grant > 0 {
             store
-                .grant(QuotaGrant {
-                    user_id: "u1".into(),
+                .key_quota_grant_as_admin(&admin, KeyQuotaGrant {
+                    api_key_id: key.id.clone(),
                     resource_kind: "chat_request".into(),
                     amount: grant,
-                    actor_user_id: "u1".into(),
+                    actor_user_id: "admin".into(),
                     reason: "test grant".into(),
                 })
+                .unwrap();
+        } else {
+            let connection = rusqlite::Connection::open(dir.path().join("data").join(aiwork_core::CORE_DB_FILE)).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO quota_budget_accounts
+                     (id, scope, user_id, api_key_id, resource_kind, enabled, version, migration_state, created_at_ms, updated_at_ms)
+                     VALUES (?1, 'key', 'u1', ?2, 'chat_request', 1, 1, 'ready', 0, 0)",
+                    rusqlite::params![format!("budget-zero-{}", rand::random::<u64>()), &key.id],
+                )
                 .unwrap();
         }
         let principal = aiwork_core::Principal {
@@ -1101,7 +1129,18 @@ mod tests {
             key_id: key.id.clone(),
             scopes: key.scopes,
         };
-        (CoreBridge::new(store, mode), principal, dir)
+        (CoreBridge::new(store, mode), principal, admin, dir)
+    }
+
+    fn key_balance(
+        bridge: &CoreBridge,
+        principal: &Principal,
+        resource_kind: &str,
+    ) -> aiwork_core::QuotaBudgetBalance {
+        bridge
+            .store
+            .key_quota_balance_for_principal(principal, resource_kind)
+            .unwrap()
     }
 
     fn chat_body() -> serde_json::Value {
@@ -1116,7 +1155,7 @@ mod tests {
 
     #[test]
     fn preflight_checks_scope_before_identity_or_policy() {
-        let (bridge, mut principal, _dir) = bridge_with_grant(1);
+        let (bridge, mut principal, _admin, _dir) = bridge_with_grant(1);
         principal.scopes.clear();
         principal.key_id = "missing-key".into();
 
@@ -1128,7 +1167,7 @@ mod tests {
 
     #[test]
     fn preflight_reports_missing_policy_before_identity_mismatch() {
-        let (bridge, mut principal, _dir) = bridge_with_grant(1);
+        let (bridge, mut principal, _admin, _dir) = bridge_with_grant(1);
         principal.key_id = "different-key".into();
         let body = json!({"model": "not-priced", "messages": []});
 
@@ -1140,7 +1179,7 @@ mod tests {
 
     #[test]
     fn preflight_reserves_before_execution_and_success_commits() {
-        let (bridge, principal, _dir) = bridge_with_grant(1);
+        let (bridge, principal, _admin, _dir) = bridge_with_grant(1);
         let first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-success"), &chat_body())
             .unwrap();
@@ -1155,14 +1194,15 @@ mod tests {
                 ChatOutcome::Success(aiwork_core::ChatExecutionResult::ok()),
             )
             .unwrap();
-        assert_eq!(bridge.balance("u1", "chat_request").unwrap().available, 0);
-        assert_eq!(bridge.balance("u1", "chat_request").unwrap().held, 0);
+        let balance = key_balance(&bridge, &principal, "chat_request");
+        assert_eq!(balance.available, 0);
+        assert_eq!(balance.held, 0);
         assert_eq!(bridge.store.request_state(&first.request_id).unwrap(), RequestState::Settled);
     }
 
     #[test]
     fn insufficient_budget_fails_preflight_without_reservation() {
-        let (bridge, principal, _dir) = bridge_with_grant(0);
+        let (bridge, principal, admin, _dir) = bridge_with_grant(0);
         let error = bridge
             .preflight_chat(
                 &principal,
@@ -1174,11 +1214,11 @@ mod tests {
         assert!(matches!(error, CoreError::QuotaInsufficient { .. }));
         bridge
             .store
-            .grant(QuotaGrant {
-                user_id: "u1".into(),
+            .key_quota_grant_as_admin(&admin, KeyQuotaGrant {
+                api_key_id: principal.key_id.clone(),
                 resource_kind: "chat_request".into(),
                 amount: 1,
-                actor_user_id: "u1".into(),
+                actor_user_id: "admin".into(),
                 reason: "retry grant".into(),
             })
             .unwrap();
@@ -1196,7 +1236,7 @@ mod tests {
 
     #[test]
     fn same_idempotency_key_reuses_one_reservation() {
-        let (bridge, principal, _dir) = bridge_with_grant(2);
+        let (bridge, principal, _admin, _dir) = bridge_with_grant(2);
         let first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-repeat"), &chat_body())
             .unwrap();
@@ -1207,12 +1247,75 @@ mod tests {
         assert_eq!(first.reservation.as_ref().unwrap().id, second.reservation.as_ref().unwrap().id);
         assert!(second.execution.is_none());
         assert_eq!(second.state, RequestState::Reserved);
-        assert_eq!(bridge.balance("u1", "chat_request").unwrap().held, 1);
+        assert_eq!(key_balance(&bridge, &principal, "chat_request").held, 1);
+    }
+
+    #[test]
+    fn core_chat_user_cap_is_shared_by_two_keys() {
+        let (bridge, first_principal, admin, _dir) = bridge_with_grant(1);
+        let second_key = bridge
+            .store
+            .issue_api_key(
+                "u1",
+                "second",
+                BTreeSet::from(["chat:invoke".to_owned()]),
+                "admin",
+            )
+            .unwrap();
+        bridge
+            .store
+            .grant(QuotaGrant {
+                user_id: "u1".into(),
+                resource_kind: "chat_request".into(),
+                amount: 2,
+                actor_user_id: "u1".into(),
+                reason: "user cap fixture".into(),
+            })
+            .unwrap();
+        bridge
+            .store
+            .key_quota_allocate_legacy_as_admin(
+                &admin,
+                LegacyQuotaAllocation {
+                    source_user_id: "u1".into(),
+                    api_key_id: second_key.id.clone(),
+                    resource_kind: "chat_request".into(),
+                    amount: 1,
+                    actor_user_id: "admin".into(),
+                    reason: "shared cap fixture".into(),
+                    migration_id: "shared-cap-fixture".into(),
+                },
+            )
+            .unwrap();
+        let second_principal = Principal {
+            user_id: "u1".into(),
+            key_id: second_key.id,
+            scopes: BTreeSet::from(["chat:invoke".to_owned()]),
+        };
+
+        let first = bridge
+            .preflight_chat(
+                &first_principal,
+                &first_principal.key_id,
+                Some("shared-cap-first"),
+                &chat_body(),
+            )
+            .unwrap();
+        assert!(first.reservation.is_some());
+        let second = bridge
+            .preflight_chat(
+                &second_principal,
+                &second_principal.key_id,
+                Some("shared-cap-second"),
+                &chat_body(),
+            )
+            .unwrap_err();
+        assert!(matches!(second, CoreError::QuotaInsufficient { available: 0, required: 1 }));
     }
 
     #[test]
     fn timeout_and_disconnect_settle_as_unknown() {
-        let (bridge, principal, _dir) = bridge_with_grant(1);
+        let (bridge, principal, _admin, _dir) = bridge_with_grant(1);
         let first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-timeout"), &chat_body())
             .unwrap();
@@ -1224,19 +1327,19 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(bridge.balance("u1", "chat_request").unwrap().held, 1);
+        assert_eq!(key_balance(&bridge, &principal, "chat_request").held, 1);
         assert_eq!(bridge.store.request_state(&first.request_id).unwrap(), RequestState::Settled);
     }
 
     #[test]
     fn off_and_shadow_bridges_reject_without_store_side_effects() {
         for mode in [CoreMode::Off, CoreMode::Shadow] {
-            let (bridge, principal, _dir) = bridge_with_grant_mode(1, mode);
+            let (bridge, principal, _admin, _dir) = bridge_with_grant_mode(1, mode);
             let error = bridge
                 .preflight_chat(&principal, &principal.key_id, Some("idem-disabled"), &chat_body())
                 .unwrap_err();
             assert!(matches!(error, CoreError::CoreModeNotEnforcing { .. }));
-            assert_eq!(bridge.balance("u1", "chat_request").unwrap().available, 1);
+            assert_eq!(key_balance(&bridge, &principal, "chat_request").available, 1);
 
             let settle_error = bridge
                 .settle_chat(&principal, "missing-reservation", ChatOutcome::Failure(UpstreamError::Timeout))
@@ -1247,7 +1350,7 @@ mod tests {
 
     #[test]
     fn body_endpoint_cannot_select_a_different_cost_policy() {
-        let (bridge, principal, _dir) = bridge_with_grant(1);
+        let (bridge, principal, _admin, _dir) = bridge_with_grant(1);
         let body = json!({"endpoint": "cheap", "model": "mock-1", "messages": []});
         let result = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-endpoint"), &body)
@@ -1257,7 +1360,7 @@ mod tests {
 
     #[test]
     fn explicit_upstream_failure_releases_quota_and_settles_request() {
-        let (bridge, principal, _dir) = bridge_with_grant(1);
+        let (bridge, principal, _admin, _dir) = bridge_with_grant(1);
         let first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-failure"), &chat_body())
             .unwrap();
@@ -1272,13 +1375,13 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(bridge.balance("u1", "chat_request").unwrap().available, 1);
+        assert_eq!(key_balance(&bridge, &principal, "chat_request").available, 1);
         assert_eq!(bridge.store.request_state(&first.request_id).unwrap(), RequestState::Settled);
     }
 
     #[test]
     fn terminal_replay_does_not_execute_mock_again() {
-        let (bridge, principal, _dir) = bridge_with_grant(2);
+        let (bridge, principal, _admin, _dir) = bridge_with_grant(2);
         let mut first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-terminal"), &chat_body())
             .unwrap();
@@ -1302,7 +1405,7 @@ mod tests {
 
     #[test]
     fn settlement_rejects_a_different_owner() {
-        let (bridge, principal, _dir) = bridge_with_grant(1);
+        let (bridge, principal, _admin, _dir) = bridge_with_grant(1);
         let first = bridge
             .preflight_chat(&principal, &principal.key_id, Some("idem-owner"), &chat_body())
             .unwrap();
@@ -1319,6 +1422,6 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, CoreError::ReservationOwnerMismatch { .. }));
-        assert_eq!(bridge.balance("u1", "chat_request").unwrap().held, 1);
+        assert_eq!(key_balance(&bridge, &principal, "chat_request").held, 1);
     }
 }

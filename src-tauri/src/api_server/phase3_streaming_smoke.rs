@@ -16,7 +16,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use aiwork_core::{
-        CoreStore, CostPolicy, NewUser, Principal, QuotaGrant, RegisterUpstreamAccount,
+        CoreStore, CostPolicy, KeyQuotaGrant, NewUser, Principal, RegisterUpstreamAccount,
         UpstreamAccountState, UpstreamObservation, ObservationStatus, UserRole,
     };
 
@@ -115,8 +115,8 @@ mod tests {
             })
             .expect("install smoke policy");
         store
-            .grant(QuotaGrant {
-                user_id: "phase3-smoke-user".into(),
+            .key_quota_grant_as_admin(&admin, KeyQuotaGrant {
+                api_key_id: principal.key_id.clone(),
                 resource_kind: "chat_request".into(),
                 amount: 2,
                 actor_user_id: "phase3-smoke-admin".into(),
@@ -307,7 +307,7 @@ mod tests {
         let store = &fixture.state.core.as_ref().unwrap().store;
         assert_eq!(store.count_rows("requests").unwrap(), 1);
         assert_eq!(store.count_rows("upstream_leases").unwrap(), 1);
-        assert_eq!(store.balance("phase3-smoke-user", "chat_request").unwrap().held, 0);
+        assert_eq!(store.key_quota_balance_for_principal(&fixture.principal, "chat_request").unwrap().held, 0);
         let db = rusqlite::Connection::open(fixture.dir.join("data/core.sqlite3")).unwrap();
         let state: String = db
             .query_row("SELECT state FROM upstream_leases", [], |row| row.get(0))
@@ -334,7 +334,7 @@ mod tests {
         let store = &fixture.state.core.as_ref().unwrap().store;
         assert_eq!(store.count_rows("requests").unwrap(), 0);
         assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
-        assert_eq!(store.balance("phase3-smoke-user", "chat_request").unwrap().held, 0);
+        assert_eq!(store.key_quota_balance_for_principal(&fixture.principal, "chat_request").unwrap().held, 0);
         assert!(mock.calls().is_empty());
     }
 
@@ -403,7 +403,8 @@ mod tests {
                         .core
                         .as_ref()
                         .unwrap()
-                        .balance("phase3-smoke-user", "chat_request")
+                        .store
+                        .key_quota_balance_for_principal(&fixture.principal, "chat_request")
                         .unwrap()
                         .held,
                     1

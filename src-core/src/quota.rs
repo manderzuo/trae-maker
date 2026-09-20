@@ -221,6 +221,237 @@ impl CoreStore {
         Ok(balance)
     }
 
+    /// Return the quota projection visible to the active API-key principal.
+    ///
+    /// Unlike the legacy user balance, this projection is scoped to the
+    /// authenticated key and refuses to silently fall back to a user-wide
+    /// ledger.  That makes it safe for request preflight and fail-closed
+    /// executor-unavailable paths.
+    pub fn key_quota_balance_for_principal(
+        &self,
+        principal: &Principal,
+        resource_kind: &str,
+    ) -> Result<QuotaBudgetBalance, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        Self::ensure_principal_in_transaction(&transaction, principal)?;
+        let account = transaction
+            .query_row(
+                "SELECT id, scope, user_id, api_key_id, resource_kind, enabled, version, migration_state
+                 FROM quota_budget_accounts
+                 WHERE scope = 'key' AND api_key_id = ?1 AND user_id = ?2 AND resource_kind = ?3
+                 ORDER BY id LIMIT 1",
+                params![&principal.key_id, &principal.user_id, resource_kind],
+                Self::budget_account_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::KeyQuotaNotConfigured {
+                api_key_id: principal.key_id.clone(),
+                resource_kind: resource_kind.into(),
+            })?;
+        Self::ensure_ready_budget_account(&account)?;
+        let balance = Self::budget_balance_in_transaction(&transaction, &account.id)?;
+        transaction.commit()?;
+        Ok(balance)
+    }
+
+    /// Validate dual-ledger event groups during enforcing scheduler startup.
+    ///
+    /// A malformed, incomplete, version-inconsistent, or unknown group is
+    /// quarantined by marking its budget accounts `reconcile_required`.  No
+    /// ledger event is synthesized and no hold is released, so recovery never
+    /// guesses about an upstream outcome.
+    pub fn reconcile_quota_event_groups(&self, now_ms: i64) -> Result<u64, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut statement = transaction.prepare(
+            "SELECT id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
+                    api_key_id, key_budget_account_id, user_cap_account_id, event_group_id
+             FROM quota_reservations
+             WHERE key_budget_account_id IS NOT NULL
+             ORDER BY created_at_ms, id",
+        )?;
+        let reservations = statement
+            .query_map([], Self::reservation_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let mut invalid_groups = 0_u64;
+        for reservation in reservations {
+            let (consistent, reason) = Self::validate_quota_event_group(&transaction, &reservation)?;
+            if consistent {
+                continue;
+            }
+
+            invalid_groups += 1;
+            let mut account_ids = Vec::new();
+            if let Some(account_id) = reservation.key_budget_account_id.as_deref() {
+                account_ids.push(account_id.to_owned());
+            }
+            if let Some(account_id) = reservation.user_cap_account_id.as_deref() {
+                if !account_ids.iter().any(|existing| existing == account_id) {
+                    account_ids.push(account_id.to_owned());
+                }
+            }
+            let mut transitioned = false;
+            for account_id in &account_ids {
+                transitioned |= transaction.execute(
+                    "UPDATE quota_budget_accounts
+                     SET migration_state = 'reconcile_required', updated_at_ms = ?1
+                     WHERE id = ?2 AND migration_state <> 'reconcile_required'",
+                    params![now_ms, account_id],
+                )? > 0;
+            }
+            if transitioned {
+                Self::insert_audit_event(
+                    &transaction,
+                    "system",
+                    "quota.reconcile_required",
+                    "quota_reservation",
+                    &reservation.id,
+                    serde_json::json!({
+                        "request_id": reservation.request_id,
+                        "event_group_id": reservation.event_group_id,
+                        "reason": reason,
+                        "hold_preserved": true,
+                    }),
+                    now_ms,
+                )?;
+            }
+        }
+
+        transaction.commit()?;
+        Ok(invalid_groups)
+    }
+
+    fn validate_quota_event_group(
+        transaction: &Transaction<'_>,
+        reservation: &Reservation,
+    ) -> Result<(bool, String), CoreError> {
+        let Some(event_group_id) = reservation.event_group_id.as_deref() else {
+            return Ok((false, "missing_event_group_id".into()));
+        };
+        if event_group_id.is_empty() {
+            return Ok((false, "empty_event_group_id".into()));
+        }
+        let Some(key_account_id) = reservation.key_budget_account_id.as_deref() else {
+            return Ok((false, "missing_key_budget_account_id".into()));
+        };
+        let mut account_ids = vec![key_account_id.to_owned()];
+        if let Some(user_account_id) = reservation.user_cap_account_id.as_deref() {
+            if user_account_id == key_account_id {
+                return Ok((false, "duplicate_budget_account_id".into()));
+            }
+            account_ids.push(user_account_id.to_owned());
+        }
+
+        let mut account_versions = Vec::with_capacity(account_ids.len());
+        for (index, account_id) in account_ids.iter().enumerate() {
+            let record = transaction
+                .query_row(
+                    "SELECT scope, version FROM quota_budget_accounts WHERE id = ?1",
+                    [account_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let Some((scope, version)) = record else {
+                return Ok((false, format!("missing_budget_account:{account_id}")));
+            };
+            let expected_scope = if index == 0 { "key" } else { "user_cap" };
+            if scope != expected_scope {
+                return Ok((false, format!("unexpected_budget_scope:{account_id}")));
+            }
+            account_versions.push(version);
+        }
+
+        if reservation.state == ReservationState::Unknown {
+            return Ok((false, "reservation_state_unknown".into()));
+        }
+
+        let mut statement = transaction.prepare(
+            "SELECT budget_account_id, event_kind, amount, delta, request_id, budget_version
+             FROM quota_ledger WHERE event_group_id = ?1 ORDER BY entry_id",
+        )?;
+        let events = statement
+            .query_map([event_group_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let final_kind = match reservation.state {
+            ReservationState::Held => None,
+            ReservationState::Released => Some("release"),
+            ReservationState::Committed => Some("commit"),
+            ReservationState::Unknown => None,
+        };
+        let expected_event_count = account_ids.len() * usize::from(final_kind.is_some() || reservation.state == ReservationState::Unknown);
+        if reservation.state == ReservationState::Held && events.len() != account_ids.len() {
+            return Ok((false, "reserve_event_count_mismatch".into()));
+        }
+        if final_kind.is_some() && events.len() != expected_event_count {
+            return Ok((false, "settlement_event_count_mismatch".into()));
+        }
+        if reservation.state == ReservationState::Unknown && !events.is_empty() {
+            return Ok((false, "unknown_group_has_ledger_events".into()));
+        }
+
+        for (event_account_id, event_kind, amount, delta, request_id, budget_version) in &events {
+            let Some(event_account_id) = event_account_id.as_deref() else {
+                return Ok((false, "ledger_event_missing_budget_account".into()));
+            };
+            let Some(account_index) = account_ids.iter().position(|id| id == event_account_id) else {
+                return Ok((false, "ledger_event_has_unexpected_budget_account".into()));
+            };
+            if request_id.as_deref() != Some(reservation.request_id.as_str()) {
+                return Ok((false, "ledger_event_request_mismatch".into()));
+            }
+            if *budget_version != Some(account_versions[account_index]) {
+                return Ok((false, "ledger_event_version_mismatch".into()));
+            }
+            match event_kind.as_str() {
+                "reserve" if *amount == reservation.amount && *delta == -reservation.amount => {}
+                "release"
+                    if reservation.state == ReservationState::Released
+                        && *amount == reservation.amount
+                        && *delta == reservation.amount => {}
+                "commit"
+                    if reservation.state == ReservationState::Committed
+                        && *amount >= 0
+                        && *amount <= reservation.amount
+                        && *delta == reservation.amount - *amount => {}
+                _ => return Ok((false, "ledger_event_shape_mismatch".into())),
+            }
+        }
+
+        for account_id in &account_ids {
+            let reserve_count = events
+                .iter()
+                .filter(|event| event.0.as_deref() == Some(account_id.as_str()) && event.1 == "reserve")
+                .count();
+            if reserve_count != 1 {
+                return Ok((false, "reserve_event_missing_or_duplicate".into()));
+            }
+            if let Some(final_kind) = final_kind {
+                let final_count = events
+                    .iter()
+                    .filter(|event| event.0.as_deref() == Some(account_id.as_str()) && event.1 == final_kind)
+                    .count();
+                if final_count != 1 {
+                    return Ok((false, "settlement_event_missing_or_duplicate".into()));
+                }
+            }
+        }
+        Ok((true, String::new()))
+    }
+
     pub fn key_quota_allocate_legacy_as_admin(
         &self,
         principal: &Principal,
