@@ -1121,6 +1121,18 @@ pub async fn chat_completions(
             }
         };
         let bound_account_refs = executor.bound_account_refs();
+        // Preserve completed idempotent replays without consuming a new
+        // execution permit. New Core requests acquire the guard before
+        // preflight and keep it through synchronous execution and settlement.
+        match bridge.lookup_chat_replay(&principal, &key_str, idempotency_key, &peek) {
+            Ok(Some(replay)) => return core_lease_replay_response(&replay),
+            Ok(None) => {}
+            Err(error) => return core_lease_error_response(error),
+        }
+        let _request_guard = match state.core_request_guard(&principal.key_id) {
+            Ok(guard) => guard,
+            Err(error) => return limit_error_response(error),
+        };
         let preflight = match bridge.preflight_chat_with_lease_for_accounts(
             &principal,
             &key_str,
@@ -6330,5 +6342,65 @@ mod tests {
 
         assert!(api_keys::load(&dir).keys[0].token_reservations.is_empty());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn core_nonstream_rejects_before_execution_when_request_limiter_is_full() {
+        let (mut fixture, _) = phase3_stream_fixture(
+            StreamTerminalOutcome::Success {
+                actual_units: None,
+                upstream_request_ref: None,
+            },
+            CancelSupport::Unsupported,
+            true,
+        );
+        Arc::get_mut(&mut fixture.state)
+            .expect("core fixture state should be uniquely owned")
+            .limiter = super::super::limits::RateLimiter::with_config(
+            super::super::limits::LimitConfig {
+                max_inflight: 1,
+                max_video_jobs: 4,
+                asset_uploads_per_minute: 8,
+                asset_bytes_per_hour: 1024,
+                video_submissions_per_minute: 8,
+            },
+        );
+        let held = fixture
+            .state
+            .acquire_request(&fixture.principal.key_id, &KeyLimits::default())
+            .expect("test should fill the Core request limiter");
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "core-nonstream-limiter-full".parse().unwrap());
+
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(false),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "concurrency_limit");
+        assert_eq!(
+            fixture
+                .state
+                .core
+                .as_ref()
+                .unwrap()
+                .store
+                .count_rows("requests")
+                .unwrap(),
+            0
+        );
+        drop(held);
     }
 }

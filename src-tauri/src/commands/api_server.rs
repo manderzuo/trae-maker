@@ -412,6 +412,10 @@ async fn do_start_with_scheduler_key(
         wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
     });
 
+    // `load_persisted` runs before ApiSharedState exists; restore legacy
+    // video-job permits only after the live limiter has been constructed.
+    crate::api_server::video::restore_persisted_job_permits(&shared.data_dir, &shared.limiter);
+
     let handle = start_api_server(&listen_host, port, shared.clone()).await?;
 
     fs_utils::app_log(

@@ -18,7 +18,7 @@ use serde_json::Value;
 use super::pool::PickedAccount;
 use super::pool::ResourceKind;
 use super::trae_resource_upload::{self, NativeUploadError};
-use super::limits::Permit;
+use super::limits::{Permit, RateLimiter};
 use super::{ApiSharedState, ErrKind, APP_ID, AGENT_HOST, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
 #[derive(Clone, Serialize)]
@@ -121,6 +121,76 @@ fn idempotency_create_lock() -> &'static Mutex<()> {
 
 fn job_permits() -> &'static Mutex<HashMap<String, Permit>> {
     JOB_PERMITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn has_job_permit(task_id: &str) -> bool {
+    job_permits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(task_id)
+}
+
+fn restore_key_limits(data_dir: &std::path::Path, owner_key_id: &str) -> super::api_keys::KeyLimits {
+    let owner_key_id = owner_key_id.trim();
+    if owner_key_id.is_empty() || owner_key_id == "anonymous" {
+        return super::api_keys::KeyLimits::default();
+    }
+    super::api_keys::constraints_for(data_dir, owner_key_id)
+        .map(|resolved| resolved.limits)
+        .unwrap_or_default()
+}
+
+fn restore_job_permits_for_tasks<I>(
+    data_dir: &std::path::Path,
+    limiter: &RateLimiter,
+    tasks: I,
+) -> usize
+where
+    I: IntoIterator<Item = (String, String, String)>,
+{
+    let mut restored = 0;
+    for (task_id, status, owner_key_id) in tasks {
+        if is_terminal_status(&status) {
+            release_job_permit(&task_id);
+            continue;
+        }
+        if has_job_permit(&task_id) {
+            continue;
+        }
+        let owner_key_id = if owner_key_id.trim().is_empty() {
+            "anonymous"
+        } else {
+            owner_key_id.trim()
+        };
+        let key_limits = restore_key_limits(data_dir, owner_key_id);
+        let Ok(permit) = limiter.acquire_video_job(owner_key_id, &key_limits) else {
+            // The limiter has already reached the effective per-Key or global
+            // cap. Leaving this persisted task without a new permit is
+            // fail-closed because the occupied limiter counters reject new
+            // submissions instead of treating recovery as unlimited.
+            continue;
+        };
+        if retain_job_permit(&task_id, permit) {
+            restored += 1;
+        }
+    }
+    restored
+}
+
+/// Restore the video-job permits owned by persisted legacy tasks after the
+/// runtime limiter has been constructed. Terminal tasks never consume a
+/// permit, and repeated startup/recovery calls keep existing permits intact.
+pub fn restore_persisted_job_permits(
+    data_dir: &std::path::Path,
+    limiter: &RateLimiter,
+) -> usize {
+    let persisted_tasks = tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .map(|task| (task.id.clone(), task.status.clone(), task.owner_key_id.clone()))
+        .collect::<Vec<_>>();
+    restore_job_permits_for_tasks(data_dir, limiter, persisted_tasks)
 }
 
 /// 将视频任务许可从 HTTP 提交作用域转移到任务生命周期。
@@ -1405,5 +1475,174 @@ mod tests {
         assert!(limiter
             .acquire_video_job("video-key", &super::super::api_keys::KeyLimits::default())
             .is_ok());
+    }
+
+    fn restore_test_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(format!(
+            r"D:\gpt\aiwork-video-restore-{label}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        dir
+    }
+
+    fn write_restore_key(data_dir: &std::path::Path, key_id: &str, max_video_jobs: usize) {
+        super::super::api_keys::save(
+            data_dir,
+            &super::super::api_keys::ApiKeysFile {
+                keys: vec![super::super::api_keys::ApiKeyEntry {
+                    id: key_id.to_string(),
+                    name: "restore test".into(),
+                    key: format!("restore-test-{}", rand::random::<u64>()),
+                    enabled: true,
+                    daily_limit: 0,
+                    created_at: 0,
+                    used_date: String::new(),
+                    used_today: 0,
+                    allowed_accounts: Vec::new(),
+                    schedule_mode: String::new(),
+                    dedicated_account: String::new(),
+                    daily_stats: Vec::new(),
+                    token_reservations: Vec::new(),
+                    limits: super::super::api_keys::KeyLimits {
+                        max_video_jobs: Some(max_video_jobs),
+                        ..super::super::api_keys::KeyLimits::default()
+                    },
+                    capabilities: vec![super::super::api_keys::CAPABILITY_VIDEO.into()],
+                }],
+                auth_disabled: false,
+            },
+        );
+    }
+
+    fn restore_record(id: &str, status: &str, owner_key_id: &str) -> (String, String, String) {
+        (id.to_string(), status.to_string(), owner_key_id.to_string())
+    }
+
+    fn cleanup_restore_permits(task_ids: &[&str]) {
+        for task_id in task_ids {
+            release_job_permit(task_id);
+        }
+    }
+
+    #[test]
+    fn restores_nonterminal_video_jobs_with_current_or_default_limits() {
+        let data_dir = restore_test_dir("nonterminal");
+        let known_key = "restore-known-key";
+        write_restore_key(&data_dir, known_key, 1);
+        let known_task = format!("restore-known-{}", rand::random::<u64>());
+        let anonymous_task = format!("restore-anonymous-{}", rand::random::<u64>());
+        let unknown_task = format!("restore-unknown-{}", rand::random::<u64>());
+        let limiter = super::super::limits::RateLimiter::with_config(
+            super::super::limits::LimitConfig {
+                max_inflight: 8,
+                max_video_jobs: 5,
+                asset_uploads_per_minute: 8,
+                asset_bytes_per_hour: 1024,
+                video_submissions_per_minute: 8,
+            },
+        );
+
+        assert_eq!(
+            restore_job_permits_for_tasks(
+                &data_dir,
+                &limiter,
+                vec![
+                    restore_record(&known_task, "queued", known_key),
+                    restore_record(&anonymous_task, "running", "anonymous"),
+                    restore_record(&unknown_task, "created", "missing-key"),
+                ],
+            ),
+            3
+        );
+
+        let known_limits = super::super::api_keys::KeyLimits {
+            max_video_jobs: Some(1),
+            ..super::super::api_keys::KeyLimits::default()
+        };
+        assert!(limiter.acquire_video_job(known_key, &known_limits).is_err());
+        let anonymous_extra = limiter
+            .acquire_video_job("anonymous", &super::super::api_keys::KeyLimits::default())
+            .expect("anonymous restore should use default limits");
+        let unknown_extra = limiter
+            .acquire_video_job("missing-key", &super::super::api_keys::KeyLimits::default())
+            .expect("unknown owner restore should use default limits");
+        drop(anonymous_extra);
+        drop(unknown_extra);
+
+        cleanup_restore_permits(&[&known_task, &anonymous_task, &unknown_task]);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn terminal_video_jobs_do_not_restore_a_job_permit() {
+        let data_dir = restore_test_dir("terminal");
+        let known_key = "restore-terminal-key";
+        write_restore_key(&data_dir, known_key, 1);
+        let task_id = format!("restore-terminal-{}", rand::random::<u64>());
+        let limiter = super::super::limits::RateLimiter::with_config(
+            super::super::limits::LimitConfig {
+                max_inflight: 8,
+                max_video_jobs: 1,
+                asset_uploads_per_minute: 8,
+                asset_bytes_per_hour: 1024,
+                video_submissions_per_minute: 8,
+            },
+        );
+
+        assert_eq!(
+            restore_job_permits_for_tasks(
+                &data_dir,
+                &limiter,
+                vec![restore_record(&task_id, "completed", known_key)],
+            ),
+            0
+        );
+        let permit = limiter
+            .acquire_video_job(known_key, &super::super::api_keys::KeyLimits {
+                max_video_jobs: Some(1),
+                ..super::super::api_keys::KeyLimits::default()
+            })
+            .expect("terminal task must not consume a video permit");
+        drop(permit);
+
+        cleanup_restore_permits(&[&task_id]);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn repeated_video_job_restore_does_not_duplicate_in_process_permits() {
+        let data_dir = restore_test_dir("repeat");
+        let task_id = format!("restore-repeat-{}", rand::random::<u64>());
+        let limiter = super::super::limits::RateLimiter::with_config(
+            super::super::limits::LimitConfig {
+                max_inflight: 8,
+                max_video_jobs: 4,
+                asset_uploads_per_minute: 8,
+                asset_bytes_per_hour: 1024,
+                video_submissions_per_minute: 8,
+            },
+        );
+        let records = vec![restore_record(&task_id, "queued", "anonymous")];
+
+        assert_eq!(restore_job_permits_for_tasks(&data_dir, &limiter, records.clone()), 1);
+        assert_eq!(restore_job_permits_for_tasks(&data_dir, &limiter, records), 0);
+
+        let extra_a = limiter
+            .acquire_video_job("extra-a", &super::super::api_keys::KeyLimits::default())
+            .unwrap();
+        let extra_b = limiter
+            .acquire_video_job("extra-b", &super::super::api_keys::KeyLimits::default())
+            .unwrap();
+        let extra_c = limiter
+            .acquire_video_job("extra-c", &super::super::api_keys::KeyLimits::default())
+            .expect("recovery must not consume a second permit for the same task");
+        drop(extra_a);
+        drop(extra_b);
+        drop(extra_c);
+
+        cleanup_restore_permits(&[&task_id]);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }

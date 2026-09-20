@@ -366,7 +366,7 @@ cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tau
 
 # Task 3 修复轮次 6：A2.3 legacy 视频幂等键原子 check-and-create
 
-日期：2026-09-20  
+日期：2026-09-20
 范围：仅修复 legacy `/v1/videos/generations` 的同一作用域幂等键并发重复创建；未扩展 Core、重启恢复或 worker permit 回收。
 状态：完成
 
@@ -405,3 +405,37 @@ Focused video：`22 passed, 0 failed`（包含 video、video_store、video_worke
 ## 提交边界
 
 本轮只提交 `src-tauri/src/api_server/video.rs`、`src-tauri/src/api_server/routes.rs` 和本报告文件；其它用户 dirty 文件未暂存、未回退、未清理。
+
+---
+
+# Task 3 修复轮次 7：A2.2b-2a 视频恢复与 Core 非流式请求许可
+
+日期：2026-09-20
+范围：仅处理 legacy 视频任务重启 permit 恢复，以及 Core 非流式 chat 的 request guard 接线
+状态：完成本轮范围
+
+## 改动
+
+1. `video.rs` 新增 `restore_persisted_job_permits`：在 live `RateLimiter` 构造后遍历已加载的 legacy 视频任务。终态任务不占用 permit；非终态任务按当前 `owner_key_id` 读取 Key limits，未知/匿名使用默认 limits；已有任务 permit 不重复保留。恢复超过 per-Key/global 上限时让当前 limiter 保持占满，新的提交继续被拒绝，不绕过限额。
+2. `commands/api_server.rs` 在 `ApiSharedState` 构造完成后调用恢复函数，保留既有的启动前 `video::load_persisted` 顺序。
+3. `routes.rs` 的 Core 非流式路径在新请求 preflight 前取得 `state.core_request_guard(&principal.key_id)`，并让 guard 覆盖同步 `execute_nonstream_chat` 与后续 settle；先做只读幂等 replay 检查，不重复修改 Core stream/video 的 guard。
+4. 新增视频非终态恢复、终态不恢复、重复恢复不重复计数，以及 Core limiter 已满时不进入非流式执行的 focused 回归测试。
+
+## focused 测试
+
+以下命令均使用 `D:\gpt\aiwork-key-limits-cargo-target`、`--offline`，每条均为 `1 passed, 0 failed`：
+
+```text
+cargo.exe test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --bin ai-work-assistant api_server::video::tests::restores_nonterminal_video_jobs_with_current_or_default_limits -- --exact
+cargo.exe test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --bin ai-work-assistant api_server::video::tests::terminal_video_jobs_do_not_restore_a_job_permit -- --exact
+cargo.exe test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --bin ai-work-assistant api_server::video::tests::repeated_video_job_restore_does_not_duplicate_in_process_permits -- --exact
+cargo.exe test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --bin ai-work-assistant api_server::routes::tests::core_nonstream_rejects_before_execution_when_request_limiter_is_full -- --exact --nocapture
+```
+
+另：`git diff --check` 通过。测试编译仅出现工作区已有的 unused/dead-code 与 Windows linker 警告。
+
+## 未处理项
+
+- Core 视频幂等、Core settle 错误深层恢复、legacy SSE worker cleanup。
+- 未运行全量 Rust suite；既有 `core_migration` 失败与其它用户 dirty 文件均未处理。
+- 未修改 `limits.rs`，本轮恢复复用了现有 per-Key/global limiter。
