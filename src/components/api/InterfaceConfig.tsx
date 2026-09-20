@@ -8,7 +8,89 @@ import { Copy, Download, Globe, Save, Link, Radio, Square, Trash2 } from 'lucide
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
 import { useAppStore } from '../../store';
-import type { ConversationSettings, ConversationSummary, FrpConfig, FrpStatus, GatewaySettings, TunnelConfig, TunnelStatus, UnifiedModel } from '../../types';
+import type {
+  ConversationSettings,
+  ConversationSummary,
+  FrpConfig,
+  FrpStatus,
+  GatewayLimitDefaults,
+  GatewaySettings,
+  TunnelConfig,
+  TunnelStatus,
+  UnifiedModel,
+} from '../../types';
+
+export const DEFAULT_GATEWAY_LIMITS: GatewayLimitDefaults = {
+  max_inflight: 32,
+  max_video_jobs: 32,
+  asset_uploads_per_minute: 30,
+  asset_bytes_per_hour: 256 * 1024 * 1024,
+  video_submissions_per_minute: 3,
+};
+
+const GATEWAY_LIMIT_FIELDS: Array<{
+  field: keyof GatewayLimitDefaults;
+  label: string;
+  max: number;
+}> = [
+  { field: 'max_inflight', label: '文字请求并发', max: 256 },
+  { field: 'max_video_jobs', label: '视频任务并发', max: 256 },
+  { field: 'video_submissions_per_minute', label: '视频提交频率', max: 1_000 },
+  { field: 'asset_uploads_per_minute', label: '素材上传频率', max: 10_000 },
+  { field: 'asset_bytes_per_hour', label: '素材容量', max: 10 * 1024 * 1024 * 1024 },
+];
+
+function normalizePositiveLimit(value: number | null | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+export function normalizeGatewayLimitDefaults(
+  limits?: Partial<GatewayLimitDefaults> | null,
+): GatewayLimitDefaults {
+  return {
+    max_inflight: normalizePositiveLimit(limits?.max_inflight, DEFAULT_GATEWAY_LIMITS.max_inflight),
+    max_video_jobs: normalizePositiveLimit(limits?.max_video_jobs, DEFAULT_GATEWAY_LIMITS.max_video_jobs),
+    asset_uploads_per_minute: normalizePositiveLimit(
+      limits?.asset_uploads_per_minute,
+      DEFAULT_GATEWAY_LIMITS.asset_uploads_per_minute,
+    ),
+    asset_bytes_per_hour: normalizePositiveLimit(
+      limits?.asset_bytes_per_hour,
+      DEFAULT_GATEWAY_LIMITS.asset_bytes_per_hour,
+    ),
+    video_submissions_per_minute: normalizePositiveLimit(
+      limits?.video_submissions_per_minute,
+      DEFAULT_GATEWAY_LIMITS.video_submissions_per_minute,
+    ),
+  };
+}
+
+export function validateGatewayLimitDefaults(limits: GatewayLimitDefaults): string | null {
+  for (const { field, label, max } of GATEWAY_LIMIT_FIELDS) {
+    const value = limits[field];
+    if (!Number.isInteger(value) || value < 1 || value > max) {
+      return `${label}需为 1-${max.toLocaleString('zh-CN')} 的整数`;
+    }
+  }
+  return null;
+}
+
+export function buildGatewaySettingsPayload(
+  current: GatewaySettings,
+  limits: GatewayLimitDefaults,
+): GatewaySettings {
+  return {
+    ...current,
+    limit_defaults: normalizeGatewayLimitDefaults(limits),
+  };
+}
+
+function formatGatewayBytes(value: number): string {
+  if (value >= 1024 * 1024 * 1024) return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+  if (value >= 1024 * 1024) return `${Math.round(value / (1024 * 1024))} MiB`;
+  if (value >= 1024) return `${Math.round(value / 1024)} KiB`;
+  return `${value} B`;
+}
 
 export default function InterfaceConfig() {
   const toast = useAppStore((s) => s.pushToast);
@@ -18,6 +100,7 @@ export default function InterfaceConfig() {
   const [corsOrigins, setCorsOrigins] = useState('');
   const [assetPublicBaseUrl, setAssetPublicBaseUrl] = useState('');
   const [model, setModel] = useState('glm-5.3');
+  const [limitDefaults, setLimitDefaults] = useState<GatewayLimitDefaults>(DEFAULT_GATEWAY_LIMITS);
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [saving, setSaving] = useState(false);
   const [copying, setCopying] = useState(false);
@@ -51,6 +134,7 @@ export default function InterfaceConfig() {
         setCorsOrigins(s.cors_origins || '');
         setAssetPublicBaseUrl(s.asset_public_base_url || '');
         setModel(s.default_model);
+        setLimitDefaults(normalizeGatewayLimitDefaults(s.limit_defaults));
       })
       .catch(() => {
         /* 保留默认值 */
@@ -75,18 +159,37 @@ export default function InterfaceConfig() {
       toast('error', '端口需为 1-65535 的整数');
       return;
     }
+    const limitError = validateGatewayLimitDefaults(limitDefaults);
+    if (limitError) {
+      toast('error', limitError);
+      return;
+    }
     setSaving(true);
     try {
-      // 后端会规范化（空模型名回退默认值），前端展示以返回值为准（§5.3）
-      const next = await withMinDelay(
-        api.apiServer.gatewaySettingsSet({
+      const current: GatewaySettings = gw ?? {
+        port: p,
+        default_model: model.trim(),
+        listen_host: listenHost.trim() || '127.0.0.1',
+        cors_origins: corsOrigins.trim(),
+        asset_public_base_url: assetPublicBaseUrl.trim(),
+        updated_at: 0,
+      };
+      // 后端会规范化（空模型名回退默认值），前端展示以返回值为准（§5.3）。
+      // 以当前对象为基底，避免限流保存时覆盖端口/CORS/素材基址等既有字段。
+      const payload = buildGatewaySettingsPayload(
+        {
+          ...current,
           port: p,
           default_model: model.trim(),
           listen_host: listenHost.trim() || '127.0.0.1',
           cors_origins: corsOrigins.trim(),
           asset_public_base_url: assetPublicBaseUrl.trim(),
           updated_at: gw?.updated_at ?? 0,
-        }),
+        },
+        limitDefaults,
+      );
+      const next = await withMinDelay(
+        api.apiServer.gatewaySettingsSet(payload),
       );
       setGw(next);
       setPort(next.port);
@@ -94,7 +197,8 @@ export default function InterfaceConfig() {
       setCorsOrigins(next.cors_origins || '');
       setAssetPublicBaseUrl(next.asset_public_base_url || '');
       setModel(next.default_model);
-      toast('success', '网关设置已保存；端口改动将在下次启动 API 服务后生效');
+      setLimitDefaults(normalizeGatewayLimitDefaults(next.limit_defaults));
+      toast('success', '网关设置已保存；端口和限流改动将在下次启动 API 服务后生效');
     } catch (e) {
       toast('error', `保存失败：${String(e).slice(0, 120)}`);
     } finally {
@@ -105,11 +209,15 @@ export default function InterfaceConfig() {
   const copyConfigExample = async () => {
     const p = gw?.port ?? 7864;
     const host = gw?.listen_host ?? listenHost ?? '127.0.0.1';
-    const m = gw?.default_model ?? 'glm-5.3';
+    const configuredModel = gw?.default_model ?? 'glm-5.3';
+    const m = configuredModel === 'seedance'
+      ? models.find((item) => item.id !== 'seedance')?.id ?? 'deepseek-v4-flash'
+      : configuredModel;
     const example = `# 客户端配置示例（OpenAI 兼容格式）
 接口地址: http://${host}:${p}/v1
 API Key:  <在「API Keys 管理」中创建并复制>
-模型 ID:  ${m}（统一目录内任一模型均可，请求按模型 ID 匹配资源池）
+文字模型 ID:  ${m}（从 /v1/models 返回的 text 能力模型中选择）
+视频模型 ID:  seedance（从 /v1/models 返回的 video 能力模型中选择）
 
 # Anthropic 兼容端点（Claude Code 等工具直连）
 POST http://${host}:${p}/v1/messages
@@ -126,6 +234,7 @@ curl -X POST http://${host}:${p}/v1/chat/completions \\
   }'
 
 # Seedance 视频生成（Trae Work CN Work 积分；异步任务）
+# 与文字请求共用上面的 Base URL 和 API Key
 curl -X POST http://${host}:${p}/v1/videos/generations \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer your-api-key" \\
@@ -382,6 +491,88 @@ POST http://${host}:${p}/v1/assets
               统一目录（Trae / Buddy 聚合）；用于 CC Switch 注册与未指定 model 的请求。服务器可用 AIWORK_DEFAULT_MODEL 覆盖
             </p>
           </div>
+        </div>
+
+        <div className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+          <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+            <div>
+              <p className="text-sm font-semibold text-slate-700 dark:text-zinc-200">全局限流默认值</p>
+              <p className="mt-1 text-xs text-slate-400">API Key 的“跟随全局”限制使用这里的值；Key 自定义值不能超过全局上限。</p>
+            </div>
+            <span className="text-xs font-medium text-amber-600 dark:text-amber-400">修改后需重启 API 服务</span>
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600 dark:text-zinc-300">文字请求并发</span>
+              <input
+                className="input"
+                type="number"
+                min={1}
+                max={256}
+                step={1}
+                value={limitDefaults.max_inflight}
+                onChange={(e) => setLimitDefaults({ ...limitDefaults, max_inflight: Number(e.target.value) })}
+              />
+              <span className="mt-1 block text-[11px] text-slate-400">1-256 个请求</span>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600 dark:text-zinc-300">视频任务并发</span>
+              <input
+                className="input"
+                type="number"
+                min={1}
+                max={256}
+                step={1}
+                value={limitDefaults.max_video_jobs}
+                onChange={(e) => setLimitDefaults({ ...limitDefaults, max_video_jobs: Number(e.target.value) })}
+              />
+              <span className="mt-1 block text-[11px] text-slate-400">1-256 个任务</span>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600 dark:text-zinc-300">视频提交频率</span>
+              <input
+                className="input"
+                type="number"
+                min={1}
+                max={1000}
+                step={1}
+                value={limitDefaults.video_submissions_per_minute}
+                onChange={(e) => setLimitDefaults({ ...limitDefaults, video_submissions_per_minute: Number(e.target.value) })}
+              />
+              <span className="mt-1 block text-[11px] text-slate-400">1-1000 次/分钟</span>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-600 dark:text-zinc-300">素材上传频率</span>
+              <input
+                className="input"
+                type="number"
+                min={1}
+                max={10000}
+                step={1}
+                value={limitDefaults.asset_uploads_per_minute}
+                onChange={(e) => setLimitDefaults({ ...limitDefaults, asset_uploads_per_minute: Number(e.target.value) })}
+              />
+              <span className="mt-1 block text-[11px] text-slate-400">1-10000 次/分钟</span>
+            </label>
+            <label className="block sm:col-span-2">
+              <span className="mb-1 block text-xs font-medium text-slate-600 dark:text-zinc-300">素材容量（字节/小时）</span>
+              <input
+                className="input"
+                type="number"
+                min={1}
+                max={10 * 1024 * 1024 * 1024}
+                step={1}
+                value={limitDefaults.asset_bytes_per_hour}
+                onChange={(e) => setLimitDefaults({ ...limitDefaults, asset_bytes_per_hour: Number(e.target.value) })}
+              />
+              <span className="mt-1 block text-[11px] text-slate-400">
+                1-10 GiB/小时；当前 {formatGatewayBytes(limitDefaults.asset_bytes_per_hour)}
+              </span>
+            </label>
+          </div>
+          <p className="mt-3 text-[11px] leading-5 text-slate-400">
+            环境变量优先于此处保存值：AIWORK_MAX_INFLIGHT、AIWORK_VIDEO_SUBMISSIONS_PER_MINUTE、AIWORK_ASSET_UPLOADS_PER_MINUTE、AIWORK_ASSET_BYTES_PER_HOUR。若环境变量已设置，重启后以环境变量为准。
+          </p>
         </div>
 
         <button

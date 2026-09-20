@@ -6,12 +6,152 @@
  * 在子弹框打开期间屏蔽 ESC 双关（主弹窗 onClose 先于子弹框触发）。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { BarChart3, Copy, KeyRound, Plus, Power, RefreshCw, Trash2 } from 'lucide-react';
+import { BarChart3, Copy, Gauge, KeyRound, Plus, Power, RefreshCw, Trash2 } from 'lucide-react';
 import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { maskApiKey, fmtTokens } from '../../lib/format';
-import type { ApiKeyEntry, PoolStatus, UsageDayView } from '../../types';
+import type {
+  ApiKeyEntry,
+  GatewayLimitDefaults,
+  KeyCapabilities,
+  KeyCapability,
+  KeyLimits,
+  PoolStatus,
+  UsageDayView,
+} from '../../types';
+
+export const DEFAULT_KEY_CAPABILITIES: KeyCapabilities = ['chat', 'video', 'assets'];
+
+const DEFAULT_GATEWAY_LIMITS: GatewayLimitDefaults = {
+  max_inflight: 32,
+  max_video_jobs: 32,
+  asset_uploads_per_minute: 30,
+  asset_bytes_per_hour: 256 * 1024 * 1024,
+  video_submissions_per_minute: 3,
+};
+
+type NullableKeyLimitField =
+  | 'max_inflight'
+  | 'max_video_jobs'
+  | 'asset_uploads_per_minute'
+  | 'asset_bytes_per_hour'
+  | 'video_submissions_per_minute';
+
+const NULLABLE_KEY_LIMIT_FIELDS: Array<{
+  field: NullableKeyLimitField;
+  label: string;
+  unit: string;
+  max: number;
+}> = [
+  { field: 'max_inflight', label: '文字请求并发', unit: '个', max: 256 },
+  { field: 'max_video_jobs', label: '视频任务并发', unit: '个', max: 256 },
+  { field: 'video_submissions_per_minute', label: '视频提交频率', unit: '次/分钟', max: 1_000 },
+  { field: 'asset_uploads_per_minute', label: '素材上传频率', unit: '次/分钟', max: 10_000 },
+  { field: 'asset_bytes_per_hour', label: '素材容量', unit: '字节/小时', max: 10 * 1024 * 1024 * 1024 },
+];
+
+const DAILY_KEY_LIMIT_FIELDS = [
+  { field: 'daily_requests' as const, label: '每日请求额度', max: 1_000_000 },
+  { field: 'daily_tokens' as const, label: '每日 Token 额度', max: 10_000_000_000 },
+];
+
+function normalizeOptionalLimit(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 1 ? Math.floor(value) : null;
+}
+
+function normalizeDailyLimit(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+}
+
+/** 旧 Key 缺失 limits 时显示为跟随全局，daily_* 缺失时保持不限。 */
+export function normalizeKeyLimits(limits?: Partial<KeyLimits> | null): KeyLimits {
+  return {
+    max_inflight: normalizeOptionalLimit(limits?.max_inflight),
+    max_video_jobs: normalizeOptionalLimit(limits?.max_video_jobs),
+    asset_uploads_per_minute: normalizeOptionalLimit(limits?.asset_uploads_per_minute),
+    asset_bytes_per_hour: normalizeOptionalLimit(limits?.asset_bytes_per_hour),
+    video_submissions_per_minute: normalizeOptionalLimit(limits?.video_submissions_per_minute),
+    daily_requests: normalizeDailyLimit(limits?.daily_requests),
+    daily_tokens: normalizeDailyLimit(limits?.daily_tokens),
+  };
+}
+
+/** undefined/null 代表旧 Key，兼容地补齐三项能力；显式空数组仍表示全部禁用。 */
+export function normalizeKeyCapabilities(capabilities?: KeyCapabilities | null): KeyCapabilities {
+  if (capabilities == null) return [...DEFAULT_KEY_CAPABILITIES];
+  return DEFAULT_KEY_CAPABILITIES.filter((capability) => capabilities.includes(capability));
+}
+
+export function validateKeyLimits(limits: KeyLimits): string | null {
+  for (const { field, label, max } of DAILY_KEY_LIMIT_FIELDS) {
+    const value = limits[field];
+    if (!Number.isInteger(value) || value < 0 || value > max) {
+      return `${label}需为 0-${max.toLocaleString('zh-CN')} 的整数`;
+    }
+  }
+  for (const { field, label, max } of NULLABLE_KEY_LIMIT_FIELDS) {
+    const value = limits[field];
+    if (value != null && (!Number.isInteger(value) || value < 1 || value > max)) {
+      return `${label}需为 1-${max.toLocaleString('zh-CN')} 的整数，或选择跟随全局`;
+    }
+  }
+  return null;
+}
+
+export function effectiveKeyLimitSummary(
+  limits: KeyLimits | null | undefined,
+  global: GatewayLimitDefaults,
+): GatewayLimitDefaults {
+  const normalized = normalizeKeyLimits(limits);
+  return {
+    max_inflight: Math.min(normalized.max_inflight ?? global.max_inflight, global.max_inflight),
+    max_video_jobs: Math.min(normalized.max_video_jobs ?? global.max_video_jobs, global.max_video_jobs),
+    asset_uploads_per_minute: Math.min(
+      normalized.asset_uploads_per_minute ?? global.asset_uploads_per_minute,
+      global.asset_uploads_per_minute,
+    ),
+    asset_bytes_per_hour: Math.min(
+      normalized.asset_bytes_per_hour ?? global.asset_bytes_per_hour,
+      global.asset_bytes_per_hour,
+    ),
+    video_submissions_per_minute: Math.min(
+      normalized.video_submissions_per_minute ?? global.video_submissions_per_minute,
+      global.video_submissions_per_minute,
+    ),
+  };
+}
+
+export function buildKeyPolicyUpdate(
+  key: ApiKeyEntry,
+  limits: KeyLimits,
+  capabilities: KeyCapabilities,
+): ApiKeyEntry {
+  return {
+    ...key,
+    limits: normalizeKeyLimits(limits),
+    capabilities: normalizeKeyCapabilities(capabilities),
+  };
+}
+
+function formatBytes(value: number): string {
+  if (value >= 1024 * 1024 * 1024) return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+  if (value >= 1024 * 1024) return `${Math.round(value / (1024 * 1024))} MiB`;
+  if (value >= 1024) return `${Math.round(value / 1024)} KiB`;
+  return `${value} B`;
+}
+
+function normalizeGatewayLimits(limits?: Partial<GatewayLimitDefaults> | null): GatewayLimitDefaults {
+  return {
+    max_inflight: limits?.max_inflight ?? DEFAULT_GATEWAY_LIMITS.max_inflight,
+    max_video_jobs: limits?.max_video_jobs ?? DEFAULT_GATEWAY_LIMITS.max_video_jobs,
+    asset_uploads_per_minute:
+      limits?.asset_uploads_per_minute ?? DEFAULT_GATEWAY_LIMITS.asset_uploads_per_minute,
+    asset_bytes_per_hour: limits?.asset_bytes_per_hour ?? DEFAULT_GATEWAY_LIMITS.asset_bytes_per_hour,
+    video_submissions_per_minute:
+      limits?.video_submissions_per_minute ?? DEFAULT_GATEWAY_LIMITS.video_submissions_per_minute,
+  };
+}
 
 export default function ApiKeysManager({
   onSubModalChange,
@@ -28,6 +168,12 @@ export default function ApiKeysManager({
   const [newKeyValue, setNewKeyValue] = useState('');
   // F-35 子 Key 配置弹框 + 删除确认（禁 window.confirm，红线）
   const [editKey, setEditKey] = useState<ApiKeyEntry | null>(null);
+  const [policyKey, setPolicyKey] = useState<ApiKeyEntry | null>(null);
+  const [policyLimits, setPolicyLimits] = useState<KeyLimits>(normalizeKeyLimits());
+  const [policyCapabilities, setPolicyCapabilities] = useState<KeyCapabilities>([
+    ...DEFAULT_KEY_CAPABILITIES,
+  ]);
+  const [policyError, setPolicyError] = useState('');
   const [editAllowed, setEditAllowed] = useState<Set<string>>(new Set());
   const [editMode, setEditMode] = useState('expire_first');
   const [editDedicated, setEditDedicated] = useState('');
@@ -36,6 +182,7 @@ export default function ApiKeysManager({
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   // 今日按 Key 的 token 用量（「今日已用」列展示）
   const [usage, setUsage] = useState<UsageDayView[]>([]);
+  const [globalLimits, setGlobalLimits] = useState<GatewayLimitDefaults>(DEFAULT_GATEWAY_LIMITS);
 
   // ---- 多 API Key 管理（原 ApiService.tsx 逻辑原样搬移） ----
   const loadKeys = useCallback(async () => {
@@ -144,6 +291,18 @@ export default function ApiKeysManager({
       });
   };
 
+  const openPolicyEdit = (k: ApiKeyEntry) => {
+    setPolicyKey(k);
+    setPolicyLimits(normalizeKeyLimits(k.limits));
+    setPolicyCapabilities(normalizeKeyCapabilities(k.capabilities));
+    setPolicyError('');
+  };
+
+  const closePolicyEdit = () => {
+    setPolicyKey(null);
+    setPolicyError('');
+  };
+
   const confirmKeyEdit = () => {
     if (!editKey) return;
     const next = apiKeys.map((k) =>
@@ -158,6 +317,38 @@ export default function ApiKeysManager({
     );
     void saveKeys(next, `Key「${editKey.name}」调度配置已更新`);
     setEditKey(null);
+  };
+
+  const confirmPolicyEdit = () => {
+    if (!policyKey) return;
+    const error = validateKeyLimits(policyLimits);
+    if (error) {
+      setPolicyError(error);
+      toast('error', error);
+      return;
+    }
+    const next = apiKeys.map((k) =>
+      k.id === policyKey.id ? buildKeyPolicyUpdate(k, policyLimits, policyCapabilities) : k,
+    );
+    void saveKeys(next, `Key「${policyKey.name}」额度与限流已更新`);
+    closePolicyEdit();
+  };
+
+  const setNullablePolicyLimit = (field: NullableKeyLimitField, mode: 'global' | 'custom') => {
+    setPolicyError('');
+    setPolicyLimits((current) => ({
+      ...current,
+      [field]: mode === 'global' ? null : current[field] ?? globalLimits[field],
+    }));
+  };
+
+  const setPolicyCapability = (capability: KeyCapability) => {
+    setPolicyError('');
+    setPolicyCapabilities((current) =>
+      current.includes(capability)
+        ? current.filter((value) => value !== capability)
+        : [...current, capability],
+    );
   };
 
   const updateKeyLimit = (id: string, limit: number) => {
@@ -193,12 +384,18 @@ export default function ApiKeysManager({
       .catch(() => {
         /* 保留空列表 */
       });
+    api.apiServer
+      .gatewaySettingsGet()
+      .then((settings) => setGlobalLimits(normalizeGatewayLimits(settings.limit_defaults)))
+      .catch(() => {
+        /* 未读取到全局设置时使用后端默认值 */
+      });
   }, [loadKeys, generateKeyValue]);
 
   // 子弹框开关状态上报（供主弹窗屏蔽 ESC 双关）
   useEffect(() => {
-    onSubModalChange?.(editKey != null || deleteForKey != null);
-  }, [editKey, deleteForKey, onSubModalChange]);
+    onSubModalChange?.(editKey != null || policyKey != null || deleteForKey != null);
+  }, [editKey, policyKey, deleteForKey, onSubModalChange]);
 
   // 今日按 Key 的 token 用量（Keys 表「今日已用」并列展示；日期口径与后端一致 = 本地时区 YYYY-MM-DD）
   const todayKey = new Date().toLocaleDateString('sv-SE');
@@ -307,7 +504,7 @@ export default function ApiKeysManager({
                 <th className="pb-2 pr-4 font-medium">Key</th>
                 <th className="pb-2 pr-4 font-medium">日限额(次)</th>
                 <th className="pb-2 pr-4 font-medium">今日已用(次/tok)</th>
-                <th className="pb-2 pr-4 font-medium">调度</th>
+                <th className="pb-2 pr-4 font-medium">调度 / 有效限流</th>
                 <th className="pb-2 pr-4 font-medium">状态</th>
                 <th className="pb-2 font-medium">操作</th>
               </tr>
@@ -317,6 +514,7 @@ export default function ApiKeysManager({
                 const exhausted = k.daily_limit > 0 && k.used_today >= k.daily_limit;
                 const kt = todayKeyTokens.get(k.id);
                 const ktTotal = kt ? kt.prompt + kt.completion : 0;
+                const effective = effectiveKeyLimitSummary(k.limits, globalLimits);
                 return (
                   <tr
                     key={k.id}
@@ -370,6 +568,11 @@ export default function ApiKeysManager({
                           限{k.allowed_accounts.length}账号
                         </span>
                       )}
+                      <div className="mt-1 max-w-[21rem] text-[10px] leading-4 text-slate-400 dark:text-zinc-500">
+                        并发 {effective.max_inflight} · 视频 {effective.max_video_jobs} · 视频提交{' '}
+                        {effective.video_submissions_per_minute}/分 · 素材 {effective.asset_uploads_per_minute}/分 ·{' '}
+                        {formatBytes(effective.asset_bytes_per_hour)}/时
+                      </div>
                     </td>
                     <td className="py-2 pr-4">
                       {k.enabled ? <Badge tone="green">启用中</Badge> : <Badge tone="slate">已禁用</Badge>}
@@ -403,6 +606,13 @@ export default function ApiKeysManager({
                         </button>
                         <button
                           className="btn-ghost !p-1.5"
+                          title="额度与限流（每日额度 / 并发 / 视频 / 素材 / 能力）"
+                          onClick={() => openPolicyEdit(k)}
+                        >
+                          <Gauge size={14} />
+                        </button>
+                        <button
+                          className="btn-ghost !p-1.5"
                           title="删除"
                           onClick={() => deleteKey(k)}
                           disabled={keysSaving}
@@ -418,6 +628,150 @@ export default function ApiKeysManager({
           </table>
         </div>
       )}
+
+      {/* Key 额度与限流配置：nullable 限制显式选择跟随全局，daily=0 表示不限 */}
+      <Modal
+        open={policyKey != null}
+        onClose={closePolicyEdit}
+        title={`额度与限流 · ${policyKey?.name ?? ''}`}
+        size="xl"
+        bodyClass="max-h-[70vh] overflow-y-auto"
+        footer={
+          <>
+            <button className="btn-outline" onClick={closePolicyEdit}>取消</button>
+            <button className="btn-primary" onClick={confirmPolicyEdit} disabled={keysSaving}>保存</button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
+            旧 Key 缺失新字段时默认跟随全局并允许 chat / video / assets。Key 级限制只能收紧全局值，空白限制请选择“跟随全局”。
+          </div>
+
+          <div>
+            <div className="mb-2 text-xs font-medium text-slate-500 dark:text-zinc-400">每日额度</div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {DAILY_KEY_LIMIT_FIELDS.map(({ field, label, max }) => {
+                const current = policyKey
+                  ? field === 'daily_requests'
+                    ? policyKey.used_today
+                    : (todayKeyTokens.get(policyKey.id)?.prompt ?? 0) + (todayKeyTokens.get(policyKey.id)?.completion ?? 0)
+                  : 0;
+                return (
+                  <label key={field} className="block">
+                    <span className="mb-1 block text-xs font-medium text-slate-600 dark:text-zinc-300">{label}</span>
+                    <input
+                      className="input"
+                      type="number"
+                      min={0}
+                      max={max}
+                      step={1}
+                      value={policyLimits[field]}
+                      onChange={(e) => {
+                        setPolicyError('');
+                        setPolicyLimits((value) => ({ ...value, [field]: Number(e.target.value) }));
+                      }}
+                    />
+                    <span className="mt-1 block text-[11px] text-slate-400">
+                      0 = 不限；今日已用 {field === 'daily_tokens' ? `${fmtTokens(current)} Token` : `${current} 次`}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+            <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+              <div>
+                <p className="text-xs font-medium text-slate-600 dark:text-zinc-300">限流覆盖</p>
+                <p className="mt-1 text-[11px] text-slate-400">跟随全局的值会随接口配置变化；自定义值大于全局值时仍按全局上限生效。</p>
+              </div>
+              <span className="text-[11px] text-slate-400">
+                全局：并发 {globalLimits.max_inflight} · 视频 {globalLimits.max_video_jobs} · 视频提交{' '}
+                {globalLimits.video_submissions_per_minute}/分
+              </span>
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {NULLABLE_KEY_LIMIT_FIELDS.map(({ field, label, unit, max }) => {
+                const value = policyLimits[field];
+                const effective = effectiveKeyLimitSummary(policyLimits, globalLimits)[field];
+                return (
+                  <div key={field}>
+                    <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-zinc-300">{label}</label>
+                    <div className="flex gap-2">
+                      <select
+                        className="input w-32 shrink-0"
+                        value={value == null ? 'global' : 'custom'}
+                        aria-label={`${label}来源`}
+                        onChange={(e) => setNullablePolicyLimit(field, e.target.value as 'global' | 'custom')}
+                      >
+                        <option value="global">跟随全局</option>
+                        <option value="custom">自定义</option>
+                      </select>
+                      <input
+                        className="input min-w-0 flex-1"
+                        type="number"
+                        min={1}
+                        max={max}
+                        step={1}
+                        value={value ?? ''}
+                        disabled={value == null}
+                        onChange={(e) => {
+                          setPolicyError('');
+                          setPolicyLimits((current) => ({
+                            ...current,
+                            [field]: Number(e.target.value),
+                          }));
+                        }}
+                        placeholder={String(globalLimits[field])}
+                      />
+                    </div>
+                    <span className="mt-1 block text-[11px] text-slate-400">
+                      有效 {field === 'asset_bytes_per_hour' ? formatBytes(effective) : `${effective} ${unit}`}
+                      {value == null ? '（全局）' : ''}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div>
+            <div className="mb-2 text-xs font-medium text-slate-500 dark:text-zinc-400">能力开关</div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              {(
+                [
+                  { key: 'chat' as const, label: 'chat', desc: '文字与兼容消息接口' },
+                  { key: 'video' as const, label: 'video', desc: '视频提交、查询与下载' },
+                  { key: 'assets' as const, label: 'assets', desc: '参考图/视频素材上传' },
+                ] satisfies Array<{ key: KeyCapability; label: string; desc: string }>
+              ).map((capability) => (
+                <label
+                  key={capability.key}
+                  className="flex cursor-pointer items-start gap-2 rounded-lg border border-slate-200 p-2.5 text-xs dark:border-zinc-700"
+                >
+                  <input
+                    type="checkbox"
+                    checked={policyCapabilities.includes(capability.key)}
+                    onChange={() => setPolicyCapability(capability.key)}
+                  />
+                  <span>
+                    <span className="block font-medium text-slate-700 dark:text-zinc-200">{capability.label}</span>
+                    <span className="mt-0.5 block text-slate-400">{capability.desc}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {policyError && (
+            <p className="rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-500/10 dark:text-rose-300">
+              {policyError}
+            </p>
+          )}
+        </div>
+      </Modal>
 
       {/* 子 Key 调度配置弹框（F-35：限定上游 + 专一/临期优先 + 按日统计） */}
       <Modal
