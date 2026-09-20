@@ -16,6 +16,7 @@ use aiwork_core::UpstreamLease;
 
 use super::core_bridge::CoreLeaseError;
 use super::core_video::{VideoAdapterOutcome, VideoExecutionRequest};
+use super::video;
 use super::{ApiSharedState, CoreBridge};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -161,6 +162,7 @@ impl VideoQueueWorker {
                     .map_err(|error| error.to_string())?;
                 if releases_payload(&outcome) {
                     let _ = self.state.video_payloads.remove(&job.id);
+                    video::release_job_permit(&job.id);
                 }
                 if let VideoAdapterOutcome::TransportUnknown { reason, .. } = outcome {
                     Ok(VideoWorkerStep::Unknown {

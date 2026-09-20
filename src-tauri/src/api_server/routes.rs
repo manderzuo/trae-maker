@@ -16,6 +16,7 @@ use aiwork_core::{
 };
 
 use super::custom_route;
+use super::api_keys::{self, KeyLimits, ResolvedKey};
 use super::assets;
 use super::core_bridge::{
     CancelSupport, ChatOutcome, CoreLeaseError, CoreUpstreamExecutor, LeasePreflightResult,
@@ -115,6 +116,43 @@ fn core_principal_or_unauthorized(principal: Option<&Extension<Principal>>) -> R
     principal
         .map(|extension| extension.0.clone())
         .ok_or_else(|| openai_error(StatusCode::UNAUTHORIZED, "unauthorized", "Core Principal required"))
+}
+
+fn legacy_policy(state: &ApiSharedState, key_id: &str) -> Option<ResolvedKey> {
+    if key_id == "anonymous" {
+        None
+    } else {
+        api_keys::constraints_for(&state.data_dir, key_id)
+    }
+}
+
+fn require_legacy_capability(
+    state: &ApiSharedState,
+    key_id: &str,
+    capability: &str,
+) -> Result<KeyLimits, Response> {
+    let Some(policy) = legacy_policy(state, key_id) else {
+        return Ok(KeyLimits::default());
+    };
+    if !policy.capabilities.iter().any(|value| value == capability) {
+        return Err(openai_error(
+            StatusCode::FORBIDDEN,
+            "capability_not_allowed",
+            &format!("API Key 未启用能力: {capability}"),
+        ));
+    }
+    Ok(policy.limits)
+}
+
+fn legacy_request_guard(
+    state: &ApiSharedState,
+    key_id: &str,
+    key_limits: &KeyLimits,
+) -> Result<InflightGuard, Response> {
+    state
+        .acquire_request(key_id, key_limits)
+        .map(|permit| state.inflight_guard_with_permit(permit))
+        .map_err(limit_error_response)
 }
 
 fn core_error_response(error: CoreError) -> Response {
@@ -831,29 +869,60 @@ pub async fn models(
     .await
     .unwrap_or_default();
     // wb_enabled=false：仅 Buddy 源的模型过滤，双源模型保留（仍可由 Trae 源服务 §3.4）
-    let data: Vec<Value> = list
+    let mut data: Vec<Value> = list
         .iter()
         .filter(|m| wb_enabled || !m.sources.iter().all(|s| s.pool == "buddy"))
-        .map(|m| {
-            json!({
-                "id": m.id,
-                "object": "model",
-                "created": 1753600000,
-                "owned_by": "unified",
-                "display": m.display,
-                "rate": m.rate,
-                "context_length": m.context_length,
-                "max_tokens": m.max_tokens,
-                "supports_image": m.supports_image,
-                "supported_efforts": m.efforts,
-                // 来源池集合：[{pool: "trae"|"buddy", rate, enabled}]（徽章/降级判定
-                // 由客户端按元数据自决，勿硬编码 §3.4）
-                "sources": m.sources,
-                "manual": m.manual,
-            })
-        })
+        .map(public_unified_model_value)
         .collect();
+    // Seedance 是 Work 视频能力，不混入文字统一目录；但公共模型发现接口需要让
+    // 外部客户端能够通过同一个 Base URL 发现并选择它。
+    data.push(public_seedance_model_value(
+        state.pool.has_selectable_for(ResourceKind::Work),
+    ));
     Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+fn public_unified_model_value(model: &unified_catalog::UnifiedModel) -> Value {
+    json!({
+        "id": model.id,
+        "object": "model",
+        "created": 1753600000,
+        "owned_by": "unified",
+        "display": model.display,
+        "rate": model.rate,
+        "context_length": model.context_length,
+        "max_tokens": model.max_tokens,
+        "supports_image": model.supports_image,
+        "supported_efforts": model.efforts,
+        "capabilities": ["text"],
+        "endpoint": "/v1/chat/completions",
+        "async": false,
+        // 来源池集合：[{pool: "trae"|"buddy"|"custom", rate, enabled}]。
+        // 客户端按元数据自决，勿硬编码来源池。
+        "sources": model.sources,
+        "manual": model.manual,
+    })
+}
+
+fn public_seedance_model_value(work_available: bool) -> Value {
+    let model = unified_catalog::seedance_model(work_available);
+    json!({
+        "id": model.id,
+        "object": "model",
+        "created": 1753600000,
+        "owned_by": model.vendor,
+        "display": model.display,
+        "rate": model.rate,
+        "context_length": model.context_length,
+        "max_tokens": model.max_tokens,
+        "supports_image": model.supports_image,
+        "supported_efforts": model.efforts,
+        "capabilities": ["video"],
+        "endpoint": "/v1/videos/generations",
+        "async": true,
+        "sources": model.sources,
+        "manual": model.manual,
+    })
 }
 
 pub async fn chat_completions(
@@ -881,10 +950,6 @@ pub async fn chat_completions(
         );
     }
 
-    state
-        .total_requests
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
     // 校验 JSON：无效请求体直接 400，不转发上游（与 /v1/messages 行为对齐）
     let mut peek: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -911,7 +976,14 @@ pub async fn chat_completions(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
-
+    let key_limits = if core_enforcing(&state) {
+        KeyLimits::default()
+    } else {
+        match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_CHAT) {
+            Ok(limits) => limits,
+            Err(response) => return response,
+        }
+    };
     if core_enforcing(&state) {
         let principal = match core_principal_or_unauthorized(principal.as_ref()) {
             Ok(principal) => principal,
@@ -1070,7 +1142,10 @@ pub async fn chat_completions(
     // 统一调度分流点（§4.1 ③~⑥）：resolve_target 决定资源池/会话池粘性/跨池回退/
     // 错误矩阵，替代原 resolve_wb_target 单向判定；默认策略下行为与改造前一致（§9.1）。
     // inflight guard 随执行路径持有至请求结束（流式含整个后台任务）
-    let guard = state.inflight_guard();
+    let guard = match legacy_request_guard(&state, &key_str, &key_limits) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let response = match dispatch::resolve_target(&state, &model, &peek) {
         Err(e) => dispatch_error_response(e, Protocol::OpenAi, &model),
         Ok(r) => match r.pool {
@@ -1131,10 +1206,6 @@ pub async fn responses_api(
         );
     }
 
-    state
-        .total_requests
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
     let peek: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -1170,6 +1241,17 @@ pub async fn responses_api(
     }
 
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+    let key_limits = if core_enforcing(&state) {
+        KeyLimits::default()
+    } else {
+        match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_CHAT) {
+            Ok(limits) => limits,
+            Err(response) => return response,
+        }
+    };
+    state
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if core_enforcing(&state) {
         if !stream {
             return scheduler_endpoint_not_enabled_response();
@@ -1197,7 +1279,10 @@ pub async fn responses_api(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     // inflight guard：随执行路径持有至请求结束（§4.5）
-    let guard = state.inflight_guard();
+    let guard = match legacy_request_guard(&state, &key_str, &key_limits) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
 
     // 统一池间路由：Responses 既可投影到 WorkBuddy，也可投影到 Trae SOLO。
     // 这样 Codex/Responses 客户端与 OpenAI/Anthropic 客户端使用同一套资源调度与
@@ -1279,10 +1364,6 @@ pub async fn messages(
         }
     }
 
-    state
-        .total_requests
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
     // 校验 JSON 并预读 stream/model，再整体转为 OpenAI 内部格式复用现有链路
     let mut peek: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1320,6 +1401,17 @@ pub async fn messages(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+    let key_limits = if core_enforcing(&state) {
+        KeyLimits::default()
+    } else {
+        match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_CHAT) {
+            Ok(limits) => limits,
+            Err(response) => return response,
+        }
+    };
+    state
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     if core_enforcing(&state) {
         if !stream {
@@ -1347,7 +1439,10 @@ pub async fn messages(
 
     // 统一调度分流点（§4.1）：resolve_target 决定资源池/回退/错误矩阵；
     // guard 随执行路径持有至请求结束（流式含整个后台任务）
-    let guard = state.inflight_guard();
+    let guard = match legacy_request_guard(&state, &key_str, &key_limits) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     match dispatch::resolve_target(&state, &model, &internal) {
         Err(e) => dispatch_error_response(e, Protocol::Anthropic, &model),
         Ok(r) => match r.pool {
@@ -1403,10 +1498,6 @@ pub async fn completions(
     if core_enforcing(&state) {
         return scheduler_endpoint_not_enabled_response();
     }
-
-    state
-        .total_requests
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let peek: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1469,9 +1560,19 @@ pub async fn completions(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+    let key_limits = match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_CHAT) {
+        Ok(limits) => limits,
+        Err(response) => return response,
+    };
+    state
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // 统一调度分流点（§4.1）；guard 随执行路径持有至请求结束
-    let guard = state.inflight_guard();
+    let guard = match legacy_request_guard(&state, &key_str, &key_limits) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     match dispatch::resolve_target(&state, &model, &internal) {
         Err(e) => dispatch_error_response(e, Protocol::OpenAiText, &model),
         Ok(r) => match r.pool {
@@ -1553,10 +1654,13 @@ pub async fn assets_upload(
         };
         return core_assets_upload(state, principal, body).await;
     }
-    let _guard = state.inflight_guard();
     let owner = key_id
         .map(|Extension(k)| k.0)
         .unwrap_or_else(|| "anonymous".to_string());
+    let key_limits = match require_legacy_capability(&state, &owner, api_keys::CAPABILITY_ASSETS) {
+        Ok(limits) => limits,
+        Err(response) => return response,
+    };
     if owner == "anonymous" {
         return openai_error(
             StatusCode::UNAUTHORIZED,
@@ -1571,13 +1675,16 @@ pub async fn assets_upload(
     let filename = parsed.filename;
     let declared_mime = parsed.declared_mime;
     let bytes = parsed.bytes;
-    let _limit_permit = match state
-        .limiter
-        .acquire_legacy(&owner, LimitKind::AssetUpload, bytes.len() as u64)
-    {
+    let request_permit = match state.acquire_limit(
+        &owner,
+        LimitKind::AssetUpload,
+        bytes.len() as u64,
+        &key_limits,
+    ) {
         Ok(permit) => permit,
         Err(error) => return limit_error_response(error),
     };
+    let _guard = state.inflight_guard_with_permit(request_permit);
     match assets::create(
         &state.data_dir,
         &owner,
@@ -1596,7 +1703,7 @@ pub async fn assets_upload(
                 "created_at": record.created_at,
                 "expires_at": record.expires_at,
             });
-            // 公网素材基址是显式 opt-in；未设置时不返回任何可访问地址。
+            // 短时查看地址是显式 opt-in；Seedance 原生上传不依赖该地址。
             if let Ok(url) = assets::public_url_for_owned(&state.data_dir, &owner, &record.id) {
                 response["content_url"] = json!(url);
             }
@@ -1612,8 +1719,8 @@ pub struct PublicAssetQuery {
 }
 
 /// 短时素材链接的内容端点。只有带随机 token 的地址可读；API Key 不会出现在
-/// URL 中，也不会写入日志。该端点只在用户显式配置公网素材基址并将链接交给
-/// 上游时使用，普通 API 客户端仍应通过 `/v1/assets` 上传并用 Key 管理素材。
+/// URL 中，也不会写入日志。该端点只在用户显式配置公网素材基址后提供短时查看，
+/// 普通 API 客户端仍应通过 `/v1/assets` 上传并用 Key 管理素材；Seedance 输入走原生上传。
 pub async fn assets_content(
     State(state): State<Arc<ApiSharedState>>,
     Path(asset_id): Path<String>,
@@ -1758,14 +1865,16 @@ async fn core_assets_upload(
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
-    let _guard = state.inflight_guard();
-    let _limit_permit = match state
-        .limiter
-        .acquire_legacy(&principal.user_id, LimitKind::AssetUpload, parsed.bytes.len() as u64)
-    {
+    let request_permit = match state.acquire_limit(
+        &principal.key_id,
+        LimitKind::AssetUpload,
+        parsed.bytes.len() as u64,
+        &KeyLimits::default(),
+    ) {
         Ok(permit) => permit,
         Err(error) => return limit_error_response(error),
     };
+    let _guard = state.inflight_guard_with_permit(request_permit);
     let (record, storage_ref) = match assets::write_core_asset(
         &state.data_dir,
         &principal.user_id,
@@ -1972,6 +2081,10 @@ async fn core_videos_generations(
         Ok(executor) => executor,
         Err(error) => return core_lease_error_response(error),
     };
+    let video_job_permit = match state.acquire_video_job(&principal.key_id, &KeyLimits::default()) {
+        Ok(permit) => permit,
+        Err(error) => return limit_error_response(error),
+    };
     let job_id = format!(
         "video-{}-{}",
         chrono::Utc::now().timestamp_millis(),
@@ -2009,6 +2122,7 @@ async fn core_videos_generations(
     };
     let job = match enqueued {
         VideoJobEnqueueResult::Replay { job, .. } => {
+            drop(video_job_permit);
             let _ = state.video_payloads.remove(&job_id);
             return core_video_response(
                 &bridge,
@@ -2021,7 +2135,16 @@ async fn core_videos_generations(
                 &state.data_dir,
             )
         }
-        VideoJobEnqueueResult::Created { job, .. } => job,
+        VideoJobEnqueueResult::Created { job, .. } => {
+            if !video::retain_job_permit(&job.id, video_job_permit) {
+                return openai_error(
+                    StatusCode::CONFLICT,
+                    "video_limit_state_conflict",
+                    "video job permit already exists",
+                );
+            }
+            job
+        }
     };
 
     let (job, lease) = match bridge.claim_video_job_for_worker("http-video-worker", &job.id) {
@@ -2104,6 +2227,7 @@ async fn core_videos_generations(
             }
             if video_outcome_releases_payload(&outcome) {
                 let _ = state.video_payloads.remove(&job.id);
+                video::release_job_permit(&job.id);
             }
         }
     }
@@ -2196,13 +2320,16 @@ pub async fn videos_generations(
         };
         return core_videos_generations(state, principal, headers, body).await;
     }
-    state
-        .total_requests
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _guard = state.inflight_guard();
     let key_str = key_id
         .map(|Extension(k)| k.0)
         .unwrap_or_else(|| "anonymous".to_string());
+    let key_limits = match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_VIDEO) {
+        Ok(limits) => limits,
+        Err(response) => return response,
+    };
+    state
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if body.len() > MAX_BODY_BYTES {
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -2224,10 +2351,6 @@ pub async fn videos_generations(
         Ok(value) => value,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &error),
     };
-    let input = match video::resolve_asset_references(&state.data_dir, &key_str, &input) {
-        Ok(value) => value,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, "invalid_asset", &error),
-    };
     let idempotency_key = headers
         .get("idempotency-key")
         .or_else(|| headers.get("x-request-id"))
@@ -2248,10 +2371,17 @@ pub async fn videos_generations(
                 .unwrap_or_else(|_| internal_error_response());
         }
     }
-    let _limit_permit = match state
-        .limiter
-        .acquire_legacy(&key_str, LimitKind::VideoSubmission, body.len() as u64)
-    {
+    let request_permit = match state.acquire_limit(
+        &key_str,
+        LimitKind::VideoSubmission,
+        body.len() as u64,
+        &key_limits,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => return limit_error_response(error),
+    };
+    let _guard = state.inflight_guard_with_permit(request_permit);
+    let video_job_permit = match state.acquire_video_job(&key_str, &key_limits) {
         Ok(permit) => permit,
         Err(error) => return limit_error_response(error),
     };
@@ -2270,7 +2400,14 @@ pub async fn videos_generations(
     if let Some(key) = scoped_idempotency_key.as_deref() {
         video::bind_idempotency(key, &task.id);
     }
-    video::start_native_task(state.clone(), task.id.clone(), input, account);
+    video::start_native_task(
+        state.clone(),
+        task.id.clone(),
+        input,
+        key_str.clone(),
+        account,
+        video_job_permit,
+    );
     state.logger.log_request(
         "trae",
         "POST",
@@ -2322,6 +2459,14 @@ pub async fn video_task(
     let owner_key_id = key_id
         .map(|Extension(k)| k.0)
         .unwrap_or_else(|| "anonymous".to_string());
+    let key_limits = match require_legacy_capability(&state, &owner_key_id, api_keys::CAPABILITY_VIDEO) {
+        Ok(limits) => limits,
+        Err(response) => return response,
+    };
+    let _guard = match legacy_request_guard(&state, &owner_key_id, &key_limits) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     match video::get(&task_id) {
         Some(mut task) if video::visible_to(&task, &owner_key_id) => {
             // 运行地址可能在重启/迁移后变化；内容地址按当前部署环境动态重算。
@@ -2416,6 +2561,14 @@ pub async fn video_content(
     let owner_key_id = key_id
         .map(|Extension(k)| k.0)
         .unwrap_or_else(|| "anonymous".to_string());
+    let key_limits = match require_legacy_capability(&state, &owner_key_id, api_keys::CAPABILITY_VIDEO) {
+        Ok(limits) => limits,
+        Err(response) => return response,
+    };
+    let _guard = match legacy_request_guard(&state, &owner_key_id, &key_limits) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let Some(task) = video::get(&task_id) else {
         return openai_error(StatusCode::NOT_FOUND, "task_not_found", "video task not found");
     };
@@ -2575,6 +2728,7 @@ pub async fn video_cancel(
             upstream_request_ref,
         },
     };
+    let confirmed_cancel = matches!(&settlement_outcome, VideoAdapterOutcome::Canceled { .. });
     if let Err(error) = bridge.settle_video_job(
         &principal,
         &task_id,
@@ -2582,6 +2736,9 @@ pub async fn video_cancel(
         settlement_outcome,
     ) {
         return core_lease_error_response(error);
+    }
+    if confirmed_cancel {
+        video::release_job_permit(&task_id);
     }
     core_video_response(
         bridge,
@@ -2604,11 +2761,19 @@ async fn images_entry(
     if core_enforcing(&state) {
         return scheduler_endpoint_not_enabled_response();
     }
+    let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+    let key_limits = match require_legacy_capability(&state, &key_str, api_keys::CAPABILITY_CHAT) {
+        Ok(limits) => limits,
+        Err(response) => return response,
+    };
     state
         .total_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // inflight guard（§4.5）：async fn 全程 inline await，作用域即请求生命周期
-    let _guard = state.inflight_guard();
+    let _guard = match legacy_request_guard(&state, &key_str, &key_limits) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     if body.len() > MAX_BODY_BYTES {
         return openai_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", "request body exceeds 8MB limit");
     }
@@ -2624,7 +2789,6 @@ async fn images_entry(
         .to_string();
     let prompt = peek.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let image_b64 = peek.get("image").and_then(|v| v.as_str()).map(str::to_string);
-    let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
     let start_ts = std::time::Instant::now();
 
     // 校验（目录命中 + 图片模态 + prompt/image 非空）
@@ -3784,6 +3948,161 @@ mod tests {
         (fixture, adapter)
     }
 
+    fn legacy_fixture_with_capabilities(
+        capabilities: &[&str],
+    ) -> (Arc<ApiSharedState>, PathBuf, String) {
+        let root = PathBuf::from(r"D:\gpt");
+        fs::create_dir_all(&root).unwrap();
+        let dir = root.join(format!(
+            "aiwork-routes-legacy-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let key_id = "legacy-route-key".to_string();
+        let key = super::super::api_keys::ApiKeyEntry {
+            id: key_id.clone(),
+            name: "route test".into(),
+            key: format!("fixture-route-{}", rand::random::<u64>()),
+            enabled: true,
+            daily_limit: 0,
+            created_at: 0,
+            used_date: String::new(),
+            used_today: 0,
+            allowed_accounts: Vec::new(),
+            schedule_mode: String::new(),
+            dedicated_account: String::new(),
+            daily_stats: Vec::new(),
+            limits: super::super::api_keys::KeyLimits::default(),
+            capabilities: capabilities.iter().map(|value| (*value).to_string()).collect(),
+        };
+        super::super::api_keys::save(
+            &dir,
+            &super::super::api_keys::ApiKeysFile {
+                keys: vec![key],
+                auth_disabled: false,
+            },
+        );
+        let state = Arc::new(ApiSharedState {
+            core: None,
+            pool: super::super::pool::ApiPool::new(),
+            wb_pool: super::super::pool::ApiPool::new(),
+            wb_enabled: std::sync::atomic::AtomicBool::new(false),
+            wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+            wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+            wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+            wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_sticky: super::super::wb_sticky::StickyStore::default(),
+            pool_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
+            model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            default_model: "mock-1".into(),
+            data_dir: dir.clone(),
+            video_payloads: super::super::video_payload::VideoPayloadStore::new(&dir),
+            cors_origins: String::new(),
+            total_requests: std::sync::atomic::AtomicU64::new(0),
+            inflight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            limiter: super::super::limits::RateLimiter::with_config(
+                super::super::limits::LimitConfig {
+                    max_inflight: 8,
+                    max_video_jobs: 8,
+                    asset_uploads_per_minute: 8,
+                    asset_bytes_per_hour: 1024 * 1024,
+                    video_submissions_per_minute: 8,
+                },
+            ),
+            active_uid: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+            logger: super::super::ApiLogger::new(dir.join("logs")),
+            debug_enabled: std::sync::atomic::AtomicBool::new(false),
+            usage: std::sync::Mutex::new(super::super::usage::UsageFile::default()),
+            wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        });
+        (state, dir, key_id)
+    }
+
+    #[tokio::test]
+    async fn disabled_capability_returns_403_without_consuming_usage() {
+        let (state, dir, key_id) = legacy_fixture_with_capabilities(&[]);
+        let body = Bytes::from(
+            json!({
+                "model": "mock-1",
+                "messages": [{"role": "user", "content": "hello"}]
+            })
+            .to_string(),
+        );
+
+        let chat = chat_completions(
+            State(state.clone()),
+            Some(Extension(KeyId(key_id.clone()))),
+            None,
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await;
+        let chat_status = chat.status();
+        let chat_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(chat.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chat_status, StatusCode::FORBIDDEN);
+        assert_eq!(chat_body["error"]["code"], "capability_not_allowed");
+
+        let video = videos_generations(
+            State(state.clone()),
+            Some(Extension(KeyId(key_id.clone()))),
+            None,
+            HeaderMap::new(),
+            Bytes::from(json!({"model": "seedance", "prompt": "hello"}).to_string()),
+        )
+        .await;
+        let video_status = video.status();
+        let video_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(video.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(video_status, StatusCode::FORBIDDEN);
+        assert_eq!(video_body["error"]["code"], "capability_not_allowed");
+
+        let assets = assets_upload(
+            State(state.clone()),
+            Some(Extension(KeyId(key_id.clone()))),
+            None,
+            Bytes::from("{}"),
+        )
+        .await;
+        let assets_status = assets.status();
+        let assets_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(assets.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(assets_status, StatusCode::FORBIDDEN);
+        assert_eq!(assets_body["error"]["code"], "capability_not_allowed");
+
+        assert_eq!(
+            state
+                .total_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let usage = state.usage.lock().unwrap();
+        assert!(usage.days.is_empty());
+        assert!(usage.wb_days.is_empty());
+        assert!(usage.custom_days.is_empty());
+        drop(usage);
+        let permit = state
+            .acquire_request(&key_id, &super::super::api_keys::KeyLimits::default())
+            .expect("capability rejection must not consume request permit");
+        drop(permit);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn core_enforce_chat_uses_core_lease_and_mock_executor_once() {
         let fixture = phase2_fixture(2);
@@ -4316,6 +4635,20 @@ mod tests {
             Some(Extension(fixture.principal.clone())),
         ).await;
         assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let seedance = payload["data"]
+            .as_array()
+            .and_then(|models| models.iter().find(|model| model["id"] == "seedance"))
+            .expect("/v1/models should expose seedance");
+        assert_eq!(seedance["capabilities"], serde_json::json!(["video"]));
+        assert_eq!(seedance["endpoint"], "/v1/videos/generations");
+        assert_eq!(seedance["async"], true);
+        assert_eq!(seedance["sources"][0]["enabled"], false);
     }
 
     #[tokio::test]
@@ -5537,5 +5870,45 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn public_text_model_value_advertises_text_route_metadata() {
+        let model = unified_catalog::UnifiedModel {
+            id: "deepseek-v4-flash".into(),
+            display: "DeepSeek V4 Flash".into(),
+            vendor: "Trae".into(),
+            rate: Some(1.0),
+            efforts: vec!["medium".into()],
+            context_length: Some(131_072),
+            max_tokens: Some(8_192),
+            supports_image: Some(false),
+            sources: vec![unified_catalog::UnifiedSource {
+                pool: "trae",
+                rate: Some(1.0),
+                enabled: true,
+            }],
+            manual: false,
+        };
+
+        let value = public_unified_model_value(&model);
+        assert_eq!(value["capabilities"], serde_json::json!(["text"]));
+        assert_eq!(value["endpoint"], "/v1/chat/completions");
+        assert_eq!(value["async"], false);
+        assert_eq!(value["id"], "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn public_seedance_value_advertises_video_route_and_availability() {
+        let value = public_seedance_model_value(false);
+        assert_eq!(value["id"], "seedance");
+        assert_eq!(value["capabilities"], serde_json::json!(["video"]));
+        assert_eq!(value["endpoint"], "/v1/videos/generations");
+        assert_eq!(value["async"], true);
+        assert_eq!(value["sources"][0]["pool"], "trae_work");
+        assert_eq!(value["sources"][0]["enabled"], false);
+
+        let available = public_seedance_model_value(true);
+        assert_eq!(available["sources"][0]["enabled"], true);
     }
 }

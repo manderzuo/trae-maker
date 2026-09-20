@@ -17,6 +17,8 @@ use serde_json::Value;
 
 use super::pool::PickedAccount;
 use super::pool::ResourceKind;
+use super::trae_resource_upload::{self, NativeUploadError};
+use super::limits::Permit;
 use super::{ApiSharedState, ErrKind, APP_ID, AGENT_HOST, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
 #[derive(Clone, Serialize)]
@@ -56,9 +58,14 @@ static TASKS: OnceLock<Mutex<HashMap<String, VideoTask>>> = OnceLock::new();
 static SEQ: OnceLock<Mutex<u64>> = OnceLock::new();
 static IDEMPOTENCY: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 static TASK_DATA_DIR: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+static JOB_PERMITS: OnceLock<Mutex<HashMap<String, Permit>>> = OnceLock::new();
 const MAX_IN_MEMORY_TASKS: usize = 2048;
 const TERMINAL_TASK_RETENTION_SECS: u64 = 24 * 60 * 60;
 const TASKS_FILE: &str = "video_tasks.json";
+
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "canceled" | "timeout")
+}
 
 fn default_owner_key() -> String {
     "anonymous".into()
@@ -105,6 +112,29 @@ fn tasks() -> &'static Mutex<HashMap<String, VideoTask>> {
 
 fn idempotency() -> &'static Mutex<HashMap<String, String>> {
     IDEMPOTENCY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn job_permits() -> &'static Mutex<HashMap<String, Permit>> {
+    JOB_PERMITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 将视频任务许可从 HTTP 提交作用域转移到任务生命周期。
+/// 已有任务不会覆盖旧许可；重复提交的许可由调用方所有权自动释放。
+pub fn retain_job_permit(task_id: &str, permit: Permit) -> bool {
+    let mut permits = job_permits().lock().unwrap_or_else(|e| e.into_inner());
+    if permits.contains_key(task_id) {
+        return false;
+    }
+    permits.insert(task_id.to_string(), permit);
+    true
+}
+
+/// 释放任务许可；不存在许可时是幂等空操作，适合恢复/终态重复通知。
+pub fn release_job_permit(task_id: &str) {
+    job_permits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(task_id);
 }
 
 fn task_store_path(data_dir: &std::path::Path) -> std::path::PathBuf {
@@ -194,12 +224,15 @@ pub fn load_persisted(data_dir: &std::path::Path) {
     map.clear();
     for item in list {
         if item.id.trim().is_empty()
-            || (matches!(item.status.as_str(), "completed" | "failed")
+            || (is_terminal_status(&item.status)
                 && now.saturating_sub(item.updated_at) > TERMINAL_TASK_RETENTION_SECS)
         {
             continue;
         }
         let task = restored(item);
+        if is_terminal_status(&task.status) {
+            release_job_permit(&task.id);
+        }
         if let Some(key) = task.request_key.clone() {
             if !key.is_empty() {
                 idempotency()
@@ -299,6 +332,14 @@ fn validate_reference_url(value: &str, allow_insecure_http: bool) -> Result<(), 
     Ok(())
 }
 
+fn is_native_resource_uri(value: &str) -> bool {
+    let raw = value.trim();
+    raw.starts_with("tos-")
+        && !raw.contains("://")
+        && !raw.chars().any(char::is_whitespace)
+        && raw.len() <= 4096
+}
+
 pub fn validate_request(body: &Value) -> Result<(String, String), String> {
     let prompt = body
         .get("prompt")
@@ -357,24 +398,46 @@ pub fn validate_request(body: &Value) -> Result<(String, String), String> {
             if matches!(key, "image_urls" | "video_urls") {
                 for value in items {
                     let url = value.as_str().expect("non-empty string checked above");
-                    validate_reference_url(url, insecure_reference_urls_allowed())?;
+                    if !is_native_resource_uri(url) {
+                        validate_reference_url(url, insecure_reference_urls_allowed())?;
+                    }
                 }
             }
         }
     }
+    validate_native_reference_inputs(body)?;
     Ok((model, prompt.to_string()))
 }
 
-/// 把网关本地素材转换成 Trae 可回取的 HTTPS/HTTP 地址。
-///
-/// 本地路径不能直接交给 Trae 上游：Trae 服务端无法读取调用方磁盘。只有在
-/// 用户显式设置 `AIWORK_ASSET_PUBLIC_BASE_URL` 或在网关设置页配置后，才会为 API Key 所有的素材
-/// 生成短时地址并放入原生 `image_urls`/`video_urls`。未配置时明确失败，
-/// 不会把 `C:\` 路径或 data URL 猜测性地转发给上游。
-pub fn resolve_asset_references(
-    data_dir: &std::path::Path,
-    owner_key_id: &str,
+fn validate_native_reference_inputs(input: &Value) -> Result<(), String> {
+    let obj = input
+        .as_object()
+        .ok_or_else(|| "video request 必须是 JSON 对象".to_string())?;
+    for key in ["image_urls", "video_urls"] {
+        let Some(values) = obj.get(key) else { continue };
+        let Some(values) = values.as_array() else {
+            return Err(format!("{key} 必须是字符串数组"));
+        };
+        for value in values {
+            let raw = value
+                .as_str()
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .ok_or_else(|| format!("{key} 只能包含非空字符串"))?;
+            if !is_native_resource_uri(raw) {
+                return Err(format!(
+                    "{key} 不能直接传公网 URL；请先 POST /v1/assets，再使用 image_asset_ids/video_asset_ids"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_native_request_with_uris(
     input: &Value,
+    image_uris: &[String],
+    video_uris: &[String],
 ) -> Result<Value, String> {
     let mut body = input.clone();
     let obj = body
@@ -385,32 +448,74 @@ pub fn resolve_asset_references(
         ("image_asset_ids", "image_urls", "图片"),
         ("video_asset_ids", "video_urls", "参考视频"),
     ] {
-        let Some(ids) = obj.remove(asset_key) else { continue };
-        let Some(ids) = ids.as_array() else {
-            return Err(format!("{asset_key} 必须是字符串数组"));
+        let mut urls = obj.remove(url_key).unwrap_or_else(|| Value::Array(Vec::new()));
+        let urls = urls
+            .as_array_mut()
+            .ok_or_else(|| format!("{url_key} 必须是字符串数组"))?;
+        if urls.iter().any(|value| {
+            value
+                .as_str()
+                .map(|item| !is_native_resource_uri(item))
+                .unwrap_or(true)
+        }) {
+            return Err(format!(
+                "{label}引用不能直接传公网 URL；请先 POST /v1/assets，再使用 {asset_key}"
+            ));
+        }
+        let additions = if url_key == "image_urls" {
+            image_uris
+        } else {
+            video_uris
         };
-        let mut urls = obj
-            .remove(url_key)
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        let Some(urls) = urls.as_array_mut() else {
-            return Err(format!("{url_key} 必须是字符串数组"));
-        };
+        urls.extend(additions.iter().cloned().map(Value::String));
+        if urls.len() > 10 {
+            return Err(format!("{url_key} 最多 10 个非空字符串"));
+        }
+        obj.insert(url_key.to_string(), Value::Array(urls.clone()));
+        obj.remove(asset_key);
+    }
+    Ok(body)
+}
+
+pub fn prepare_native_request(
+    data_dir: &std::path::Path,
+    owner_key_id: &str,
+    input: &Value,
+    account: &PickedAccount,
+) -> Result<Value, NativeUploadError> {
+    validate_native_reference_inputs(input)
+        .map_err(|error| NativeUploadError::new(error, false))?;
+    let obj = input
+        .as_object()
+        .ok_or_else(|| NativeUploadError::new("video request 必须是 JSON 对象", false))?;
+    let mut image_uris = Vec::new();
+    let mut video_uris = Vec::new();
+    for (asset_key, output, label) in [
+        ("image_asset_ids", &mut image_uris, "图片"),
+        ("video_asset_ids", &mut video_uris, "参考视频"),
+    ] {
+        let Some(ids) = obj.get(asset_key) else { continue };
+        let ids = ids
+            .as_array()
+            .ok_or_else(|| NativeUploadError::new(format!("{asset_key} 必须是字符串数组"), false))?;
         for id in ids {
             let id = id
                 .as_str()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| format!("{asset_key} 只能包含非空字符串"))?;
-            let url = super::assets::public_url_for_owned(data_dir, owner_key_id, id)
-                .map_err(|error| format!("{label}素材 {id} 无法传给上游：{error}"))?;
-            urls.push(Value::String(url));
+                .ok_or_else(|| NativeUploadError::new(format!("{asset_key} 只能包含非空字符串"), false))?;
+            let (record, bytes) = super::assets::read_owned(data_dir, owner_key_id, id)
+                .map_err(|error| NativeUploadError::new(format!("{label}素材 {id} 无法读取：{error}"), false))?;
+            let uri = trae_resource_upload::upload_asset(account, &record, &bytes)
+                .map_err(|error| NativeUploadError::new(
+                    format!("{label}素材 {id} 原生上传失败：{}", error.message),
+                    error.retryable_account,
+                ))?;
+            output.push(uri);
         }
-        if urls.len() > 10 {
-            return Err(format!("{url_key} 最多 10 个非空字符串"));
-        }
-        obj.insert(url_key.to_string(), Value::Array(urls.clone()));
     }
-    Ok(body)
+    build_native_request_with_uris(input, &image_uris, &video_uris)
+        .map_err(|error| NativeUploadError::new(error, false))
 }
 
 pub fn create_pending_for(model: String, prompt: String, owner_key_id: &str) -> VideoTask {
@@ -443,12 +548,12 @@ pub fn create_pending_for(model: String, prompt: String, owner_key_id: &str) -> 
     let mut map = tasks().lock().unwrap_or_else(|e| e.into_inner());
     let cutoff = now.saturating_sub(TERMINAL_TASK_RETENTION_SECS);
     map.retain(|_, item| {
-        !matches!(item.status.as_str(), "completed" | "failed") || item.updated_at >= cutoff
+        !is_terminal_status(&item.status) || item.updated_at >= cutoff
     });
     if map.len() >= MAX_IN_MEMORY_TASKS {
         let mut terminal: Vec<(String, u64)> = map
             .iter()
-            .filter(|(_, item)| matches!(item.status.as_str(), "completed" | "failed"))
+            .filter(|(_, item)| is_terminal_status(&item.status))
             .map(|(id, item)| (id.clone(), item.updated_at))
             .collect();
         terminal.sort_by_key(|(_, updated)| *updated);
@@ -586,12 +691,14 @@ pub fn bind_idempotency(key: &str, task_id: &str) {
 }
 
 fn update_task(task_id: &str, update: impl FnOnce(&mut VideoTask)) {
+    let mut terminal = false;
     let changed = if let Some(task) = tasks()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_mut(task_id)
     {
         update(task);
+        terminal = is_terminal_status(&task.status);
         task.updated_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -602,6 +709,9 @@ fn update_task(task_id: &str, update: impl FnOnce(&mut VideoTask)) {
     };
     if changed {
         persist_current(task_id);
+        if terminal {
+            release_job_permit(task_id);
+        }
     }
 }
 
@@ -742,14 +852,50 @@ fn resolve_resource_url(account: &PickedAccount, uri: &str) -> Result<String, St
 }
 
 /// 启动后台 Seedance SSE 任务；不阻塞网关 tokio worker。
-pub fn start_native_task(state: std::sync::Arc<ApiSharedState>, task_id: String, input: Value, account: PickedAccount) {
+pub fn start_native_task(
+    state: std::sync::Arc<ApiSharedState>,
+    task_id: String,
+    input: Value,
+    owner_key_id: String,
+    account: PickedAccount,
+    permit: Permit,
+) {
+    if !retain_job_permit(&task_id, permit) {
+        update_task(&task_id, |task| {
+            task.status = "failed".into();
+            task.error = Some("视频任务许可重复绑定".into());
+        });
+        return;
+    }
     thread::spawn(move || {
-        let body = build_request_body(&input);
         // HTTP 层尚未收到 SSE 前允许切到下一个 Work 账号；一旦进入 SSE，
-        // 不再重放，避免重复扣费或重复创建视频任务。
+        // 账号切换时必须用新账号重新上传参考素材，不能复用上一个账号的 TOS URI。
         let mut account = account;
         let mut tried = HashSet::from([account.uid.clone()]);
         let response = loop {
+            let body = match prepare_native_request(
+                &state.data_dir,
+                &owner_key_id,
+                &input,
+                &account,
+            ) {
+                Ok(value) => build_request_body(&value),
+                Err(error) => {
+                    if error.retryable_account {
+                        state.pool.note_error(&account.uid, ErrKind::SessionDead);
+                        if let Some(next) = state.pool.pick_excluding_for(&tried, ResourceKind::Work) {
+                            tried.insert(next.uid.clone());
+                            account = next;
+                            continue;
+                        }
+                    }
+                    update_task(&task_id, |task| {
+                        task.status = "failed".into();
+                        task.error = Some(error.message);
+                    });
+                    return;
+                }
+            };
             let trace = now_id("trace");
             let url = format!("{}{}", AGENT_HOST, "/api/ide/v1/tool_text_to_video_stream");
             let referer = format!("{}{}", REFERER_BASE, "/api/ide/v1/tool_text_to_video_stream");
@@ -987,6 +1133,56 @@ mod tests {
     }
 
     #[test]
+    fn native_request_uses_trae_resource_uris_for_uploaded_assets() {
+        let input = serde_json::json!({
+            "prompt": "cat",
+            "image_asset_ids": ["asset-1"],
+            "video_asset_ids": ["asset-2"]
+        });
+        let body = build_native_request_with_uris(
+            &input,
+            &["tos-cn-i-test/image/frame.png".to_string()],
+            &["tos-cn-i-test/video/reference.mp4".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            body.get("image_urls").unwrap(),
+            &serde_json::json!(["tos-cn-i-test/image/frame.png"])
+        );
+        assert_eq!(
+            body.get("video_urls").unwrap(),
+            &serde_json::json!(["tos-cn-i-test/video/reference.mp4"])
+        );
+        assert!(body.get("image_asset_ids").is_none());
+        assert!(body.get("video_asset_ids").is_none());
+    }
+
+    #[test]
+    fn native_request_rejects_public_urls_that_would_fail_upstream_signing() {
+        let input = serde_json::json!({
+            "prompt": "cat",
+            "image_urls": ["https://www.gemstory.cn/v1/assets/a/content?token=x"]
+        });
+        let error = build_native_request_with_uris(&input, &[], &[]).unwrap_err();
+        assert!(error.contains("/v1/assets"));
+    }
+
+    #[test]
+    fn validate_request_allows_native_resource_uri_but_rejects_public_url() {
+        assert!(validate_request(&serde_json::json!({
+            "prompt": "cat",
+            "image_urls": ["tos-cn-i-test/image/frame.png"]
+        }))
+        .is_ok());
+        let error = validate_request(&serde_json::json!({
+            "prompt": "cat",
+            "image_urls": ["https://example.com/frame.png"]
+        }))
+        .unwrap_err();
+        assert!(error.contains("image_asset_ids"));
+    }
+
+    #[test]
     fn idempotency_returns_same_task() {
         let task = create_pending("seedance".into(), "same".into());
         let key = scoped_idempotency_key("key-a", "test-idempotency");
@@ -1063,5 +1259,69 @@ mod tests {
         assert_eq!(restored.owner_key_id, "key-a");
         assert_eq!(restored.content_url.as_deref(), Some("/v1/videos/video-test/content"));
         assert_eq!(restored.video_url, task.video_url);
+    }
+
+    #[test]
+    fn video_job_permit_survives_http_submission_until_terminal_update() {
+        let limiter = super::super::limits::RateLimiter::with_config(
+            super::super::limits::LimitConfig {
+                max_inflight: 4,
+                max_video_jobs: 1,
+                asset_uploads_per_minute: 4,
+                asset_bytes_per_hour: 1024,
+                video_submissions_per_minute: 4,
+            },
+        );
+        let permit = limiter
+            .acquire_video_job("video-key", &super::super::api_keys::KeyLimits::default())
+            .unwrap();
+        let task = create_pending_for("seedance".into(), "permit lifetime".into(), "video-key");
+        let task_id = task.id.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            let _permit = permit;
+            entered_tx.send(()).unwrap();
+            terminal_rx.recv().unwrap();
+            update_task(&task_id, |task| task.status = "completed".into());
+        });
+        entered_rx.recv().unwrap();
+        assert!(limiter
+            .acquire_video_job("video-key", &super::super::api_keys::KeyLimits::default())
+            .is_err());
+        terminal_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(get(&task.id).unwrap().status, "completed");
+        assert!(limiter
+            .acquire_video_job("video-key", &super::super::api_keys::KeyLimits::default())
+            .is_ok());
+    }
+
+    #[test]
+    fn retained_video_job_permit_is_released_when_task_reaches_terminal_state() {
+        let limiter = super::super::limits::RateLimiter::with_config(
+            super::super::limits::LimitConfig {
+                max_inflight: 4,
+                max_video_jobs: 1,
+                asset_uploads_per_minute: 4,
+                asset_bytes_per_hour: 1024,
+                video_submissions_per_minute: 4,
+            },
+        );
+        let task_id = format!("video-permit-{}-{}", std::process::id(), rand::random::<u64>());
+        let permit = limiter
+            .acquire_video_job("video-key", &super::super::api_keys::KeyLimits::default())
+            .unwrap();
+        assert!(retain_job_permit(&task_id, permit));
+        assert!(limiter
+            .acquire_video_job("video-key", &super::super::api_keys::KeyLimits::default())
+            .is_err());
+
+        update_task(&task_id, |task| task.status = "completed".into());
+        release_job_permit(&task_id);
+        assert!(limiter
+            .acquire_video_job("video-key", &super::super::api_keys::KeyLimits::default())
+            .is_ok());
     }
 }

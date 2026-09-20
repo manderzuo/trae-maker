@@ -96,12 +96,18 @@ pub async fn bearer_auth(
     // async 调度线程；锁与原子语义不变（verify_and_consume_locked 进程级锁内完成）
     let (auth_required, check) = {
         let data_dir = state.data_dir.clone();
+        let capability = capability_for_path(request.uri().path());
         tokio::task::spawn_blocking(move || {
             let keys: ApiKeysFile = api_keys::load(&data_dir);
             // 存在启用 Key 时必须鉴权；无启用 Key 时由显式开关决定放行或拒绝
             let auth_required = keys.has_enabled() || !keys.auth_disabled;
             let check = presented.map(|p| {
-                api_keys::verify_and_consume_locked(&data_dir, &p, &super::usage::today_key())
+                api_keys::verify_and_consume_locked_for_capability(
+                    &data_dir,
+                    &p,
+                    &super::usage::today_key(),
+                    capability,
+                )
             });
             (auth_required, check)
         })
@@ -120,6 +126,9 @@ pub async fn bearer_auth(
         Some(KeyCheck::QuotaExceeded { limit }) => {
             return quota_exceeded(limit);
         }
+        Some(KeyCheck::CapabilityNotAllowed { capability }) => {
+            return capability_not_allowed(&capability);
+        }
         Some(KeyCheck::Invalid) => {}
         None => {
             // 未携带 Key
@@ -137,6 +146,34 @@ pub async fn bearer_auth(
     }
 
     (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
+}
+
+fn capability_for_path(path: &str) -> Option<&'static str> {
+    match path {
+        "/v1/chat/completions"
+        | "/v1/completions"
+        | "/v1/messages"
+        | "/v1/responses" => Some(api_keys::CAPABILITY_CHAT),
+        "/v1/images/generations" | "/v1/images/edits" => Some(api_keys::CAPABILITY_CHAT),
+        "/v1/assets" => Some(api_keys::CAPABILITY_ASSETS),
+        "/v1/videos/generations" => Some(api_keys::CAPABILITY_VIDEO),
+        path if path.starts_with("/v1/videos/") => Some(api_keys::CAPABILITY_VIDEO),
+        _ => None,
+    }
+}
+
+fn capability_not_allowed(capability: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(json!({
+            "error": {
+                "message": format!("API Key 未启用能力: {capability}"),
+                "type": "permission_error",
+                "code": "capability_not_allowed",
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// Enforce-mode authentication is intentionally isolated from the legacy JSON

@@ -37,6 +37,8 @@ pub enum KeyCheck {
     Invalid,
     /// 超出当日配额
     QuotaExceeded { limit: u64 },
+    /// Key 已认证，但未被授予当前路由能力。
+    CapabilityNotAllowed { capability: String },
 }
 
 /// Key 可用能力。空 capability 字段表示没有可用能力；字段缺失由 serde 默认成全能力。
@@ -200,6 +202,11 @@ pub struct ResolvedKey {
 pub struct KeyDailyStat {
     pub date: String,
     pub requests: u64,
+    /// 已知上游用量；缺失 token_usage 时保持 0，不做估算。
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
 }
 
 /// API Key 条目
@@ -290,6 +297,17 @@ fn quota_left(e: &mut ApiKeyEntry, today: &str) -> Result<(), u64> {
     if e.daily_limit > 0 && e.used_today >= e.daily_limit {
         return Err(e.daily_limit);
     }
+    if e.limits.daily_tokens > 0 {
+        let used_tokens = e
+            .daily_stats
+            .iter()
+            .find(|stat| stat.date == today)
+            .map(|stat| stat.prompt_tokens.saturating_add(stat.completion_tokens))
+            .unwrap_or(0);
+        if used_tokens >= e.limits.daily_tokens {
+            return Err(e.limits.daily_tokens);
+        }
+    }
     Ok(())
 }
 
@@ -304,6 +322,8 @@ fn bump_daily_stats(e: &mut ApiKeyEntry, today: &str) {
         e.daily_stats.push(KeyDailyStat {
             date: today.to_string(),
             requests: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
         });
         if e.daily_stats.len() > DAILY_STATS_CAP {
             let drop = e.daily_stats.len() - DAILY_STATS_CAP;
@@ -312,6 +332,30 @@ fn bump_daily_stats(e: &mut ApiKeyEntry, today: &str) {
     }
     if let Some(s) = e.daily_stats.last_mut() {
         s.requests = s.requests.saturating_add(1);
+    }
+}
+
+fn add_daily_tokens(e: &mut ApiKeyEntry, today: &str, prompt_tokens: u64, completion_tokens: u64) {
+    let need_new = e
+        .daily_stats
+        .last()
+        .map(|s| s.date.as_str() != today)
+        .unwrap_or(true);
+    if need_new {
+        e.daily_stats.push(KeyDailyStat {
+            date: today.to_string(),
+            requests: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        });
+        if e.daily_stats.len() > DAILY_STATS_CAP {
+            let drop = e.daily_stats.len() - DAILY_STATS_CAP;
+            e.daily_stats.drain(0..drop);
+        }
+    }
+    if let Some(stat) = e.daily_stats.last_mut() {
+        stat.prompt_tokens = stat.prompt_tokens.saturating_add(prompt_tokens);
+        stat.completion_tokens = stat.completion_tokens.saturating_add(completion_tokens);
     }
 }
 
@@ -324,6 +368,26 @@ impl ApiKeysFile {
 
     /// 按呈现的 Key 校验并记账（命中即 +1 + 按日统计）。调用方负责把结果写盘。
     pub fn verify_and_consume(&mut self, presented: &str, today: &str) -> KeyCheck {
+        self.verify_and_consume_with_capability(presented, today, None)
+    }
+
+    /// 按呈现的 Key 校验、先检查能力再记账。
+    /// 能力拒绝必须发生在每日请求计数和配额检查之前，避免 403 被计量。
+    pub fn verify_and_consume_for_capability(
+        &mut self,
+        presented: &str,
+        today: &str,
+        capability: &str,
+    ) -> KeyCheck {
+        self.verify_and_consume_with_capability(presented, today, Some(capability))
+    }
+
+    fn verify_and_consume_with_capability(
+        &mut self,
+        presented: &str,
+        today: &str,
+        capability: Option<&str>,
+    ) -> KeyCheck {
         // 常量时间比较（审查 P2-3）：对两侧求 sha256 再比对，避免逐字节提前返回泄露前缀匹配长度
         let digest = |s: &str| {
             use sha2::{Digest, Sha256};
@@ -340,6 +404,13 @@ impl ApiKeysFile {
             return KeyCheck::Invalid;
         };
         e.normalize_policy();
+        if let Some(capability) = capability {
+            if !e.capabilities.iter().any(|value| value == capability) {
+                return KeyCheck::CapabilityNotAllowed {
+                    capability: capability.to_string(),
+                };
+            }
+        }
         if let Err(limit) = quota_left(e, today) {
             return KeyCheck::QuotaExceeded { limit };
         }
@@ -374,6 +445,29 @@ pub fn constraints_for(data_dir: &Path, key_id: &str) -> Option<ResolvedKey> {
     })
 }
 
+/// 查询 Key 当日已知 token 用量是否已达到额度；只读，不消费请求额度。
+pub fn daily_token_quota(data_dir: &Path, key_id: &str, today: &str) -> Result<(), u64> {
+    let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let file = load(data_dir);
+    let Some(entry) = file.keys.iter().find(|entry| entry.id == key_id) else {
+        return Ok(());
+    };
+    if entry.limits.daily_tokens == 0 {
+        return Ok(());
+    }
+    let used_tokens = entry
+        .daily_stats
+        .iter()
+        .find(|stat| stat.date == today)
+        .map(|stat| stat.prompt_tokens.saturating_add(stat.completion_tokens))
+        .unwrap_or(0);
+    if used_tokens >= entry.limits.daily_tokens {
+        Err(entry.limits.daily_tokens)
+    } else {
+        Ok(())
+    }
+}
+
 /// 数据文件路径：data_dir/data/api_keys.json
 pub fn keys_path(data_dir: &Path) -> PathBuf {
     let dir = data_dir.join("data");
@@ -397,6 +491,28 @@ pub fn save(data_dir: &Path, f: &ApiKeysFile) {
 /// 原子完成，否则并发请求互相覆盖 used_today/daily_stats——配额可被穿透、统计少记。
 static KEYS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 在已有 Key 锁内更新已知 token 用量；请求数由鉴权路径单独记账。
+/// token_usage 缺失时调用方传入 0，因而不会伪造 token。
+pub fn record_token_usage_locked(
+    data_dir: &Path,
+    key_id: &str,
+    today: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) {
+    if key_id == "anonymous" || (prompt_tokens == 0 && completion_tokens == 0) {
+        return;
+    }
+    let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = load(data_dir);
+    let Some(entry) = file.keys.iter_mut().find(|entry| entry.id == key_id) else {
+        return;
+    };
+    entry.normalize_policy();
+    add_daily_tokens(entry, today, prompt_tokens, completion_tokens);
+    save(data_dir, &file);
+}
+
 /// 序列化对比：verify 后文件是否发生变化（P1 修复5a）。
 /// 无变化（Invalid 等只读路径）跳过写盘，消除鉴权热路径的无效磁盘写
 fn keys_file_changed(before: &[u8], f: &ApiKeysFile) -> bool {
@@ -406,6 +522,16 @@ fn keys_file_changed(before: &[u8], f: &ApiKeysFile) -> bool {
 /// 鉴权记账原子操作：锁内 load → verify_and_consume → 有变化才 save。
 /// auth 中间件每请求调用本函数，禁止绕开锁直接 load+save。
 pub fn verify_and_consume_locked(data_dir: &Path, presented: &str, today: &str) -> KeyCheck {
+    verify_and_consume_locked_for_capability(data_dir, presented, today, None)
+}
+
+/// 锁内完成鉴权、能力校验和请求记账；能力不允许时不改变每日统计。
+pub fn verify_and_consume_locked_for_capability(
+    data_dir: &Path,
+    presented: &str,
+    today: &str,
+    capability: Option<&str>,
+) -> KeyCheck {
     let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     match aiwork_core::CoreStore::legacy_key_is_disabled(data_dir, presented) {
         Ok(false) => {}
@@ -413,7 +539,7 @@ pub fn verify_and_consume_locked(data_dir: &Path, presented: &str, today: &str) 
     }
     let mut f = load(data_dir);
     let before = serde_json::to_vec(&f).unwrap_or_default();
-    let r = f.verify_and_consume(presented, today);
+    let r = f.verify_and_consume_with_capability(presented, today, capability);
     if keys_file_changed(&before, &f) {
         save(data_dir, &f);
     }
@@ -608,6 +734,34 @@ mod tests {
         assert_eq!(resolved.capabilities, f.keys[0].capabilities);
         let serialized = serde_json::to_string(&resolved).unwrap();
         assert!(!serialized.contains("\"key\""));
+    }
+
+    #[test]
+    fn disabled_capability_is_rejected_before_daily_request_consumption() {
+        let mut file = ApiKeysFile {
+            keys: vec![entry("k1", "fixture-capability", true, 1)],
+            auth_disabled: false,
+        };
+        file.keys[0].capabilities = vec![CAPABILITY_CHAT.into()];
+
+        assert!(matches!(
+            file.verify_and_consume_for_capability(
+                "fixture-capability",
+                "2026-09-20",
+                CAPABILITY_ASSETS,
+            ),
+            KeyCheck::CapabilityNotAllowed { .. }
+        ));
+        assert_eq!(file.keys[0].used_today, 0);
+        assert!(matches!(
+            file.verify_and_consume_for_capability(
+                "fixture-capability",
+                "2026-09-20",
+                CAPABILITY_CHAT,
+            ),
+            KeyCheck::Ok(_)
+        ));
+        assert_eq!(file.keys[0].used_today, 1);
     }
 
     #[test]

@@ -365,6 +365,8 @@ pub fn query_recent_in(data_dir: &Path, days: u32, bucket: UsageBucket) -> Vec<U
 mod tests {
     use super::*;
 
+    use crate::api_server::api_keys::{ApiKeysFile, KeyCheck};
+
     #[test]
     fn record_aggregates_dimensions() {
         let mut f = UsageFile::default();
@@ -483,5 +485,47 @@ mod tests {
         let d = loaded.days.get(&today_key()).expect("应能读回当日数据");
         assert_eq!(d.total.requests, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daily_token_quota_blocks_after_recorded_usage_reaches_limit() {
+        let dir = std::path::PathBuf::from(r"D:\gpt")
+            .join(format!("twa-usage-token-{}-{}", std::process::id(), rand::random::<u64>()));
+        let file: ApiKeysFile = serde_json::from_value(serde_json::json!({
+            "keys": [{
+                "id": "token-key",
+                "name": "token test",
+                "key": "fixture-token-key",
+                "enabled": true,
+                "daily_limit": 0,
+                "limits": {"daily_tokens": 10}
+            }],
+            "auth_disabled": false
+        }))
+        .unwrap();
+        crate::api_server::api_keys::save(&dir, &file);
+        crate::api_server::api_keys::record_token_usage_locked(
+            &dir,
+            "token-key",
+            "day-1",
+            6,
+            4,
+        );
+
+        let mut loaded = crate::api_server::api_keys::load(&dir);
+        assert!(matches!(
+            loaded.verify_and_consume("fixture-token-key", "day-1"),
+            KeyCheck::QuotaExceeded { limit: 10 }
+        ));
+
+        assert!(matches!(
+            crate::api_server::api_keys::daily_token_quota(&dir, "token-key", "day-1"),
+            Err(10)
+        ));
+        assert!(matches!(
+            crate::api_server::api_keys::daily_token_quota(&dir, "token-key", "day-2"),
+            Ok(())
+        ));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

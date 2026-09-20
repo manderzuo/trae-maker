@@ -23,6 +23,7 @@ pub mod routes;
 pub mod server;
 pub mod scheduler;
 pub mod sse;
+pub mod trae_resource_upload;
 pub mod unified_catalog;
 pub mod upstream_observation;
 pub mod usage;
@@ -119,6 +120,12 @@ impl ApiSharedState {
         InflightGuard::acquire(&self.inflight)
     }
 
+    /// 将真实请求许可与旧有 inflight 计数绑定；permit 会随流式/后台执行路径
+    /// 一起存活，直到调用方传入的 guard 被丢弃。
+    pub fn inflight_guard_with_permit(&self, permit: limits::Permit) -> InflightGuard {
+        InflightGuard::acquire_with_permit(&self.inflight, permit)
+    }
+
     /// 获取按 Key 生效的请求并发许可；Key 级覆盖由 RateLimiter 与全局上限取小值。
     pub fn acquire_request(
         &self,
@@ -163,14 +170,23 @@ impl ApiSharedState {
         prompt_tokens: u64,
         completion_tokens: u64,
     ) {
-        let mut guard = self
-            .usage
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.record(
-            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+        {
+            let mut guard = self
+                .usage
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.record(
+                is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+            );
+            usage::save(&self.data_dir, &guard);
+        }
+        api_keys::record_token_usage_locked(
+            &self.data_dir,
+            key_id,
+            &usage::today_key(),
+            prompt_tokens,
+            completion_tokens,
         );
-        usage::save(&self.data_dir, &guard);
     }
 
     /// 记录一次自定义模型请求用量（独立 custom_days 桶，与 Trae/WB 侧分账）；
@@ -195,6 +211,13 @@ impl ApiSharedState {
             model, "custom", key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
         );
         usage::save(&self.data_dir, &guard);
+        api_keys::record_token_usage_locked(
+            &self.data_dir,
+            key_id,
+            &usage::today_key(),
+            prompt_tokens,
+            completion_tokens,
+        );
     }
 }
 
@@ -203,6 +226,7 @@ impl ApiSharedState {
 /// 流式场景随 spawn 任务存续至流结束；不做下溢防护依赖"构造必 +1"配对语义
 pub struct InflightGuard {
     counter: Arc<AtomicU64>,
+    permit: Option<limits::Permit>,
 }
 
 impl InflightGuard {
@@ -210,6 +234,18 @@ impl InflightGuard {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         InflightGuard {
             counter: counter.clone(),
+            permit: None,
+        }
+    }
+
+    pub fn acquire_with_permit(
+        counter: &Arc<AtomicU64>,
+        permit: limits::Permit,
+    ) -> InflightGuard {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        InflightGuard {
+            counter: counter.clone(),
+            permit: Some(permit),
         }
     }
 }
