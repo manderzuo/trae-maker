@@ -2457,7 +2457,7 @@ pub async fn videos_generations(
         Ok(permit) => permit,
         Err(error) => return limit_error_response(error),
     };
-    let _guard = state.inflight_guard_with_permit(request_permit);
+    let guard = state.inflight_guard_with_permit(request_permit);
     let video_job_permit = match state.acquire_video_job(&key_str, &key_limits) {
         Ok(permit) => permit,
         Err(error) => return limit_error_response(error),
@@ -2473,10 +2473,24 @@ pub async fn videos_generations(
             )
         }
     };
-    let task = video::create_pending_for(model.clone(), prompt, &key_str);
-    if let Some(key) = scoped_idempotency_key.as_deref() {
-        video::bind_idempotency(key, &task.id);
-    }
+    let task = match video::create_pending_with_idempotency(
+        model.clone(),
+        prompt,
+        &key_str,
+        scoped_idempotency_key.as_deref(),
+    ) {
+        video::IdempotentCreateResult::Existing(task) => {
+            drop(video_job_permit);
+            drop(guard);
+            let detail = json!({ "task": task, "request_key": key_str, "idempotent_replay": true });
+            return Response::builder()
+                .status(StatusCode::ACCEPTED)
+                .header("content-type", "application/json")
+                .body(Body::from(detail.to_string()))
+                .unwrap_or_else(|_| internal_error_response());
+        }
+        video::IdempotentCreateResult::Created(task) => task,
+    };
     video::start_native_task(
         state.clone(),
         task.id.clone(),

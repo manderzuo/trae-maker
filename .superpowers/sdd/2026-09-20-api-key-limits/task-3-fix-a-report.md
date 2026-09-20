@@ -1,6 +1,6 @@
 # Task 3 修复轮次 1：子任务 A 收尾报告
 
-日期：2026-09-20  
+日期：2026-09-20
 范围：额度日期、认证策略快照、文字请求额度一致性  
 状态：未完成（保留已有改动，停止继续扩展）
 
@@ -319,6 +319,13 @@ cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tau
 - D 盘 focused 验证：`admin_save_preserves_runtime_reservations_and_key_list_changes` 1 passed；`token_reservation_` 6 passed；认证快照、quota error、Chat 单次计数测试各 1 passed。
 - 仍未处理 Core request permit、视频幂等原子性、视频 permit 回收/恢复语义；quota canonical code 继续使用 `quota_exceeded`，并保留 `legacy_code=daily_quota_exceeded`。
 
+## A2.2b-1：legacy 视频幂等原子化
+
+- 新增 `create_pending_with_idempotency` 临界区，把内部哈希键的检查、悬空映射清理、任务创建和绑定串为一个操作；路由在重放时显式释放本次 request/video permits。
+- 新增并发回归测试：8 个并发调用同一内部幂等键最终只得到 1 个任务 ID；客户端原始幂等键仍不进入任务索引或日志。
+- D 盘 focused 验证：`concurrent_idempotent_creates_return_one_task_id` 1 passed，`git diff --check` clean。
+- 本轮尚未处理服务重启后的非终态视频任务 permit 恢复、Core 视频幂等存储和 Core settle 错误恢复；这些继续留在 A2.2b-2。
+
 ---
 
 # Task 3 修复轮次 5：管理端保存不覆盖运行态 Token reservation
@@ -354,3 +361,47 @@ cargo test --quiet --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tau
 - 保留 `daily_stats_capped_at_90` 的既有失败，不扩大到本轮无关的 A2.2a 统计排序逻辑。
 - 未运行全量 Rust suite；完整 suite 的既有失败和其它未提交改动继续按前述报告处理。
 - 未修改 Core/video、quota error 字段或任何其它用户改动；提交时仅暂存本轮修复 hunks 与本报告追加内容。
+
+---
+
+# Task 3 修复轮次 6：A2.3 legacy 视频幂等键原子 check-and-create
+
+日期：2026-09-20  
+范围：仅修复 legacy `/v1/videos/generations` 的同一作用域幂等键并发重复创建；未扩展 Core、重启恢复或 worker permit 回收。
+状态：完成
+
+## 本轮修复
+
+1. `src-tauri/src/api_server/video.rs` 新增 `create_pending_with_idempotency`，用专用临界区原子完成内部哈希键的检查、悬空映射清理、任务创建和绑定；已有任务返回 `Existing`，新任务返回 `Created`。helper 只接收已作用域哈希的内部键，不记录原始客户端幂等键。
+2. `src-tauri/src/api_server/routes.rs` 使用该 helper。保留已有任务的快速 replay 以维持无可用 Work 账号时的原有响应；并发竞争在 permit 已取得后命中 `Existing` 时显式释放本次 video-job permit 与 request guard，响应仍为 `202`，并保留 `task`、`request_key`、`idempotent_replay` 字段。
+3. 新增不依赖真实上游的 barrier 并发回归测试，证明同一个内部 key 的 8 个并发调用只返回一个 task id。
+
+## TDD / 测试结果
+
+以下命令均使用 `C:\Users\StarLink\.cargo\bin\cargo.exe`、`D:\gpt\aiwork-key-limits-cargo-target` 和 `--offline`；未使用 C 盘作为 Cargo target。
+
+```text
+cargo test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --bin ai-work-assistant api_server::video::tests::concurrent_idempotent_creates_return_one_task_id -- --exact
+```
+
+RED：按原先先查后建路径得到 8 个 task id，断言失败（实际 8，期望 1）。
+
+GREEN：`1 passed, 0 failed`。
+
+```text
+cargo test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml --bin ai-work-assistant api_server::video
+```
+
+Focused video：`22 passed, 0 failed`（包含 video、video_store、video_worker、video_payload 过滤命中的测试）。
+
+为完成性核对运行的二进制全量测试：`493 passed, 3 failed, 4 ignored`。3 个失败均为未改动的 `core_migration` 测试：缺失 legacy asset 文件、legacy asset hash mismatch 断言、remaining credit history 依赖缺失 legacy asset；未处理、未修改。
+
+## 未处理项
+
+- 不处理重启恢复、Core 幂等/额度路径、worker permit 回收或跨进程状态恢复。
+- 不处理上述 `core_migration` 测试失败及工作区其它已有 dirty 文件。
+- 不运行真实视频上游；回归测试只覆盖本地任务索引的并发 check-and-create。
+
+## 提交边界
+
+本轮只提交 `src-tauri/src/api_server/video.rs`、`src-tauri/src/api_server/routes.rs` 和本报告文件；其它用户 dirty 文件未暂存、未回退、未清理。

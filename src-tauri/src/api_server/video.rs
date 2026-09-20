@@ -57,6 +57,7 @@ pub struct VideoTask {
 static TASKS: OnceLock<Mutex<HashMap<String, VideoTask>>> = OnceLock::new();
 static SEQ: OnceLock<Mutex<u64>> = OnceLock::new();
 static IDEMPOTENCY: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static IDEMPOTENCY_CREATE: OnceLock<Mutex<()>> = OnceLock::new();
 static TASK_DATA_DIR: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
 static JOB_PERMITS: OnceLock<Mutex<HashMap<String, Permit>>> = OnceLock::new();
 const MAX_IN_MEMORY_TASKS: usize = 2048;
@@ -112,6 +113,10 @@ fn tasks() -> &'static Mutex<HashMap<String, VideoTask>> {
 
 fn idempotency() -> &'static Mutex<HashMap<String, String>> {
     IDEMPOTENCY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn idempotency_create_lock() -> &'static Mutex<()> {
+    IDEMPOTENCY_CREATE.get_or_init(|| Mutex::new(()))
 }
 
 fn job_permits() -> &'static Mutex<HashMap<String, Permit>> {
@@ -568,9 +573,52 @@ pub fn create_pending_for(model: String, prompt: String, owner_key_id: &str) -> 
     task
 }
 
-/// 测试/内部调用的匿名任务构造器；HTTP 路由使用 `create_pending_for` 绑定 Key。
+/// 测试/内部调用的匿名任务构造器；HTTP 路由使用原子幂等 helper 绑定 Key。
 pub fn create_pending(model: String, prompt: String) -> VideoTask {
     create_pending_for(model, prompt, "anonymous")
+}
+
+pub(crate) enum IdempotentCreateResult {
+    Existing(VideoTask),
+    Created(VideoTask),
+}
+
+/// 原子地重放或创建视频任务。
+///
+/// `internal_key` 必须是已按 API Key 作用域哈希后的内部键；原始客户端键
+/// 不进入这里，也不会被保存。键映射和任务索引仍是两个数据结构，因此用
+/// 专用临界区把“检查、清理悬空映射、创建、绑定”串成一个操作。
+pub(crate) fn create_pending_with_idempotency(
+    model: String,
+    prompt: String,
+    owner_key_id: &str,
+    internal_key: Option<&str>,
+) -> IdempotentCreateResult {
+    let Some(key) = internal_key.map(str::trim).filter(|key| !key.is_empty()) else {
+        return IdempotentCreateResult::Created(create_pending_for(model, prompt, owner_key_id));
+    };
+
+    let _critical_section = idempotency_create_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mapped_task_id = idempotency()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(key)
+        .cloned();
+    if let Some(task_id) = mapped_task_id {
+        if let Some(task) = get(&task_id) {
+            return IdempotentCreateResult::Existing(task);
+        }
+        idempotency()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(key);
+    }
+
+    let task = create_pending_for(model, prompt, owner_key_id);
+    bind_idempotency(key, &task.id);
+    IdempotentCreateResult::Created(task)
 }
 
 pub fn visible_to(task: &VideoTask, owner_key_id: &str) -> bool {
@@ -1189,6 +1237,40 @@ mod tests {
         remember_idempotent(&key, &task.id);
         assert_eq!(find_idempotent(&key).unwrap().id, task.id);
         assert!(find_idempotent(&scoped_idempotency_key("key-b", "test-idempotency")).is_none());
+    }
+
+    #[test]
+    fn concurrent_idempotent_creates_return_one_task_id() {
+        let key = scoped_idempotency_key(
+            "key-concurrent",
+            &format!("test-atomic-{}", rand::random::<u64>()),
+        );
+        let workers = 8;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let handles = (0..workers)
+            .map(|_| {
+                let key = key.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    match create_pending_with_idempotency(
+                        "seedance".into(),
+                        "concurrent idempotency".into(),
+                        "key-concurrent",
+                        Some(&key),
+                    ) {
+                        IdempotentCreateResult::Existing(task)
+                        | IdempotentCreateResult::Created(task) => task.id,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let task_ids = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(task_ids.len(), 1);
     }
 
     #[test]
