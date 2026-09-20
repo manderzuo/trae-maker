@@ -6,7 +6,7 @@ use std::{
 
 use aiwork_core::{
     ChatExecutionRequest, ChatExecutor, CoreStore, BeginRequestInput, IssuedApiKey,
-    NewUser, PreflightReserveInput, PreflightReserveResult, Principal, QuotaGrant,
+    KeyQuotaGrant, NewUser, PreflightReserveInput, PreflightReserveResult, Principal, QuotaGrant,
     QuotaBalance, RequestResult, RequestState, ReservationState, Settlement, UserRole,
     MockChatExecutor, UpstreamError,
 };
@@ -160,6 +160,18 @@ pub fn run_phase1_smoke() -> Phase1SmokeResult {
         )
         .expect("grant two logical chat units");
     assert_eq!(granted.available, 2);
+    store
+        .key_quota_grant_as_admin(
+            &admin_principal,
+            KeyQuotaGrant {
+                api_key_id: user_key.id.clone(),
+                resource_kind: RESOURCE_KIND.to_owned(),
+                amount: 2,
+                actor_user_id: "ignored-by-principal".to_owned(),
+                reason: "phase1 key grant".to_owned(),
+            },
+        )
+        .expect("grant two key-scoped chat units");
 
     let success_input = chat_input(&user_key.id, "phase1-success", 1);
     let (success_request, success_reservation) = match store
@@ -285,9 +297,15 @@ pub fn run_phase1_smoke() -> Phase1SmokeResult {
     };
     assert_eq!(recovered.id, timeout_reservation.id);
 
-    let balance = restarted
-        .balance(USER_ID, RESOURCE_KIND)
-        .expect("read bounded user balance");
+    let key_balance = restarted
+        .key_quota_balance_as_admin(&admin_principal, &user_key.id, RESOURCE_KIND)
+        .expect("read bounded key balance");
+    let balance = QuotaBalance {
+        user_id: key_balance.user_id,
+        resource_kind: key_balance.resource_kind,
+        available: key_balance.available,
+        held: key_balance.held,
+    };
     assert_eq!(balance.available, 0);
     assert_eq!(balance.held, 1);
     assert_audit_and_ledger_are_bounded(&dir, &balance);

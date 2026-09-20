@@ -6,7 +6,7 @@ use std::{
 };
 
 use aiwork_core::{
-    BeginRequestInput, CoreStore, CostPolicy, LeaseOutcome, LeaseState, NewUser,
+    BeginRequestInput, CoreStore, CostPolicy, KeyQuotaGrant, LeaseOutcome, LeaseState, NewUser,
     ObservationStatus, PreflightReserveInput, Principal, QuotaGrant, RegisterUpstreamAccount,
     RequestState, ReservationState, SchedulerLeaseRequest, SchedulerLeaseResult, ScheduleError,
     SelectionStrategy, UpstreamAccountState, UpstreamObservation, UserRole, CORE_DB_FILE,
@@ -48,6 +48,7 @@ impl Drop for TempDir {
 struct Fixture {
     dir: TempDir,
     store: Arc<CoreStore>,
+    admin: Principal,
     principal: Principal,
 }
 
@@ -139,6 +140,18 @@ fn fixture(prefix: &str) -> Fixture {
             reason: "phase3 fixed mock streaming grant".to_owned(),
         })
         .expect("grant phase3 user quota");
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: principal.key_id.clone(),
+                resource_kind: RESOURCE_KIND.to_owned(),
+                amount: 8,
+                actor_user_id: "ignored-by-principal".to_owned(),
+                reason: "phase3 key quota".to_owned(),
+            },
+        )
+        .expect("grant phase3 key quota");
 
     store
         .upsert_upstream_account(account(), &admin)
@@ -167,6 +180,7 @@ fn fixture(prefix: &str) -> Fixture {
     Fixture {
         dir,
         store,
+        admin,
         principal,
     }
 }
@@ -383,7 +397,14 @@ fn phase3_streaming_lifecycle_is_atomic_replay_safe_and_recoverable() {
     assert_eq!(main_fixture.store.request_state(&unknown_request_id).unwrap(), RequestState::Unknown);
     assert_eq!(main_fixture.store.reservation_for_request(&unknown_request_id).unwrap().unwrap().state, ReservationState::Unknown);
     assert_eq!(release_event_count(main_fixture.dir.path(), &unknown_request_id), 0);
-    let balance = main_fixture.store.balance(USER_ID, RESOURCE_KIND).unwrap();
+    let balance = main_fixture
+        .store
+        .key_quota_balance_as_admin(
+            &main_fixture.admin,
+            &main_fixture.principal.key_id,
+            RESOURCE_KIND,
+        )
+        .unwrap();
     assert_eq!(balance.held, 1);
     assert!(balance.available >= 0);
 
@@ -412,6 +433,7 @@ fn phase3_streaming_lifecycle_is_atomic_replay_safe_and_recoverable() {
     let recovery_request_id = request_id_for_lease(recovery.dir.path(), &recovery_grant.lease_id);
     let recovery_dir = recovery.dir.path().to_path_buf();
     let recovery_principal = recovery.principal.clone();
+    let recovery_admin = recovery.admin.clone();
     drop(recovery.store);
     let reopened = CoreStore::open(&recovery_dir).expect("reopen phase3 CoreStore");
     reopened.migrate().expect("re-migrate phase3 CoreStore");
@@ -423,7 +445,13 @@ fn phase3_streaming_lifecycle_is_atomic_replay_safe_and_recoverable() {
         .any(|lease| lease.id == recovery_grant.lease_id && lease.state == LeaseState::Unknown));
     assert_eq!(reopened.request_state(&recovery_request_id).unwrap(), RequestState::Unknown);
     assert_eq!(reopened.reservation_for_request(&recovery_request_id).unwrap().unwrap().state, ReservationState::Unknown);
-    let recovered_balance = reopened.balance(USER_ID, RESOURCE_KIND).unwrap();
+    let recovered_balance = reopened
+        .key_quota_balance_as_admin(
+            &recovery_admin,
+            &recovery_principal.key_id,
+            RESOURCE_KIND,
+        )
+        .unwrap();
     assert_eq!(recovered_balance.held, 1);
     assert_eq!(release_event_count(&recovery_dir, &recovery_request_id), 0);
     let replay = reopened

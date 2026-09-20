@@ -348,11 +348,19 @@ fn scheduler_recovery_after_request_progression_preserves_the_quota_hold() {
         id: "scheduler-policy".into(), endpoint: "chat".into(), model_pattern: "mock-*".into(),
         resource_kind: "chat_request".into(), reserve_amount: 3, max_actual_amount: Some(3), version: 1, enabled: true,
     }).unwrap();
-    store.grant(QuotaGrant {
-        user_id: "u1".into(), resource_kind: "chat_request".into(), amount: 3,
-        actor_user_id: "admin-1".into(), reason: "fixed scheduler grant".into(),
-    }).unwrap();
     let admin = Principal { user_id: "admin-1".into(), key_id: admin_key.id, scopes: Default::default() };
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: key.id.clone(),
+                resource_kind: "chat_request".into(),
+                amount: 3,
+                actor_user_id: "admin-1".into(),
+                reason: "fixed scheduler grant".into(),
+            },
+        )
+        .unwrap();
     let mut account = RegisterUpstreamAccount::new("scheduler-account".into(), "fixture".into(), "vault://quota-fixture".into());
     account.capabilities = std::collections::BTreeSet::from(["chat".to_owned()]);
     account.state = UpstreamAccountState::Available;
@@ -383,7 +391,13 @@ fn scheduler_recovery_after_request_progression_preserves_the_quota_hold() {
     store.transition_request(&request_id, aiwork_core::RequestState::Queued, aiwork_core::RequestState::Dispatched, None).unwrap();
     store.recover_expired_upstream_leases(SCHEDULER_NOW_MS + 2).unwrap();
     assert_eq!(store.request_state(&request_id).unwrap(), aiwork_core::RequestState::Unknown);
-    assert_eq!(store.balance("u1", "chat_request").unwrap().held, 3);
+    assert_eq!(
+        store
+            .key_quota_balance_as_admin(&admin, &principal.key_id, "chat_request")
+            .unwrap()
+            .held,
+        3
+    );
     let state: String = connection.query_row("SELECT state FROM upstream_leases WHERE id = ?1", [&lease_id], |row| row.get(0)).unwrap();
     assert_eq!(state, LeaseState::Unknown.as_str());
 }

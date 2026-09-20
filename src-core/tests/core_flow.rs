@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use aiwork_core::{
     BeginRequest, BeginRequestInput, ChatExecutionRequest, ChatExecutionResult, ChatExecutor,
-    CoreStore, CostPolicy, MockChatExecutor, NewUser, PreflightReserveInput,
+    CoreStore, CostPolicy, KeyQuotaGrant, MockChatExecutor, NewUser, PreflightReserveInput,
     PreflightReserveResult, Principal, QuotaGrant, QuotaReserve, ReservationState,
     ReserveResult, Settlement, UserRole, CORE_DB_FILE,
 };
@@ -67,6 +67,9 @@ fn test_store_with_dir(grant: i64) -> (CoreStore, String, PathBuf) {
             enabled: true,
         })
         .unwrap();
+    let admin_key = store
+        .issue_api_key("admin-1", "test-admin", BTreeSet::new(), "admin-1")
+        .unwrap();
     if grant > 0 {
         store
             .grant(QuotaGrant {
@@ -76,6 +79,33 @@ fn test_store_with_dir(grant: i64) -> (CoreStore, String, PathBuf) {
                 actor_user_id: "admin-1".into(),
                 reason: "test grant".into(),
             })
+            .unwrap();
+        store
+            .key_quota_grant_as_admin(
+                &Principal {
+                    user_id: "admin-1".into(),
+                    key_id: admin_key.id,
+                    scopes: BTreeSet::new(),
+                },
+                KeyQuotaGrant {
+                    api_key_id: key.id.clone(),
+                    resource_kind: "chat_request".into(),
+                    amount: grant,
+                    actor_user_id: "admin-1".into(),
+                    reason: "test key grant".into(),
+                },
+            )
+            .unwrap();
+    } else {
+        let connection = Connection::open(dir.join("data").join(CORE_DB_FILE)).unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_budget_accounts
+                 (id, scope, user_id, api_key_id, resource_kind, enabled, version,
+                  migration_state, created_at_ms, updated_at_ms)
+                 VALUES ('zero-key-budget', 'key', 'u1', ?1, 'chat_request', 1, 1, 'ready', 1, 1)",
+                [&key.id],
+            )
             .unwrap();
     }
     (store, key.id, dir)
@@ -261,6 +291,25 @@ fn atomic_preflight_insufficient_quota_leaves_no_orphan_and_can_retry() {
             actor_user_id: "admin-1".into(),
             reason: "retry grant".into(),
         })
+        .unwrap();
+    let admin_key = store
+        .issue_api_key("admin-1", "retry-admin", BTreeSet::new(), "admin-1")
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &Principal {
+                user_id: "admin-1".into(),
+                key_id: admin_key.id,
+                scopes: BTreeSet::new(),
+            },
+            KeyQuotaGrant {
+                api_key_id: key_id.clone(),
+                resource_kind: "chat_request".into(),
+                amount: 1,
+                actor_user_id: "admin-1".into(),
+                reason: "retry key grant".into(),
+            },
+        )
         .unwrap();
     let retry = store.preflight_reserve(preflight_input(&key_id, "idem-atomic-insufficient"));
     assert!(matches!(retry, Ok(PreflightReserveResult::Created { .. })));

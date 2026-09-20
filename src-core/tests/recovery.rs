@@ -6,8 +6,8 @@ use std::{
 };
 
 use aiwork_core::{
-    BeginRequestInput, CoreStore, CostPolicy, LeaseOutcome, LeaseState, NewUser, ObservationStatus,
-    PreflightReserveInput, Principal, QuotaGrant, RegisterUpstreamAccount,
+    BeginRequestInput, CoreStore, CostPolicy, KeyQuotaGrant, LeaseOutcome, LeaseState, NewUser,
+    ObservationStatus, PreflightReserveInput, Principal, QuotaGrant, RegisterUpstreamAccount,
     SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, UpstreamAccountState,
     UpstreamObservation, UserRole,
 };
@@ -88,6 +88,22 @@ impl Fixture {
                 actor_user_id: "admin-1".into(),
                 reason: "task6 fixture".into(),
             })
+            .unwrap();
+        store
+            .key_quota_grant_as_admin(
+                &Principal {
+                    user_id: "admin-1".into(),
+                    key_id: admin_key.id.clone(),
+                    scopes: BTreeSet::new(),
+                },
+                KeyQuotaGrant {
+                    api_key_id: user_key.id.clone(),
+                    resource_kind: RESOURCE_KIND.into(),
+                    amount: 10,
+                    actor_user_id: "ignored-by-principal".into(),
+                    reason: "task6 key quota fixture".into(),
+                },
+            )
             .unwrap();
         Self {
             dir,
@@ -180,6 +196,8 @@ fn expired_active_lease_becomes_unknown_after_store_reopen() {
     fixture.account();
     let lease_id = fixture.acquire("recovery-key");
     let dir = fixture.dir.clone();
+    let admin = fixture.admin.clone();
+    let user = fixture.user.clone();
     let store = fixture.store.clone();
     drop(fixture);
     drop(store);
@@ -191,7 +209,10 @@ fn expired_active_lease_becomes_unknown_after_store_reopen() {
         .unwrap();
     let lease = recovered.iter().find(|lease| lease.id == lease_id).unwrap();
     assert_eq!(lease.state, LeaseState::Unknown);
-    assert_eq!(reopened.balance("user-1", RESOURCE_KIND).unwrap().held, 3);
+    let balance = reopened
+        .key_quota_balance_as_admin(&admin, &user.key_id, RESOURCE_KIND)
+        .unwrap();
+    assert_eq!(balance.held, 3);
 
     let connection = Connection::open(dir.join("data/core.sqlite3")).unwrap();
     let reservation_state: String = connection

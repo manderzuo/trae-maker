@@ -6,7 +6,7 @@ use std::{
 };
 
 use aiwork_core::{
-    BeginRequestInput, CoreStore, CostPolicy, LeaseOutcome, LeaseState, NewUser,
+    BeginRequestInput, CoreStore, CostPolicy, KeyQuotaGrant, LeaseOutcome, LeaseState, NewUser,
     ObservationStatus, PreflightReserveInput, Principal, QuotaGrant, RegisterUpstreamAccount,
     RequestState, ReservationState, SchedulerLeaseRequest, SchedulerLeaseResult, ScheduleError,
     SelectionStrategy, UpstreamAccountState, UpstreamLeaseGrant, UpstreamObservation, UserRole,
@@ -91,7 +91,37 @@ fn test_store() -> (Arc<CoreStore>, String, String, PathBuf) {
             reason: "fixed streaming test allocation".into(),
         })
         .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &Principal {
+                user_id: "admin-1".into(),
+                key_id: admin_key.id.clone(),
+                scopes: BTreeSet::new(),
+            },
+            KeyQuotaGrant {
+                api_key_id: user_key.id.clone(),
+                resource_kind: RESOURCE_KIND.into(),
+                amount: 30,
+                actor_user_id: "ignored-by-principal".into(),
+                reason: "fixed streaming key allocation".into(),
+            },
+        )
+        .unwrap();
     (store, user_key.id, admin_key.id, dir)
+}
+
+fn key_balance(store: &CoreStore, key_id: &str, admin_key_id: &str) -> aiwork_core::QuotaBudgetBalance {
+    store
+        .key_quota_balance_as_admin(
+            &Principal {
+                user_id: "admin-1".into(),
+                key_id: admin_key_id.into(),
+                scopes: BTreeSet::new(),
+            },
+            key_id,
+            RESOURCE_KIND,
+        )
+        .unwrap()
 }
 
 fn account(id: &str, provider: &str, region: &str) -> RegisterUpstreamAccount {
@@ -346,7 +376,7 @@ fn cancel_requires_owner_and_keeps_reservation_held_until_confirmation() {
     ));
     assert_eq!(store.request_state(&request_id).unwrap(), RequestState::Reserved);
     assert_eq!(store.reservation_for_request(&request_id).unwrap().unwrap().state, ReservationState::Held);
-    assert_eq!(store.balance("u1", RESOURCE_KIND).unwrap().held, 3);
+    assert_eq!(key_balance(&store, &key_id, &admin_key_id).held, 3);
     assert_eq!(release_event_count(&dir, &request_id), 0);
 
     let lease = store
@@ -355,7 +385,7 @@ fn cancel_requires_owner_and_keeps_reservation_held_until_confirmation() {
     assert_eq!(lease.state, LeaseState::Held);
     assert_eq!(store.request_state(&request_id).unwrap(), RequestState::CancelRequested);
     assert_eq!(store.reservation_for_request(&request_id).unwrap().unwrap().state, ReservationState::Held);
-    assert_eq!(store.balance("u1", RESOURCE_KIND).unwrap().held, 3);
+    assert_eq!(key_balance(&store, &key_id, &admin_key_id).held, 3);
     assert_eq!(release_event_count(&dir, &request_id), 0);
 }
 
@@ -386,8 +416,8 @@ fn confirmed_cancel_releases_once_and_idempotent_replay_has_no_grant() {
     assert_eq!(canceled.lease.state, LeaseState::Failed);
     assert_eq!(store.request_state(&request_id).unwrap(), RequestState::Settled);
     assert_eq!(store.reservation_for_request(&request_id).unwrap().unwrap().state, ReservationState::Released);
-    assert_eq!(store.balance("u1", RESOURCE_KIND).unwrap().available, 30);
-    assert_eq!(store.balance("u1", RESOURCE_KIND).unwrap().held, 0);
+    assert_eq!(key_balance(&store, &key_id, &admin_key_id).available, 30);
+    assert_eq!(key_balance(&store, &key_id, &admin_key_id).held, 0);
     assert_eq!(release_event_count(&dir, &request_id), 1);
 
     let replay = store

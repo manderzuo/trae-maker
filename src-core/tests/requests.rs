@@ -1,8 +1,15 @@
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::PathBuf,
+    sync::{Arc, Barrier},
+    thread,
+};
 
 use aiwork_core::{
     canonical_json_hash, BeginRequest, BeginRequestInput, CoreError, CoreStore, CostPolicy,
-    NewUser, RequestResult, RequestState, UserRole,
+    KeyQuotaGrant, NewUser, PreflightReserveInput, Principal, RequestResult, RequestState,
+    Settlement, UserRole,
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -65,6 +72,81 @@ fn install_chat_policy(store: &CoreStore, endpoint: &str) {
             enabled: true,
         })
         .unwrap();
+}
+
+fn dual_store() -> (Arc<CoreStore>, PathBuf, String, String, Principal) {
+    let dir = test_dir("dual-layer");
+    let store = Arc::new(CoreStore::open(&dir).unwrap());
+    store.migrate().unwrap();
+    store.create_user(user("admin-1", UserRole::Admin), "bootstrap").unwrap();
+    store.create_user(user("u1", UserRole::User), "admin-1").unwrap();
+    let key_a = store
+        .issue_api_key("u1", "key-a", BTreeSet::new(), "admin-1")
+        .unwrap();
+    let key_b = store
+        .issue_api_key("u1", "key-b", BTreeSet::new(), "admin-1")
+        .unwrap();
+    let admin_key = store
+        .issue_api_key("admin-1", "admin", BTreeSet::new(), "admin-1")
+        .unwrap();
+    let admin = Principal {
+        user_id: "admin-1".into(),
+        key_id: admin_key.id,
+        scopes: BTreeSet::new(),
+    };
+    for key in [&key_a, &key_b] {
+        store
+            .key_quota_grant_as_admin(
+                &admin,
+                KeyQuotaGrant {
+                    api_key_id: key.id.clone(),
+                    resource_kind: "chat_request".into(),
+                    amount: 5,
+                    actor_user_id: "admin-1".into(),
+                    reason: "dual-layer fixture".into(),
+                },
+            )
+            .unwrap();
+    }
+    (store, dir, key_a.id, key_b.id, admin)
+}
+
+fn insert_user_cap(dir: &PathBuf, amount: i64) {
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO quota_budget_accounts
+             (id, scope, user_id, api_key_id, resource_kind, enabled, version,
+              migration_state, created_at_ms, updated_at_ms)
+             VALUES ('user-cap-1', 'user_cap', 'u1', NULL, 'chat_request', 1, 1, 'ready', 1, 1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO quota_ledger
+             (entry_id, user_id, resource_kind, event_kind, amount, delta, actor_user_id,
+              reason, created_at_ms, budget_account_id, event_group_id, budget_version)
+             VALUES ('user-cap-grant', 'u1', 'chat_request', 'adjust', ?1, ?1, 'admin-1',
+                     'dual-layer fixture', 1, 'user-cap-1', 'user-cap-grant', 1)",
+            [amount],
+        )
+        .unwrap();
+}
+
+fn dual_input(key_id: &str, idempotency_key: &str) -> PreflightReserveInput {
+    PreflightReserveInput {
+        request: input(
+            "u1",
+            key_id,
+            "chat",
+            idempotency_key,
+            json!({"model": "mock-1", "messages": []}),
+        ),
+        resource_kind: "chat_request".into(),
+        amount: 4,
+        ttl_ms: 60_000,
+    }
 }
 
 #[test]
@@ -271,4 +353,220 @@ fn request_records_store_metadata_but_not_the_full_prompt_or_output() {
     assert!(!schema.contains("prompt"));
     assert!(!schema.contains("output"));
     assert!(!stored_prompt);
+}
+
+#[test]
+fn dual_layer_reservation_enforces_user_cap_across_keys() {
+    let (store, dir, key_a, key_b, _admin) = dual_store();
+    insert_user_cap(&dir, 6);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+    for (key_id, idempotency_key) in [(&key_a, "dual-a"), (&key_b, "dual-b")] {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let key_id = key_id.clone();
+        let idempotency_key = idempotency_key.to_owned();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            store.preflight_reserve(dual_input(&key_id, &idempotency_key))
+        }));
+    }
+    barrier.wait();
+
+    let results: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap().unwrap()).collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, aiwork_core::PreflightReserveResult::Created { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, aiwork_core::PreflightReserveResult::Insufficient { .. }))
+            .count(),
+        1
+    );
+    let created = results
+        .iter()
+        .find_map(|result| match result {
+            aiwork_core::PreflightReserveResult::Created { reservation, .. } => Some(reservation),
+            _ => None,
+        })
+        .expect("one request must reserve both budget layers");
+    assert!(created.event_group_id.is_some());
+    assert!(created.key_budget_account_id.is_some());
+    assert_eq!(created.user_cap_account_id.as_deref(), Some("user-cap-1"));
+
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let (requests, reservations, user_cap_held, key_held): (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM requests),
+                (SELECT COUNT(*) FROM quota_reservations),
+                (SELECT COALESCE(SUM(amount), 0) FROM quota_reservations
+                 WHERE user_cap_account_id = 'user-cap-1' AND state = 'held'),
+                (SELECT COALESCE(SUM(amount), 0) FROM quota_reservations
+                 WHERE key_budget_account_id IS NOT NULL AND state = 'held')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(requests, 1);
+    assert_eq!(reservations, 1);
+    assert_eq!(user_cap_held, 4);
+    assert_eq!(key_held, 4);
+
+    drop(connection);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn dual_layer_without_user_cap_keeps_key_balances_independent() {
+    let (store, dir, key_a, key_b, admin) = dual_store();
+    let first = store
+        .preflight_reserve(dual_input(&key_a, "key-only-a"))
+        .unwrap();
+    let second = store
+        .preflight_reserve(dual_input(&key_b, "key-only-b"))
+        .unwrap();
+    let reservation_a = match first {
+        aiwork_core::PreflightReserveResult::Created { reservation, .. } => reservation,
+        other => panic!("expected key A reservation, got {other:?}"),
+    };
+    let reservation_b = match second {
+        aiwork_core::PreflightReserveResult::Created { reservation, .. } => reservation,
+        other => panic!("expected key B reservation, got {other:?}"),
+    };
+    assert!(reservation_a.user_cap_account_id.is_none());
+    assert!(reservation_b.user_cap_account_id.is_none());
+
+    let owner_a = Principal {
+        user_id: "u1".into(),
+        key_id: key_a.clone(),
+        scopes: BTreeSet::new(),
+    };
+    let owner_b = Principal {
+        user_id: "u1".into(),
+        key_id: key_b.clone(),
+        scopes: BTreeSet::new(),
+    };
+    store
+        .settle(&owner_a, &reservation_a.id, Settlement::Release)
+        .unwrap();
+    store
+        .settle(&owner_a, &reservation_a.id, Settlement::Release)
+        .unwrap();
+    store
+        .settle(
+            &owner_b,
+            &reservation_b.id,
+            Settlement::Commit {
+                actual_amount: Some(2),
+            },
+        )
+        .unwrap();
+    store
+        .settle(
+            &owner_b,
+            &reservation_b.id,
+            Settlement::Commit {
+                actual_amount: Some(2),
+            },
+        )
+        .unwrap();
+
+    let unknown = match store
+        .preflight_reserve(dual_input(&key_a, "key-only-unknown"))
+        .unwrap()
+    {
+        aiwork_core::PreflightReserveResult::Created { reservation, .. } => reservation,
+        other => panic!("expected unknown reservation, got {other:?}"),
+    };
+    store
+        .settle(&owner_a, &unknown.id, Settlement::Unknown)
+        .unwrap();
+    store
+        .settle(&owner_a, &unknown.id, Settlement::Unknown)
+        .unwrap();
+
+    let key_a_balance = store
+        .key_quota_balance_as_admin(&admin, &key_a, "chat_request")
+        .unwrap();
+    let key_b_balance = store
+        .key_quota_balance_as_admin(&admin, &key_b, "chat_request")
+        .unwrap();
+    assert_eq!(key_a_balance.available, 1);
+    assert_eq!(key_a_balance.held, 4);
+    assert_eq!(key_a_balance.settled, 0);
+    assert_eq!(key_b_balance.available, 3);
+    assert_eq!(key_b_balance.held, 0);
+    assert_eq!(key_b_balance.settled, 2);
+
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let (release_events, commit_events): (i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM quota_ledger WHERE event_group_id = ?1),
+                (SELECT COUNT(*) FROM quota_ledger WHERE event_group_id = ?2)",
+            [&reservation_a.event_group_id.clone().unwrap(), &reservation_b.event_group_id.clone().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(release_events, 2);
+    assert_eq!(commit_events, 2);
+
+    drop(connection);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn dual_layer_idempotency_replays_without_a_second_reservation() {
+    let (store, dir, key_a, _key_b, _admin) = dual_store();
+    let first = store
+        .preflight_reserve(dual_input(&key_a, "same-dual-request"))
+        .unwrap();
+    let first_id = match first {
+        aiwork_core::PreflightReserveResult::Created { request, reservation } => {
+            (request.id, reservation.id)
+        }
+        other => panic!("expected created request, got {other:?}"),
+    };
+    let replay = store
+        .preflight_reserve(dual_input(&key_a, "same-dual-request"))
+        .unwrap();
+    match replay {
+        aiwork_core::PreflightReserveResult::Existing { request, reservation } => {
+            assert_eq!(request.id, first_id.0);
+            assert_eq!(reservation.unwrap().id, first_id.1);
+        }
+        other => panic!("expected replay, got {other:?}"),
+    }
+    let mut conflict = dual_input(&key_a, "same-dual-request");
+    conflict.request.body = json!({"model": "mock-1", "messages": [{"role": "user", "content": "different"}]});
+    assert!(matches!(
+        store.preflight_reserve(conflict),
+        Ok(aiwork_core::PreflightReserveResult::Conflict)
+    ));
+
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let (request_count, reservation_count, ledger_count): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM requests),
+                    (SELECT COUNT(*) FROM quota_reservations),
+                    (SELECT COUNT(*) FROM quota_ledger WHERE request_id = ?1)",
+            [&first_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(request_count, 1);
+    assert_eq!(reservation_count, 1);
+    assert_eq!(ledger_count, 1);
+
+    drop(connection);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
 }

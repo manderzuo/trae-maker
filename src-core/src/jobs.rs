@@ -983,7 +983,7 @@ impl crate::CoreStore {
                     reservation_id: job.request_id.clone(),
                 })?;
             if reservation.state == ReservationState::Held {
-                Self::apply_settlement(
+                Self::apply_settlement_for_reservation(
                     &transaction,
                     &reservation,
                     Settlement::Release,

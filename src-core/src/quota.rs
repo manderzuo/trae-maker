@@ -878,7 +878,8 @@ impl CoreStore {
         let connection = self.connection.lock().expect("core store mutex poisoned");
         connection
             .query_row(
-                "SELECT id, user_id, request_id, resource_kind, amount, state, expires_at_ms \
+                "SELECT id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
+                        api_key_id, key_budget_account_id, user_cap_account_id, event_group_id \
                  FROM quota_reservations WHERE request_id = ?1",
                 [request_id],
                 Self::reservation_from_row,
@@ -932,11 +933,18 @@ impl CoreStore {
         Self::validate_reservation_owner(&transaction, &reservation, principal)?;
 
         if reservation.state != ReservationState::Held {
-            let balance = Self::balance_in_transaction(
-                &transaction,
-                &reservation.user_id,
-                &reservation.resource_kind,
-            )?;
+            if reservation.key_budget_account_id.is_some() {
+                Self::validate_dual_settlement_replay(&transaction, &reservation, &settlement)?;
+            }
+            let balance = if let Some(account_id) = reservation.key_budget_account_id.as_deref() {
+                Self::quota_balance_from_budget(&Self::budget_balance_in_transaction(&transaction, account_id)?)
+            } else {
+                Self::balance_in_transaction(
+                    &transaction,
+                    &reservation.user_id,
+                    &reservation.resource_kind,
+                )?
+            };
             transaction.commit()?;
             return Ok(balance);
         }
@@ -967,13 +975,17 @@ impl CoreStore {
             }
         }
 
-        Self::apply_settlement(&transaction, &reservation, settlement, now)?;
+        Self::apply_settlement_for_reservation(&transaction, &reservation, settlement, now)?;
 
-        let balance = Self::balance_in_transaction(
-            &transaction,
-            &reservation.user_id,
-            &reservation.resource_kind,
-        )?;
+        let balance = if let Some(account_id) = reservation.key_budget_account_id.as_deref() {
+            Self::quota_balance_from_budget(&Self::budget_balance_in_transaction(&transaction, account_id)?)
+        } else {
+            Self::balance_in_transaction(
+                &transaction,
+                &reservation.user_id,
+                &reservation.resource_kind,
+            )?
+        };
         transaction.commit()?;
         Ok(balance)
     }
@@ -1008,6 +1020,10 @@ impl CoreStore {
             amount: input.amount,
             state: ReservationState::Held,
             expires_at_ms,
+            api_key_id: None,
+            key_budget_account_id: None,
+            user_cap_account_id: None,
+            event_group_id: None,
         };
         transaction.execute(
             "INSERT INTO quota_reservations \
@@ -1036,6 +1052,137 @@ impl CoreStore {
             None,
             now,
         )?;
+        Ok(ReserveResult::Created(reservation))
+    }
+
+    pub(crate) fn reserve_dual_in_transaction(
+        transaction: &Transaction<'_>,
+        input: &QuotaReserve,
+        api_key_id: &str,
+        now: i64,
+        expires_at_ms: i64,
+    ) -> Result<ReserveResult, CoreError> {
+        if let Some(reservation) = Self::reservation_by_request(transaction, &input.request_id)? {
+            if reservation.user_id != input.user_id
+                || reservation.resource_kind != input.resource_kind
+                || reservation.api_key_id.as_deref() != Some(api_key_id)
+            {
+                return Err(CoreError::ReservationRequestConflict {
+                    request_id: input.request_id.clone(),
+                });
+            }
+            return Ok(ReserveResult::Existing(reservation));
+        }
+
+        let key_account = transaction
+            .query_row(
+                "SELECT id, scope, user_id, api_key_id, resource_kind, enabled, version, migration_state
+                 FROM quota_budget_accounts
+                 WHERE scope = 'key' AND api_key_id = ?1 AND user_id = ?2 AND resource_kind = ?3
+                 ORDER BY id LIMIT 1",
+                params![api_key_id, &input.user_id, &input.resource_kind],
+                Self::budget_account_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::KeyQuotaNotConfigured {
+                api_key_id: api_key_id.into(),
+                resource_kind: input.resource_kind.clone(),
+            })?;
+        Self::ensure_ready_budget_account(&key_account)?;
+        let key_balance = Self::budget_balance_in_transaction(transaction, &key_account.id)?;
+
+        let user_cap_account = transaction
+            .query_row(
+                "SELECT id, scope, user_id, api_key_id, resource_kind, enabled, version, migration_state
+                 FROM quota_budget_accounts
+                 WHERE scope = 'user_cap' AND user_id = ?1 AND resource_kind = ?2
+                 ORDER BY id LIMIT 1",
+                params![&input.user_id, &input.resource_kind],
+                Self::budget_account_from_row,
+            )
+            .optional()?;
+        if let Some(account) = user_cap_account.as_ref() {
+            Self::ensure_ready_budget_account(account)?;
+        }
+        let user_cap_balance = user_cap_account
+            .as_ref()
+            .map(|account| Self::budget_balance_in_transaction(transaction, &account.id))
+            .transpose()?;
+        let available = user_cap_balance
+            .as_ref()
+            .map_or(key_balance.available, |balance| key_balance.available.min(balance.available));
+        if available < input.amount {
+            return Ok(ReserveResult::Insufficient { available });
+        }
+
+        let event_group_id = Self::new_id("quota-event");
+        let reservation = Reservation {
+            id: Self::new_id("reservation"),
+            user_id: input.user_id.clone(),
+            request_id: input.request_id.clone(),
+            resource_kind: input.resource_kind.clone(),
+            amount: input.amount,
+            state: ReservationState::Held,
+            expires_at_ms,
+            api_key_id: Some(api_key_id.into()),
+            key_budget_account_id: Some(key_account.id.clone()),
+            user_cap_account_id: user_cap_account.as_ref().map(|account| account.id.clone()),
+            event_group_id: Some(event_group_id.clone()),
+        };
+        transaction.execute(
+            "INSERT INTO quota_reservations
+             (id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
+              created_at_ms, api_key_id, key_budget_account_id, user_cap_account_id, event_group_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                &reservation.id,
+                &reservation.user_id,
+                &reservation.request_id,
+                &reservation.resource_kind,
+                reservation.amount,
+                reservation.state.as_str(),
+                reservation.expires_at_ms,
+                now,
+                api_key_id,
+                &key_account.id,
+                reservation.user_cap_account_id.as_deref(),
+                &event_group_id,
+            ],
+        )?;
+        Self::insert_budget_ledger_entry(
+            transaction,
+            &reservation.user_id,
+            &reservation.resource_kind,
+            "reserve",
+            reservation.amount,
+            -reservation.amount,
+            Some(&reservation.request_id),
+            None,
+            None,
+            now,
+            Some(&key_account.id),
+            Some(&event_group_id),
+            Some(api_key_id),
+            key_account.version,
+        )?;
+        if let Some(account) = user_cap_account {
+            Self::insert_budget_ledger_entry(
+                transaction,
+                &reservation.user_id,
+                &reservation.resource_kind,
+                "reserve",
+                reservation.amount,
+                -reservation.amount,
+                Some(&reservation.request_id),
+                None,
+                None,
+                now,
+                Some(&account.id),
+                Some(&event_group_id),
+                Some(api_key_id),
+                account.version,
+            )?;
+        }
         Ok(ReserveResult::Created(reservation))
     }
 
@@ -1091,12 +1238,198 @@ impl CoreStore {
         Ok(())
     }
 
+    pub(crate) fn apply_settlement_for_reservation(
+        transaction: &Transaction<'_>,
+        reservation: &Reservation,
+        settlement: Settlement,
+        now: i64,
+    ) -> Result<(), CoreError> {
+        if reservation.key_budget_account_id.is_some() {
+            Self::apply_dual_settlement(transaction, reservation, settlement, now)
+        } else {
+            Self::apply_settlement(transaction, reservation, settlement, now)
+        }
+    }
+
+    fn apply_dual_settlement(
+        transaction: &Transaction<'_>,
+        reservation: &Reservation,
+        settlement: Settlement,
+        now: i64,
+    ) -> Result<(), CoreError> {
+        let event_group_id = reservation
+            .event_group_id
+            .as_deref()
+            .ok_or_else(|| CoreError::InvalidConfiguration {
+                key: "quota_reservations.event_group_id".into(),
+                value: reservation.id.clone(),
+            })?;
+        match settlement {
+            Settlement::Release => {
+                Self::set_reservation_state(transaction, &reservation.id, ReservationState::Released, now)?;
+                Self::insert_reservation_budget_event(
+                    transaction,
+                    reservation,
+                    "release",
+                    reservation.amount,
+                    reservation.amount,
+                    None,
+                    now,
+                    event_group_id,
+                )?;
+            }
+            Settlement::Commit { actual_amount: Some(actual_amount) } => {
+                if actual_amount < 0 {
+                    return Err(CoreError::InvalidQuotaAmount);
+                }
+                if actual_amount > reservation.amount {
+                    return Err(CoreError::ActualAmountExceedsReservation);
+                }
+                Self::set_reservation_state(transaction, &reservation.id, ReservationState::Committed, now)?;
+                Self::insert_reservation_budget_event(
+                    transaction,
+                    reservation,
+                    "commit",
+                    actual_amount,
+                    reservation.amount - actual_amount,
+                    None,
+                    now,
+                    event_group_id,
+                )?;
+            }
+            Settlement::Commit { actual_amount: None } | Settlement::Unknown => {
+                Self::set_reservation_state(transaction, &reservation.id, ReservationState::Unknown, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_reservation_budget_event(
+        transaction: &Transaction<'_>,
+        reservation: &Reservation,
+        event_kind: &str,
+        amount: i64,
+        delta: i64,
+        reason: Option<&str>,
+        now: i64,
+        event_group_id: &str,
+    ) -> Result<(), CoreError> {
+        let key_account_id = reservation
+            .key_budget_account_id
+            .as_deref()
+            .ok_or_else(|| CoreError::InvalidConfiguration {
+                key: "quota_reservations.key_budget_account_id".into(),
+                value: reservation.id.clone(),
+            })?;
+        let key_version = Self::budget_account_version(transaction, key_account_id)?;
+        Self::insert_budget_ledger_entry(
+            transaction,
+            &reservation.user_id,
+            &reservation.resource_kind,
+            event_kind,
+            amount,
+            delta,
+            Some(&reservation.request_id),
+            None,
+            reason,
+            now,
+            Some(key_account_id),
+            Some(event_group_id),
+            reservation.api_key_id.as_deref(),
+            key_version,
+        )?;
+        if let Some(user_account_id) = reservation.user_cap_account_id.as_deref() {
+            let user_version = Self::budget_account_version(transaction, user_account_id)?;
+            Self::insert_budget_ledger_entry(
+                transaction,
+                &reservation.user_id,
+                &reservation.resource_kind,
+                event_kind,
+                amount,
+                delta,
+                Some(&reservation.request_id),
+                None,
+                reason,
+                now,
+                Some(user_account_id),
+                Some(event_group_id),
+                reservation.api_key_id.as_deref(),
+                user_version,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_dual_settlement_replay(
+        transaction: &Transaction<'_>,
+        reservation: &Reservation,
+        settlement: &Settlement,
+    ) -> Result<(), CoreError> {
+        let compatible = match reservation.state {
+            ReservationState::Released => matches!(settlement, Settlement::Release),
+            ReservationState::Unknown => matches!(settlement, Settlement::Unknown | Settlement::Commit { actual_amount: None }),
+            ReservationState::Committed => {
+                if let Settlement::Commit { actual_amount: Some(actual_amount) } = settlement {
+                    let committed_amount: Option<i64> = transaction.query_row(
+                        "SELECT amount FROM quota_ledger
+                         WHERE budget_account_id = ?1 AND event_group_id = ?2 AND event_kind = 'commit'
+                         ORDER BY entry_id LIMIT 1",
+                        params![reservation.key_budget_account_id.as_deref(), reservation.event_group_id.as_deref()],
+                        |row| row.get(0),
+                    ).optional()?;
+                    committed_amount == Some(*actual_amount)
+                } else {
+                    false
+                }
+            }
+            ReservationState::Held => true,
+        };
+        if compatible {
+            Ok(())
+        } else {
+            Err(CoreError::ReservationSettlementConflict {
+                reservation_id: reservation.id.clone(),
+            })
+        }
+    }
+
+    fn budget_account_version(
+        transaction: &Transaction<'_>,
+        account_id: &str,
+    ) -> Result<i64, CoreError> {
+        transaction
+            .query_row(
+                "SELECT version FROM quota_budget_accounts WHERE id = ?1",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::InvalidConfiguration {
+                key: "quota_budget_accounts.id".into(),
+                value: account_id.into(),
+            })
+    }
+
+    fn quota_balance_from_budget(balance: &QuotaBudgetBalance) -> QuotaBalance {
+        QuotaBalance {
+            user_id: balance.user_id.clone(),
+            resource_kind: balance.resource_kind.clone(),
+            available: balance.available,
+            held: balance.held,
+        }
+    }
+
     pub(crate) fn validate_reservation_owner(
         transaction: &Transaction<'_>,
         reservation: &Reservation,
         principal: &Principal,
     ) -> Result<(), CoreError> {
         if reservation.user_id != principal.user_id {
+            return Err(CoreError::ReservationOwnerMismatch {
+                reservation_id: reservation.id.clone(),
+            });
+        }
+        if reservation.api_key_id.as_deref().is_some_and(|key_id| key_id != principal.key_id) {
             return Err(CoreError::ReservationOwnerMismatch {
                 reservation_id: reservation.id.clone(),
             });
@@ -1215,9 +1548,14 @@ impl CoreStore {
     ) -> Result<QuotaBalance, CoreError> {
         let (available, held) = connection.query_row(
             "SELECT \
-             COALESCE((SELECT SUM(delta) FROM quota_ledger WHERE user_id = ?1 AND resource_kind = ?2), 0), \
+             COALESCE((SELECT SUM(delta) FROM quota_ledger
+                       WHERE user_id = ?1 AND resource_kind = ?2
+                         AND (budget_account_id IS NULL OR budget_account_id IN
+                              (SELECT id FROM quota_budget_accounts WHERE scope = 'user_cap'))), 0), \
              COALESCE((SELECT SUM(amount) FROM quota_reservations \
-                       WHERE user_id = ?1 AND resource_kind = ?2 AND state IN ('held', 'unknown')), 0)",
+                       WHERE user_id = ?1 AND resource_kind = ?2
+                         AND state IN ('held', 'unknown')
+                         AND (key_budget_account_id IS NULL OR user_cap_account_id IS NOT NULL)), 0)",
             params![user_id, resource_kind],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -1235,7 +1573,8 @@ impl CoreStore {
     ) -> Result<Option<Reservation>, CoreError> {
         transaction
             .query_row(
-                "SELECT id, user_id, request_id, resource_kind, amount, state, expires_at_ms \
+                "SELECT id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
+                        api_key_id, key_budget_account_id, user_cap_account_id, event_group_id \
                  FROM quota_reservations WHERE request_id = ?1",
                 [request_id],
                 Self::reservation_from_row,
@@ -1250,7 +1589,8 @@ impl CoreStore {
     ) -> Result<Option<Reservation>, CoreError> {
         transaction
             .query_row(
-                "SELECT id, user_id, request_id, resource_kind, amount, state, expires_at_ms \
+                "SELECT id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
+                        api_key_id, key_budget_account_id, user_cap_account_id, event_group_id \
                  FROM quota_reservations WHERE id = ?1",
                 [reservation_id],
                 Self::reservation_from_row,
@@ -1276,6 +1616,10 @@ impl CoreStore {
             amount: row.get(4)?,
             state,
             expires_at_ms: row.get(6)?,
+            api_key_id: row.get(7)?,
+            key_budget_account_id: row.get(8)?,
+            user_cap_account_id: row.get(9)?,
+            event_group_id: row.get(10)?,
         })
     }
 

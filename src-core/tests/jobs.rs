@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use aiwork_core::{
     BeginRequestInput, CoreStore, CostPolicy, CreateVideoJobInput, LeaseOutcome, LeaseState, NewUser, ObservationStatus,
-    PreflightReserveInput, Principal, QuotaGrant, RegisterUpstreamAccount, SchedulerLeaseRequest,
+    KeyQuotaGrant, PreflightReserveInput, Principal, QuotaGrant, RegisterUpstreamAccount, SchedulerLeaseRequest,
     SelectionStrategy, UpstreamObservation, UserRole, VideoJobEnqueueResult, VideoJobLeaseResult,
     CURRENT_SCHEMA_VERSION,
 };
@@ -68,7 +68,7 @@ fn fixture() -> (CoreStore, Principal, Principal, PathBuf) {
     )
 }
 
-fn prepare_video_scheduler(store: &CoreStore, admin: &Principal) {
+fn prepare_video_scheduler(store: &CoreStore, admin: &Principal, principal: &Principal) {
     store
         .upsert_cost_policy(CostPolicy {
             id: "video-policy".into(),
@@ -89,6 +89,18 @@ fn prepare_video_scheduler(store: &CoreStore, admin: &Principal) {
             actor_user_id: "admin".into(),
             reason: "phase3c fixture".into(),
         })
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            admin,
+            KeyQuotaGrant {
+                api_key_id: principal.key_id.clone(),
+                resource_kind: "video_job".into(),
+                amount: 10,
+                actor_user_id: "ignored-by-principal".into(),
+                reason: "phase3c key quota fixture".into(),
+            },
+        )
         .unwrap();
     let mut account = RegisterUpstreamAccount::new(
         "video-account".into(),
@@ -174,7 +186,7 @@ fn durable_video_queue_claim_round_robins_users_and_claims_each_job_once() {
             "videos:cancel".to_string(),
         ]),
     };
-    prepare_video_scheduler(&store, &admin);
+    prepare_video_scheduler(&store, &admin, &principal);
     let mut account = RegisterUpstreamAccount::new(
         "video-account".into(),
         "mock-video".into(),
@@ -191,6 +203,18 @@ fn durable_video_queue_claim_round_robins_users_and_claims_each_job_once() {
             actor_user_id: "admin".into(),
             reason: "phase4e queue fixture".into(),
         })
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: principal2.key_id.clone(),
+                resource_kind: "video_job".into(),
+                amount: 20,
+                actor_user_id: "ignored-by-principal".into(),
+                reason: "phase4e key quota fixture".into(),
+            },
+        )
         .unwrap();
 
     let queue_request = |owner: &Principal, user_id: &str, key: &str, now_ms: i64| {
@@ -272,7 +296,7 @@ fn durable_video_queue_claim_round_robins_users_and_claims_each_job_once() {
 #[test]
 fn queued_video_cancel_releases_user_hold_before_any_upstream_lease_exists() {
     let (store, admin, principal, dir) = fixture();
-    prepare_video_scheduler(&store, &admin);
+    prepare_video_scheduler(&store, &admin, &principal);
     let result = store
         .enqueue_video_job(
             &principal,
@@ -294,7 +318,9 @@ fn queued_video_cancel_releases_user_hold_before_any_upstream_lease_exists() {
     assert_eq!(canceled.state, aiwork_core::JobState::Canceled);
     assert_eq!(store.request_state(&job.request_id).unwrap(), aiwork_core::RequestState::Settled);
     assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
-    let balance = store.balance("video-user", "video_job").unwrap();
+    let balance = store
+        .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+        .unwrap();
     assert_eq!((balance.available, balance.held), (10, 0));
     drop(store);
     fs::remove_dir_all(dir).unwrap();
@@ -303,7 +329,7 @@ fn queued_video_cancel_releases_user_hold_before_any_upstream_lease_exists() {
 #[test]
 fn queued_video_job_can_resolve_its_internal_principal_without_exposing_key_material() {
     let (store, admin, principal, dir) = fixture();
-    prepare_video_scheduler(&store, &admin);
+    prepare_video_scheduler(&store, &admin, &principal);
     let result = store
         .enqueue_video_job(
             &principal,
@@ -333,7 +359,7 @@ fn queued_video_job_can_resolve_its_internal_principal_without_exposing_key_mate
 #[test]
 fn admin_video_job_projection_is_bounded_and_redacted() {
     let (store, admin, principal, dir) = fixture();
-    prepare_video_scheduler(&store, &admin);
+    prepare_video_scheduler(&store, &admin, &principal);
     let result = store
         .enqueue_video_job(
             &principal,
@@ -397,7 +423,7 @@ fn admin_video_job_projection_is_bounded_and_redacted() {
 #[test]
 fn claimed_video_job_heartbeat_is_owner_bound_and_keeps_all_runtime_rows_alive() {
     let (store, admin, principal, dir) = fixture();
-    prepare_video_scheduler(&store, &admin);
+    prepare_video_scheduler(&store, &admin, &principal);
     let result = store
         .enqueue_video_job(
             &principal,
@@ -465,7 +491,7 @@ fn claimed_video_job_heartbeat_is_owner_bound_and_keeps_all_runtime_rows_alive()
 #[test]
 fn expired_claim_recovery_clears_worker_ownership_without_releasing_the_hold() {
     let (store, admin, principal, dir) = fixture();
-    prepare_video_scheduler(&store, &admin);
+    prepare_video_scheduler(&store, &admin, &principal);
     let result = store
         .enqueue_video_job(
             &principal,
@@ -502,7 +528,9 @@ fn expired_claim_recovery_clears_worker_ownership_without_releasing_the_hold() {
         .unwrap();
     assert_eq!(ownership, (None, None));
     drop(connection);
-    let balance = store.balance("video-user", "video_job").unwrap();
+    let balance = store
+        .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+        .unwrap();
     assert_eq!((balance.available, balance.held), (6, 4));
     drop(store);
     fs::remove_dir_all(dir).unwrap();
@@ -511,7 +539,7 @@ fn expired_claim_recovery_clears_worker_ownership_without_releasing_the_hold() {
 #[test]
 fn unknown_video_lease_requires_explicit_success_evidence_to_reconcile_once() {
     let (store, admin, principal, dir) = fixture();
-    prepare_video_scheduler(&store, &admin);
+    prepare_video_scheduler(&store, &admin, &principal);
     let result = store
         .enqueue_video_job(
             &principal,
@@ -563,7 +591,13 @@ fn unknown_video_lease_requires_explicit_success_evidence_to_reconcile_once() {
     assert_eq!(store.request_state(&claim.job.request_id).unwrap(), aiwork_core::RequestState::Settled);
     assert_eq!(store.video_job_for_user(&principal, &job_id).unwrap().unwrap().state, aiwork_core::JobState::Succeeded);
     assert_eq!(store.reservation_for_request(&claim.job.request_id).unwrap().unwrap().state, aiwork_core::ReservationState::Committed);
-    assert_eq!(store.balance("video-user", "video_job").unwrap().held, 0);
+    assert_eq!(
+        store
+            .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+            .unwrap()
+            .held,
+        0
+    );
 
     let replay = store
         .reconcile_unknown_upstream_lease(
@@ -577,7 +611,13 @@ fn unknown_video_lease_requires_explicit_success_evidence_to_reconcile_once() {
         )
         .unwrap();
     assert!(!replay.applied);
-    assert_eq!(store.balance("video-user", "video_job").unwrap().held, 0);
+    assert_eq!(
+        store
+            .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+            .unwrap()
+            .held,
+        0
+    );
     drop(store);
     fs::remove_dir_all(dir).unwrap();
 }
@@ -678,6 +718,18 @@ fn video_preflight_creates_one_job_and_attempt_and_replays_idempotently() {
             actor_user_id: "admin".into(),
             reason: "phase3c fixture".into(),
         })
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: principal.key_id.clone(),
+                resource_kind: "video_job".into(),
+                amount: 10,
+                actor_user_id: "ignored-by-principal".into(),
+                reason: "phase3c key quota fixture".into(),
+            },
+        )
         .unwrap();
     let mut account = RegisterUpstreamAccount::new(
         "video-account".into(),
@@ -781,7 +833,13 @@ fn video_preflight_creates_one_job_and_attempt_and_replays_idempotently() {
             .state,
         aiwork_core::JobAttemptState::Succeeded
     );
-    assert_eq!(store.balance("video-user", "video_job").unwrap().available, 6);
+    assert_eq!(
+        store
+            .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+            .unwrap()
+            .available,
+        6
+    );
     let replay = store
         .preflight_video_job(
             &principal,
@@ -811,7 +869,7 @@ fn video_preflight_creates_one_job_and_attempt_and_replays_idempotently() {
 #[test]
 fn cancel_request_is_persisted_without_releasing_until_confirmed() {
     let (store, admin, principal, dir) = fixture();
-    prepare_video_scheduler(&store, &admin);
+    prepare_video_scheduler(&store, &admin, &principal);
     let acquired = store
         .preflight_video_job(
             &principal,
@@ -840,7 +898,9 @@ fn cancel_request_is_persisted_without_releasing_until_confirmed() {
         aiwork_core::JobAttemptState::CancelRequested
     );
     assert_eq!(store.request_state(&request_id).unwrap(), aiwork_core::RequestState::CancelRequested);
-    let balance = store.balance("video-user", "video_job").unwrap();
+    let balance = store
+        .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+        .unwrap();
     assert_eq!(balance.available, 6);
     assert_eq!(balance.held, 4);
     let audit_after_cancel = store.count_rows("audit_events").unwrap();
@@ -857,7 +917,7 @@ fn cancel_request_is_persisted_without_releasing_until_confirmed() {
 #[test]
 fn expired_video_lease_recovers_job_to_unknown_without_release() {
     let (store, admin, principal, dir) = fixture();
-    prepare_video_scheduler(&store, &admin);
+    prepare_video_scheduler(&store, &admin, &principal);
     let acquired = store
         .preflight_video_job(
             &principal,
@@ -881,7 +941,9 @@ fn expired_video_lease_recovers_job_to_unknown_without_release() {
     assert_eq!(job.state, aiwork_core::JobState::Unknown);
     assert!(job.reconcile_required);
     assert_eq!(store.request_state(&request_id).unwrap(), aiwork_core::RequestState::Unknown);
-    let balance = store.balance("video-user", "video_job").unwrap();
+    let balance = store
+        .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+        .unwrap();
     assert_eq!(balance.available, 6);
     assert_eq!(balance.held, 4);
     drop(store);

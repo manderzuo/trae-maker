@@ -876,6 +876,10 @@ pub struct Reservation {
     pub amount: i64,
     pub state: ReservationState,
     pub expires_at_ms: i64,
+    pub api_key_id: Option<String>,
+    pub key_budget_account_id: Option<String>,
+    pub user_cap_account_id: Option<String>,
+    pub event_group_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

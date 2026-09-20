@@ -60,6 +60,8 @@ pub enum CoreError {
     ApiKeyOwnershipMismatch { api_key_id: String, user_id: String },
     #[error("quota migration {migration_id} conflicts with an existing allocation")]
     QuotaMigrationConflict { migration_id: String },
+    #[error("reservation {reservation_id} has already been settled with a different decision")]
+    ReservationSettlementConflict { reservation_id: String },
     #[error("idempotency key conflicts with an existing request")]
     IdempotencyConflict,
     #[error("reservation {reservation_id} failed after reservation: {source}")]

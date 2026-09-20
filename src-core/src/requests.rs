@@ -223,17 +223,6 @@ impl CoreStore {
                 job,
             });
         }
-        let balance = Self::balance_in_transaction(
-            &transaction,
-            &input.preflight.request.user_id,
-            &input.preflight.resource_kind,
-        )?;
-        if balance.available < input.preflight.amount {
-            return Err(ScheduleError::Core(CoreError::QuotaInsufficient {
-                available: balance.available,
-                required: input.preflight.amount,
-            }));
-        }
         let now = input.now_ms;
         let reservation_expires = now
             .checked_add(input.preflight.ttl_ms)
@@ -272,7 +261,7 @@ impl CoreStore {
             None,
             now,
         )?;
-        let reservation = match Self::reserve_in_transaction(
+        let reservation = match Self::reserve_dual_in_transaction(
             &transaction,
             &QuotaReserve {
                 user_id: input.preflight.request.user_id.clone(),
@@ -281,6 +270,7 @@ impl CoreStore {
                 amount: input.preflight.amount,
                 ttl_ms: input.preflight.ttl_ms,
             },
+            &input.preflight.request.api_key_id,
             now,
             reservation_expires,
         )? {
@@ -417,14 +407,6 @@ impl CoreStore {
         }
 
         let candidate = Self::select_upstream_candidate(&transaction, &input)?;
-        let balance = Self::balance_in_transaction(
-            &transaction, &input.preflight.request.user_id, &input.preflight.resource_kind,
-        )?;
-        if balance.available < input.preflight.amount {
-            return Err(ScheduleError::Core(CoreError::QuotaInsufficient {
-                available: balance.available, required: input.preflight.amount,
-            }));
-        }
         let reservation_expires = now.checked_add(input.preflight.ttl_ms).ok_or(CoreError::InvalidQuotaAmount)?;
         let lease_expires = now.checked_add(input.lease_ttl_ms).ok_or(CoreError::InvalidQuotaAmount)?;
         let reconcile_until = now.checked_add(input.reconcile_ttl_ms).ok_or(CoreError::InvalidQuotaAmount)?;
@@ -441,11 +423,11 @@ impl CoreStore {
             params![&scope, &input.preflight.request.idempotency_key, request_hash.to_vec(), &request_id, now],
         )?;
         Self::transition_request_on_connection(&transaction, &request_id, RequestState::Received, RequestState::Validating, None, now)?;
-        let reservation = match Self::reserve_in_transaction(&transaction, &QuotaReserve {
+        let reservation = match Self::reserve_dual_in_transaction(&transaction, &QuotaReserve {
             user_id: input.preflight.request.user_id.clone(), request_id: request_id.clone(),
             resource_kind: input.preflight.resource_kind.clone(), amount: input.preflight.amount,
             ttl_ms: input.preflight.ttl_ms,
-        }, now, reservation_expires)? {
+        }, &input.preflight.request.api_key_id, now, reservation_expires)? {
             crate::ReserveResult::Created(reservation) => reservation,
             crate::ReserveResult::Insufficient { available } => return Err(ScheduleError::Core(CoreError::QuotaInsufficient {
                 available, required: input.preflight.amount,
@@ -674,7 +656,7 @@ impl CoreStore {
         } else {
             Self::settle_request_state(&transaction, &lease.request_id, current_request_state, request_state, result, now)?;
         }
-        Self::apply_settlement(&transaction, &reservation, settlement, now)?;
+        Self::apply_settlement_for_reservation(&transaction, &reservation, settlement, now)?;
         let updated = if is_unknown_reconciliation {
             transaction.execute(
                 "UPDATE upstream_leases SET state = ?1, reconcile_until_ms = ?2, upstream_request_ref = ?3, error_kind = ?4, updated_at_ms = ?5, settled_at_ms = ?6 WHERE id = ?7 AND state = 'unknown'",
@@ -736,7 +718,7 @@ impl CoreStore {
             // Recovery preserves the hold: an expired upstream call is not known
             // to have succeeded or failed. Mark the user reservation unknown so
             // it remains non-spendable without emitting a release ledger entry.
-            Self::apply_settlement(&transaction, &reservation, Settlement::Unknown, now_ms)?;
+            Self::apply_settlement_for_reservation(&transaction, &reservation, Settlement::Unknown, now_ms)?;
             transaction.execute(
                 "UPDATE upstream_leases SET state = 'unknown', reconcile_until_ms = ?1, error_kind = 'lease_expired', updated_at_ms = ?2 WHERE id = ?3 AND state IN ('held', 'active')",
                 params![now_ms.checked_add(crate::upstream::DEFAULT_RECONCILE_TTL_MS).ok_or(CoreError::InvalidQuotaAmount)?, now_ms, &lease.id],
@@ -958,18 +940,6 @@ impl CoreStore {
             };
         }
 
-        let balance = Self::balance_in_transaction(
-            &transaction,
-            &input.request.user_id,
-            &input.resource_kind,
-        )?;
-        if balance.available < input.amount {
-            return Ok(PreflightReserveResult::Insufficient {
-                available: balance.available,
-                required: input.amount,
-            });
-        }
-
         let request_id = Self::new_id("request");
         transaction.execute(
             "INSERT INTO requests \
@@ -1007,7 +977,7 @@ impl CoreStore {
             None,
             now,
         )?;
-        let reservation = match Self::reserve_in_transaction(
+        let reservation = match Self::reserve_dual_in_transaction(
             &transaction,
             &QuotaReserve {
                 user_id: request.user_id.clone(),
@@ -1016,6 +986,7 @@ impl CoreStore {
                 amount: input.amount,
                 ttl_ms: input.ttl_ms,
             },
+            &input.request.api_key_id,
             now,
             expires_at_ms,
         )? {

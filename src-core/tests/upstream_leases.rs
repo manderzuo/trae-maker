@@ -7,7 +7,7 @@ use std::{
 };
 
 use aiwork_core::{
-    BeginRequestInput, CoreStore, CostPolicy, LeaseOutcome, LeaseState, NewUser,
+    BeginRequestInput, CoreStore, CostPolicy, KeyQuotaGrant, LeaseOutcome, LeaseState, NewUser,
     ObservationStatus, PreflightReserveInput, Principal, QuotaGrant,
     RegisterUpstreamAccount, SchedulerLeaseRequest, SchedulerLeaseResult, ScheduleError,
     SelectionStrategy, UpstreamLeaseGrant,
@@ -67,7 +67,25 @@ fn test_store() -> (Arc<CoreStore>, String, String, PathBuf) {
         user_id: "u1".into(), resource_kind: RESOURCE_KIND.into(), amount: 30,
         actor_user_id: "admin-1".into(), reason: "fixed test allocation".into(),
     }).unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin_principal(&admin_key.id),
+            KeyQuotaGrant {
+                api_key_id: user_key.id.clone(),
+                resource_kind: RESOURCE_KIND.into(),
+                amount: 30,
+                actor_user_id: "ignored-by-principal".into(),
+                reason: "fixed key test allocation".into(),
+            },
+        )
+        .unwrap();
     (store, user_key.id, admin_key.id, dir)
+}
+
+fn key_balance(store: &CoreStore, key_id: &str, admin_key_id: &str) -> aiwork_core::QuotaBudgetBalance {
+    store
+        .key_quota_balance_as_admin(&admin_principal(admin_key_id), key_id, RESOURCE_KIND)
+        .unwrap()
 }
 
 fn account(id: &str, provider: &str, region: &str, max_concurrency: i64) -> RegisterUpstreamAccount {
@@ -237,7 +255,7 @@ fn timeout_unknown_survives_restart_and_is_not_ttl_released() {
     restarted.migrate().unwrap();
     let recovered = restarted.recover_expired_upstream_leases(NOW_MS + 120_001).unwrap();
     assert!(recovered.iter().any(|lease| lease.id == grant.lease_id && lease.state == LeaseState::Unknown));
-    assert_eq!(restarted.balance("u1", RESOURCE_KIND).unwrap().held, 3);
+    assert_eq!(key_balance(&restarted, &key_id, &admin_key_id).held, 3);
     assert_eq!(restarted.list_recoverable_leases().unwrap()[0].state, LeaseState::Unknown);
 }
 
@@ -256,12 +274,12 @@ fn settlement_is_idempotent_and_expired_held_lease_becomes_unknown() {
         LeaseOutcome::Rejected { status: 429, code: Some("ignored-repeat".into()), accepted: false, now_ms: NOW_MS + 3 },
     ).unwrap();
     assert_eq!(replay.state, LeaseState::Succeeded);
-    assert_eq!(store.balance("u1", RESOURCE_KIND).unwrap().available, 28);
+    assert_eq!(key_balance(&store, &key_id, &admin_key_id).available, 28);
 
     let held = acquired(store.preflight_reserve_with_lease(&principal(&key_id), lease_request(&key_id, "expired-key")));
     let recovered = store.recover_expired_upstream_leases(NOW_MS + 120_001).unwrap();
     assert!(recovered.iter().any(|lease| lease.id == held.lease_id && lease.state == LeaseState::Unknown));
-    assert_eq!(store.balance("u1", RESOURCE_KIND).unwrap().held, 3);
+    assert_eq!(key_balance(&store, &key_id, &admin_key_id).held, 3);
 
     let mut rejected_request = lease_request(&key_id, "reject-key");
     rejected_request.provider_hint = Some("workbuddy".into());
@@ -274,7 +292,11 @@ fn settlement_is_idempotent_and_expired_held_lease_becomes_unknown() {
         LeaseOutcome::Rejected { status: 400, code: Some("fixed-reject".into()), accepted: false, now_ms: NOW_MS + 4 },
     ).unwrap();
     assert_eq!(rejected.state, LeaseState::Failed);
-    assert_eq!(store.balance("u1", RESOURCE_KIND).unwrap().held, 3, "only the unknown lease remains held");
+    assert_eq!(
+        key_balance(&store, &key_id, &admin_key_id).held,
+        3,
+        "only the unknown lease remains held"
+    );
 }
 
 #[test]

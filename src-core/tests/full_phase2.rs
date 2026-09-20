@@ -9,7 +9,7 @@ use std::{
 use aiwork_core::{
     BeginRequestInput, ChatExecutionRequest, ChatExecutor, CoreStore, CostPolicy, LeaseOutcome,
     LeaseState, MockChatExecutor, NewUser, ObservationStatus, PreflightReserveInput, Principal,
-    QuotaGrant, RegisterUpstreamAccount, RequestState, ReservationState, ScheduleError,
+    KeyQuotaGrant, QuotaGrant, RegisterUpstreamAccount, RequestState, ReservationState, ScheduleError,
     SchedulerLeaseRequest, SchedulerLeaseResult, SelectionStrategy, UpstreamAccountState,
     UpstreamObservation, UserRole, CORE_DB_FILE,
 };
@@ -215,6 +215,18 @@ fn fixture() -> Fixture {
             &admin,
         )
         .expect("grant fixed user quota");
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: user.key_id.clone(),
+                resource_kind: RESOURCE_KIND.to_owned(),
+                amount: 3,
+                actor_user_id: "ignored-by-principal".to_owned(),
+                reason: "phase2 fixed key quota".to_owned(),
+            },
+        )
+        .expect("grant fixed key quota");
 
     store
         .upsert_upstream_account(
@@ -518,8 +530,8 @@ fn phase2_full_mock_flow_is_atomic_restartable_and_budget_safe() {
     let dir = fixture.dir.path().to_path_buf();
     let before_restart = fixture
         .store
-        .balance(USER_ID, RESOURCE_KIND)
-        .expect("read balance before restart");
+        .key_quota_balance_as_admin(&fixture.admin, &fixture.user.key_id, RESOURCE_KIND)
+        .expect("read key balance before restart");
     assert_eq!(before_restart.available, 1);
     assert_eq!(before_restart.held, 1);
     drop(fixture.store.clone());
@@ -531,7 +543,13 @@ fn phase2_full_mock_flow_is_atomic_restartable_and_budget_safe() {
     assert!(recovered
         .iter()
         .any(|lease| lease.id == unknown_grant.lease_id && lease.state == LeaseState::Unknown));
-    assert_eq!(reopened.balance(USER_ID, RESOURCE_KIND).unwrap().held, 1);
+    assert_eq!(
+        reopened
+            .key_quota_balance_as_admin(&fixture.admin, &fixture.user.key_id, RESOURCE_KIND)
+            .unwrap()
+            .held,
+        1
+    );
 
     let status = reopened
         .scheduler_status_for_admin(&fixture.admin, NOW_MS + 5)
@@ -557,8 +575,8 @@ fn phase2_full_mock_flow_is_atomic_restartable_and_budget_safe() {
     assert!(!audit_text.contains("prompt-body"));
     assert!(!audit_text.contains("cookie"));
     let balance = reopened
-        .balance(USER_ID, RESOURCE_KIND)
-        .expect("read final bounded balance");
+        .key_quota_balance_as_admin(&fixture.admin, &fixture.user.key_id, RESOURCE_KIND)
+        .expect("read final bounded key balance");
     assert!(balance.available >= 0);
     assert!(balance.held >= 0);
     assert!(balance.available + balance.held <= 3, "quota must never overdraw");
