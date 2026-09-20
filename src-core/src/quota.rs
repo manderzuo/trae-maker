@@ -95,7 +95,127 @@ impl CoreStore {
         };
 
         transaction.commit()?;
-        Ok(CoreQuotaUsageView { balances, ledger })
+        Ok(CoreQuotaUsageView {
+            balances,
+            ledger,
+            key_available: None,
+            user_cap_available: None,
+            key_quota_configured: false,
+        })
+    }
+
+    /// Return a bounded, owner-checked projection for the current API key.
+    ///
+    /// Key ledger entries are the only public consumption projection. A
+    /// user-cap account constrains effective availability but is never added
+    /// to held/settled, which prevents one request from appearing twice.
+    pub fn key_quota_usage_for_principal(
+        &self,
+        principal: &Principal,
+        limit: usize,
+    ) -> Result<CoreQuotaUsageView, CoreError> {
+        if !(1..=100).contains(&limit) {
+            return Err(CoreError::Validation {
+                field: "usage.limit".into(),
+                reason: "must be between 1 and 100".into(),
+            });
+        }
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        Self::ensure_principal_in_transaction(&transaction, principal)?;
+
+        let key_accounts = {
+            let mut statement = transaction.prepare(
+                "SELECT id, scope, user_id, api_key_id, resource_kind, enabled, version, migration_state
+                 FROM quota_budget_accounts
+                 WHERE scope = 'key' AND user_id = ?1 AND api_key_id = ?2
+                 ORDER BY resource_kind, id",
+            )?;
+            let rows = statement.query_map(
+                params![&principal.user_id, &principal.key_id],
+                Self::budget_account_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if key_accounts.is_empty() {
+            return Err(CoreError::KeyQuotaNotConfigured {
+                api_key_id: principal.key_id.clone(),
+                resource_kind: "usage".into(),
+            });
+        }
+
+        let mut balances = Vec::with_capacity(key_accounts.len());
+        let mut boundary_values = Vec::with_capacity(key_accounts.len());
+        for account in &key_accounts {
+            Self::ensure_ready_budget_account(account)?;
+            let key_balance = Self::budget_balance_in_transaction(&transaction, &account.id)?;
+            let user_cap_account = transaction
+                .query_row(
+                    "SELECT id, scope, user_id, api_key_id, resource_kind, enabled, version, migration_state
+                     FROM quota_budget_accounts
+                     WHERE scope = 'user_cap' AND user_id = ?1 AND resource_kind = ?2
+                     ORDER BY id LIMIT 1",
+                    params![&principal.user_id, &account.resource_kind],
+                    Self::budget_account_from_row,
+                )
+                .optional()?;
+            let user_cap_available = if let Some(user_cap_account) = user_cap_account {
+                Self::ensure_ready_budget_account(&user_cap_account)?;
+                Some(Self::budget_balance_in_transaction(&transaction, &user_cap_account.id)?.available)
+            } else {
+                None
+            };
+            let effective_available = user_cap_available
+                .map_or(key_balance.available, |user_available| key_balance.available.min(user_available));
+            balances.push(CoreQuotaBalanceView {
+                resource_kind: account.resource_kind.clone(),
+                available: effective_available,
+                held: key_balance.held,
+                settled: key_balance.settled,
+            });
+            boundary_values.push((key_balance.available, user_cap_available));
+        }
+
+        let ledger = {
+            let mut statement = transaction.prepare(
+                "SELECT resource_kind, event_kind, amount, delta, request_id, created_at_ms
+                 FROM quota_ledger
+                 WHERE budget_account_id IN (
+                     SELECT id FROM quota_budget_accounts
+                     WHERE scope = 'key' AND user_id = ?1 AND api_key_id = ?2
+                 ) AND api_key_id = ?2
+                 ORDER BY created_at_ms DESC, entry_id DESC
+                 LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                params![&principal.user_id, &principal.key_id, limit as i64],
+                |row| {
+                    Ok(CoreQuotaLedgerView {
+                        resource_kind: row.get(0)?,
+                        event_kind: row.get(1)?,
+                        amount: row.get(2)?,
+                        delta: row.get(3)?,
+                        request_id: row.get(4)?,
+                        created_at_ms: row.get(5)?,
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let (key_available, user_cap_available) = if boundary_values.len() == 1 {
+            boundary_values[0]
+        } else {
+            (0, None)
+        };
+        transaction.commit()?;
+        Ok(CoreQuotaUsageView {
+            balances,
+            ledger,
+            key_available: if boundary_values.len() == 1 { Some(key_available) } else { None },
+            user_cap_available,
+            key_quota_configured: true,
+        })
     }
 
     pub fn quota_balance_as_admin(
@@ -784,6 +904,12 @@ impl CoreStore {
     }
 
     fn ensure_ready_budget_account(account: &BudgetAccountRecord) -> Result<(), CoreError> {
+        if account.version <= 0 {
+            return Err(CoreError::InvalidConfiguration {
+                key: "quota_budget_accounts.version".into(),
+                value: account.version.to_string(),
+            });
+        }
         if !account.enabled {
             return Err(CoreError::Validation {
                 field: "quota_budget_account.enabled".into(),
@@ -799,6 +925,12 @@ impl CoreStore {
     }
 
     fn ensure_ready_or_legacy_account(account: &BudgetAccountRecord) -> Result<(), CoreError> {
+        if account.version <= 0 {
+            return Err(CoreError::InvalidConfiguration {
+                key: "quota_budget_accounts.version".into(),
+                value: account.version.to_string(),
+            });
+        }
         if !account.enabled {
             return Err(CoreError::Validation {
                 field: "quota_budget_account.enabled".into(),

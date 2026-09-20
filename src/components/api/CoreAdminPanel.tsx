@@ -16,6 +16,7 @@ import { useAppStore } from '../../store';
 import type {
   CoreApiKeyAdminView,
   CoreIssuedApiKeyResponse,
+  CoreKeyQuotaBalanceResponse,
   CoreQuotaBalanceResponse,
   CoreStatus,
   CoreUserAdminView,
@@ -25,7 +26,24 @@ import type {
 type CoreAdminAction =
   | { kind: 'user'; user: CoreUserAdminView; active: boolean }
   | { kind: 'key'; key: CoreApiKeyAdminView }
-  | { kind: 'grant'; userId: string; resourceKind: string; amount: number; reason: string };
+  | { kind: 'grant'; userId: string; resourceKind: string; amount: number; reason: string }
+  | { kind: 'key-grant'; key: CoreApiKeyAdminView; resourceKind: string; amount: number; reason: string }
+  | {
+      kind: 'key-allocate';
+      key: CoreApiKeyAdminView;
+      resourceKind: string;
+      amount: number;
+      migrationId: string;
+      reason: string;
+    };
+
+type CoreKeyQuotaAction = 'grant' | 'allocate' | 'balance';
+
+export function keyQuotaActionLabel(action: CoreKeyQuotaAction): string {
+  if (action === 'grant') return '发放 Key 额度';
+  if (action === 'allocate') return '迁移 legacy 额度';
+  return '查看 Key 余额';
+}
 
 export function normalizeCoreScopes(value: string): string[] {
   return [...new Set(value.split(',').map((scope) => scope.trim()).filter(Boolean))];
@@ -78,11 +96,13 @@ export default function CoreAdminPanel({
   const [videoJobs, setVideoJobs] = useState<CoreVideoJobAdminView[]>([]);
   const [jobStateFilter, setJobStateFilter] = useState('');
   const [selectedUserId, setSelectedUserId] = useState('');
+  const [selectedKeyId, setSelectedKeyId] = useState('');
   const [keyFilterUserId, setKeyFilterUserId] = useState('');
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [balance, setBalance] = useState<CoreQuotaBalanceResponse | null>(null);
+  const [keyBalance, setKeyBalance] = useState<CoreKeyQuotaBalanceResponse | null>(null);
   const [resourceKind, setResourceKind] = useState('video');
   const [confirmAction, setConfirmAction] = useState<CoreAdminAction | null>(null);
   const [issuedKey, setIssuedKey] = useState<CoreIssuedApiKeyResponse | null>(null);
@@ -94,6 +114,9 @@ export default function CoreAdminPanel({
   const [newKeyScopes, setNewKeyScopes] = useState('');
   const [grantAmount, setGrantAmount] = useState('');
   const [grantReason, setGrantReason] = useState('');
+  const [keyGrantAmount, setKeyGrantAmount] = useState('');
+  const [keyGrantReason, setKeyGrantReason] = useState('');
+  const [migrationId, setMigrationId] = useState('');
 
   const hasAdminKey = adminApiKey.trim().length > 0;
 
@@ -128,6 +151,7 @@ export default function CoreAdminPanel({
       setScheduler(nextScheduler);
       setVideoJobs(nextVideoJobs);
       if (!selectedUserId && nextUsers.length > 0) setSelectedUserId(nextUsers[0].id);
+      if (!selectedKeyId && nextKeys.length > 0) setSelectedKeyId(nextKeys[0].id);
       toast('success', `Core 管理数据已刷新（${nextUsers.length} 个用户 / ${nextKeys.length} 个 Key）`);
     } catch (error) {
       setError(errorMessage(error));
@@ -135,7 +159,7 @@ export default function CoreAdminPanel({
     } finally {
       setLoading(false);
     }
-  }, [adminApiKey, jobStateFilter, keyFilterUserId, selectedUserId, toast]);
+  }, [adminApiKey, jobStateFilter, keyFilterUserId, selectedKeyId, selectedUserId, toast]);
 
   useEffect(() => {
     void refreshStatus();
@@ -227,6 +251,47 @@ export default function CoreAdminPanel({
     }
   };
 
+  const selectedKey = keys.find((key) => key.id === selectedKeyId) ?? null;
+
+  const readKeyBalance = async (keyId = selectedKeyId, kind = resourceKind) => {
+    if (!keyId.trim() || !kind.trim() || !hasAdminKey) return;
+    try {
+      setKeyBalance(await api.core.keyQuotaBalance(adminApiKey.trim(), keyId.trim(), kind.trim()));
+    } catch (error) {
+      toast('error', `读取 Key 额度失败：${errorMessage(error)}`);
+    }
+  };
+
+  const grantKeyQuota = () => {
+    const amount = Number.parseInt(keyGrantAmount, 10);
+    const kind = resourceKind.trim();
+    const reason = keyGrantReason.trim();
+    if (!selectedKey || !kind || !Number.isFinite(amount) || amount <= 0 || !reason) {
+      toast('error', '请选择 Key，并填写资源类型、正整数额度和原因');
+      return;
+    }
+    setConfirmAction({ kind: 'key-grant', key: selectedKey, resourceKind: kind, amount, reason });
+  };
+
+  const allocateLegacyQuota = () => {
+    const amount = Number.parseInt(keyGrantAmount, 10);
+    const kind = resourceKind.trim();
+    const migration = migrationId.trim();
+    const reason = keyGrantReason.trim();
+    if (!selectedKey || !kind || !Number.isFinite(amount) || amount <= 0 || !migration || !reason) {
+      toast('error', '请选择 Key，并填写资源类型、正整数额度、迁移 ID 和原因');
+      return;
+    }
+    setConfirmAction({
+      kind: 'key-allocate',
+      key: selectedKey,
+      resourceKind: kind,
+      amount,
+      migrationId: migration,
+      reason,
+    });
+  };
+
   const confirmMutation = async () => {
     if (!confirmAction) return;
     const action = confirmAction;
@@ -241,7 +306,7 @@ export default function CoreAdminPanel({
         () => api.core.apiKeyRevoke(adminApiKey.trim(), action.key.id),
         `Key「${action.key.name}」已撤销`,
       );
-    } else {
+    } else if (action.kind === 'grant') {
       await runMutation(
         () => api.core.quotaGrant(adminApiKey.trim(), action.userId, action.resourceKind, action.amount, action.reason),
         `已向 ${action.userId} 增加 ${action.amount} 点 ${action.resourceKind} 额度`,
@@ -249,6 +314,31 @@ export default function CoreAdminPanel({
       setGrantAmount('');
       setGrantReason('');
       await readBalance(action.userId, action.resourceKind);
+    } else if (action.kind === 'key-grant') {
+      await runMutation(
+        () => api.core.keyQuotaGrant(adminApiKey.trim(), action.key.id, action.resourceKind, action.amount, action.reason),
+        `已向 Key ${action.key.prefix} 增加 ${action.amount} 点 ${action.resourceKind} 额度`,
+      );
+      setKeyGrantAmount('');
+      setKeyGrantReason('');
+      await readKeyBalance(action.key.id, action.resourceKind);
+    } else {
+      await runMutation(
+        () => api.core.keyQuotaAllocateLegacy(
+          adminApiKey.trim(),
+          action.key.user_id,
+          action.key.id,
+          action.resourceKind,
+          action.amount,
+          action.migrationId,
+          action.reason,
+        ),
+        `已向 Key ${action.key.prefix} 迁移 ${action.amount} 点 legacy 额度`,
+      );
+      setKeyGrantAmount('');
+      setKeyGrantReason('');
+      setMigrationId('');
+      await readKeyBalance(action.key.id, action.resourceKind);
     }
   };
 
@@ -382,6 +472,19 @@ export default function CoreAdminPanel({
               <button className="btn-outline flex items-center justify-center gap-1 !px-3 text-xs" onClick={() => void grantQuota()} disabled={busy || !hasAdminKey}><Plus size={14} />发放</button>
             </div>
             {balance && <div className="mb-3 flex flex-wrap gap-2 text-xs"><Badge tone="green">可用 {balance.available}</Badge><Badge tone="amber">占用 {balance.held}</Badge><span className="self-center text-slate-400">{balance.user_id} / {balance.resource_kind}</span></div>}
+            <div className="mb-3 grid gap-2 rounded-lg border border-brand-100 bg-brand-50/40 p-3 dark:border-brand-900/40 dark:bg-brand-950/20 sm:grid-cols-[minmax(12rem,1fr)_8rem_auto] sm:items-end">
+              <label className="text-xs text-slate-500">Key<select className="input mt-1" value={selectedKeyId} onChange={(event) => { setSelectedKeyId(event.target.value); const key = keys.find((item) => item.id === event.target.value); if (key) setSelectedUserId(key.user_id); }}><option value="">请选择 Key</option>{keys.map((key) => <option key={key.id} value={key.id}>{key.prefix} · {key.name}（{key.user_id}）</option>)}</select></label>
+              <span className="text-xs text-slate-500">{selectedKey ? <><span className="block font-mono">{selectedKey.prefix}</span><span>{selectedKey.scopes.length ? selectedKey.scopes.join(', ') : '无 scope'}</span></> : '未选择 Key'}</span>
+              <button className="btn-ghost !px-3 text-xs" onClick={() => void readKeyBalance()} disabled={!selectedKey || !hasAdminKey}>{keyQuotaActionLabel('balance')}</button>
+            </div>
+            <div className="mb-3 grid gap-2 rounded-lg border border-brand-100 bg-brand-50/40 p-3 dark:border-brand-900/40 dark:bg-brand-950/20 sm:grid-cols-[8rem_1fr_10rem_auto_auto] sm:items-end">
+              <label className="text-xs text-slate-500">Key 额度<input className="input mt-1" type="number" min={1} value={keyGrantAmount} onChange={(event) => setKeyGrantAmount(event.target.value)} placeholder="100" /></label>
+              <label className="text-xs text-slate-500">原因<input className="input mt-1" value={keyGrantReason} onChange={(event) => setKeyGrantReason(event.target.value)} placeholder="Key 初始额度 / 迁移说明" /></label>
+              <label className="text-xs text-slate-500">迁移 ID<input className="input mt-1" value={migrationId} onChange={(event) => setMigrationId(event.target.value)} placeholder="legacy-2026-09" /></label>
+              <button className="btn-outline flex items-center justify-center gap-1 !px-3 text-xs" onClick={grantKeyQuota} disabled={busy || !selectedKey || !hasAdminKey}><Plus size={14} />{keyQuotaActionLabel('grant')}</button>
+              <button className="btn-ghost !px-3 text-xs" onClick={allocateLegacyQuota} disabled={busy || !selectedKey || !hasAdminKey}>{keyQuotaActionLabel('allocate')}</button>
+            </div>
+            {keyBalance && selectedKey && <div className="mb-3 flex flex-wrap gap-2 text-xs"><Badge tone="green">Key 可用 {keyBalance.available}</Badge><Badge tone="amber">held {keyBalance.held}</Badge><Badge tone="blue">settled {keyBalance.settled}</Badge><Badge tone={keyBalance.migration_state === 'ready' ? 'green' : 'amber'}>{keyBalance.migration_state}</Badge><span className="self-center text-slate-400">{selectedKey.prefix} · {keyBalance.scope} · v{keyBalance.version}</span></div>}
             <div className="overflow-x-auto">
               <table className="w-full text-sm"><thead><tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400"><th className="pb-2 pr-3">ID</th><th className="pb-2 pr-3">名称</th><th className="pb-2 pr-3">角色</th><th className="pb-2 pr-3">状态</th><th className="pb-2 pr-3">更新时间</th><th className="pb-2">操作</th></tr></thead><tbody>{users.map((user) => <tr key={user.id} className="row-hover border-b border-slate-100 last:border-0 dark:border-zinc-800"><td className="py-2 pr-3 font-mono text-xs">{user.id}</td><td className="py-2 pr-3">{user.name}</td><td className="py-2 pr-3"><Badge tone={user.role === 'admin' ? 'violet' : 'slate'}>{user.role}</Badge></td><td className="py-2 pr-3"><Badge tone={statusTone(user.status)}>{user.status}</Badge></td><td className="py-2 pr-3 text-xs text-slate-400">{formatTime(user.updated_at_ms)}</td><td className="py-2"><button className="btn-ghost !px-2 text-xs" onClick={() => setConfirmAction({ kind: 'user', user, active: user.status !== 'active' })}>{user.status === 'active' ? '禁用' : '启用'}</button></td></tr>)}</tbody></table>
               {users.length === 0 && <p className="py-4 text-center text-xs text-slate-400">暂无用户，或管理员 Key 尚未加载。</p>}
@@ -398,14 +501,18 @@ export default function CoreAdminPanel({
       <Modal
         open={confirmAction != null}
         onClose={() => setConfirmAction(null)}
-        title={confirmAction?.kind === 'key' ? '确认撤销 Core Key' : confirmAction?.kind === 'grant' ? '确认发放 Core 额度' : '确认变更用户状态'}
+        title={confirmAction?.kind === 'key' ? '确认撤销 Core Key' : confirmAction?.kind === 'grant' ? '确认发放 Core 额度' : confirmAction?.kind === 'key-grant' ? '确认发放 Key 额度' : confirmAction?.kind === 'key-allocate' ? '确认迁移 legacy 额度' : '确认变更用户状态'}
         footer={<><button className="btn-ghost" onClick={() => setConfirmAction(null)}>取消</button><button className="btn-danger" onClick={() => void confirmMutation()}>确认</button></>}
       >
         {confirmAction?.kind === 'key'
           ? <>将撤销「{confirmAction.key.name}」（{confirmAction.key.prefix}），撤销后不能恢复。</>
           : confirmAction?.kind === 'grant'
             ? <>将向用户「{confirmAction.userId}」发放 {confirmAction.amount} 点「{confirmAction.resourceKind}」额度。原因：{confirmAction.reason}</>
-            : <>将{confirmAction?.active ? '启用' : '禁用'}用户「{confirmAction?.user.name}」。最后一个管理员或当前管理员不能被禁用。</>}
+            : confirmAction?.kind === 'key-grant'
+              ? <>将向 Key「{confirmAction.key.prefix}」发放 {confirmAction.amount} 点「{confirmAction.resourceKind}」额度。原因：{confirmAction.reason}</>
+              : confirmAction?.kind === 'key-allocate'
+                ? <>将从用户「{confirmAction.key.user_id}」的 legacy 额度向 Key「{confirmAction.key.prefix}」迁移 {confirmAction.amount} 点。迁移 ID：{confirmAction.migrationId}；原因：{confirmAction.reason}</>
+                : <>将{confirmAction?.active ? '启用' : '禁用'}用户「{confirmAction?.user.name}」。最后一个管理员或当前管理员不能被禁用。</>}
       </Modal>
 
       <Modal

@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
-use aiwork_core::{CoreStore, NewUser, Principal, QuotaGrant, UserRole};
+use aiwork_core::{
+    CoreStore, KeyQuotaGrant, LegacyQuotaAllocation, NewUser, Principal, QuotaGrant, UserRole,
+};
 use serde::Serialize;
 use tauri::State;
 
@@ -35,6 +37,22 @@ pub struct CoreQuotaBalanceResponse {
     pub resource_kind: String,
     pub available: i64,
     pub held: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoreKeyQuotaBalanceResponse {
+    pub account_id: String,
+    pub scope: String,
+    pub user_id: String,
+    pub api_key_id: Option<String>,
+    pub resource_kind: String,
+    pub available: i64,
+    pub held: i64,
+    pub settled: i64,
+    pub version: i64,
+    pub enabled: bool,
+    pub migration_state: String,
+    pub key_quota_configured: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,6 +149,23 @@ fn api_key_admin_response(view: aiwork_core::CoreApiKeyAdminView) -> CoreApiKeyA
     }
 }
 
+fn key_quota_balance_response(balance: aiwork_core::QuotaBudgetBalance) -> CoreKeyQuotaBalanceResponse {
+    CoreKeyQuotaBalanceResponse {
+        account_id: balance.account_id,
+        scope: balance.scope.as_str().into(),
+        user_id: balance.user_id,
+        api_key_id: balance.api_key_id,
+        resource_kind: balance.resource_kind,
+        available: balance.available,
+        held: balance.held,
+        settled: balance.settled,
+        version: balance.version,
+        enabled: balance.enabled,
+        migration_state: balance.migration_state.as_str().into(),
+        key_quota_configured: balance.key_quota_configured,
+    }
+}
+
 pub(crate) fn core_users_list_for_store(
     store: &CoreStore,
     admin_api_key: &str,
@@ -188,6 +223,97 @@ pub(crate) fn core_quota_balance_for_store(
         available: balance.available,
         held: balance.held,
     })
+}
+
+pub(crate) fn core_key_quota_grant_for_store(
+    store: &CoreStore,
+    admin_api_key: &str,
+    api_key_id: &str,
+    resource_kind: &str,
+    amount: i64,
+    reason: &str,
+) -> Result<CoreKeyQuotaBalanceResponse, String> {
+    if api_key_id.trim().is_empty() {
+        return Err("api_key_id is required".into());
+    }
+    if resource_kind.trim().is_empty() {
+        return Err("resource_kind is required".into());
+    }
+    if reason.trim().is_empty() {
+        return Err("reason is required".into());
+    }
+    let principal = authenticate_admin(store, admin_api_key)?;
+    store
+        .key_quota_grant_as_admin(
+            &principal,
+            KeyQuotaGrant {
+                api_key_id: api_key_id.into(),
+                resource_kind: resource_kind.into(),
+                amount,
+                actor_user_id: principal.user_id.clone(),
+                reason: reason.into(),
+            },
+        )
+        .map(key_quota_balance_response)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn core_key_quota_balance_for_store(
+    store: &CoreStore,
+    admin_api_key: &str,
+    api_key_id: &str,
+    resource_kind: &str,
+) -> Result<CoreKeyQuotaBalanceResponse, String> {
+    if api_key_id.trim().is_empty() {
+        return Err("api_key_id is required".into());
+    }
+    if resource_kind.trim().is_empty() {
+        return Err("resource_kind is required".into());
+    }
+    let principal = authenticate_admin(store, admin_api_key)?;
+    store
+        .key_quota_balance_as_admin(&principal, api_key_id, resource_kind)
+        .map(key_quota_balance_response)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn core_key_quota_allocate_legacy_for_store(
+    store: &CoreStore,
+    admin_api_key: &str,
+    source_user_id: &str,
+    api_key_id: &str,
+    resource_kind: &str,
+    amount: i64,
+    migration_id: &str,
+    reason: &str,
+) -> Result<CoreKeyQuotaBalanceResponse, String> {
+    for (field, value) in [
+        ("source_user_id", source_user_id),
+        ("api_key_id", api_key_id),
+        ("resource_kind", resource_kind),
+        ("migration_id", migration_id),
+        ("reason", reason),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("{field} is required"));
+        }
+    }
+    let principal = authenticate_admin(store, admin_api_key)?;
+    store
+        .key_quota_allocate_legacy_as_admin(
+            &principal,
+            LegacyQuotaAllocation {
+                source_user_id: source_user_id.into(),
+                api_key_id: api_key_id.into(),
+                resource_kind: resource_kind.into(),
+                amount,
+                actor_user_id: principal.user_id.clone(),
+                reason: reason.into(),
+                migration_id: migration_id.into(),
+            },
+        )
+        .map(key_quota_balance_response)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn core_user_set_status_for_store(
@@ -402,6 +528,57 @@ pub fn core_quota_balance(
 }
 
 #[tauri::command]
+pub fn core_key_quota_grant(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    admin_api_key: String,
+    api_key_id: String,
+    resource_kind: String,
+    amount: i64,
+    reason: String,
+) -> Result<CoreKeyQuotaBalanceResponse, String> {
+    let store = core_store_for_admin(&state, &runtime)?;
+    core_key_quota_grant_for_store(&store, &admin_api_key, &api_key_id, &resource_kind, amount, &reason)
+}
+
+#[tauri::command]
+pub fn core_key_quota_balance(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    admin_api_key: String,
+    api_key_id: String,
+    resource_kind: String,
+) -> Result<CoreKeyQuotaBalanceResponse, String> {
+    let store = core_store_for_admin(&state, &runtime)?;
+    core_key_quota_balance_for_store(&store, &admin_api_key, &api_key_id, &resource_kind)
+}
+
+#[tauri::command]
+pub fn core_key_quota_allocate_legacy(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    admin_api_key: String,
+    source_user_id: String,
+    api_key_id: String,
+    resource_kind: String,
+    amount: i64,
+    migration_id: String,
+    reason: String,
+) -> Result<CoreKeyQuotaBalanceResponse, String> {
+    let store = core_store_for_admin(&state, &runtime)?;
+    core_key_quota_allocate_legacy_for_store(
+        &store,
+        &admin_api_key,
+        &source_user_id,
+        &api_key_id,
+        &resource_kind,
+        amount,
+        &migration_id,
+        &reason,
+    )
+}
+
+#[tauri::command]
 pub fn core_user_set_status(
     state: State<'_, AppState>,
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
@@ -428,12 +605,13 @@ pub fn core_api_key_revoke(
 mod tests {
     use std::{collections::BTreeSet, fs};
 
-    use aiwork_core::{CoreStore, NewUser, UserRole};
+    use aiwork_core::{CoreStore, NewUser, QuotaGrant, UserRole};
 
     use super::{
         authenticate_admin, core_api_key_revoke_for_store, core_api_keys_list_for_store,
-        core_quota_balance_for_store, core_user_set_status_for_store, core_users_list_for_store,
-        core_video_jobs_list_for_store,
+        core_key_quota_allocate_legacy_for_store, core_key_quota_balance_for_store,
+        core_key_quota_grant_for_store, core_quota_balance_for_store, core_user_set_status_for_store,
+        core_users_list_for_store, core_video_jobs_list_for_store,
     };
 
     #[test]
@@ -530,6 +708,9 @@ mod tests {
             "commands::core::core_api_keys_list",
             "commands::core::core_video_jobs_list",
             "commands::core::core_quota_balance",
+            "commands::core::core_key_quota_grant",
+            "commands::core::core_key_quota_balance",
+            "commands::core::core_key_quota_allocate_legacy",
             "commands::core::core_user_set_status",
             "commands::core::core_api_key_revoke",
         ] {
@@ -566,6 +747,73 @@ mod tests {
         assert!(core_video_jobs_list_for_store(&store, &user_key.plaintext, None, Some(10)).is_err());
         assert!(core_video_jobs_list_for_store(&store, &admin_key.plaintext, None, Some(501)).is_err());
         assert!(core_video_jobs_list_for_store(&store, &admin_key.plaintext, Some("invalid".into()), Some(10)).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn key_quota_commands_require_admin_scope_and_are_idempotent_without_key_material() {
+        let dir = std::env::temp_dir().join(format!("aiwork-command-key-quota-{}", rand::random::<u64>()));
+        let store = CoreStore::open(&dir).unwrap();
+        store.migrate().unwrap();
+        store
+            .create_user(NewUser { id: "admin".into(), name: "Admin".into(), role: UserRole::Admin }, "bootstrap")
+            .unwrap();
+        store
+            .create_user(NewUser { id: "user".into(), name: "User".into(), role: UserRole::User }, "admin")
+            .unwrap();
+        store
+            .create_user(NewUser { id: "other".into(), name: "Other".into(), role: UserRole::User }, "admin")
+            .unwrap();
+        let admin_key = store
+            .issue_api_key("admin", "admin", BTreeSet::from(["admin:*".into()]), "bootstrap")
+            .unwrap();
+        let user_key = store
+            .issue_api_key("user", "worker", BTreeSet::new(), "admin")
+            .unwrap();
+        let other_key = store
+            .issue_api_key("other", "other", BTreeSet::new(), "admin")
+            .unwrap();
+        store
+            .grant(QuotaGrant {
+                user_id: "user".into(),
+                resource_kind: "chat_request".into(),
+                amount: 8,
+                actor_user_id: "admin".into(),
+                reason: "legacy pool".into(),
+            })
+            .unwrap();
+
+        assert!(core_key_quota_grant_for_store(
+            &store, &user_key.plaintext, &user_key.id, "chat_request", 1, "forged"
+        )
+        .is_err());
+        assert!(core_key_quota_grant_for_store(
+            &store, &admin_key.plaintext, &user_key.id, "chat_request", 1, ""
+        )
+        .is_err());
+        assert!(core_key_quota_grant_for_store(
+            &store, &admin_key.plaintext, &user_key.id, "chat_request", 0, "invalid"
+        )
+        .is_err());
+
+        let first = core_key_quota_allocate_legacy_for_store(
+            &store, &admin_key.plaintext, "user", &user_key.id, "chat_request", 5, "migration-1", "split legacy"
+        )
+        .unwrap();
+        let second = core_key_quota_allocate_legacy_for_store(
+            &store, &admin_key.plaintext, "user", &user_key.id, "chat_request", 5, "migration-1", "split legacy"
+        )
+        .unwrap();
+        assert_eq!(first.available, 5);
+        assert_eq!(first.account_id, second.account_id);
+        assert_eq!(first.migration_state, "ready");
+        assert!(core_key_quota_balance_for_store(
+            &store, &admin_key.plaintext, &other_key.id, "chat_request"
+        )
+        .is_err());
+        let serialized = serde_json::to_string(&first).unwrap();
+        assert!(!serialized.contains(&user_key.plaintext));
+        assert!(!serialized.contains("key_digest"));
         let _ = fs::remove_dir_all(dir);
     }
 }

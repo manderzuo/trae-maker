@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { coreJobTone, normalizeCoreScopes } from './CoreAdminPanel';
+import { coreJobTone, keyQuotaActionLabel, normalizeCoreScopes } from './CoreAdminPanel';
 
 describe('CoreAdminPanel helpers', () => {
   it('normalizes and de-duplicates comma-separated scopes', () => {
@@ -14,5 +14,11 @@ describe('CoreAdminPanel helpers', () => {
     expect(coreJobTone('unknown')).toBe('amber');
     expect(coreJobTone('failed')).toBe('red');
     expect(coreJobTone('unexpected')).toBe('slate');
+  });
+
+  it('describes key-budget actions without exposing key material', () => {
+    expect(keyQuotaActionLabel('grant')).toBe('发放 Key 额度');
+    expect(keyQuotaActionLabel('allocate')).toBe('迁移 legacy 额度');
+    expect(keyQuotaActionLabel('balance')).toBe('查看 Key 余额');
   });
 });

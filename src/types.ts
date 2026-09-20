@@ -568,6 +568,21 @@ export interface CoreQuotaBalanceResponse {
   held: number;
 }
 
+export interface CoreKeyQuotaBalanceResponse {
+  account_id: string;
+  scope: 'key' | 'user_cap' | string;
+  user_id: string;
+  api_key_id: string | null;
+  resource_kind: string;
+  available: number;
+  held: number;
+  settled: number;
+  version: number;
+  enabled: boolean;
+  migration_state: 'ready' | 'legacy_unassigned' | 'reconcile_required' | string;
+  key_quota_configured: boolean;
+}
+
 export interface ConversationSummary {
   conversation_id: string;
   model: string;

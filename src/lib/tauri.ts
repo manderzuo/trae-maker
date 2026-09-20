@@ -83,6 +83,7 @@ import type {
   TraeInstanceView,
   CoreApiKeyAdminView,
   CoreIssuedApiKeyResponse,
+  CoreKeyQuotaBalanceResponse,
   CoreQuotaBalanceResponse,
   CoreSchedulerStatus,
   CoreStatus,
@@ -312,6 +313,44 @@ export const api = {
         userId,
         resourceKind,
         amount,
+        reason,
+      }),
+    keyQuotaGrant: (
+      adminApiKey: string,
+      apiKeyId: string,
+      resourceKind: string,
+      amount: number,
+      reason: string,
+    ) =>
+      invoke<CoreKeyQuotaBalanceResponse>('core_key_quota_grant', {
+        adminApiKey,
+        apiKeyId,
+        resourceKind,
+        amount,
+        reason,
+      }),
+    keyQuotaBalance: (adminApiKey: string, apiKeyId: string, resourceKind: string) =>
+      invoke<CoreKeyQuotaBalanceResponse>('core_key_quota_balance', {
+        adminApiKey,
+        apiKeyId,
+        resourceKind,
+      }),
+    keyQuotaAllocateLegacy: (
+      adminApiKey: string,
+      sourceUserId: string,
+      apiKeyId: string,
+      resourceKind: string,
+      amount: number,
+      migrationId: string,
+      reason: string,
+    ) =>
+      invoke<CoreKeyQuotaBalanceResponse>('core_key_quota_allocate_legacy', {
+        adminApiKey,
+        sourceUserId,
+        apiKeyId,
+        resourceKind,
+        amount,
+        migrationId,
         reason,
       }),
   },

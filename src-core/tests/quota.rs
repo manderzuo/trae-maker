@@ -474,6 +474,126 @@ fn user_quota_usage_projection_is_owner_scoped_bounded_and_redacted() {
 }
 
 #[test]
+fn key_quota_usage_projection_exposes_effective_boundaries_without_cross_key_leakage() {
+    let (store, dir) = test_store_with_grant(100);
+    let key_a = store
+        .issue_api_key(
+            "u1",
+            "usage-a",
+            std::collections::BTreeSet::from(["usage:read".to_owned()]),
+            "admin-1",
+        )
+        .unwrap();
+    let key_b = store
+        .issue_api_key(
+            "u1",
+            "usage-b",
+            std::collections::BTreeSet::from(["usage:read".to_owned()]),
+            "admin-1",
+        )
+        .unwrap();
+    let admin_key = store
+        .issue_api_key("admin-1", "admin", Default::default(), "admin-1")
+        .unwrap();
+    let admin = Principal {
+        user_id: "admin-1".into(),
+        key_id: admin_key.id,
+        scopes: Default::default(),
+    };
+    store
+        .key_quota_allocate_legacy_as_admin(
+            &admin,
+            LegacyQuotaAllocation {
+                source_user_id: "u1".into(),
+                api_key_id: key_a.id.clone(),
+                resource_kind: "chat_request".into(),
+                amount: 60,
+                actor_user_id: "forged".into(),
+                reason: "public usage test".into(),
+                migration_id: "usage-migration".into(),
+            },
+        )
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: key_b.id.clone(),
+                resource_kind: "chat_request".into(),
+                amount: 7,
+                actor_user_id: "forged".into(),
+                reason: "other key secret".into(),
+            },
+        )
+        .unwrap();
+
+    let owner_a = Principal {
+        user_id: "u1".into(),
+        key_id: key_a.id,
+        scopes: std::collections::BTreeSet::from(["usage:read".to_owned()]),
+    };
+    let view_a = store.key_quota_usage_for_principal(&owner_a, 100).unwrap();
+    assert_eq!(view_a.key_available, Some(60));
+    assert_eq!(view_a.user_cap_available, Some(40));
+    assert!(view_a.key_quota_configured);
+    assert_eq!(view_a.balances[0].available, 40);
+    assert_eq!(view_a.balances[0].held, 0);
+    assert_eq!(view_a.balances[0].settled, 0);
+    assert!(view_a.ledger.iter().all(|entry| entry.request_id.is_none()));
+    let serialized = serde_json::to_string(&view_a).unwrap();
+    assert!(!serialized.contains("other key secret"));
+    assert!(!serialized.contains(&key_b.id));
+
+    let owner_b = Principal {
+        user_id: "u1".into(),
+        key_id: key_b.id,
+        scopes: std::collections::BTreeSet::from(["usage:read".to_owned()]),
+    };
+    let view_b = store.key_quota_usage_for_principal(&owner_b, 100).unwrap();
+    assert_eq!(view_b.key_available, Some(7));
+    assert_eq!(view_b.user_cap_available, Some(40));
+    assert_eq!(view_b.balances[0].available, 7);
+
+    store.create_user(user("u3", UserRole::User), "admin-1").unwrap();
+    let key_c = store
+        .issue_api_key(
+            "u3",
+            "usage-c",
+            std::collections::BTreeSet::from(["usage:read".to_owned()]),
+            "admin-1",
+        )
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: key_c.id.clone(),
+                resource_kind: "chat_request".into(),
+                amount: 9,
+                actor_user_id: "forged".into(),
+                reason: "no user cap".into(),
+            },
+        )
+        .unwrap();
+    let view_c = store
+        .key_quota_usage_for_principal(
+            &Principal {
+                user_id: "u3".into(),
+                key_id: key_c.id,
+                scopes: std::collections::BTreeSet::from(["usage:read".to_owned()]),
+            },
+            100,
+        )
+        .unwrap();
+    assert_eq!(view_c.key_available, Some(9));
+    assert_eq!(view_c.user_cap_available, None);
+    assert_eq!(view_c.balances[0].available, 9);
+
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn key_grant_rejects_cross_user_key_and_non_positive_amount() {
     let (store, dir) = test_store_with_grant(20);
     store.create_user(user("u2", UserRole::User), "admin-1").unwrap();

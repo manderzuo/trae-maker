@@ -810,14 +810,20 @@ pub struct QuotaBalance {
     pub held: i64,
 }
 
-/// User-scoped quota projection for the public `usage:read` endpoint.
+/// Quota projection for the public `usage:read` endpoint.
 ///
+/// The public route uses the current API key projection. The optional
+/// boundary fields are populated when the projection has one resource kind;
+/// the legacy user-only projection leaves them absent for compatibility.
 /// This intentionally contains no actor, reason, ledger entry id, prompt,
 /// digest, credential or upstream-account fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreQuotaUsageView {
     pub balances: Vec<CoreQuotaBalanceView>,
     pub ledger: Vec<CoreQuotaLedgerView>,
+    pub key_available: Option<i64>,
+    pub user_cap_available: Option<i64>,
+    pub key_quota_configured: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

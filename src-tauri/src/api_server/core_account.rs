@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aiwork_core::{require_scope, CoreQuotaUsageView, Principal};
+use aiwork_core::{require_scope, CoreError, CoreQuotaUsageView, Principal};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -21,6 +21,7 @@ enum UsageError {
     Unauthorized,
     InsufficientScope,
     InvalidLimit,
+    KeyQuotaNotConfigured,
 }
 
 fn validate_usage_request(
@@ -46,6 +47,9 @@ fn usage_payload(view: &CoreQuotaUsageView, limit: usize) -> Value {
         "balances": &view.balances,
         "ledger": &view.ledger,
         "limit": limit,
+        "key_available": view.key_available,
+        "user_cap_available": view.user_cap_available,
+        "key_quota_configured": view.key_quota_configured,
     })
 }
 
@@ -70,6 +74,11 @@ fn usage_error_response(error: UsageError) -> Response {
             StatusCode::BAD_REQUEST,
             "invalid_usage_limit",
             "limit must be between 1 and 100",
+        ),
+        UsageError::KeyQuotaNotConfigured => (
+            StatusCode::CONFLICT,
+            "key_quota_not_configured",
+            "Core key quota is not configured or requires migration",
         ),
     };
     (
@@ -115,8 +124,21 @@ pub(crate) async fn usage(
     let Some(principal) = principal else {
         return usage_error_response(UsageError::Unauthorized);
     };
-    match bridge.store.quota_usage_for_principal(principal, limit) {
+    match bridge.store.key_quota_usage_for_principal(principal, limit) {
         Ok(view) => Json(usage_payload(&view, limit)).into_response(),
+        Err(CoreError::KeyQuotaNotConfigured { .. } | CoreError::QuotaMigrationPending { .. }) => {
+            usage_error_response(UsageError::KeyQuotaNotConfigured)
+        }
+        Err(CoreError::InvalidConfiguration { ref key, .. })
+            if key == "quota_budget_accounts.version" =>
+        {
+            usage_error_response(UsageError::KeyQuotaNotConfigured)
+        }
+        Err(CoreError::Validation { ref field, .. })
+            if field == "quota_budget_account.enabled" =>
+        {
+            usage_error_response(UsageError::KeyQuotaNotConfigured)
+        }
         Err(_) => usage_storage_error_response(),
     }
 }
@@ -152,6 +174,9 @@ mod tests {
                 request_id: Some("request-1".into()),
                 created_at_ms: 1,
             }],
+            key_available: Some(8),
+            user_cap_available: Some(5),
+            key_quota_configured: true,
         }
     }
 
@@ -185,10 +210,13 @@ mod tests {
     }
 
     #[test]
-    fn usage_payload_contains_only_the_user_scoped_projection() {
+    fn usage_payload_contains_only_the_key_scoped_projection() {
         let payload = usage_payload(&view(), 1);
         assert_eq!(payload["object"], "user_usage");
         assert_eq!(payload["limit"], 1);
+        assert_eq!(payload["key_available"], 8);
+        assert_eq!(payload["user_cap_available"], 5);
+        assert_eq!(payload["key_quota_configured"], true);
         assert_eq!(payload["balances"][0]["held"], 2);
         assert_eq!(payload["balances"][0]["settled"], 4);
         let serialized = serde_json::to_string(&payload).unwrap();
@@ -196,5 +224,11 @@ mod tests {
             assert!(!serialized.contains(forbidden), "usage payload leaked {forbidden}");
         }
         assert!(matches!(payload, Value::Object(_)));
+    }
+
+    #[test]
+    fn usage_error_maps_key_budget_configuration_to_conflict() {
+        let response = usage_error_response(UsageError::KeyQuotaNotConfigured);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }
