@@ -70,3 +70,36 @@ Cargo 测试使用 `CARGO_TARGET_DIR=D:\gpt\aiwork-key-limits-cargo-target`；�
   失败信息指向 legacy asset 文件缺失或 hash 校验预期，与本任务 Key 模型改动无关；按文件范围要求未修改相关文件。
 - 当前 Rust 工具链未安装 `rustfmt` 组件，因此无法执行格式检查命令；编译、focused/full 测试和 `git diff --check` 已完成。
 - Cargo 初始联网解析受不可用本地代理阻断，后续使用已有本地依赖缓存离线完成验证。
+
+## 修复轮次 1（审查反馈）
+
+### 处理内容
+
+- 在 `KeyLimits` 中增加 `max_video_jobs: Option<usize>`，上限归一化与其他继承型并发字段一致；旧 JSON 缺失时默认为 `None`。
+- `ResolvedKey` 通过其 `limits` 策略快照携带 `max_video_jobs`；TypeScript `KeyLimits` mirror 同步增加 `number | null` 字段。
+- 保留 `KeyCapabilities = Vec<String>`，因为能力集合以字符串落盘且后续可能扩展；不采用会让旧/未来值反序列化失败的 Rust 枚举。通过同一归一化入口过滤未知值并去重，反序列化、认证快照和 `save` 都执行；显式空列表仍保持空，不被当作旧字段缺失。
+- 增加非空 legacy Key 认证测试、显式空 capability 列表保存/读取测试、能力归一化持久化测试，以及 `max_video_jobs` 的默认、上限和 ResolvedKey 传递断言。
+
+### 修复轮次测试命令及结果
+
+1. RED：
+
+   `cargo test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml api_keys -- --nocapture`
+
+   新测试先运行，因 `max_video_jobs` 字段和安全上限常量缺失而编译失败。
+
+2. GREEN focused：
+
+   同一命令通过：`15 passed; 0 failed`；Cargo target 仍为 `D:\gpt\aiwork-key-limits-cargo-target`。
+
+3. 前端复核：
+
+   `node_modules\\.bin\\tsc.cmd --noEmit`：通过。
+
+   `node_modules\\.bin\\vitest.cmd run`：`5 files passed; 29 tests passed`。
+
+4. 完整 Rust 套件：
+
+   `cargo test --offline --manifest-path E:\AIWORK\workspace\TraeWorkAssistant\src-tauri\Cargo.toml`
+
+   `464 passed; 4 ignored; 3 failed`。仍是原有三个 `core_migration` legacy asset/hash 测试，失败位置和原因未变；无新增失败。

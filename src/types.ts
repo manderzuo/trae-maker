@@ -772,6 +772,7 @@ export type KeyCapabilities = KeyCapability[];
 /** Key 级限流与每日额度；null 表示跟随全局默认，daily_* 为 0 表示不限。 */
 export interface KeyLimits {
   max_inflight: number | null;
+  max_video_jobs: number | null;
   asset_uploads_per_minute: number | null;
   asset_bytes_per_hour: number | null;
   video_submissions_per_minute: number | null;
