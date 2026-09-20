@@ -19,6 +19,37 @@ pub(crate) struct SeedanceChatError {
     message: String,
 }
 
+pub(crate) fn append_inline_image_asset_ids(
+    video_input: &mut Value,
+    asset_ids: impl IntoIterator<Item = String>,
+) -> Result<(), SeedanceChatError> {
+    let object = video_input.as_object_mut().ok_or_else(|| {
+        SeedanceChatError::new("seedance_prompt_required", "Seedance 视频输入必须是 JSON 对象")
+    })?;
+    let existing = object
+        .entry("image_asset_ids")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let ids = existing.as_array_mut().ok_or_else(|| {
+        SeedanceChatError::new("seedance_asset_invalid", "image_asset_ids 必须是字符串数组")
+    })?;
+    for id in asset_ids {
+        if id.trim().is_empty() {
+            return Err(SeedanceChatError::new(
+                "seedance_asset_invalid",
+                "内联图片素材 ID 不能为空",
+            ));
+        }
+        ids.push(Value::String(id));
+    }
+    if ids.len() > 10 {
+        return Err(SeedanceChatError::new(
+            "seedance_asset_invalid",
+            "图片素材最多 10 个",
+        ));
+    }
+    Ok(())
+}
+
 impl SeedanceChatError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self { code, message: message.into() }
@@ -184,6 +215,12 @@ fn parse_inline_image(url: &str) -> Result<InlineImage, SeedanceChatError> {
             "参考图内容不能为空",
         ));
     }
+    if bytes.len() > super::assets::MAX_ASSET_BYTES {
+        return Err(SeedanceChatError::new(
+            "seedance_inline_image_too_large",
+            format!("参考图超过 {} MiB 限制", super::assets::MAX_ASSET_BYTES / (1024 * 1024)),
+        ));
+    }
     Ok(InlineImage { mime_type: mime_type.to_string(), bytes })
 }
 
@@ -273,5 +310,41 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(error.code(), "seedance_inline_image_invalid");
+    }
+
+    #[test]
+    fn merges_inline_asset_ids_without_dropping_explicit_assets() {
+        let mut input = serde_json::json!({
+            "model": "seedance",
+            "prompt": "动画",
+            "image_asset_ids": ["asset-explicit"]
+        });
+        append_inline_image_asset_ids(&mut input, vec!["asset-inline".into()]).unwrap();
+        assert_eq!(
+            input["image_asset_ids"],
+            serde_json::json!(["asset-explicit", "asset-inline"])
+        );
+    }
+
+    #[test]
+    fn rejects_more_than_ten_combined_image_assets() {
+        let mut input = serde_json::json!({
+            "model": "seedance",
+            "prompt": "动画",
+            "image_asset_ids": [
+                "asset-1", "asset-2", "asset-3", "asset-4", "asset-5",
+                "asset-6", "asset-7", "asset-8", "asset-9", "asset-10"
+            ]
+        });
+        let error = append_inline_image_asset_ids(&mut input, vec!["asset-11".into()]).unwrap_err();
+        assert_eq!(error.code(), "seedance_asset_invalid");
+    }
+
+    #[test]
+    fn rejects_inline_image_larger_than_asset_limit() {
+        let encoded = STANDARD.encode(vec![0_u8; super::super::assets::MAX_ASSET_BYTES + 1]);
+        let error = parse_inline_image(&format!("data:image/png;base64,{encoded}"))
+            .expect_err("oversized inline image must be rejected");
+        assert_eq!(error.code(), "seedance_inline_image_too_large");
     }
 }

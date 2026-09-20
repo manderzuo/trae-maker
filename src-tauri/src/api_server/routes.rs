@@ -4,10 +4,11 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 
 use aiwork_core::{
@@ -26,6 +27,9 @@ use super::core_video::{VideoAdapterOutcome, VideoCancelOutcome, VideoExecutionR
 use super::core_stream::core_stream_chat;
 use super::dispatch::{self, DispatchError, TargetPool};
 use super::retry::{retry_plan, RetryAction};
+use super::seedance_chat::{
+    append_inline_image_asset_ids, is_seedance_model, project_chat_to_video, InlineImage,
+};
 use super::sse;
 use super::unified_catalog;
 use super::usage::{extract_tokens, KeyId};
@@ -124,6 +128,13 @@ fn require_legacy_capability(
     capability: &str,
 ) -> Result<KeyLimits, Response> {
     if key_id == "anonymous" {
+        if matches!(capability, api_keys::CAPABILITY_VIDEO | api_keys::CAPABILITY_ASSETS) {
+            return Err(openai_error(
+                StatusCode::UNAUTHORIZED,
+                "api_key_required",
+                "此接口必须使用已启用的 API Key",
+            ));
+        }
         return Ok(KeyLimits::default());
     }
     let Some(policy) = resolved_key else {
@@ -967,6 +978,257 @@ fn public_seedance_model_value(work_available: bool) -> Value {
     })
 }
 
+async fn seedance_chat_completions(
+    state: Arc<ApiSharedState>,
+    key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
+    input: Value,
+) -> Response {
+    if input.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "seedance_stream_unsupported",
+            "Seedance Chat 兼容入口暂不支持 stream=true，请使用非流式请求",
+        );
+    }
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if idempotency_key.is_none() {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "idempotency_key_required",
+            "Seedance Chat 请求必须提供 Idempotency-Key",
+        );
+    }
+    let projection = match project_chat_to_video(&input) {
+        Ok(projection) => projection,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.code(), error.message()),
+    };
+    let mut video_input = projection.video_input;
+    let idempotency_key = idempotency_key.expect("validated above");
+    let owner_key_id = key_id.as_ref().map(|Extension(key)| key.0.as_str());
+    if let Err(error) = persist_seedance_inline_assets(
+        &state,
+        &mut video_input,
+        &projection.inline_images,
+        owner_key_id,
+        principal.as_ref().map(|Extension(value)| value),
+        idempotency_key,
+    ) {
+        return openai_error(StatusCode::BAD_REQUEST, "invalid_asset", &error);
+    }
+    let body = match serde_json::to_vec(&video_input) {
+        Ok(body) => bytes::Bytes::from(body),
+        Err(_) => return internal_error_response(),
+    };
+    let video_response = videos_generations(
+        State(state),
+        key_id,
+        resolved_key,
+        principal,
+        headers,
+        body,
+    )
+    .await;
+    if !video_response.status().is_success() {
+        return video_response;
+    }
+    wrap_seedance_video_response(video_response).await
+}
+
+fn persist_seedance_inline_assets(
+    state: &ApiSharedState,
+    video_input: &mut Value,
+    inline_images: &[InlineImage],
+    legacy_key_id: Option<&str>,
+    core_principal: Option<&Principal>,
+    idempotency_key: &str,
+) -> Result<Vec<String>, String> {
+    if inline_images.is_empty() {
+        return Ok(Vec::new());
+    }
+    let owner = if core_enforcing(state) {
+        core_principal
+            .map(|principal| principal.user_id.as_str())
+            .ok_or_else(|| "Core 模式缺少调用方身份".to_string())?
+    } else {
+        legacy_key_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "参考图上传必须绑定 API Key".to_string())?
+    };
+    let asset_ids = inline_images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let mut seed = Vec::new();
+            seed.extend_from_slice(b"seedance-inline-asset-v1\0");
+            seed.extend_from_slice(state.data_dir.to_string_lossy().as_bytes());
+            seed.push(0);
+            seed.extend_from_slice(owner.as_bytes());
+            seed.push(0);
+            seed.extend_from_slice(idempotency_key.as_bytes());
+            seed.push(0);
+            seed.extend_from_slice(index.to_string().as_bytes());
+            seed.push(0);
+            seed.extend_from_slice(&image.bytes);
+            format!("asset-inline-{:x}", Sha256::digest(seed))
+        })
+        .collect::<Vec<_>>();
+    let candidate_ids = asset_ids.iter().cloned();
+    let mut candidate = video_input.clone();
+    append_inline_image_asset_ids(&mut candidate, candidate_ids)
+        .map_err(|error| error.message().to_string())?;
+
+    let mut persisted_ids = Vec::with_capacity(inline_images.len());
+    for (index, image) in inline_images.iter().enumerate() {
+        let extension = match image.mime_type.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/webp" => "webp",
+            _ => return Err("参考图 MIME 类型不受支持".into()),
+        };
+        let filename = format!("seedance-reference-{}.{}", index + 1, extension);
+        if core_enforcing(state) {
+            let principal = core_principal.ok_or_else(|| "Core 模式缺少调用方身份".to_string())?;
+            let bridge = state
+                .core
+                .as_ref()
+                .ok_or_else(|| "Core 素材服务未启用".to_string())?;
+            if let Some(existing) = bridge
+                .store
+                .asset_for_user(principal, &asset_ids[index])
+                .map_err(|error| format!("Core 参考图查询失败: {error}"))?
+            {
+                assets::read_core(
+                    &state.data_dir,
+                    &existing.storage_ref,
+                    existing.size,
+                    &existing.sha256,
+                )
+                .map_err(|error| format!("Core 参考图校验失败: {error}"))?;
+                persisted_ids.push(existing.id);
+                continue;
+            }
+            let (record, storage_ref) = assets::write_core_asset_with_id(
+                &state.data_dir,
+                &principal.user_id,
+                &asset_ids[index],
+                &filename,
+                Some(&image.mime_type),
+                &image.bytes,
+            )
+            .map_err(|error| format!("参考图保存失败: {error}"))?;
+            let created_at_ms = i64::try_from(record.created_at.saturating_mul(1_000))
+                .map_err(|_| "参考图创建时间无效".to_string())?;
+            let expires_at_ms = i64::try_from(record.expires_at.saturating_mul(1_000))
+                .map_err(|_| "参考图过期时间无效".to_string())?;
+            let input = aiwork_core::CreateAssetInput {
+                id: record.id.clone(),
+                filename: record.filename.clone(),
+                mime_type: record.mime_type.clone(),
+                extension: record.extension.clone(),
+                size: record.size as i64,
+                sha256: record.sha256.clone(),
+                storage_ref: storage_ref.clone(),
+                content_token_digest: assets::content_token_digest(&record.public_token),
+                created_at_ms,
+                expires_at_ms,
+            };
+            if let Err(error) = bridge.store.create_asset(principal, input) {
+                let _ = assets::remove_core_asset(&state.data_dir, &storage_ref);
+                return Err(format!("Core 参考图登记失败: {error}"));
+            }
+            persisted_ids.push(record.id);
+        } else {
+            let owner_key_id = legacy_key_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "参考图上传必须绑定 API Key".to_string())?;
+            let record = assets::create_with_id(
+                &state.data_dir,
+                owner_key_id,
+                &asset_ids[index],
+                &filename,
+                Some(&image.mime_type),
+                &image.bytes,
+            )
+            .map_err(|error| format!("参考图保存失败: {error}"))?;
+            persisted_ids.push(record.id);
+        }
+    }
+    append_inline_image_asset_ids(video_input, persisted_ids.clone())
+        .map_err(|error| error.message().to_string())?;
+    Ok(persisted_ids)
+}
+
+async fn wrap_seedance_video_response(response: Response) -> Response {
+    let status = response.status();
+    let request_id = response.headers().get("x-request-id").cloned();
+    let body = match axum::body::to_bytes(response.into_body(), MAX_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return internal_error_response(),
+    };
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => return internal_error_response(),
+    };
+    let task = payload.get("task").cloned().unwrap_or(payload);
+    let task_id = match task.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+        Some(task_id) => task_id,
+        None => return openai_error(StatusCode::BAD_GATEWAY, "video_task_unavailable", "视频任务响应缺少任务 ID"),
+    };
+    let model = task
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("seedance");
+    let task_status = task
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("queued");
+    let created = task.get("created_at").and_then(Value::as_u64).unwrap_or_else(now_ts);
+    let mut video_task = json!({
+        "id": task_id,
+        "model": model,
+        "status": task_status,
+        "status_endpoint": format!("/v1/videos/{task_id}"),
+    });
+    if task.get("content_url").is_some() {
+        video_task["content_endpoint"] = json!(format!("/v1/videos/{task_id}/content"));
+    }
+    if let Some(updated_at) = task.get("updated_at") {
+        video_task["updated_at"] = updated_at.clone();
+    }
+    let response_body = json!({
+        "id": format!("chatcmpl-{task_id}"),
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "视频任务已提交，完成后可下载"
+            },
+            "finish_reason": "video_async"
+        }],
+        "video_task": video_task,
+    });
+    let mut builder = Response::builder()
+        .status(if status.is_success() { status } else { StatusCode::ACCEPTED })
+        .header("content-type", "application/json");
+    if let Some(request_id) = request_id {
+        builder = builder.header("x-request-id", request_id);
+    }
+    builder
+        .body(Body::from(response_body.to_string()))
+        .unwrap_or_else(|_| internal_error_response())
+}
+
 pub async fn chat_completions(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
@@ -1016,6 +1278,9 @@ pub async fn chat_completions(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    if is_seedance_model(&model) {
+        return seedance_chat_completions(state, key_id, resolved_key, principal, headers, peek).await;
+    }
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
@@ -6229,6 +6494,17 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn anonymous_legacy_video_capability_requires_an_api_key() {
+        let response = require_legacy_capability(
+            "anonymous",
+            None,
+            api_keys::CAPABILITY_VIDEO,
+        )
+        .expect_err("anonymous callers must not access legacy video endpoints");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn legacy_handlers_use_auth_snapshot_and_fail_closed_when_snapshot_is_missing() {
         let (_state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_CHAT]);
@@ -6417,5 +6693,320 @@ mod tests {
             0
         );
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn core_stream_rejects_before_preflight_when_request_limiter_is_full() {
+        let (mut fixture, _) = phase3_stream_fixture(
+            StreamTerminalOutcome::Success {
+                actual_units: None,
+                upstream_request_ref: None,
+            },
+            CancelSupport::Unsupported,
+            true,
+        );
+        Arc::get_mut(&mut fixture.state)
+            .expect("core fixture state should be uniquely owned")
+            .limiter = super::super::limits::RateLimiter::with_config(
+            super::super::limits::LimitConfig {
+                max_inflight: 1,
+                max_video_jobs: 4,
+                asset_uploads_per_minute: 8,
+                asset_bytes_per_hour: 1024,
+                video_submissions_per_minute: 8,
+            },
+        );
+        let held = fixture
+            .state
+            .acquire_request(&fixture.principal.key_id, &KeyLimits::default())
+            .expect("test should fill the Core request limiter");
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "core-stream-limiter-full".parse().unwrap());
+
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            chat_body(true),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "concurrency_limit");
+        assert_eq!(
+            fixture
+                .state
+                .core
+                .as_ref()
+                .unwrap()
+                .store
+                .count_rows("requests")
+                .unwrap(),
+            0
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn seedance_chat_requires_video_scope_in_core_mode() {
+        let fixture = core_fixture(1, &["chat:invoke"]);
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "seedance-scope-test".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            Bytes::from(
+                json!({
+                    "model": "seedance",
+                    "messages": [{"role": "user", "content": "海边日落"}]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "insufficient_scope");
+    }
+
+    #[tokio::test]
+    async fn seedance_chat_rejects_streaming_and_missing_idempotency() {
+        let fixture = core_fixture(1, &["videos:submit"]);
+        let mut stream_headers = HeaderMap::new();
+        stream_headers.insert("idempotency-key", "seedance-stream-test".parse().unwrap());
+        let stream_response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
+            Some(Extension(fixture.principal.clone())),
+            stream_headers,
+            Bytes::from(
+                json!({
+                    "model": "seedance",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "一只猫"}]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(stream_response.status(), StatusCode::BAD_REQUEST);
+        let stream_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(stream_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stream_body["error"]["code"], "seedance_stream_unsupported");
+
+        let missing_key_response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
+            Some(Extension(fixture.principal.clone())),
+            HeaderMap::new(),
+            Bytes::from(
+                json!({
+                    "model": "seedance",
+                    "messages": [{"role": "user", "content": "一只狗"}]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(missing_key_response.status(), StatusCode::BAD_REQUEST);
+        let missing_key_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(missing_key_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(missing_key_body["error"]["code"], "idempotency_key_required");
+    }
+
+    #[tokio::test]
+    async fn seedance_chat_submits_through_core_video_adapter_and_returns_chat_envelope() {
+        let (fixture, _adapter) = phase3_video_fixture(
+            2,
+            vec![VideoAdapterOutcome::Accepted {
+                upstream_request_ref: "mock-seedance-task".into(),
+            }],
+            vec![],
+        );
+        fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .store
+            .upsert_cost_policy(CostPolicy {
+                id: "route-seedance-chat-policy".into(),
+                endpoint: "videos".into(),
+                model_pattern: "seedance".into(),
+                resource_kind: "video_job".into(),
+                reserve_amount: 1,
+                max_actual_amount: Some(1),
+                version: 1,
+                enabled: true,
+            })
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "seedance-chat-success".parse().unwrap());
+        let response = chat_completions(
+            State(fixture.state.clone()),
+            Some(Extension(KeyId(fixture.principal.key_id.clone()))),
+            None,
+            Some(Extension(fixture.principal.clone())),
+            headers,
+            Bytes::from(
+                json!({
+                    "model": " Seedance ",
+                    "messages": [{"role": "user", "content": "一只猫在月光下奔跑"}]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["model"], "seedance");
+        assert_eq!(body["choices"][0]["finish_reason"], "video_async");
+        assert_eq!(body["video_task"]["model"], "seedance");
+        assert_eq!(body["video_task"]["status"], "running");
+    }
+
+    #[test]
+    fn seedance_inline_asset_is_owned_by_the_legacy_api_key() {
+        let (state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_VIDEO]);
+        let projection = super::super::seedance_chat::project_chat_to_video(&json!({
+            "model": "seedance",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "让画面动起来"},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64,iVBORw0KGgo="
+                }}
+            ]}]
+        }))
+        .unwrap();
+        let mut video_input = projection.video_input.clone();
+        let asset_ids = persist_seedance_inline_assets(
+            &state,
+            &mut video_input,
+            &projection.inline_images,
+            Some(&key_id),
+            None,
+            "legacy-inline-test",
+        )
+        .unwrap();
+        assert_eq!(asset_ids.len(), 1);
+        assert_eq!(video_input["image_asset_ids"][0], asset_ids[0]);
+        assert!(super::super::assets::read_owned(&dir, &key_id, &asset_ids[0]).is_ok());
+        assert!(super::super::assets::read_owned(&dir, "another-key", &asset_ids[0]).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn seedance_inline_asset_is_owned_by_the_core_user() {
+        let fixture = core_fixture(1, &["videos:submit"]);
+        let projection = super::super::seedance_chat::project_chat_to_video(&json!({
+            "model": "seedance",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "让画面动起来"},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64,iVBORw0KGgo="
+                }}
+            ]}]
+        }))
+        .unwrap();
+        let mut video_input = projection.video_input.clone();
+        let asset_ids = persist_seedance_inline_assets(
+            &fixture.state,
+            &mut video_input,
+            &projection.inline_images,
+            None,
+            Some(&fixture.principal),
+            "core-inline-test",
+        )
+        .unwrap();
+        let asset = fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .store
+            .asset_for_user(&fixture.principal, &asset_ids[0])
+            .unwrap();
+        assert!(asset.is_some());
+        assert!(fixture
+            .state
+            .core
+            .as_ref()
+            .unwrap()
+            .store
+            .asset_for_user(&fixture.admin, &asset_ids[0])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn repeated_seedance_inline_asset_persistence_reuses_the_same_asset() {
+        let (state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_VIDEO]);
+        let projection = super::super::seedance_chat::project_chat_to_video(&json!({
+            "model": "seedance",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "重复请求"},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64,iVBORw0KGgo="
+                }}
+            ]}]
+        }))
+        .unwrap();
+        let mut first = projection.video_input.clone();
+        let first_ids = persist_seedance_inline_assets(
+            &state,
+            &mut first,
+            &projection.inline_images,
+            Some(&key_id),
+            None,
+            "same-idempotency-key",
+        )
+        .unwrap();
+        let mut second = projection.video_input.clone();
+        let second_ids = persist_seedance_inline_assets(
+            &state,
+            &mut second,
+            &projection.inline_images,
+            Some(&key_id),
+            None,
+            "same-idempotency-key",
+        )
+        .unwrap();
+        assert_eq!(first_ids, second_ids);
+        assert_eq!(first["image_asset_ids"], second["image_asset_ids"]);
+        let index: Value = crate::fs_utils::read_json(&dir.join("data/assets.json"));
+        assert_eq!(index["assets"].as_array().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(dir);
     }
 }

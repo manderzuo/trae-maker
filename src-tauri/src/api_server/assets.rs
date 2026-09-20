@@ -1,8 +1,8 @@
 //! 参考图/参考视频资源暂存层。
 //!
 //! 资源只由 API Key 所有者可见，文件落在可配置的本地目录，不写入日志。
-//! 本模块先负责安全接收和生命周期管理；Trae 原生上传适配器在确认上游
-//! 协议后读取 `read_owned`，不会把本地路径直接转发给上游。
+//! 本模块负责安全接收和生命周期管理；Trae 原生上传适配器读取
+//! `read_owned` 后上传原始字节，不会把本地路径直接转发给上游。
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -188,7 +188,7 @@ fn public_base_url(data_dir: &Path) -> Result<String, String> {
                 .asset_public_base_url;
             (!configured.trim().is_empty()).then_some(configured)
         })
-        .ok_or_else(|| "未配置素材公开基址，不能把素材交给上游读取（设置 AIWORK_ASSET_PUBLIC_BASE_URL 或网关设置页）".to_string())?;
+        .ok_or_else(|| "未配置素材公开基址，不能生成短时查看链接（设置 AIWORK_ASSET_PUBLIC_BASE_URL 或网关设置页）".to_string())?;
     validate_public_base_url(&raw, allow_insecure_asset_base())
 }
 
@@ -320,6 +320,18 @@ pub fn write_core_asset(
     declared_mime: Option<&str>,
     bytes: &[u8],
 ) -> Result<(AssetRecord, String), String> {
+    let id = format!("asset-{}-{}", now_secs(), crate::commands::oauth::random_hex(12));
+    write_core_asset_with_id(data_dir, user_id, &id, filename, declared_mime, bytes)
+}
+
+pub fn write_core_asset_with_id(
+    data_dir: &Path,
+    user_id: &str,
+    id: &str,
+    filename: &str,
+    declared_mime: Option<&str>,
+    bytes: &[u8],
+) -> Result<(AssetRecord, String), String> {
     if user_id.trim().is_empty() {
         return Err("素材上传必须绑定 Core 用户".into());
     }
@@ -327,7 +339,7 @@ pub fn write_core_asset(
     let _guard = index_lock().lock().unwrap_or_else(|error| error.into_inner());
     let now = now_secs();
     let record = AssetRecord {
-        id: format!("asset-{now}-{}", crate::commands::oauth::random_hex(12)),
+        id: id.trim().to_string(),
         owner_key_id: user_id.trim().to_string(),
         filename: safe_filename(filename, extension),
         mime_type: detected_mime.to_string(),
@@ -427,6 +439,18 @@ pub fn create(
     declared_mime: Option<&str>,
     bytes: &[u8],
 ) -> Result<AssetRecord, String> {
+    let id = format!("asset-{}-{}", now_secs(), crate::commands::oauth::random_hex(12));
+    create_with_id(data_dir, owner_key_id, &id, filename, declared_mime, bytes)
+}
+
+pub fn create_with_id(
+    data_dir: &Path,
+    owner_key_id: &str,
+    id: &str,
+    filename: &str,
+    declared_mime: Option<&str>,
+    bytes: &[u8],
+) -> Result<AssetRecord, String> {
     let (detected_mime, extension) = validate_upload_bytes(filename, declared_mime, bytes)?;
 
     let owner = owner_key_id.trim();
@@ -438,7 +462,19 @@ pub fn create(
     let now = now_secs();
     let mut index = load_index(data_dir);
     purge_expired_locked(data_dir, &mut index, now);
-    let id = format!("asset-{now}-{}", crate::commands::oauth::random_hex(12));
+    let id = safe_asset_id(id)?.to_string();
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    if let Some(existing) = index.assets.iter().find(|asset| asset.id == id) {
+        if existing.owner_key_id == owner
+            && existing.mime_type == detected_mime
+            && existing.size == bytes.len() as u64
+            && existing.sha256 == digest
+            && file_path(data_dir, existing).map(|path| path.is_file()).unwrap_or(false)
+        {
+            return Ok(existing.clone());
+        }
+        return Err("素材 ID 已存在且内容或所有权不匹配".into());
+    }
     let record = AssetRecord {
         id,
         owner_key_id: owner.to_string(),
@@ -446,7 +482,7 @@ pub fn create(
         mime_type: detected_mime.to_string(),
         extension: extension.to_string(),
         size: bytes.len() as u64,
-        sha256: format!("{:x}", Sha256::digest(bytes)),
+        sha256: digest,
         created_at: now,
         expires_at: now.saturating_add(asset_ttl_secs()),
         public_token: crate::commands::oauth::random_hex(32),
@@ -494,7 +530,7 @@ pub fn public_url_for_owned(
     ))
 }
 
-/// 通过短时 token 读取素材，供 Trae 上游从公网回取。token 不与 API Key 共用。
+/// 通过短时 token 读取素材，供已授权客户端查看。token 不与 API Key 共用。
 pub fn read_public(
     data_dir: &Path,
     asset_id: &str,
@@ -597,6 +633,7 @@ mod tests {
                 cors_origins: String::new(),
                 asset_public_base_url: "https://example.test/v1/".into(),
                 core_mode: "off".into(),
+                scheduler_mode: "off".into(),
                 limit_defaults: Default::default(),
                 updated_at: 0,
             },

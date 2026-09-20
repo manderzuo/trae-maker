@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -96,7 +97,7 @@ pub async fn bearer_auth(
     // async 调度线程；锁与原子语义不变（verify_and_consume_locked 进程级锁内完成）
     let (auth_required, check) = {
         let data_dir = state.data_dir.clone();
-        let capability = capability_for_path(request.uri().path());
+        let capability = capability_for_request(&mut request).await;
         tokio::task::spawn_blocking(move || {
             let keys: ApiKeysFile = api_keys::load(&data_dir);
             // 存在启用 Key 时必须鉴权；无启用 Key 时由显式开关决定放行或拒绝
@@ -160,6 +161,37 @@ fn capability_for_path(path: &str) -> Option<&'static str> {
         path if path.starts_with("/v1/videos/") => Some(api_keys::CAPABILITY_VIDEO),
         _ => None,
     }
+}
+
+const AUTH_BODY_PEEK_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+async fn capability_for_request(request: &mut Request) -> Option<&'static str> {
+    let path = request.uri().path().to_owned();
+    if path != "/v1/chat/completions" {
+        return capability_for_path(&path);
+    }
+
+    let body = std::mem::take(request.body_mut());
+    match axum::body::to_bytes(body, AUTH_BODY_PEEK_MAX_BYTES).await {
+        Ok(bytes) => {
+            let capability = capability_for_request_body(&path, &bytes);
+            *request.body_mut() = Body::from(bytes);
+            capability
+        }
+        Err(_) => capability_for_path(&path),
+    }
+}
+
+fn capability_for_request_body(path: &str, body: &[u8]) -> Option<&'static str> {
+    if path == "/v1/chat/completions"
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("model").and_then(|model| model.as_str()).map(super::seedance_chat::is_seedance_model))
+            .unwrap_or(false)
+    {
+        return Some(api_keys::CAPABILITY_VIDEO);
+    }
+    capability_for_path(path)
 }
 
 fn capability_not_allowed(capability: &str) -> Response {
@@ -298,8 +330,8 @@ mod tests {
     use axum::{body::Body, http::Request};
 
     use super::{
-        authenticate_enforce_request, is_public_asset_content_path, is_public_liveness_path,
-        require_request_scope,
+        authenticate_enforce_request, capability_for_request_body, is_public_asset_content_path,
+        is_public_liveness_path, require_request_scope,
     };
     use crate::api_server::{CoreBridge, CoreMode};
 
@@ -356,6 +388,24 @@ mod tests {
         assert!(!is_public_asset_content_path("/v1/assets/asset-1"));
         assert!(!is_public_asset_content_path("/v1/assets/../content"));
         assert!(!is_public_asset_content_path("/v1/assets/asset-1/content/extra"));
+    }
+
+    #[test]
+    fn legacy_chat_capability_switches_to_video_for_seedance_model() {
+        assert_eq!(
+            capability_for_request_body(
+                "/v1/chat/completions",
+                br#"{"model":"seedance","messages":[]}"#,
+            ),
+            Some(super::api_keys::CAPABILITY_VIDEO)
+        );
+        assert_eq!(
+            capability_for_request_body(
+                "/v1/chat/completions",
+                br#"{"model":"gpt-4o","messages":[]}"#,
+            ),
+            Some(super::api_keys::CAPABILITY_CHAT)
+        );
     }
 
     #[test]
