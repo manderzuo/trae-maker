@@ -1,5 +1,9 @@
 # Seedance MCP 接入
 
+Seedance 现在也支持直接 HTTP API：MCP/Skill 是可选适配层，不是视频生产的必要条件。
+能读取 `/v1/models` 能力元数据的客户端可以使用同一 Base URL 和 API Key 选择
+`seedance`，再按模型项的 `endpoint` 进入异步视频流程；普通文字客户端仍调用文字端点。
+
 ## 推荐入口：Agent Skill
 
 跨客户端使用时，优先安装仓库内的 `skills/aiwork-seedance`。Skill 本体是
@@ -63,8 +67,9 @@ CC Switch 和 Claude Code。该按钮只更新 `aiwork-seedance` 自有条目，
 `seedance_generate` 必填 `prompt`，默认 5 秒、720p、16:9，可选 `duration`、`resolution`、`ratio`、
 `image_urls`、`video_urls`、`image_paths`、`video_paths`、`image_asset_ids`、
 `video_asset_ids`、`idempotency_key` 和 `download_path`。工具会创建任务并轮询
-至 `completed`/`failed`，优先返回网关缓存的 `content_url`。指定 `download_path` 时，
-视频会以临时文件 + 原子改名方式下载到调用方电脑。
+至 `completed`/`failed`，完成后自动以临时文件 + 原子改名方式下载到调用方电脑的
+`Downloads` 文件夹。指定 `download_path` 可覆盖默认位置；对用户只返回本地文件路径，
+不返回任务查询地址。
 
 ### 本地参考图/参考视频
 
@@ -72,17 +77,12 @@ CC Switch 和 Claude Code。该按钮只更新 `aiwork-seedance` 自有条目，
 逐个上传到网关的 `POST /v1/assets`；网关会检查文件魔数、类型、大小（单个最多
 32 MiB）并按 API Key 隔离。不会扫描目录，也不会把 `C:\` 路径直接发送给 Trae。
 
-上传后视频请求携带 `image_asset_ids` / `video_asset_ids`。要让 Trae 上游读取这些
-素材，网关主机必须显式设置 `AIWORK_ASSET_PUBLIC_BASE_URL`（或在网关设置页填写），指向 Trae 能访问的
-HTTPS 网关前缀，例如 `https://example.com/v1`。生产默认拒绝 HTTP；仅在隔离测试中显式设置
-`AIWORK_ALLOW_INSECURE_ASSET_BASE=true` 才允许。网关生成带随机短时 token 的
-`/v1/assets/<id>/content` 地址，默认 30 分钟后失效（可用 `AIWORK_ASSET_TTL_SECS` 调整，范围 5 分钟至 2 小时）。未设置该变量时，
-素材仍可安全存储，但生成请求会明确返回“未配置公网素材基址”，不会猜测性上传。
-
-本机/局域网地址（`127.0.0.1`、`192.168.x.x`）通常不能被 Trae 云端回取；这两种
-部署要么继续使用 `image_urls` 提供已公开可达的地址，要么待确认 Trae 原生参考图
-上传协议后启用原生上传适配器。公网/腾讯云反向代理场景可把该地址设置为 HTTPS
-域名，并只在用户明确开启时暴露素材端点。
+上传后视频请求携带 `image_asset_ids` / `video_asset_ids`。网关会按当前
+Trae Work 账号执行原生资源上传：请求上传地址、PUT 原始字节、提交上传结果，
+再把返回的 `store_uri` 放入 Seedance 的 `image_urls` / `video_urls`。因此本机、
+局域网和公网部署都不要求 Trae 云端能访问调用方电脑，也不要求配置公网素材基址。
+`AIWORK_ASSET_PUBLIC_BASE_URL` 仍可用于客户端查看临时素材，但不参与 Seedance
+输入图签名。账号切换时会用新账号重新上传，不能复用旧账号的 `store_uri`。
 
 例如 DSH/Claude Code 的工具参数可以直接写：
 
@@ -96,13 +96,30 @@ HTTPS 网关前缀，例如 `https://example.com/v1`。生产默认拒绝 HTTP�
 }
 ```
 
-若客户端只能传 URL，也可以继续使用 `image_urls` / `video_urls`；网关不会替换或
-下载这些外部 URL。
+`image_urls` / `video_urls` 只接受 Trae 原生资源 URI（例如 `tos-cn-...`）。任意
+公网 `https://...` 地址不会直接转发给 Seedance；请先通过 `/v1/assets` 上传，
+再使用返回的资产 ID。这样可以避免上游把公网 URL 当作原生 URI 签名而报
+`invalid uri`，也避免网关主动下载不受信任的外部地址。
 
 ## DSH
 
-DSH 的自定义 Provider 继续配置文字模型的 `/v1` 地址；视频不能仅通过选择模型名实现，
-需要把本桥注册为 DSH 的自定义工具/插件，或直接调用同一个 HTTP 视频端点。
+DSH 的自定义 Provider 继续配置同一个 `/v1` 地址和 API Key。若 DSH 版本支持
+`GET /v1/models` 返回的 `capabilities`/`endpoint` 元数据，选择 `seedance` 后可直接进入
+视频生产流程；若 DSH 只支持固定的 OpenAI 文字协议，则使用本桥、Skill，或直接调用下面的
+视频端点。
+
+```text
+POST {BASE_URL}/videos/generations
+Authorization: Bearer <AIWORK_API_KEY>
+Content-Type: application/json
+
+{"model":"seedance","prompt":"一只猫在窗边看雨，电影感镜头","duration":4,"resolution":"720p","ratio":"16:9"}
+```
+
+底层接口返回任务 ID 后由桥在内部轮询 `GET {BASE_URL}/videos/{task_id}`，完成后读取
+`GET {BASE_URL}/videos/{task_id}/content`。这里的 `{BASE_URL}` 已包含 `/v1`，
+局域网和公网只需替换 Base URL，不需要改 Key 或另配 MCP；正常使用不需要向用户展示
+任务 ID 或查询地址。
 
 ## 存储边界
 
@@ -121,4 +138,25 @@ DSH 的自定义 Provider 继续配置文字模型的 `/v1` 地址；视频不�
 - 默认启用按 Key 的保护：全局并发 32；每个 Key 每分钟最多 30 次素材上传、每小时 256 MiB；每分钟最多 3 次视频提交。可通过
   `AIWORK_MAX_INFLIGHT`、`AIWORK_ASSET_UPLOADS_PER_MINUTE`、`AIWORK_ASSET_BYTES_PER_HOUR`、
   `AIWORK_VIDEO_SUBMISSIONS_PER_MINUTE` 调整，修改后重启网关生效。超限返回 HTTP 429 与 `Retry-After`。
-- 客户端访问地址可以是局域网 HTTP；但给 Trae 云端回取素材的 `AIWORK_ASSET_PUBLIC_BASE_URL` 仍应使用 HTTPS。
+- 客户端访问地址可以是局域网 HTTP；`AIWORK_ASSET_PUBLIC_BASE_URL` 若启用，仅用于
+  客户端查看短时素材内容，生产环境仍应使用 HTTPS。
+# Seedance 与独立 Core
+
+Core 是统一的公网入口和额度中转层。需要参考图或参考视频时，先在 Core 管理界面创建普通 API Key，勾选“视频生成”和“素材上传”，并为该 Key 分配积分；然后把下面的地址和 Key 配置到客户端：
+
+```text
+公网：   https://api.gemstory.cn/v1
+局域网： http://中转机IP/v1
+本机：   http://127.0.0.1:7865/v1
+```
+
+同一个 Core Base URL 和普通 API Key 同时支持文字与视频。文字请求调用 `/chat/completions`；视频请求调用 `/videos/generations`，或在兼容客户端中选择 `model=seedance`。Core 会按请求类型记账，再使用内部 AI Work 桥接配置转发到 AI Work。客户端不需要填写 AI Work 桥接 Key，也不需要把 Core 管理员登录信息放进客户端。
+
+权限建议：
+
+- 纯文字：`chat:invoke`；
+- 纯文字生成视频：`videos:submit`；
+- 带参考图/参考视频：同时勾选 `videos:submit` 和 `assets:write`；
+- 如果客户端只是调用已上传的资产 ID，仍建议保留 `assets:write`，便于 MCP 在本机素材变化后重新上传。
+
+MCP/Skill 不是额度管理入口，而是不能直接调用视频端点的 Agent 的兼容适配层。MCP 会先把本地参考素材上传到 `POST /v1/assets`，再把返回的资产 ID 交给视频接口；不会把本地路径直接发送给上游。Core 会在内部完成素材到 AI Work 原生资源的转换。Seedance Chat 兼容入口不支持 `stream=true`，请关闭流式输出；直接视频端点则由 MCP 内部轮询并自动下载到调用方电脑的 `Downloads` 文件夹，不向最终用户展示查询地址。

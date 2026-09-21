@@ -118,14 +118,47 @@ class SeedanceMcpTests(unittest.TestCase):
                 return 202, {"task": {"id": "video-test"}}
             return 200, {"task": {"id": "video-test", "status": "completed", "content_url": "https://example.invalid/video.mp4"}}
 
-        with patch.object(mcp, "_http_json", side_effect=fake_http), patch.object(mcp.time, "sleep"):
+        with patch.object(mcp, "_http_json", side_effect=fake_http), patch.object(mcp, "_download", return_value=123) as download, patch.object(mcp.time, "sleep"):
             result = mcp.seedance_generate({"prompt": "test", "image_asset_ids": ["asset-1"]})
-        self.assertEqual(result["task_id"], "video-test")
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["local_path"].endswith(".mp4"))
+        self.assertNotIn("task_id", result)
+        self.assertNotIn("content_url", result)
+        download.assert_called_once()
         self.assertEqual(calls[0][2]["image_asset_ids"], ["asset-1"])
         self.assertEqual(calls[0][2]["duration"], 5)
         self.assertEqual(calls[0][2]["resolution"], "720p")
         self.assertEqual(calls[0][2]["ratio"], "16:9")
         self.assertTrue(calls[0][3]["Idempotency-Key"].startswith("seedance-"))
+
+    def test_seedance_uploads_inline_reference_before_video_submission(self):
+        calls = []
+
+        def fake_http(method, url, payload=None, extra_headers=None):
+            calls.append((method, url, payload, extra_headers))
+            if url.endswith("/assets"):
+                return 200, {"id": "asset-inline-1", "object": "asset"}
+            if method == "POST" and url.endswith("/videos/generations"):
+                self.assertNotIn("data_base64", payload)
+                self.assertEqual(payload["image_asset_ids"], ["asset-inline-1"])
+                return 202, {"task": {"id": "video-inline"}}
+            return 200, {"task": {"id": "video-inline", "status": "completed", "content_url": "https://example.invalid/video.mp4"}}
+
+        with patch.object(mcp, "_http_json", side_effect=fake_http), patch.object(mcp, "_download", return_value=123), patch.object(mcp.time, "sleep"):
+            result = mcp.seedance_generate({"prompt": "test", "image_data": ["data:image/png;base64,AAAA"]})
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual([call[1].rsplit("/", 1)[-1] for call in calls], ["assets", "generations", "video-inline"])
+        self.assertEqual(calls[0][2]["filename"], "reference-1.png")
+
+    def test_default_download_uses_configured_download_directory(self):
+        with patch.dict(mcp.os.environ, {"AIWORK_VIDEO_DOWNLOAD_DIR": "D:/gpt/aiwork-download-test"}, clear=False):
+            target = mcp._default_download_path("video/test:001")
+        self.assertEqual(target.parent, Path("D:/gpt/aiwork-download-test"))
+        self.assertTrue(target.name.startswith("aiwork-seedance-"))
+        self.assertTrue(target.name.endswith(".mp4"))
+        self.assertNotIn("/", target.name)
+        self.assertNotIn(":", target.name)
 
 
 if __name__ == "__main__":
