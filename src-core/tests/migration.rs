@@ -116,7 +116,7 @@ fn prepare_v11_quota_database(prefix: &str, mismatched_reservation_key: bool) ->
 fn v11_user_ledger_is_backfilled_once_without_key_copy() {
     let (store, dir) = prepare_v11_quota_database("v11-quota-backfill", false);
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 12);
+    assert_eq!(store.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
 
     let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
     let user_cap_count: i64 = connection

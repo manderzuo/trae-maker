@@ -1,4 +1,6 @@
 mod cost;
+mod admin_summary;
+mod admin_credentials;
 mod error;
 mod identity;
 mod jobs;
@@ -34,6 +36,8 @@ pub use ports::{
 };
 pub use requests::canonical_json_hash;
 pub use store::{CoreStore, CORE_DB_FILE, CURRENT_SCHEMA_VERSION};
+pub use admin_summary::CoreAdminSummary;
+pub use admin_credentials::{AdminCredentialRecord, NewAdminCredential};
 pub use upstream::{
     LeaseOutcome, LeaseSettlement, ScheduleError, SchedulerLeaseRequest, SchedulerLeaseResult,
     SelectionStrategy, UpstreamLeaseGrant, VideoJobLeaseResult,

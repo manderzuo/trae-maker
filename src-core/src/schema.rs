@@ -489,3 +489,20 @@ CREATE TABLE IF NOT EXISTS quota_reservations (
   event_group_id TEXT
 );
 "#;
+
+pub(crate) const SCHEMA_V13: &str = r#"
+ALTER TABLE api_keys ADD COLUMN max_concurrency INTEGER NOT NULL DEFAULT 32 CHECK(max_concurrency > 0);
+"#;
+
+pub(crate) const SCHEMA_V14: &str = r#"
+CREATE TABLE IF NOT EXISTS admin_credentials (
+  user_id TEXT PRIMARY KEY REFERENCES users(id),
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  salt TEXT NOT NULL,
+  iterations INTEGER NOT NULL CHECK(iterations >= 100000),
+  must_change_password INTEGER NOT NULL CHECK(must_change_password IN (0,1)),
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+"#;

@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 use crate::{
     schema::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
-        SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
+        SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
@@ -19,13 +19,14 @@ use crate::{
         validate_required,
     },
     AuthError, CoreApiKeyAdminView, CoreError, CoreUserAdminView, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
-    AssetState, CoreAsset, CreateAssetInput, NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
+    AdminCredentialRecord, AssetState, CoreAsset, CreateAssetInput, NewAdminCredential, NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
     UpstreamAccountState, QuotaMigrationState,
     UpstreamLease, UpstreamObservation, User,
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub const DEFAULT_API_KEY_MAX_CONCURRENCY: i64 = 32;
 
 pub struct CoreStore {
     pub(crate) connection: Mutex<Connection>,
@@ -249,12 +250,22 @@ impl CoreStore {
                     .map_err(CoreError::migration)?;
             }
             11 => {}
+            12 => {}
+            13 => {}
             CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
                 version => return Err(CoreError::UnsupportedSchemaVersion { version }),
             }
 
-            if version < CURRENT_SCHEMA_VERSION {
+            if version < 12 {
                 Self::migrate_v11_to_v12(&transaction)?;
+            }
+            if version < 13 {
+                Self::migrate_v12_to_v13(&transaction)?;
+            }
+            if version < 14 {
+                Self::migrate_v13_to_v14(&transaction)?;
+            }
+            if version < CURRENT_SCHEMA_VERSION {
                 transaction
                     .execute(
                         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
@@ -315,6 +326,69 @@ impl CoreStore {
 
     pub fn table_exists(&self, table_name: &str) -> Result<bool, CoreError> {
         Ok(self.table_count(table_name)? == 1)
+    }
+
+    pub fn find_admin_credential(&self, username: &str) -> Result<Option<AdminCredentialRecord>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        connection
+            .query_row(
+                "SELECT user_id, username, password_hash, salt, iterations, must_change_password
+                 FROM admin_credentials WHERE username = ?1",
+                [username],
+                |row| {
+                    Ok(AdminCredentialRecord {
+                        user_id: row.get(0)?,
+                        username: row.get(1)?,
+                        password_hash: row.get(2)?,
+                        salt: row.get(3)?,
+                        iterations: row.get(4)?,
+                        must_change_password: row.get::<_, i64>(5)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(CoreError::from)
+    }
+
+    pub fn upsert_admin_credential(&self, input: NewAdminCredential) -> Result<(), CoreError> {
+        if input.user_id.trim().is_empty() || input.username.trim().is_empty() || input.password_hash.trim().is_empty() || input.salt.trim().is_empty() {
+            return Err(CoreError::Validation { field: "admin_credential".into(), reason: "user_id, username, password_hash and salt are required".into() });
+        }
+        if input.iterations < 100_000 {
+            return Err(CoreError::Validation { field: "iterations".into(), reason: "must be at least 100000".into() });
+        }
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let is_active_admin: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active' AND role = 'admin')",
+            [&input.user_id],
+            |row| row.get(0),
+        )?;
+        if !is_active_admin {
+            return Err(CoreError::AdminRequired);
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        transaction.execute(
+            "INSERT INTO admin_credentials (user_id, username, password_hash, salt, iterations, must_change_password, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash,
+               salt = excluded.salt, iterations = excluded.iterations, must_change_password = excluded.must_change_password,
+               updated_at_ms = excluded.updated_at_ms",
+            params![input.user_id, input.username, input.password_hash, input.salt, input.iterations, input.must_change_password as i64, now_ms],
+        )?;
+        transaction.commit().map_err(CoreError::from)
+    }
+
+    pub fn mark_admin_password_changed(&self, username: &str, password_hash: String, salt: String, iterations: u32) -> Result<(), CoreError> {
+        if password_hash.trim().is_empty() || salt.trim().is_empty() || iterations < 100_000 {
+            return Err(CoreError::Validation { field: "admin_credential".into(), reason: "password hash, salt and iterations are invalid".into() });
+        }
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let updated = connection.execute(
+            "UPDATE admin_credentials SET password_hash = ?1, salt = ?2, iterations = ?3, must_change_password = 0, updated_at_ms = ?4 WHERE username = ?5",
+            params![password_hash, salt, iterations, Utc::now().timestamp_millis(), username],
+        )?;
+        if updated == 1 { Ok(()) } else { Err(CoreError::UserNotFound { user_id: username.to_owned() }) }
     }
 
     pub fn count_rows(&self, table_name: &str) -> Result<u64, CoreError> {
@@ -1088,7 +1162,24 @@ impl CoreStore {
         scopes: BTreeSet<String>,
         actor: &str,
     ) -> Result<IssuedApiKey, CoreError> {
-        self.issue_api_key_inner(user_id, name, scopes, actor, false)
+        self.issue_api_key_with_max_concurrency(
+            user_id,
+            name,
+            scopes,
+            DEFAULT_API_KEY_MAX_CONCURRENCY,
+            actor,
+        )
+    }
+
+    pub fn issue_api_key_with_max_concurrency(
+        &self,
+        user_id: &str,
+        name: &str,
+        scopes: BTreeSet<String>,
+        max_concurrency: i64,
+        actor: &str,
+    ) -> Result<IssuedApiKey, CoreError> {
+        self.issue_api_key_inner(user_id, name, scopes, max_concurrency, actor, false)
     }
 
     pub fn issue_api_key_as_admin(
@@ -1098,6 +1189,24 @@ impl CoreStore {
         scopes: BTreeSet<String>,
         principal: &Principal,
     ) -> Result<IssuedApiKey, CoreError> {
+        self.issue_api_key_as_admin_with_max_concurrency(
+            user_id,
+            name,
+            scopes,
+            DEFAULT_API_KEY_MAX_CONCURRENCY,
+            principal,
+        )
+    }
+
+    pub fn issue_api_key_as_admin_with_max_concurrency(
+        &self,
+        user_id: &str,
+        name: &str,
+        scopes: BTreeSet<String>,
+        max_concurrency: i64,
+        principal: &Principal,
+    ) -> Result<IssuedApiKey, CoreError> {
+        Self::validate_max_concurrency(max_concurrency)?;
         let plaintext = Self::new_api_key();
         let prefix = plaintext[..16].to_owned();
         let key_digest = Self::digest_api_key(&plaintext);
@@ -1111,9 +1220,9 @@ impl CoreStore {
         Self::ensure_active_user(&transaction, user_id)?;
         transaction.execute(
             "INSERT INTO api_keys \
-             (id, user_id, name, prefix, key_digest, scopes_json, status, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
-            params![key_id, user_id, name, prefix, key_digest, scopes_json, now],
+             (id, user_id, name, prefix, key_digest, scopes_json, max_concurrency, status, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8)",
+            params![key_id, user_id, name, prefix, key_digest, scopes_json, max_concurrency, now],
         )?;
         Self::insert_audit_event(
             &transaction,
@@ -1140,9 +1249,11 @@ impl CoreStore {
         user_id: &str,
         name: &str,
         scopes: BTreeSet<String>,
+        max_concurrency: i64,
         actor: &str,
         require_admin: bool,
     ) -> Result<IssuedApiKey, CoreError> {
+        Self::validate_max_concurrency(max_concurrency)?;
         let plaintext = Self::new_api_key();
         let prefix = plaintext[..16].to_owned();
         let key_digest = Self::digest_api_key(&plaintext);
@@ -1158,9 +1269,9 @@ impl CoreStore {
         Self::ensure_active_user(&transaction, user_id)?;
         transaction.execute(
             "INSERT INTO api_keys \
-             (id, user_id, name, prefix, key_digest, scopes_json, status, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
-            params![key_id, user_id, name, prefix, key_digest, scopes_json, now],
+             (id, user_id, name, prefix, key_digest, scopes_json, max_concurrency, status, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8)",
+            params![key_id, user_id, name, prefix, key_digest, scopes_json, max_concurrency, now],
         )?;
         Self::insert_audit_event(
             &transaction,
@@ -1180,6 +1291,16 @@ impl CoreStore {
             user_id: user_id.to_owned(),
             scopes,
         })
+    }
+
+    fn validate_max_concurrency(max_concurrency: i64) -> Result<(), CoreError> {
+        if !(1..=1024).contains(&max_concurrency) {
+            return Err(CoreError::Validation {
+                field: "max_concurrency".into(),
+                reason: "must be between 1 and 1024".into(),
+            });
+        }
+        Ok(())
     }
 
     pub fn revoke_api_key(&self, key_id: &str, actor: &str) -> Result<(), CoreError> {
@@ -2170,6 +2291,31 @@ impl CoreStore {
             }
         }
         Ok(())
+    }
+
+    fn migrate_v12_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        let table_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_keys')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(());
+        }
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('api_keys') WHERE name = 'max_concurrency')",
+            [],
+            |row| row.get(0),
+        )?;
+        if exists {
+            Ok(())
+        } else {
+            transaction.execute_batch(SCHEMA_V13).map_err(CoreError::migration)
+        }
+    }
+
+    fn migrate_v13_to_v14(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        transaction.execute_batch(SCHEMA_V14).map_err(CoreError::migration)
     }
 
     fn migrate_v5_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {

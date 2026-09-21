@@ -51,7 +51,7 @@ fn schema_v12_creates_budget_account_directory_and_indexes() {
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 12);
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     assert_eq!(store.table_count("quota_budget_accounts").unwrap(), 1);
     assert!(store.foreign_keys_enabled().unwrap());
 
@@ -108,7 +108,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     connection
         .execute_batch(
             "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
-             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '13');",
+             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '15');",
         )
         .unwrap();
     drop(connection);
@@ -116,7 +116,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     let store = CoreStore::open(&future_dir).unwrap();
     assert!(matches!(
         store.migrate(),
-        Err(CoreError::UnsupportedSchemaVersion { version: 13 })
+        Err(CoreError::UnsupportedSchemaVersion { version: 15 })
     ));
     drop(store);
     fs::remove_dir_all(future_dir).unwrap();
