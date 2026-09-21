@@ -1564,6 +1564,14 @@ impl CoreStore {
         transaction: &rusqlite::Transaction<'_>,
         principal: &Principal,
     ) -> Result<(), CoreError> {
+        if principal.key_id.starts_with("admin_session:") {
+            let authorized = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active' AND role = 'admin')",
+                [&principal.user_id],
+                |row| row.get(0),
+            )?;
+            return if authorized { Ok(()) } else { Err(CoreError::AdminRequired) };
+        }
         let authorized = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM api_keys INNER JOIN users ON users.id = api_keys.user_id WHERE api_keys.id = ?1 AND api_keys.user_id = ?2 AND api_keys.status = 'active' AND users.status = 'active' AND users.role = 'admin')",
             params![principal.key_id, principal.user_id],

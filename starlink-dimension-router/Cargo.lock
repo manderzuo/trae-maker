@@ -1043,6 +1043,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "tokio",
+ "tower",
  "ureq",
 ]
 
