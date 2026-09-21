@@ -10,3 +10,4 @@ pub mod admin_session;
 pub mod admin_routes;
 pub mod bridge_config;
 pub mod migration;
+pub mod assets;
