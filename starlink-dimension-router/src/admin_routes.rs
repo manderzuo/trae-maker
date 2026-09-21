@@ -75,6 +75,9 @@ pub async fn page() -> Html<&'static str> {
 }
 
 pub async fn bootstrap(State(state): State<Arc<StarlinkRouterState>>, Json(input): Json<BootstrapInput>) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if input.username != "admin" {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "invalid_admin_username", "message": "管理员账户名必须是 admin"}}))));
+    }
     if state.store.find_admin_credential(&input.username).map_err(internal)?.is_some() {
         return Err((StatusCode::CONFLICT, Json(json!({"error": {"type": "admin_already_initialized", "message": "管理员账户已经初始化"}}))));
     }

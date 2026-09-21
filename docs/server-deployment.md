@@ -56,8 +56,8 @@ JSON 和迁移报告；禁止对正在运行的 SQLite 做热文件复制。
 仅检查 JSON 可解析性、数量和哈希；owner 是否存在以及素材文件存在性、大小和 SHA 由
 `core_migration_apply` 做 fail-closed 校验。写入/变更类命令
 `core_migration_apply`、`core_user_create`、`core_api_key_issue` 和 `core_quota_grant`
-必须提供真实 admin API Key；只读的 `core_status`、`core_migration_inspect` 是例外，具体
-鉴权以当前实现为准。不能由客户端传入 actor 身份。Key 明文只在签发响应中显示一次，
+必须提供已认证的管理员会话；旧的 admin API Key 仅保留给兼容自动化路径；只读的
+`core_status`、`core_migration_inspect` 是例外，具体鉴权以当前实现为准。不能由客户端传入 actor 身份。Key 明文只在签发响应中显示一次，
 Core 只保存 digest/prefix。
 
 切换 `enforce` 前必须完成：迁移前备份、user、Key、scope、cost policy、grant 和 parity
@@ -67,7 +67,7 @@ Mock executor；不得以真实 upstream、真实余额、真实计费或真实�
 
 ## Core schema v12 迁移与双层预算运维
 
-本版本的 v11→v12 是单事务迁移：新增 `quota_budget_accounts` 并把旧用户流水归入 `user_cap`；不会把旧额度复制到每一个 Key。没有明确 Key 目标的余额标为 `legacy_unassigned`，管理员必须在切换 `enforce` 前使用真实 admin Core Key 显式迁移，迁移未完成时保持 fail-closed。
+本版本的 v11→v12 是单事务迁移：新增 `quota_budget_accounts` 并把旧用户流水归入 `user_cap`；不会把旧额度复制到每一个 Key。没有明确 Key 目标的余额标为 `legacy_unassigned`，管理员必须在切换 `enforce` 前通过已认证管理会话显式迁移，迁移未完成时保持 fail-closed。
 
 启用 `enforce` 前逐项确认：备份 SQLite/WAL/SHM；迁移报告无未处理项；Key 已启用且 scope 正确；Key budget 版本为 ready；可选 User cap 已配置；未结束 reservation 和 `unknown` 任务已有 `event_group_id` 对账方案。Key、User cap 和上游账号 observation/lease 分开查看，不能把上游余额换算为用户额度。
 
@@ -127,6 +127,6 @@ PostgreSQL。`video_tasks.json` 和 `data/videos` 是当前单机/小规模部�
 
 独立程序 `starlink-dimension-router.exe` 默认监听 `127.0.0.1:7865`，管理页面为 `/admin`，对外 API 为 `/v1/*`。AI Work 仍是执行端，默认监听 `7864`；它只接受由 AI Work 管理界面生成、部署到 Core 的桥接管理员 Key。普通用户 API Key、积分、并发与任务归属全部由 Core 管理。
 
-生产部署建议：Core 只通过 HTTPS 反向代理或可信内网暴露；公网反代到 7865，AI Work 的 7864 仅允许 Core 所在主机访问。先访问 `/healthz`，再在 `/admin` 中输入管理员 Key、配置 AI Work Base URL 与桥接 Key，必须测试成功后才保存。桥接测试失败不会替换旧配置。
+生产部署建议：Core 只通过 HTTPS 反向代理或可信内网暴露；公网反代到 7865，AI Work 的 7864 仅允许 Core 所在主机访问。先访问 `/healthz`，再在 `/admin` 中使用管理员账户登录，配置 AI Work Base URL 与桥接 Key，必须测试成功后才保存。桥接测试失败不会替换旧配置。
 
 发布产物位于 `D:\gpt\starlink-dimension-router-release\release\starlink-dimension-router.exe`。迁移脚本默认只读检查源数据并输出哈希；只有明确提供 MigrationId 和 `-Apply` 才会复制 Core 数据库，绝不删除源 JSON、SQLite、素材或视频产物。

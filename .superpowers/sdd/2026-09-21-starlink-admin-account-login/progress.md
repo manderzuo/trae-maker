@@ -40,7 +40,8 @@
 
 - Built the release with Cargo target/temp directories under `D:\gpt\starlink-admin-login-verify-target` / `D:\gpt`; no continuous test writes were made on C:.
 - Release artifact: `D:\gpt\starlink-dimension-router-release\release\starlink-dimension-router.exe`.
-- SHA-256: `2F12D265BCD2A7597DBBDC4D4334D2198F49E8A3937C483DFB96909A9384D746`.
+- SHA-256: `4E37E9A7D2458923F5753F110ADC875ADBFC036E1CCBD2C130C0DECF248896E4`.
 - Local smoke: `/healthz` HTTP 200; account login/session/forced-change/logout flow passed; admin page HTTP 200 and browser tab shows the new login page. Full Core suite, full Router suite, UI contract and `git diff --check` passed.
 - The local acceptance credential was reset to the configured initial value with `must_change_password=true` after smoke testing, so the next manual login starts at the intended first-login screen.
+- Self-review fix: bootstrap now rejects non-`admin` administrator names, and deployment/manual text no longer instructs operators to enter an admin Key in the page.
 - Final review: self-review (no subagent tool).

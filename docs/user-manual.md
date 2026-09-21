@@ -303,8 +303,8 @@ API 管理中的 `core_mode` 有三种值：
 - `enforce`：Core Key 解析出的用户是唯一权威身份；scope、cost policy、幂等和逻辑
   grant 缺失时 fail closed。Phase 1 只允许非流式 Chat，`stream=true` 返回 501。
 
-管理员操作 Core 时必须使用真实 admin API Key。Key 签发后明文只显示一次，Core 只保存
-digest/prefix；请立即保存到安全位置，遗失后撤销并重新签发。`core_quota_grant` 是按
+管理员页面使用 `admin` 账户会话；旧 admin API Key 仅保留给兼容自动化路径。普通 Key
+签发后明文只显示一次，Core 只保存 digest/prefix；请立即保存到安全位置，遗失后撤销并重新签发。`core_quota_grant` 是按
 用户和资源写入 Core 逻辑额度账本的管理操作，常用 `resource_kind=chat_request`；它
 不是上游账户余额查询，也不代表真实上游计费。
 
@@ -342,7 +342,7 @@ Core 管理命令只允许通过已登录的 Core 管理页面调用，公网访
 
 - 旧用户额度不会自动复制到多个 Key。迁移后未明确分配的额度保持 `legacy_unassigned`；管理员在 Core 管理 Tab 中按用户、Key、`resource_kind`、数量和原因执行显式迁移。
 - `/v1/usage?limit=1..100` 在 `enforce` 且拥有 `usage:read` 时只返回当前 Key 的脱敏投影。`balances.available` 是双层有效可用量，`held`/`settled` 和 ledger 只属于当前 Key；没有 Key 预算、预算版本无效或迁移未完成时返回 409 `key_quota_not_configured`，不会冒充 legacy 用户余额。
-- Core Admin Panel 提供「发放 Key 额度」「迁移 legacy 额度」「查看 Key 余额」；管理员认证必须是真实 admin Core Key，页面不显示明文 Key、digest 或上游账号。重复迁移使用同一迁移标识时保持幂等。
+- Core Admin Panel 提供「发放 Key 额度」「迁移 legacy 额度」「查看 Key 余额」；管理员认证使用账户会话，页面不显示管理员 Key、digest 或上游账号。重复迁移使用同一迁移标识时保持幂等。
 - 公网、LAN 和本机使用同一 Core 身份、scope 和预算事务。Nginx/FRP 只做反向代理和传输，不根据域名、Host 或客户端字段授权。
 - `unknown` 任务保留 held 并进入 `reconcile_required`，不能自动退款、换号或重放。需要回滚时先停服务并备份 v12 SQLite/WAL，切到 `core_mode=off`，完成对账后再恢复 `shadow`/`enforce`。
 
