@@ -319,9 +319,10 @@ scope、cost policy、grant 和 parity report，并先在 `shadow` 完成核对�
 
 #### Core 管理 Tab（Phase 4D）
 
-在 **API 管理 → Core 管理** 中输入真实的 admin Core Key 后点击「加载管理数据」。该 Key
-只保留在当前弹窗会话的内存中，不会写入本地配置、Zustand 或浏览器存储；普通用户 Key、
-用户 ID 和字符串 `admin` 都不能代替管理员认证。
+Core 管理页面改为账户会话登录：本机打开 `http://127.0.0.1:7865/admin`，公网打开
+`https://api.gemstory.cn/admin`，使用管理员账户进入控制台。浏览器只使用 HttpOnly 会话
+Cookie，不保存 Core 管理员凭证；首次登录必须修改初始密码。普通用户 Key、用户 ID 和字符串
+`admin` 都不能代替管理员账户认证。
 
 - **用户**：可创建 `user`、`operator` 或 `admin`，并启用/禁用用户。禁用不会删除其额度、
   预占、任务、素材或审计记录；最后一个管理员和当前管理员不能被禁用。
@@ -331,7 +332,7 @@ scope、cost policy、grant 和 parity report，并先在 `shadow` 完成核对�
   `held`。不同资源类型分别记账，Core 逻辑 grant 不是 Trae/WorkBuddy 上游余额，也不代表
   已核验的真实上游计费；当前没有公网管理员 API 或在线支付入口。
 
-Core 管理命令只通过桌面 Tauri 命令提供，未开放成公网管理端点。Core 视频在未注册可信
+Core 管理命令只允许通过已登录的 Core 管理页面调用，公网访问必须经过 HTTPS 反向代理。Core 视频在未注册可信
 生产 adapter 时仍按 fail-closed 规则返回 `501/scheduler_endpoint_not_enabled`；本地 Mock
 测试不能替代真实上游协议、余额或扣费证明。
 
@@ -357,7 +358,7 @@ Tauri/Rust 验证的临时 target、日志和测试缓存统一放在 `D:\gpt`�
 - **模型目录（Trae）**：统一聚合目录，展示模型 ID / 展示名 / 积分倍率 / 思考档位 / 上下文 / 图片支持；「同步官网模型」拉取官网最新列表
 - **元数据编辑**：行内「编辑」可人工维护展示名、倍率、思考档位、上下文、max_tokens、图片支持；**留空字段自动回退**官网同步与内置参考值。已人工维护的条目名称标 `*`，可一键「清除人工值」恢复自动来源；官网同步不覆盖人工值
 
-> Seedance 通过 Trae Work CN 原生 SSE 任务桥调用，按 Work 积分账号取号；外置 API 提供 `POST /v1/videos/generations`（支持 `Idempotency-Key`）、`GET /v1/videos/:task_id` 与 `GET /v1/videos/:task_id/content`。生成完成后网关会将视频流式缓存到 `data/videos`（可用环境变量 `AIWORK_VIDEO_DIR` 指定独立磁盘），任务索引保存到 `data/video_tasks.json`，重启后仍可查询。内容端点按 API Key 隔离并支持失败时临时回退上游地址。原生插件仍作为动态设备头不兼容时的降级入口；若上游在开始 SSE 前明确返回账号额度耗尽、套餐失效或登录失效，网关会自动冷却当前账号并尝试下一个 Work 账号；一旦已经进入 SSE，不会重放任务。它不写入普通 `/v1/models`。
+> Seedance 通过 Trae Work CN 原生 SSE 任务桥调用，按 Work 积分账号取号；外置 API 提供 `POST /v1/videos/generations`（支持 `Idempotency-Key`）、`GET /v1/videos/:task_id` 与 `GET /v1/videos/:task_id/content`。生成完成后网关会将视频流式缓存到 `data/videos`（可用环境变量 `AIWORK_VIDEO_DIR` 指定独立磁盘），任务索引保存到 `data/video_tasks.json`，重启后仍可查询。内容端点按 API Key 隔离并支持失败时临时回退上游地址。原生插件仍作为动态设备头不兼容时的降级入口；若上游在开始 SSE 前明确返回账号额度耗尽、套餐失效或登录失效，网关会自动冷却当前账号并尝试下一个 Work 账号；一旦已经进入 SSE，不会重放任务。公共 `GET /v1/models` 会追加 `seedance`，并通过 `capabilities: ["video"]`、`endpoint: "/v1/videos/generations"`、`async: true` 声明视频路由；没有 Work 可用资源时仍可发现该模型，但来源会标记为不可用。
 
 ### 7.3 Buddy · 资源调度
 
@@ -391,7 +392,7 @@ response = client.chat.completions.create(
 - `POST /v1/chat/completions` — 对话（legacy 可流式；`core_mode=enforce` 的 Phase 1 仅非流式，流式返回 501）
 - `POST /v1/completions` — legacy 文本补全（prompt 转 user message 复用对话链路）
 - `POST /v1/messages` — Anthropic 兼容端点（Claude Code 等工具直连）
-- `GET /v1/models` — 统一模型目录（Trae + Buddy 合并去重）
+- `GET /v1/models` — 统一模型目录（Trae + Buddy 合并去重），并包含带能力路由元数据的 `seedance`
 - `GET /status` — 账号池状态
 - `GET /health` — 健康检查
 - `POST /v1/embeddings` — 上游无向量能力，固定返回 501
@@ -401,12 +402,24 @@ response = client.chat.completions.create(
 - `GET /v1/videos/:task_id` — 查询视频任务状态
 - `GET /v1/videos/:task_id/content` — 受 Key 保护的视频文件流（网关本地缓存优先）
 
+### 7.4.1 统一 Base URL 与模型能力分流
+
+文字和视频共用一个 Base URL、一个 API Key。局域网客户端使用
+`http://<AI Work 主机>:7864/v1`，外网客户端使用反向代理后的
+`https://<你的域名>/v1`；客户端只需替换 Base URL，不需要为 Seedance 配置另一把 Key。
+
+先读取 `GET /v1/models`：文字模型带 `capabilities: ["text"]`、
+`endpoint: "/v1/chat/completions"`、`async: false`；`seedance` 带
+`capabilities: ["video"]`、`endpoint: "/v1/videos/generations"`、`async: true`。
+支持这组元数据的客户端选择 `seedance` 后进入视频任务提交/轮询流程，选择其他模型则调用文字接口。
+完全不了解视频协议的旧 OpenAI 客户端不会仅凭模型名自动切换接口，此时请使用支持 Seedance 的适配器或直接调用视频端点。
+
 ### 7.5 部署路径与环境覆盖
 
 - 桌面端默认数据目录仍为 `%APPDATA%\\AIWorkAssistant`；便携/服务器运行可设置 `AIWORK_DATA_DIR`（旧别名 `AIWORKDATA_DIR` 仍兼容）。
 - 网关设置文件值可由 `AIWORK_BIND`、`AIWORK_PORT`、`AIWORK_DEFAULT_MODEL`、`AIWORK_CORS_ORIGINS` 覆盖，视频返回地址可由 `AIWORK_PUBLIC_BASE_URL` 指定，便于容器或服务编排，不把端口和运行位置写入代码。
 - `AIWORK_VIDEO_DIR` 可将视频产物放到独立磁盘。局域网直接使用 `http://<内网IP>:<port>/v1`；跨公网应使用 HTTPS 反向代理或 SSH 反向隧道，不开放裸端口。
-- 参考素材可用 `AIWORK_ASSET_DIR` 指定临时目录。若要把上传素材交给 Trae 云端回取，必须显式配置 `AIWORK_ASSET_PUBLIC_BASE_URL=https://你的域名/v1`；不配置时仅保存在网关本机，`image_asset_ids` 请求会被明确拒绝，不会猜测性上传。
+- 参考素材可用 `AIWORK_ASSET_DIR` 指定临时目录。提交 `image_asset_ids` / `video_asset_ids` 时，网关会按当前 Trae Work 账号执行原生资源上传并传递 `store_uri`，因此不需要配置公网素材基址；`AIWORK_ASSET_PUBLIC_BASE_URL=https://你的域名/v1` 仅用于客户端查看短时素材内容。账号切换时会重新上传素材，避免跨账号复用资源。
 - 当前账号发现、BitBrowser、Trae 原生快照仍是 Windows 桌面能力；若迁移到 Linux 服务器，需先从桌面端导出加密账号资料，再由无头网关负责 API 调度与视频存储，不能把 Trae 桌面 profile 直接搬到服务器。
 
 ### 7.6 积分口径
@@ -666,3 +679,12 @@ v2.4.3 起，代理启动时会**自动读取你已有的系统代理作为上�
 - 仅查询展示，不做代刷；凭证等同密码，仅本地存储并全程掩码展示。
 
 > **合规说明**：本工具仅管理本人合法持有的账号，不破解、不绕过付费。手动录入的 sessionid 等凭证等同密码，仅本地存储并全程掩码展示；客户端加密机制不做破解。
+# 独立 Core 管理入口
+
+“星链维度分流系统”是独立于 AI Work 的 Core 程序。启动后打开 `http://127.0.0.1:7865/admin`，
+首次启动前由运行环境提供 `STARLINK_ADMIN_INITIAL_PASSWORD`，然后使用 `admin` 账户登录并在
+首次登录时修改密码。公网管理地址为 `https://api.gemstory.cn/admin`，必须经 HTTPS 反向代理，
+不能直接暴露 7865。Core 的公共 API Base URL 是 `http://<主机>:7865/v1`；AI Work 的 7864
+只作为内部执行桥接端点。
+
+Core 的摘要只显示活跃普通 Key、CORE 总积分、可用/持有中/已结算/今日消耗、排队/运行中/待对账任务，不显示账号池、UID、Cookie、JWT 或单账号余额。视频和文字共用同一套普通 Key 与积分账本，`seedance` 由 AI Work 侧执行。
