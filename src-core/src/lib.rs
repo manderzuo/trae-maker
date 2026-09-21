@@ -11,6 +11,7 @@ mod requests;
 mod schema;
 mod store;
 mod upstream;
+mod usage_trend;
 
 pub use cost::{CostError, CostEstimate, CostPolicy};
 pub use error::CoreError;
@@ -36,6 +37,7 @@ pub use ports::{
 };
 pub use requests::canonical_json_hash;
 pub use store::{CoreStore, CORE_DB_FILE, CURRENT_SCHEMA_VERSION};
+pub use usage_trend::UsageTrendPoint;
 pub use admin_summary::CoreAdminSummary;
 pub use admin_credentials::{AdminCredentialRecord, NewAdminCredential};
 pub use upstream::{

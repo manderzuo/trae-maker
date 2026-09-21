@@ -56,6 +56,12 @@ async fn admin_login_sets_cookie_and_session_reads_summary() {
     assert_eq!(session.status(), StatusCode::OK);
     let summary = get_with_cookie(&app, "/admin/v1/summary", &cookie).await;
     assert_eq!(summary.status(), StatusCode::OK);
+    let trend = get_with_cookie(&app, "/admin/v1/usage-trend?window=24h", &cookie).await;
+    assert_eq!(trend.status(), StatusCode::OK);
+    let trend_body = to_bytes(trend.into_body(), usize::MAX).await.unwrap();
+    let trend_json: Value = serde_json::from_slice(&trend_body).unwrap();
+    assert_eq!(trend_json["window"], "24h");
+    assert_eq!(trend_json["points"].as_array().map(Vec::len), Some(24));
 }
 
 #[tokio::test]

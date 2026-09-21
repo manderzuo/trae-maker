@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
-use aiwork_core::{CoreAdminSummary, NewUser, QuotaGrant, UserRole};
-use axum::{extract::{Extension, Path, State}, http::{HeaderMap, StatusCode}, response::{Html, IntoResponse, Response}, routing::{get, post, put}, Json, Router};
+use aiwork_core::{CoreAdminSummary, NewUser, QuotaGrant, UsageTrendPoint, UserRole};
+use axum::{extract::{Extension, Path, Query, State}, http::{HeaderMap, StatusCode}, response::{Html, IntoResponse, Response}, routing::{get, post, put}, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -47,9 +47,25 @@ pub struct PasswordChangeInput { pub current_password: String, pub new_password:
 #[derive(Debug, Serialize)]
 pub struct SummaryResponse { pub core: CoreAdminSummary, pub bridge: serde_json::Value }
 
+#[derive(Debug, Deserialize)]
+pub struct TrendQuery {
+    #[serde(default = "default_trend_window")]
+    pub window: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageTrendResponse {
+    pub window: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub bucket_ms: i64,
+    pub points: Vec<UsageTrendPoint>,
+}
+
 pub fn router() -> Router<Arc<StarlinkRouterState>> {
     Router::new()
         .route("/admin/v1/summary", get(summary))
+        .route("/admin/v1/usage-trend", get(usage_trend))
         .route("/admin/v1/bridge/status", get(bridge_status))
         .route("/admin/v1/bridge/test", post(bridge_test))
         .route("/admin/v1/bridge/config", put(bridge_config_save))
@@ -163,6 +179,34 @@ async fn summary(State(state): State<Arc<StarlinkRouterState>>) -> Result<Json<S
     Ok(Json(SummaryResponse { core, bridge }))
 }
 
+fn default_trend_window() -> String { "24h".into() }
+
+fn trend_window(window: &str, end_ms: i64) -> Result<(i64, i64, i64), String> {
+    let (range_ms, bucket_ms) = match window.trim().to_ascii_lowercase().as_str() {
+        "24h" => (24 * 60 * 60 * 1_000, 60 * 60 * 1_000),
+        "7d" => (7 * 24 * 60 * 60 * 1_000, 24 * 60 * 60 * 1_000),
+        "30d" => (30 * 24 * 60 * 60 * 1_000, 24 * 60 * 60 * 1_000),
+        other => return Err(format!("不支持的趋势时间范围：{other}")),
+    };
+    if end_ms <= range_ms {
+        return Err("趋势时间范围无效".into());
+    }
+    Ok((end_ms - range_ms, end_ms, bucket_ms))
+}
+
+async fn usage_trend(State(state): State<Arc<StarlinkRouterState>>, Query(query): Query<TrendQuery>) -> Result<Json<UsageTrendResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let end_ms = chrono::Utc::now().timestamp_millis();
+    let (start_ms, end_ms, bucket_ms) = trend_window(&query.window, end_ms).map_err(internal)?;
+    let points = state.store.usage_trend(start_ms, end_ms, bucket_ms).map_err(internal)?;
+    Ok(Json(UsageTrendResponse {
+        window: query.window,
+        start_ms,
+        end_ms,
+        bucket_ms,
+        points,
+    }))
+}
+
 async fn bridge_status(State(state): State<Arc<StarlinkRouterState>>) -> Json<serde_json::Value> {
     Json(BridgeConfigStore::new(state).public_status())
 }
@@ -223,8 +267,16 @@ fn internal<E: ToString>(error: E) -> (StatusCode, Json<serde_json::Value>) {
 
 #[cfg(test)]
 mod tests {
-    use super::default_role;
+    use super::{default_role, trend_window};
     #[test]
     fn ordinary_users_default_to_user_role() { assert_eq!(default_role(), "user"); }
+
+    #[test]
+    fn usage_trend_window_uses_hour_or_day_buckets() {
+        assert_eq!(trend_window("24h", 2_000_000_000_000).unwrap().2, 3_600_000);
+        assert_eq!(trend_window("7d", 2_000_000_000_000).unwrap().2, 86_400_000);
+        assert_eq!(trend_window("30d", 2_000_000_000_000).unwrap().2, 86_400_000);
+        assert!(trend_window("all", 2_000_000_000_000).is_err());
+    }
 
 }

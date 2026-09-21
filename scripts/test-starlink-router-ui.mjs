@@ -14,4 +14,13 @@ assert.doesNotMatch(html, /ADMIN_KEY_STORAGE/, 'management page must not contain
 assert.match(html, /max_concurrency/, 'management page must submit a per-key concurrency limit');
 assert.match(html, /文字处理/, 'scope labels must be translated to Chinese');
 assert.match(html, /视频生成/, 'video scope label must be translated to Chinese');
+assert.match(html, /积分消耗趋势/, 'management page must show the points consumption trend section');
+assert.match(html, /usage-trend/, 'management page must request the points consumption trend');
+assert.match(html, /trendRange/, 'management page must expose a trend range selector');
+assert.match(html, /文字消耗/, 'trend chart must distinguish text consumption');
+assert.match(html, /视频消耗/, 'trend chart must distinguish video consumption');
+assert.match(html, /最近 24 小时/, 'trend chart must support a 24 hour range');
+assert.match(html, /id="page-overview"/, 'dashboard must have a dedicated overview page');
+assert.match(html, /id="page-settings"/, 'configuration must have a dedicated settings page');
+assert.ok(html.indexOf('id="page-settings"') < html.indexOf('AI Work 桥接配置'), 'bridge configuration must live under settings');
 console.log('starlink router UI contract: PASS');
