@@ -1,2 +1,12 @@
 pub mod config;
 pub mod dto;
+pub mod auth;
+pub mod bridge_client;
+pub mod state;
+pub mod user_routes;
+pub mod server;
+pub mod admin_auth;
+pub mod admin_session;
+pub mod admin_routes;
+pub mod bridge_config;
+pub mod migration;

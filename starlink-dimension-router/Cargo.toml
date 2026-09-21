@@ -8,8 +8,14 @@ aiwork-core = { path = "../src-core" }
 axum = "0.7"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
+hex = "0.4"
+hmac = "0.12.1"
+pbkdf2 = "0.12.2"
+rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 ureq = { version = "2", features = ["json"] }
