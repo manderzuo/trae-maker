@@ -2,6 +2,7 @@ use std::{collections::{BTreeMap, HashMap}, sync::Arc};
 
 use aiwork_core::{CoreError, CoreStore, Principal, PreflightReserveInput, PreflightReserveResult, RequestResult, RequestState, Settlement};
 use axum::{body::{Body, Bytes}, extract::{Extension, Path, Query, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
 use serde_json::{json, Value};
 
@@ -21,6 +22,86 @@ fn authorize_scope(principal: &Principal, scope: &str) -> Result<(), Response> {
     if principal.scopes.contains(scope) || principal.scopes.contains("admin:*") { Ok(()) } else {
         Err((StatusCode::FORBIDDEN, Json(json!({"error": {"type": "permission_error", "code": "insufficient_scope", "message": format!("需要作用域 {scope}")}}))).into_response())
     }
+}
+
+const MAX_VISION_DATA_URL_BYTES: usize = 6 * 1024 * 1024;
+
+fn is_seedance_model(model: &str) -> bool { model.trim().eq_ignore_ascii_case("seedance") }
+
+fn request_error(status: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
+    (status, Json(json!({"error": {"type": error_type, "message": message.into()}}))).into_response()
+}
+
+fn validate_vision_data_urls(body: &Value) -> Result<(), Response> {
+    let mut total = 0_usize;
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else { return Ok(()); };
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else { continue; };
+        for part in parts {
+            let Some(url) = part.get("image_url").and_then(Value::as_object).and_then(|image| image.get("url")).and_then(Value::as_str) else { continue; };
+            if url.starts_with("data:") {
+                total = total.saturating_add(url.len());
+                if total > MAX_VISION_DATA_URL_BYTES {
+                    return Err(request_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", "图片 data URL 总大小超过限制"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_text_asset_ids(
+    state: &StarlinkRouterState,
+    principal: &Principal,
+    body: &mut Value,
+) -> Result<(), Response> {
+    if body.get("video_asset_ids").is_some() {
+        return Err(request_error(StatusCode::BAD_REQUEST, "invalid_request_error", "文字模型不支持 video_asset_ids"));
+    }
+    let Some(value) = body.get("image_asset_ids") else { return Ok(()); };
+    let Some(ids) = value.as_array() else {
+        return Err(request_error(StatusCode::BAD_REQUEST, "invalid_request_error", "image_asset_ids 必须是字符串数组"));
+    };
+    let mut image_parts = Vec::with_capacity(ids.len());
+    let mut total = 0_usize;
+    for value in ids {
+        let Some(id) = value.as_str().map(str::trim).filter(|value| !value.is_empty()) else {
+            return Err(request_error(StatusCode::BAD_REQUEST, "invalid_request_error", "image_asset_ids 只能包含非空字符串"));
+        };
+        let asset = crate::assets::read_owned(&state.store, &state.config.data_dir, principal, id)
+            .map_err(crate::assets::response)?;
+        let encoded = STANDARD.encode(asset.bytes);
+        let url = format!("data:{};base64,{}", asset.record.mime_type, encoded);
+        total = total.saturating_add(url.len());
+        if total > MAX_VISION_DATA_URL_BYTES {
+            return Err(request_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", "图片 data URL 总大小超过限制"));
+        }
+        image_parts.push(json!({"type":"image_url","image_url":{"url":url}}));
+    }
+    if image_parts.is_empty() {
+        body.as_object_mut().map(|object| { object.remove("image_asset_ids"); });
+        return Ok(());
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return Err(request_error(StatusCode::BAD_REQUEST, "invalid_request_error", "使用 image_asset_ids 时必须提供 messages"));
+    };
+    let Some(message) = messages.iter_mut().rev().find(|message| message.get("role").and_then(Value::as_str).map(|role| role.eq_ignore_ascii_case("user")).unwrap_or(false)) else {
+        return Err(request_error(StatusCode::BAD_REQUEST, "invalid_request_error", "使用 image_asset_ids 时必须有 user 消息"));
+    };
+    let Some(content) = message.get_mut("content") else {
+        return Err(request_error(StatusCode::BAD_REQUEST, "invalid_request_error", "user 消息缺少 content"));
+    };
+    match content {
+        Value::String(text) => {
+            let mut parts = vec![json!({"type":"text","text":text.clone()})];
+            parts.extend(image_parts);
+            *content = Value::Array(parts);
+        }
+        Value::Array(parts) => parts.extend(image_parts),
+        _ => return Err(request_error(StatusCode::BAD_REQUEST, "invalid_request_error", "user content 必须是字符串或数组")),
+    }
+    if let Some(object) = body.as_object_mut() { object.remove("image_asset_ids"); }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -187,9 +268,14 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
         Ok(value) => value,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "invalid_request_error", "message": "请求体必须是 JSON"}}))).into_response(),
     };
-    if let Err(response) = authorize_scope(&principal, "chat:invoke") { return response; }
     let model = value.get("model").and_then(Value::as_str).unwrap_or(&state.config.default_model).to_string();
-    let prepared = match preflight(&state.store, &principal, "chat", &model, idempotency(&headers), &value) { Ok(value) => value, Err(response) => return response };
+    let seedance = is_seedance_model(&model);
+    if seedance && value.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        return request_error(StatusCode::BAD_REQUEST, "seedance_stream_unsupported", "Seedance Chat 兼容入口暂不支持 stream=true，请使用非流式请求");
+    }
+    if let Err(response) = authorize_scope(&principal, if seedance { "videos:submit" } else { "chat:invoke" }) { return response; }
+    let endpoint = if seedance { "videos" } else { "chat" };
+    let prepared = match preflight(&state.store, &principal, endpoint, &model, idempotency(&headers), &value) { Ok(value) => value, Err(response) => return response };
     let (request_handle, reservation) = match prepared {
         PreflightReserveResult::Conflict => return (StatusCode::CONFLICT, Json(json!({"error": {"type": "idempotency_conflict", "message": "Idempotency-Key 与历史请求内容不一致"}}))).into_response(),
         PreflightReserveResult::Insufficient { available, required } => return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": {"type": "insufficient_quota", "message": format!("积分不足：可用 {available}，需要 {required}")}}))).into_response(),
@@ -197,7 +283,35 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
         PreflightReserveResult::Created { request, reservation } => (request, reservation),
     };
     let request_id = request_handle.id.clone();
-    match state.bridge.lock().unwrap().forward("POST", "/v1/chat/completions", &body, &header_map(&headers), &request_id) {
+    let mut forward_value = value;
+    let has_asset_ids = forward_value.get("image_asset_ids").is_some() || forward_value.get("video_asset_ids").is_some();
+    if seedance {
+        if has_asset_ids {
+            if let Err(response) = materialize_bridge_assets(&state, &principal, &mut forward_value, &request_id).await {
+                let _ = state.store.settle_request(&principal, &reservation.id, Settlement::Release, RequestState::Failed, Some(RequestResult { status: Some(response.status().as_u16() as i64), error_code: Some("asset_materialization_failed".into()) }));
+                return response;
+            }
+        }
+        if let Err(response) = validate_vision_data_urls(&forward_value) {
+            let _ = state.store.settle_request(&principal, &reservation.id, Settlement::Release, RequestState::Failed, Some(RequestResult { status: Some(response.status().as_u16() as i64), error_code: Some("vision_input_invalid".into()) }));
+            return response;
+        }
+    } else {
+        if let Err(response) = materialize_text_asset_ids(&state, &principal, &mut forward_value) {
+            let _ = state.store.settle_request(&principal, &reservation.id, Settlement::Release, RequestState::Failed, Some(RequestResult { status: Some(response.status().as_u16() as i64), error_code: Some("vision_input_invalid".into()) }));
+            return response;
+        }
+        if let Err(response) = validate_vision_data_urls(&forward_value) {
+            let _ = state.store.settle_request(&principal, &reservation.id, Settlement::Release, RequestState::Failed, Some(RequestResult { status: Some(response.status().as_u16() as i64), error_code: Some("vision_input_invalid".into()) }));
+            return response;
+        }
+    }
+    let forward_body = if has_asset_ids || !seedance && forward_value.get("image_asset_ids").is_none() && forward_value != serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null) {
+        serde_json::to_vec(&forward_value).unwrap_or_else(|_| body.to_vec())
+    } else {
+        body.to_vec()
+    };
+    match state.bridge.lock().unwrap().forward("POST", "/v1/chat/completions", &forward_body, &header_map(&headers), &request_id) {
         Ok(response) if (200..300).contains(&response.status) => { let _ = state.store.settle_request(&principal, &reservation.id, Settlement::Commit { actual_amount: Some(1) }, RequestState::Succeeded, Some(RequestResult { status: Some(response.status as i64), error_code: None })); proxy(response.status, response.headers, response.body) }
         Ok(response) => { let _ = state.store.settle_request(&principal, &reservation.id, Settlement::Release, RequestState::Failed, Some(RequestResult { status: Some(response.status as i64), error_code: Some("bridge_http_error".into()) })); proxy(response.status, response.headers, response.body) }
         Err(error) => { let _ = state.store.settle_request(&principal, &reservation.id, Settlement::Unknown, RequestState::Unknown, Some(RequestResult { status: None, error_code: Some("bridge_result_unknown".into()) })); (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "bridge_error", "message": error, "request_id": request_id}}))).into_response() }

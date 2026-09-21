@@ -33,6 +33,7 @@ struct Fixture {
 struct VideoFixture {
     app: Router,
     key: String,
+    other_key: String,
     bridge: Arc<VideoBridge>,
     dir: PathBuf,
 }
@@ -177,12 +178,26 @@ fn video_fixture() -> VideoFixture {
         .issue_api_key_for_new_user_as_admin(
             &admin,
             "视频用户",
-            BTreeSet::from(["assets:write".into(), "videos:submit".into()]),
+            BTreeSet::from(["assets:write".into(), "videos:submit".into(), "chat:invoke".into()]),
+            2,
+        )
+        .unwrap();
+    let other = store
+        .issue_api_key_for_new_user_as_admin(
+            &admin,
+            "其他视频用户",
+            BTreeSet::from(["assets:write".into(), "videos:submit".into(), "chat:invoke".into()]),
             2,
         )
         .unwrap();
     store
         .quota_pool_grant_as_admin(&admin, aiwork_core::QuotaGrant { user_id: key.user_id.clone(), resource_kind: "credits".into(), amount: 100, actor_user_id: "admin".into(), reason: "asset relay test".into() })
+        .unwrap();
+    store
+        .quota_pool_grant_as_admin(&admin, aiwork_core::QuotaGrant { user_id: other.user_id.clone(), resource_kind: "credits".into(), amount: 100, actor_user_id: "admin".into(), reason: "asset relay test".into() })
+        .unwrap();
+    store
+        .key_quota_allocate_from_pool_as_admin(&admin, aiwork_core::KeyQuotaGrant { api_key_id: other.id.clone(), resource_kind: "credits".into(), amount: 100, actor_user_id: "admin".into(), reason: "asset relay test".into() })
         .unwrap();
     store
         .key_quota_allocate_from_pool_as_admin(&admin, aiwork_core::KeyQuotaGrant { api_key_id: key.id.clone(), resource_kind: "credits".into(), amount: 100, actor_user_id: "admin".into(), reason: "asset relay test".into() })
@@ -191,7 +206,7 @@ fn video_fixture() -> VideoFixture {
     let config = RouterConfig::defaults(dir.clone());
     let client = BridgeClient::from_transport("http://bridge", "bridge-secret", bridge.clone());
     let state = StarlinkRouterState::for_test(store, client, config);
-    VideoFixture { app: build_router(state), key: key.plaintext, bridge, dir }
+    VideoFixture { app: build_router(state), key: key.plaintext, other_key: other.plaintext, bridge, dir }
 }
 
 async fn post_bearer(app: &Router, path: &str, key: &str, value: Value) -> Response<Body> {
@@ -393,4 +408,60 @@ async fn bridge_asset_failure_does_not_submit_video_or_keep_reservation() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert!(!fixture.bridge.paths().iter().any(|path| path == "/v1/videos/generations"));
+}
+
+#[tokio::test]
+async fn seedance_chat_rejects_streaming_and_checks_asset_owner_before_forwarding() {
+    let fixture = video_fixture();
+    let asset_id = upload_png_id(&fixture.app, &fixture.key).await;
+    let streamed = post_bearer(
+        &fixture.app,
+        "/v1/chat/completions",
+        &fixture.key,
+        json!({"model":"seedance","stream":true,"messages":[{"role":"user","content":"让画面动起来"}]}),
+    )
+    .await;
+    assert_eq!(streamed.status(), StatusCode::BAD_REQUEST);
+    let rejected = post_bearer(
+        &fixture.app,
+        "/v1/chat/completions",
+        &fixture.other_key,
+        json!({"model":"seedance","stream":false,"messages":[{"role":"user","content":"让画面动起来"}],"image_asset_ids":[asset_id]}),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+    assert!(!fixture.bridge.paths().iter().any(|path| path == "/v1/chat/completions"));
+}
+
+#[tokio::test]
+async fn standard_vision_data_url_is_preserved_for_text_models() {
+    let fixture = video_fixture();
+    let data_url = "data:image/png;base64,iVBORw0KGgo=";
+    let response = post_bearer(
+        &fixture.app,
+        "/v1/chat/completions",
+        &fixture.key,
+        json!({"model":"vision-model","stream":false,"messages":[{"role":"user","content":[{"type":"text","text":"请识别"},{"type":"image_url","image_url":{"url":data_url}}]}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let forwarded = fixture.bridge.last_json("/v1/chat/completions");
+    assert_eq!(forwarded["messages"][0]["content"][1]["image_url"]["url"], data_url);
+}
+
+#[tokio::test]
+async fn text_model_asset_ids_become_owned_data_urls() {
+    let fixture = video_fixture();
+    let asset_id = upload_png_id(&fixture.app, &fixture.key).await;
+    let response = post_bearer(
+        &fixture.app,
+        "/v1/chat/completions",
+        &fixture.key,
+        json!({"model":"vision-model","stream":false,"messages":[{"role":"user","content":"请识别"}],"image_asset_ids":[asset_id]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let forwarded = fixture.bridge.last_json("/v1/chat/completions");
+    assert_eq!(forwarded["messages"][0]["content"][1]["image_url"]["url"], format!("data:image/png;base64,{}", STANDARD.encode(PNG_BYTES)));
+    assert!(forwarded.get("image_asset_ids").is_none());
 }

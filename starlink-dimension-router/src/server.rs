@@ -8,7 +8,7 @@ use crate::{admin_auth, admin_routes, auth, state::StarlinkRouterState, user_rou
 pub fn build_router(state: Arc<StarlinkRouterState>) -> Router {
     let user = Router::new()
         .route("/v1/models", get(user_routes::models))
-        .route("/v1/chat/completions", post(user_routes::chat_completions))
+        .route("/v1/chat/completions", post(user_routes::chat_completions).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/v1/assets", post(user_routes::assets_upload).layer(DefaultBodyLimit::max(46 * 1024 * 1024)))
         .route("/v1/videos/generations", post(user_routes::video_generations))
         .route("/v1/videos/:task_id", get(user_routes::video_task))
