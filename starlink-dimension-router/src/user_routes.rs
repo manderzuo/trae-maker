@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::{BTreeMap, HashMap}, sync::Arc};
 
 use aiwork_core::{CoreError, CoreStore, Principal, PreflightReserveInput, PreflightReserveResult, RequestResult, RequestState, Settlement};
 use axum::{body::{Body, Bytes}, extract::{Extension, Path, Query, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json};
@@ -21,6 +21,67 @@ fn authorize_scope(principal: &Principal, scope: &str) -> Result<(), Response> {
     if principal.scopes.contains(scope) || principal.scopes.contains("admin:*") { Ok(()) } else {
         Err((StatusCode::FORBIDDEN, Json(json!({"error": {"type": "permission_error", "code": "insufficient_scope", "message": format!("需要作用域 {scope}")}}))).into_response())
     }
+}
+
+#[derive(Default)]
+struct BridgeAssetMap {
+    image: Vec<String>,
+    video: Vec<String>,
+}
+
+struct PendingAsset {
+    core_id: String,
+    filename: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+}
+
+async fn materialize_bridge_assets(
+    state: &StarlinkRouterState,
+    principal: &Principal,
+    body: &mut Value,
+    request_id: &str,
+) -> Result<BridgeAssetMap, Response> {
+    let mut requested = Vec::<(String, String)>::new();
+    for field in ["image_asset_ids", "video_asset_ids"] {
+        let Some(value) = body.get(field) else { continue; };
+        let Some(ids) = value.as_array() else {
+            return Err((StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "invalid_request_error", "message": format!("{field} 必须是字符串数组")}}))).into_response());
+        };
+        for id in ids {
+            let Some(id) = id.as_str().map(str::trim).filter(|value| !value.is_empty()) else {
+                return Err((StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "invalid_request_error", "message": format!("{field} 只能包含非空字符串")}}))).into_response());
+            };
+            requested.push((field.to_string(), id.to_string()));
+        }
+    }
+    if requested.is_empty() { return Ok(BridgeAssetMap::default()); }
+
+    let mut pending = Vec::<PendingAsset>::new();
+    let mut seen = HashMap::<String, usize>::new();
+    for (_, id) in &requested {
+        if seen.contains_key(id) { continue; }
+        let asset = crate::assets::read_owned(&state.store, &state.config.data_dir, principal, id)
+            .map_err(crate::assets::response)?;
+        seen.insert(id.clone(), pending.len());
+        pending.push(PendingAsset { core_id: id.clone(), filename: asset.record.filename, mime_type: asset.record.mime_type, bytes: asset.bytes });
+    }
+
+    let mut bridge_ids = HashMap::<String, String>::new();
+    for asset in pending {
+        let bridge_id = state.bridge.lock().unwrap().upload_asset(&asset.filename, &asset.mime_type, &asset.bytes, request_id)
+            .map_err(|error| (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "bridge_error", "message": error, "request_id": request_id}}))).into_response())?;
+        bridge_ids.insert(asset.core_id, bridge_id);
+    }
+
+    let mut result = BridgeAssetMap::default();
+    for (field, id) in requested {
+        let bridge_id = bridge_ids.get(&id).expect("bridge asset map must contain every validated asset").clone();
+        if field == "image_asset_ids" { result.image.push(bridge_id.clone()); } else { result.video.push(bridge_id.clone()); }
+        let values = body.get_mut(&field).and_then(Value::as_array_mut).expect("asset id field was validated as array");
+        for value in values { if value.as_str() == Some(id.as_str()) { *value = Value::String(bridge_id.clone()); } }
+    }
+    Ok(result)
 }
 
 pub async fn assets_upload(
@@ -158,7 +219,24 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
         PreflightReserveResult::Created { request, reservation } => (request, reservation),
     };
     let request_id = request_handle.id.clone();
-    let response = match state.bridge.lock().unwrap().forward("POST", "/v1/videos/generations", &body, &header_map(&headers), &request_id) {
+    let mut forward_value = value;
+    let has_asset_ids = forward_value.get("image_asset_ids").is_some() || forward_value.get("video_asset_ids").is_some();
+    if has_asset_ids {
+        if let Err(response) = materialize_bridge_assets(&state, &principal, &mut forward_value, &request_id).await {
+            let _ = state.store.settle_request(&principal, &reservation.id, Settlement::Release, RequestState::Failed, Some(RequestResult { status: Some(response.status().as_u16() as i64), error_code: Some("asset_materialization_failed".into()) }));
+            return response;
+        }
+    }
+    let forward_body = if has_asset_ids {
+        match serde_json::to_vec(&forward_value) {
+            Ok(body) => body,
+            Err(error) => {
+                let _ = state.store.settle_request(&principal, &reservation.id, Settlement::Release, RequestState::Failed, Some(RequestResult { status: Some(500), error_code: Some("asset_request_encoding_failed".into()) }));
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": {"type": "internal_error", "message": error.to_string()}}))).into_response();
+            }
+        }
+    } else { body.to_vec() };
+    let response = match state.bridge.lock().unwrap().forward("POST", "/v1/videos/generations", &forward_body, &header_map(&headers), &request_id) {
         Ok(response) => response,
         Err(error) => {
             let _ = state.store.settle_request(&principal, &reservation.id, Settlement::Unknown, RequestState::Unknown, Some(RequestResult { status: None, error_code: Some("bridge_result_unknown".into()) }));
