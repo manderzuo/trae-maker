@@ -9,6 +9,13 @@ import seedance_mcp as mcp
 
 
 class SeedanceMcpTests(unittest.TestCase):
+    def test_base_url_normalizes_admin_path_to_public_v1_api(self):
+        with patch.dict(mcp.os.environ, {"AIWORK_GATEWAY_BASE_URL": "https://api.gemstory.cn/admin"}, clear=False):
+            self.assertEqual(mcp._base_url(), "https://api.gemstory.cn/v1")
+
+        with patch.dict(mcp.os.environ, {"AIWORK_GATEWAY_BASE_URL": "https://api.gemstory.cn/admin/v1"}, clear=False):
+            self.assertEqual(mcp._base_url(), "https://api.gemstory.cn/v1")
+
     def test_local_asset_rejects_unknown_format_before_upload(self):
         with patch.object(mcp, "_upload_asset_payload") as upload:
             with self.assertRaisesRegex(ValueError, "不支持的素材格式"):

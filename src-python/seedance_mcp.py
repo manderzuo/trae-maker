@@ -8,6 +8,7 @@ Work credits and video storage to AI Work Assistant.
 Environment:
   AIWORK_GATEWAY_BASE_URL  default http://127.0.0.1:7864/v1
   AIWORK_API_KEY           API Key created in AI Work Assistant
+  AIWORK_VIDEO_DOWNLOAD_DIR optional local video directory; default is Downloads
   SEEDANCE_POLL_TIMEOUT    default 900 seconds
   SEEDANCE_POLL_INTERVAL   default 3 seconds
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 import json
 import base64
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -28,13 +30,24 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 def _base_url() -> str:
     value = os.environ.get("AIWORK_GATEWAY_BASE_URL", "http://127.0.0.1:7864/v1").strip()
     if not value:
         raise RuntimeError("AIWORK_GATEWAY_BASE_URL 不能为空")
-    return value.rstrip("/")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("AIWORK_GATEWAY_BASE_URL 必须是 http/https 地址")
+    path = parsed.path.rstrip("/")
+    if path in {"/admin", "/admin/v1"}:
+        path = "/v1"
+    elif not path or path == "/":
+        path = "/v1"
+    elif not path.endswith("/v1"):
+        path = f"{path}/v1"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
 
 
 def _health_url() -> str:
@@ -151,6 +164,21 @@ def _absolute_content_url(value: str) -> str:
     # `/v1` is the API prefix; content_url is relative to the same origin.
     origin = base[:-3] if base.endswith("/v1") else base
     return f"{origin}{value}"
+
+
+def _download_directory() -> Path:
+    configured = os.environ.get("AIWORK_VIDEO_DOWNLOAD_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    profile = os.environ.get("USERPROFILE", "").strip()
+    home = Path(profile) if profile else Path.home()
+    return home / "Downloads"
+
+
+def _default_download_path(task_id: str) -> Path:
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(task_id)).strip("-") or "video"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return _download_directory() / f"aiwork-seedance-{stamp}-{safe_id}.mp4"
 
 
 def _download(url: str, target: str) -> int:
@@ -337,23 +365,22 @@ def _wait_for_task(task_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
             content_url = task.get("content_url") or task.get("video_url") or task.get("resource_uri")
             if content_url:
                 content_url = _absolute_content_url(str(content_url))
+            target = str(arguments.get("download_path", "")).strip()
+            destination = Path(target).expanduser() if target else _default_download_path(task_id)
+            if not content_url:
+                raise RuntimeError("视频任务已完成，但网关没有返回可下载内容")
             result: dict[str, Any] = {
-                "task_id": task_id,
                 "status": state,
-                "content_url": content_url,
-                "video_url": task.get("video_url"),
+                "local_path": str(destination),
                 "duration": task.get("video_duration"),
             }
-            target = str(arguments.get("download_path", "")).strip()
-            if target and content_url:
-                result["download_path"] = str(Path(target).expanduser())
-                result["download_bytes"] = _download(content_url, target)
+            result["download_bytes"] = _download(content_url, str(destination))
             return result
         # 空响应/尚未产生状态都视为 pending；只在下一次轮询前等待。
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(interval, remaining))
-    raise TimeoutError(f"视频任务超过 {timeout} 秒仍未完成（task_id={task_id}）")
+    raise TimeoutError(f"视频任务超过 {timeout} 秒仍未完成")
 
 
 def aiwork_wait(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -433,24 +460,24 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
                     "required": ["task_id"],
                     "properties": {
                         "task_id": {"type": "string"},
-                        "download_path": {"type": "string"},
+                        "download_path": {"type": "string", "description": "可选：覆盖默认 Downloads 保存位置"},
                     },
                 },
             },
             {
-            "name": "seedance_generate",
-            "description": "通过 AI Work Assistant 的 Trae Work CN Seedance 生成视频并等待完成。",
-            "inputSchema": {
-                "type": "object",
-                "required": ["prompt"],
-                "properties": {
+                "name": "seedance_generate",
+                "description": "通过 AI Work Assistant 的 Trae Work CN Seedance 生成视频，等待完成并自动下载到本机 Downloads。",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["prompt"],
+                    "properties": {
                     "prompt": {"type": "string", "description": "视频描述"},
                     "model": {"type": "string", "default": "seedance"},
                     "duration": {"type": "integer", "minimum": 2, "maximum": 15},
                     "resolution": {"type": "string", "enum": ["480p", "720p", "1080p", "4k"]},
                     "ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"]},
-                    "image_urls": {"type": "array", "items": {"type": "string"}},
-                    "video_urls": {"type": "array", "items": {"type": "string"}},
+                    "image_urls": {"type": "array", "items": {"type": "string"}, "description": "可选：Trae 原生 tos-... 资源 URI；普通公网 URL 请改用 image_paths/image_data 上传"},
+                    "video_urls": {"type": "array", "items": {"type": "string"}, "description": "可选：Trae 原生 tos-... 资源 URI；普通公网 URL 请改用 video_paths/video_data 上传"},
                     "image_paths": {"type": "array", "items": {"type": "string"}, "description": "可选：调用方本地图片绝对路径；只在本次调用上传"},
                     "video_paths": {"type": "array", "items": {"type": "string"}, "description": "可选：调用方本地参考视频绝对路径；只在本次调用上传"},
                     "image_data": {"type": "array", "items": {"oneOf": [{"type": "string"}, {"type": "object", "properties": {"data_base64": {"type": "string"}, "data": {"type": "string"}, "filename": {"type": "string"}, "mime_type": {"type": "string"}}, "additionalProperties": True}]}, "description": "可选：拖拽附件的 Base64/data URL，或含 data/name/mime_type 的附件对象；只在本次调用上传"},
@@ -458,7 +485,7 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
                     "image_asset_ids": {"type": "array", "items": {"type": "string"}, "description": "可选：此前 /assets 返回的图片 ID"},
                     "video_asset_ids": {"type": "array", "items": {"type": "string"}, "description": "可选：此前 /assets 返回的参考视频 ID"},
                     "idempotency_key": {"type": "string"},
-                    "download_path": {"type": "string", "description": "可选：下载到调用方本地路径"},
+                    "download_path": {"type": "string", "description": "可选：覆盖默认 Downloads 保存位置"},
                 },
             },
         }]})
