@@ -9,6 +9,12 @@ pub struct RouterConfig {
     pub host: String,
     pub port: u16,
     pub display_name: String,
+    #[serde(default = "default_model")]
+    pub default_model: String,
+    /// Public URL prefix used in short-lived asset content links.
+    /// An explicit STARLINK_ROUTER_PUBLIC_BASE_URL environment variable wins.
+    #[serde(default)]
+    pub public_base_url: String,
     #[serde(default)]
     pub bridge: Option<BridgeConfig>,
 }
@@ -27,6 +33,8 @@ impl RouterConfig {
             host: "127.0.0.1".to_string(),
             port: Self::default_port(),
             display_name: "星链维度分流系统".to_string(),
+            default_model: "deepseek-v4-flash".to_string(),
+            public_base_url: String::new(),
             bridge: None,
         }
     }
@@ -52,6 +60,12 @@ impl RouterConfig {
         if let Some(port) = env::var_os("STARLINK_ROUTER_PORT") {
             config.port = port.to_string_lossy().parse::<u16>()
                 .map_err(|_| "STARLINK_ROUTER_PORT 必须是有效端口".to_string())?;
+        }
+        if let Some(public_base_url) = env::var_os("STARLINK_ROUTER_PUBLIC_BASE_URL") {
+            let public_base_url = public_base_url.to_string_lossy().trim().trim_end_matches('/').to_string();
+            if !public_base_url.is_empty() {
+                config.public_base_url = public_base_url;
+            }
         }
         config.validate()?;
         Ok(config)
@@ -80,19 +94,46 @@ impl RouterConfig {
         if self.display_name.trim().is_empty() {
             return Err("路由器显示名称不能为空".to_string());
         }
+        if self.public_base_url.chars().any(char::is_whitespace) {
+            return Err("公网素材地址不能包含空白字符".to_string());
+        }
         Ok(())
     }
 }
 
+fn default_model() -> String { "deepseek-v4-flash".to_string() }
+
 #[cfg(test)]
 mod tests {
     use super::RouterConfig;
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
     #[test]
     fn router_defaults_to_port_7865_and_separate_data_directory() {
         let config = RouterConfig::defaults(PathBuf::from(r"D:\gpt\starlink-dimension-router-data"));
         assert_eq!(config.port, 7865);
         assert_eq!(config.display_name, "星链维度分流系统");
+    }
+
+    #[test]
+    fn persisted_public_base_url_survives_router_restart() {
+        let dir = PathBuf::from(format!(r"D:\gpt\starlink-router-config-test-{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("router.json"),
+            r#"{
+                "data_dir": "D:\\gpt\\starlink-dimension-router-data",
+                "host": "127.0.0.1",
+                "port": 7865,
+                "display_name": "星链维度分流系统",
+                "default_model": "deepseek-v4-flash",
+                "public_base_url": "https://api.gemstory.cn"
+            }"#,
+        )
+        .unwrap();
+
+        let config = RouterConfig::load(&dir).unwrap();
+        assert_eq!(config.public_base_url, "https://api.gemstory.cn");
+        let _ = fs::remove_dir_all(dir);
     }
 }

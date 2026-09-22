@@ -152,6 +152,8 @@ Core 是统一的公网入口和额度中转层。需要参考图或参考视频
 
 同一个 Core Base URL 和普通 API Key 同时支持文字与视频。文字请求调用 `/chat/completions`；视频请求调用 `/videos/generations`，或在兼容客户端中选择 `model=seedance`。Core 会按请求类型记账，再使用内部 AI Work 桥接配置转发到 AI Work。客户端不需要填写 AI Work 桥接 Key，也不需要把 Core 管理员登录信息放进客户端。
 
+公网素材地址保存在 Core 数据目录的 `router.json` 中（当前为 `https://api.gemstory.cn`），不是只保存在当前终端环境变量里。重启程序或电脑后，启动脚本只需继续使用同一个 `D:\gpt\starlink-dimension-router-data` 数据目录即可恢复该配置。
+
 权限建议：
 
 - 纯文字：`chat:invoke`；

@@ -296,6 +296,7 @@ pub fn content_url(config: &crate::config::RouterConfig, asset_id: &str, token: 
     let base = std::env::var("STARLINK_ROUTER_PUBLIC_BASE_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!config.public_base_url.trim().is_empty()).then(|| config.public_base_url.clone()))
         .unwrap_or_else(|| format!("http://{}:{}", config.host, config.port));
     format!(
         "{}/v1/assets/{}/content?token={}",
@@ -398,7 +399,9 @@ pub fn response(error: AssetError) -> axum::response::Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetError, AssetLimiter};
+    use super::{content_url, AssetError, AssetLimiter};
+    use crate::config::RouterConfig;
+    use std::path::PathBuf;
 
     #[test]
     fn limiter_releases_inflight_and_enforces_windows() {
@@ -411,6 +414,16 @@ mod tests {
         drop(second);
         let third = limiter.acquire("key-1", 1);
         assert!(matches!(third, Err(AssetError::RateLimited { .. })));
+    }
+
+    #[test]
+    fn content_url_uses_persisted_public_base_url() {
+        let mut config = RouterConfig::defaults(PathBuf::from(r"D:\gpt\starlink-dimension-router-data"));
+        config.public_base_url = "https://api.gemstory.cn".into();
+        assert_eq!(
+            content_url(&config, "asset-1", "token-1"),
+            "https://api.gemstory.cn/v1/assets/asset-1/content?token=token-1"
+        );
     }
 }
 
