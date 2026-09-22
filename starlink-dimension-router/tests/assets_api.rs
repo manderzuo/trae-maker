@@ -202,6 +202,14 @@ fn video_fixture() -> VideoFixture {
     store
         .key_quota_allocate_from_pool_as_admin(&admin, aiwork_core::KeyQuotaGrant { api_key_id: key.id.clone(), resource_kind: "credits".into(), amount: 100, actor_user_id: "admin".into(), reason: "asset relay test".into() })
         .unwrap();
+    store
+        .set_video_billing_control(aiwork_core::VideoBillingControlInput {
+            mode: aiwork_core::VideoBillingMode::Active,
+            reason: "video asset route test".into(),
+            diagnostic_key_id: None,
+            diagnostic_request_hash: None,
+        })
+        .unwrap();
     let bridge = Arc::new(VideoBridge::default());
     let config = RouterConfig::defaults(dir.clone());
     let client = BridgeClient::from_transport("http://bridge", "bridge-secret", bridge.clone());

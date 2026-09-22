@@ -9,13 +9,25 @@ use crate::{admin_session::{ensure_initial_admin_credential, AdminSessionStore, 
 pub struct UserVideoJob {
     pub id: String,
     pub user_id: String,
+    #[serde(default)]
+    pub api_key_id: String,
     pub request_id: String,
     pub upstream_id: Option<String>,
     pub status: String,
     pub output_ref: Option<String>,
     pub error_code: Option<String>,
     pub reconcile_required: bool,
+    #[serde(default)]
+    pub reservation_id: Option<String>,
+    #[serde(default = "default_billing_state")]
+    pub billing_state: String,
+    #[serde(default)]
+    pub actual_credits: Option<String>,
+    #[serde(default)]
+    pub last_reconciled_at_ms: Option<i64>,
 }
+
+fn default_billing_state() -> String { "held".into() }
 
 pub struct StarlinkRouterState {
     pub store: Arc<CoreStore>,

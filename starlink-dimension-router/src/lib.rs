@@ -11,3 +11,5 @@ pub mod admin_routes;
 pub mod bridge_config;
 pub mod migration;
 pub mod assets;
+pub mod video_billing;
+pub mod video_reconciler;
