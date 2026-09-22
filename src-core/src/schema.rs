@@ -506,3 +506,25 @@ CREATE TABLE IF NOT EXISTS admin_credentials (
   updated_at_ms INTEGER NOT NULL
 );
 "#;
+
+pub(crate) const SCHEMA_V16: &str = r#"
+CREATE TABLE IF NOT EXISTS video_billing_control (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  mode TEXT NOT NULL CHECK(mode IN ('paused','diagnostic_once','active')),
+  reason TEXT NOT NULL,
+  diagnostic_key_id TEXT REFERENCES api_keys(id),
+  diagnostic_request_hash TEXT,
+  diagnostic_claimed_at_ms INTEGER,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS video_diagnostic_claims (
+  claim_id TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL REFERENCES api_keys(id),
+  request_hash TEXT NOT NULL,
+  claimed_at_ms INTEGER NOT NULL,
+  UNIQUE(key_id, request_hash)
+);
+INSERT OR IGNORE INTO video_billing_control
+  (id, mode, reason, diagnostic_key_id, diagnostic_request_hash, diagnostic_claimed_at_ms, updated_at_ms)
+VALUES (1, 'paused', '尚未取得可核验的单任务上游积分回执', NULL, NULL, NULL, 0);
+"#;

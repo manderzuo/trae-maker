@@ -61,7 +61,7 @@ fn schema_v14_migrates_existing_v13_without_touching_users_or_keys() {
     create_v13_fixture_with_admin_and_key(&dir);
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 14);
+    assert_eq!(store.schema_version().unwrap(), 16);
     assert_eq!(store.count_rows("users").unwrap(), 1);
     assert_eq!(store.count_rows("api_keys").unwrap(), 1);
     assert_eq!(store.table_count("admin_credentials").unwrap(), 1);

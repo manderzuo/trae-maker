@@ -625,7 +625,7 @@ fn unknown_video_lease_requires_explicit_success_evidence_to_reconcile_once() {
 #[test]
 fn bootstrap_creates_authoritative_video_job_tables() {
     let (store, _admin, _principal, dir) = fixture();
-    assert_eq!(CURRENT_SCHEMA_VERSION, 14);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 16);
     assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     for table in ["jobs", "job_attempts", "dispatch_queue_cursors"] {
         assert_eq!(store.table_count(table).unwrap(), 1, "missing table {table}");

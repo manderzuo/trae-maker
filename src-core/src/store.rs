@@ -12,6 +12,7 @@ use crate::{
     schema::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
         SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+        SCHEMA_V16,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
@@ -20,12 +21,13 @@ use crate::{
     },
     AuthError, CoreApiKeyAdminView, CoreError, CoreUserAdminView, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
     AdminCredentialRecord, AssetState, CoreAsset, CreateAssetInput, NewAdminCredential, NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
-    UpstreamAccountState, QuotaMigrationState,
+    UpstreamAccountState, QuotaMigrationState, VideoBillingControl, VideoBillingControlInput,
+    VideoBillingMode, VideoDiagnosticClaim,
     UpstreamLease, UpstreamObservation, User,
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_SCHEMA_VERSION: u32 = 16;
 pub const DEFAULT_API_KEY_MAX_CONCURRENCY: i64 = 32;
 
 pub struct CoreStore {
@@ -252,7 +254,7 @@ impl CoreStore {
             11 => {}
             12 => {}
             13 => {}
-            CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
+            14 | 15 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
                 version => return Err(CoreError::UnsupportedSchemaVersion { version }),
             }
 
@@ -264,6 +266,12 @@ impl CoreStore {
             }
             if version < 14 {
                 Self::migrate_v13_to_v14(&transaction)?;
+            }
+            if version < 15 {
+                Self::migrate_v14_to_v15(&transaction)?;
+            }
+            if version < 16 {
+                Self::migrate_v15_to_v16(&transaction)?;
             }
             if version < CURRENT_SCHEMA_VERSION {
                 transaction
@@ -306,6 +314,129 @@ impl CoreStore {
                 .map_err(|_| CoreError::InvalidSchemaVersion { value }),
             None => Ok(0),
         }
+    }
+
+    pub fn video_billing_control(&self) -> Result<VideoBillingControl, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        connection
+            .query_row(
+                "SELECT mode, reason, diagnostic_key_id, diagnostic_request_hash,
+                        diagnostic_claimed_at_ms, updated_at_ms
+                 FROM video_billing_control WHERE id = 1",
+                [],
+                |row| {
+                    let mode_value: String = row.get(0)?;
+                    let mode = VideoBillingMode::from_db(&mode_value).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("invalid video billing mode: {mode_value}"),
+                            )),
+                        )
+                    })?;
+                    Ok(VideoBillingControl {
+                        mode,
+                        reason: row.get(1)?,
+                        diagnostic_key_id: row.get(2)?,
+                        diagnostic_request_hash: row.get(3)?,
+                        diagnostic_claimed_at_ms: row.get(4)?,
+                        updated_at_ms: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(CoreError::from)
+    }
+
+    pub fn set_video_billing_control(
+        &self,
+        input: VideoBillingControlInput,
+    ) -> Result<(), CoreError> {
+        validate_video_billing_control_input(&input)?;
+        let now = Utc::now().timestamp_millis();
+        let diagnostic_key_id = if input.mode == VideoBillingMode::DiagnosticOnce {
+            input.diagnostic_key_id.as_deref()
+        } else {
+            None
+        };
+        let diagnostic_request_hash = if input.mode == VideoBillingMode::DiagnosticOnce {
+            input.diagnostic_request_hash.as_deref()
+        } else {
+            None
+        };
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        connection.execute(
+            "UPDATE video_billing_control
+             SET mode = ?1, reason = ?2, diagnostic_key_id = ?3,
+                 diagnostic_request_hash = ?4, diagnostic_claimed_at_ms = NULL,
+                 updated_at_ms = ?5
+             WHERE id = 1",
+            params![
+                input.mode.as_str(),
+                input.reason.trim(),
+                diagnostic_key_id,
+                diagnostic_request_hash,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_video_diagnostic(
+        &self,
+        key_id: &str,
+        request_hash: &str,
+    ) -> Result<Option<VideoDiagnosticClaim>, CoreError> {
+        validate_video_diagnostic_values(key_id, request_hash)?;
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let control = transaction
+            .query_row(
+                "SELECT mode, diagnostic_key_id, diagnostic_request_hash,
+                        diagnostic_claimed_at_ms
+                 FROM video_billing_control WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((mode, configured_key, configured_hash, claimed_at_ms)) = control else {
+            return Err(CoreError::InvalidConfiguration {
+                key: "video_billing_control".into(),
+                value: "control row is missing".into(),
+            });
+        };
+        if mode != VideoBillingMode::DiagnosticOnce.as_str()
+            || claimed_at_ms.is_some()
+            || configured_key.as_deref() != Some(key_id)
+            || configured_hash.as_deref() != Some(request_hash)
+        {
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        let claim_id = Self::new_id("video-diagnostic");
+        transaction.execute(
+            "INSERT INTO video_diagnostic_claims (claim_id, key_id, request_hash, claimed_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![claim_id, key_id, request_hash, now],
+        )?;
+        transaction.execute(
+            "UPDATE video_billing_control
+             SET mode = 'paused', diagnostic_claimed_at_ms = ?1, updated_at_ms = ?1
+             WHERE id = 1",
+            [now],
+        )?;
+        transaction.commit()?;
+        Ok(Some(VideoDiagnosticClaim { claimed_at_ms: now }))
     }
 
     pub fn foreign_keys_enabled(&self) -> Result<bool, CoreError> {
@@ -1301,6 +1432,13 @@ impl CoreStore {
             });
         }
         Ok(())
+    }
+
+    fn normalize_api_key_scopes(mut scopes: BTreeSet<String>) -> BTreeSet<String> {
+        if scopes.contains("videos:submit") {
+            scopes.insert("videos:read".into());
+        }
+        scopes
     }
 
     pub fn revoke_api_key(&self, key_id: &str, actor: &str) -> Result<(), CoreError> {
@@ -2326,6 +2464,51 @@ impl CoreStore {
         transaction.execute_batch(SCHEMA_V14).map_err(CoreError::migration)
     }
 
+    fn migrate_v14_to_v15(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        let table_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_keys')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(());
+        }
+        let scopes_column_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('api_keys') WHERE name = 'scopes_json')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !scopes_column_exists {
+            return Ok(());
+        }
+        let mut updates = Vec::new();
+        {
+            let mut statement = transaction.prepare("SELECT id, scopes_json FROM api_keys")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (key_id, scopes_json) = row?;
+                let scopes: BTreeSet<String> = serde_json::from_str(&scopes_json)?;
+                let normalized = Self::normalize_api_key_scopes(scopes.clone());
+                if normalized != scopes {
+                    updates.push((key_id, serde_json::to_string(&normalized)?));
+                }
+            }
+        }
+        for (key_id, scopes_json) in updates {
+            transaction.execute(
+                "UPDATE api_keys SET scopes_json = ?1 WHERE id = ?2",
+                params![scopes_json, key_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v15_to_v16(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        transaction.execute_batch(SCHEMA_V16).map_err(CoreError::migration)
+    }
+
     fn migrate_v5_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
         let observations_table_exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'upstream_observations')",
@@ -2602,6 +2785,51 @@ impl CoreStore {
         )?;
         Ok(())
     }
+}
+
+fn validate_video_billing_control_input(
+    input: &VideoBillingControlInput,
+) -> Result<(), CoreError> {
+    if input.reason.trim().is_empty()
+        || input.reason.len() > 256
+        || input.reason.chars().any(char::is_control)
+    {
+        return Err(CoreError::Validation {
+            field: "video_billing.reason".into(),
+            reason: "must be a non-empty reason without control characters".into(),
+        });
+    }
+    match input.mode {
+        VideoBillingMode::DiagnosticOnce => {
+            let key_id = input.diagnostic_key_id.as_deref().unwrap_or("");
+            let request_hash = input.diagnostic_request_hash.as_deref().unwrap_or("");
+            validate_video_diagnostic_values(key_id, request_hash)?;
+        }
+        VideoBillingMode::Paused | VideoBillingMode::Active => {
+            if input.diagnostic_key_id.is_some() || input.diagnostic_request_hash.is_some() {
+                return Err(CoreError::Validation {
+                    field: "video_billing.diagnostic".into(),
+                    reason: "diagnostic fields require diagnostic_once mode".into(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_video_diagnostic_values(key_id: &str, request_hash: &str) -> Result<(), CoreError> {
+    if key_id.trim().is_empty()
+        || key_id.len() > 160
+        || key_id.chars().any(char::is_control)
+        || request_hash.len() != 64
+        || !request_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(CoreError::Validation {
+            field: "video_billing.diagnostic".into(),
+            reason: "key id and request hash are invalid".into(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_asset_identifier(value: &str) -> Result<(), CoreError> {

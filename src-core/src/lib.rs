@@ -12,6 +12,7 @@ mod schema;
 mod store;
 mod upstream;
 mod usage_trend;
+mod video_billing;
 
 pub use cost::{CostError, CostEstimate, CostPolicy};
 pub use error::CoreError;
@@ -38,6 +39,7 @@ pub use ports::{
 pub use requests::canonical_json_hash;
 pub use store::{CoreStore, CORE_DB_FILE, CURRENT_SCHEMA_VERSION};
 pub use usage_trend::UsageTrendPoint;
+pub use video_billing::{VideoBillingControl, VideoBillingControlInput, VideoBillingMode, VideoDiagnosticClaim};
 pub use admin_summary::CoreAdminSummary;
 pub use admin_credentials::{AdminCredentialRecord, NewAdminCredential};
 pub use upstream::{
