@@ -115,3 +115,19 @@ stale、active、unknown、reader failure、槽位饱和等），普通用户不
 调度事件采用固定 JSONL 结构，使用 account/observation hash 和固定 error category；
 请求/响应 body、prompt、JWT、Cookie、credentials_ref 不得进入该结构化事件。遗留的 debug
 请求日志仍是显式诊断开关，启用前应按本机日志权限和敏感内容风险处理。
+
+## 7. 视频实际积分结算安全门
+
+视频计费控制默认持久化为 `paused`。在没有经任务级回执证明的上游 `credits` 单位前，
+普通视频提交必须在预占额度前返回 `video_billing_paused`，不能调用上游，也不能产生固定
+1 积分扣费。管理员只能为已有普通 Key 登记一次、绑定请求哈希的一次性诊断；诊断成功后
+控制会自动回到 `paused`。
+
+视频 202 接受只创建 `held` 预占。只有同时匹配任务 ID、终态、明确的 `credits` 单位、
+非负且受支持精度的实际值，并且实际值不超过预占上限时，才允许一次性结算；缺失、冲突、
+格式错误、超额或重启后的未知结果都保留预占并进入 `reconcile_required`。后台对账器每
+15 秒检查一次，查询接口重复调用不会产生第二条账本记录。
+
+本地验收使用 `scripts/test-video-billing-state.mjs`，Cargo target、日志和报告固定写入
+`D:\gpt\starlink-video-billing-test`。在真实回执被独立确认前，不得启用 `active`，不得
+进行固定点或小数积分迁移，也不得把上游余额、token、时长或价格字段当作单任务消耗。
