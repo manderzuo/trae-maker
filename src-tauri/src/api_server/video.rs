@@ -21,6 +21,54 @@ use super::trae_resource_upload::{self, NativeUploadError};
 use super::limits::{Permit, RateLimiter};
 use super::{ApiSharedState, ErrKind, APP_ID, AGENT_HOST, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingStatus {
+    Absent,
+    Unverified,
+    Verified,
+}
+
+impl Default for BillingStatus {
+    fn default() -> Self {
+        Self::Absent
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VideoBillingReceipt {
+    pub status: BillingStatus,
+    pub actual_credits: Option<String>,
+    pub unit: Option<String>,
+    pub source: Option<String>,
+    pub task_ref: Option<String>,
+    pub observed_at_ms: u64,
+}
+
+impl Default for VideoBillingReceipt {
+    fn default() -> Self {
+        Self {
+            status: BillingStatus::Absent,
+            actual_credits: None,
+            unit: None,
+            source: None,
+            task_ref: None,
+            observed_at_ms: 0,
+        }
+    }
+}
+
+impl VideoBillingReceipt {
+    fn unverified(observed_at_ms: u64) -> Self {
+        Self {
+            status: BillingStatus::Unverified,
+            source: Some("upstream_task_receipt".into()),
+            observed_at_ms,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 pub struct VideoTask {
     pub id: String,
@@ -46,6 +94,8 @@ pub struct VideoTask {
     /// 生成成功但本地缓存失败时给客户端的可读提示；不影响上游 video_url。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_error: Option<String>,
+    /// 仅暴露经过 allowlist 校验的单任务积分回执候选，不包含原始上游响应。
+    pub billing: VideoBillingReceipt,
     /// 进程重启后恢复幂等键；只保存哈希后的内部键，不保存客户端原文。
     #[serde(skip)]
     request_key: Option<String>,
@@ -91,6 +141,8 @@ struct PersistedVideoTask {
     content_url: Option<String>,
     #[serde(default)]
     artifact_error: Option<String>,
+    #[serde(default)]
+    billing: VideoBillingReceipt,
     #[serde(default)]
     request_key: Option<String>,
     #[serde(default = "default_owner_key")]
@@ -266,6 +318,7 @@ fn persisted(task: &VideoTask) -> PersistedVideoTask {
         video_duration: task.video_duration,
         content_url: task.content_url.clone(),
         artifact_error: task.artifact_error.clone(),
+        billing: task.billing.clone(),
         request_key: task.request_key.clone(),
         owner_key_id: task.owner_key_id.clone(),
     }
@@ -287,6 +340,7 @@ fn restored(task: PersistedVideoTask) -> VideoTask {
         video_duration: task.video_duration,
         content_url: task.content_url,
         artifact_error: task.artifact_error,
+        billing: task.billing,
         request_key: task.request_key,
         owner_key_id: task.owner_key_id,
     }
@@ -656,6 +710,7 @@ pub fn create_pending_for(model: String, prompt: String, owner_key_id: &str) -> 
         video_duration: None,
         content_url: None,
         artifact_error: None,
+        billing: VideoBillingReceipt::default(),
         request_key: None,
         owner_key_id: if owner_key_id.trim().is_empty() {
             "anonymous".into()
@@ -926,31 +981,192 @@ fn result_fields(value: &Value) -> (Option<String>, Option<String>, Option<f64>)
     (uri, url, duration)
 }
 
+fn billing_observed_at_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn extract_billing_candidate(data: &str, expected_task_id: &str) -> Result<VideoBillingReceipt, String> {
+    let value: Value = serde_json::from_str(data)
+        .map_err(|error| format!("billing receipt JSON 无效: {error}"))?;
+    Ok(extract_billing_candidate_value(
+        &value,
+        expected_task_id,
+        credit_value_contains_exponent(data),
+    ))
+}
+
+fn credit_value_contains_exponent(data: &str) -> bool {
+    let lower = data.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(relative) = lower[offset..].find("\"credits\"") {
+        let key_end = offset + relative + "\"credits\"".len();
+        let Some(colon) = lower[key_end..].find(':') else {
+            return false;
+        };
+        let value_start = key_end + colon + 1;
+        let rest = lower[value_start..].trim_start();
+        let end = rest
+            .find(|character| character == ',' || character == '}')
+            .unwrap_or(rest.len());
+        let token = rest[..end].trim().trim_matches('"');
+        if token.contains('e') {
+            return true;
+        }
+        offset = value_start + end;
+    }
+    false
+}
+
+fn extract_billing_candidate_value(
+    value: &Value,
+    expected_task_id: &str,
+    credit_value_has_exponent: bool,
+) -> VideoBillingReceipt {
+    let observed_at_ms = billing_observed_at_ms();
+    let mut objects = vec![value];
+    for key in ["data", "result", "output", "video"] {
+        if let Some(nested) = value.get(key).filter(|candidate| candidate.is_object()) {
+            objects.push(nested);
+        }
+    }
+
+    let mut saw_billing_signal = false;
+    for object in objects {
+        if [
+            "task_id",
+            "task_ref",
+            "usage",
+            "credits",
+            "unit",
+            "balance_before",
+            "balance_after",
+            "total_tokens",
+            "cost",
+        ]
+        .iter()
+        .any(|key| object.get(*key).is_some())
+        {
+            saw_billing_signal = true;
+        }
+
+        let Some(task_ref) = ["task_id", "task_ref"].iter().find_map(|key| {
+            object.get(*key).and_then(Value::as_str)
+        }) else {
+            continue;
+        };
+        let Some(usage) = object.get("usage").and_then(Value::as_object) else {
+            continue;
+        };
+        if task_ref != expected_task_id
+            || usage.get("unit").and_then(Value::as_str) != Some("credits")
+        {
+            continue;
+        }
+        if credit_value_has_exponent {
+            return VideoBillingReceipt::unverified(observed_at_ms);
+        }
+        let Some(actual_credits) = usage
+            .get("credits")
+            .and_then(canonical_credit_amount)
+        else {
+            continue;
+        };
+        return VideoBillingReceipt {
+            status: BillingStatus::Verified,
+            actual_credits: Some(actual_credits),
+            unit: Some("credits".into()),
+            source: Some("upstream_task_receipt".into()),
+            task_ref: Some(expected_task_id.to_string()),
+            observed_at_ms,
+        };
+    }
+
+    if saw_billing_signal {
+        VideoBillingReceipt::unverified(observed_at_ms)
+    } else {
+        VideoBillingReceipt::default()
+    }
+}
+
+fn canonical_credit_amount(value: &Value) -> Option<String> {
+    let raw = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(string) => string.trim().to_string(),
+        _ => return None,
+    };
+    if raw.is_empty()
+        || raw.len() > 64
+        || raw.starts_with('-')
+        || raw.contains(['e', 'E'])
+    {
+        return None;
+    }
+    let (whole, fraction) = raw.split_once('.').unwrap_or((&raw, ""));
+    if whole.is_empty()
+        || whole.len() > 24
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_empty()
+        || fraction.len() > 6
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let mut canonical = String::with_capacity(whole.len() + 7);
+    canonical.push_str(whole);
+    canonical.push('.');
+    canonical.push_str(fraction);
+    for _ in fraction.len()..6 {
+        canonical.push('0');
+    }
+    Some(canonical)
+}
+
+fn merge_billing_candidate(task: &mut VideoTask, candidate: VideoBillingReceipt) {
+    if candidate.status == BillingStatus::Verified
+        || (task.billing.status == BillingStatus::Absent
+            && candidate.status == BillingStatus::Unverified)
+    {
+        task.billing = candidate;
+    }
+}
+
+fn apply_result_payload(task_id: &str, value: &Value, billing: VideoBillingReceipt) {
+    let (uri, url, duration) = result_fields(value);
+    if uri.is_some() || url.is_some() || duration.is_some() || billing.status != BillingStatus::Absent {
+        update_task(task_id, |task| {
+            if uri.is_some() {
+                task.resource_uri = uri;
+            }
+            if url.is_some() {
+                task.video_url = url;
+            }
+            if duration.is_some() {
+                task.video_duration = duration;
+            }
+            merge_billing_candidate(task, billing);
+        });
+    }
+}
+
 fn parse_sse_event(event: &str, data: &str, task_id: &str) -> Result<bool, String> {
     if event == "result" || event == "output" {
         let value: Value = serde_json::from_str(data)
             .map_err(|e| format!("Seedance {event} JSON 无效: {e}"))?;
-        let (uri, url, duration) = result_fields(&value);
-        if uri.is_some() || url.is_some() || duration.is_some() {
-            update_task(task_id, |task| {
-                if uri.is_some() { task.resource_uri = uri; }
-                if url.is_some() { task.video_url = url; }
-                if duration.is_some() { task.video_duration = duration; }
-            });
-        }
+        let billing = extract_billing_candidate(data, task_id)?;
+        apply_result_payload(task_id, &value, billing);
     } else if event == "done" {
         // “done” 没有 result 资源时不能向调用方报告成功，否则会得到一个
         // 永远无法下载的空任务。允许 done 携带最后一条结果数据作为兜底。
         if !data.trim().is_empty() {
             if let Ok(value) = serde_json::from_str::<Value>(data) {
-                let (uri, url, duration) = result_fields(&value);
-                if uri.is_some() || url.is_some() || duration.is_some() {
-                    update_task(task_id, |task| {
-                        if uri.is_some() { task.resource_uri = uri; }
-                        if url.is_some() { task.video_url = url; }
-                        if duration.is_some() { task.video_duration = duration; }
-                    });
-                }
+                let billing = extract_billing_candidate(data, task_id)
+                    .map_err(|error| error.to_string())?;
+                apply_result_payload(task_id, &value, billing);
             }
         }
         let has_resource = get(task_id)
@@ -1259,6 +1475,57 @@ mod tests {
     }
 
     #[test]
+    fn billing_candidate_requires_task_reference_and_credit_unit() {
+        let candidate = extract_billing_candidate(
+            r#"{"task_id":"video-1","usage":{"credits":12.5,"unit":"credits"}}"#,
+            "video-1",
+        )
+        .unwrap();
+        assert_eq!(candidate.status, BillingStatus::Verified);
+        assert_eq!(candidate.actual_credits, Some("12.500000".into()));
+    }
+
+    #[test]
+    fn balance_delta_duration_token_cost_and_unrelated_numbers_are_not_billing() {
+        for data in [
+            r#"{"video_duration":5,"credits":12.5}"#,
+            r#"{"usage":{"total_tokens":999,"cost":"12.50","currency":"CNY"}}"#,
+            r#"{"balance_before":100,"balance_after":80}"#,
+        ] {
+            assert_eq!(
+                extract_billing_candidate(data, "video-1")
+                    .unwrap()
+                    .status,
+                BillingStatus::Unverified
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_or_negative_receipts_are_exposed_as_unverified_without_failing_the_video_task() {
+        let candidate = extract_billing_candidate(
+            r#"{"task_id":"video-1","usage":{"credits":-1,"unit":"credits"}}"#,
+            "video-1",
+        )
+        .unwrap();
+        assert_eq!(candidate.status, BillingStatus::Unverified);
+        assert!(candidate.actual_credits.is_none());
+    }
+
+    #[test]
+    fn exponent_nan_and_over_precision_values_stay_unverified() {
+        for data in [
+            r#"{"task_id":"video-1","usage":{"credits":1e2,"unit":"credits"}}"#,
+            r#"{"task_id":"video-1","usage":{"credits":"NaN","unit":"credits"}}"#,
+            r#"{"task_id":"video-1","usage":{"credits":1.1234567,"unit":"credits"}}"#,
+        ] {
+            let candidate = extract_billing_candidate(data, "video-1").unwrap();
+            assert_eq!(candidate.status, BillingStatus::Unverified);
+            assert!(candidate.actual_credits.is_none());
+        }
+    }
+
+    #[test]
     fn pending_task_is_queryable() {
         let task = create_pending("seedance".into(), "test".into());
         assert_eq!(task.status, "queued");
@@ -1393,6 +1660,26 @@ mod tests {
     }
 
     #[test]
+    fn result_event_updates_billing_without_exposing_raw_payload() {
+        let task = create_pending("seedance".into(), "billing".into());
+        let data = serde_json::json!({
+            "task_id": task.id,
+            "uri": "tos://video-billing",
+            "usage": {"credits": 1.25, "unit": "credits", "account": "private"}
+        })
+        .to_string();
+        assert!(!parse_sse_event("result", &data, &task.id).unwrap());
+        let updated = get(&task.id).unwrap();
+        assert_eq!(updated.billing.status, BillingStatus::Verified);
+        assert_eq!(updated.billing.actual_credits.as_deref(), Some("1.250000"));
+        assert_eq!(updated.billing.task_ref.as_deref(), Some(task.id.as_str()));
+        assert!(serde_json::to_string(&updated)
+            .unwrap()
+            .contains("upstream_task_receipt"));
+        assert!(!serde_json::to_string(&updated).unwrap().contains("private"));
+    }
+
+    #[test]
     fn done_without_resource_is_not_success() {
         let task = create_pending("seedance".into(), "empty".into());
         assert!(parse_sse_event("done", "{}", &task.id).unwrap());
@@ -1427,6 +1714,11 @@ mod tests {
 
     #[test]
     fn persisted_task_roundtrip_keeps_owner_and_artifact_fields() {
+        let billing = extract_billing_candidate(
+            r#"{"task_id":"video-test","usage":{"credits":12.5,"unit":"credits"}}"#,
+            "video-test",
+        )
+        .unwrap();
         let task = VideoTask {
             id: "video-test".into(),
             object: "video".into(),
@@ -1442,6 +1734,7 @@ mod tests {
             video_duration: Some(4.0),
             content_url: Some("/v1/videos/video-test/content".into()),
             artifact_error: None,
+            billing: billing.clone(),
             request_key: Some("idem-test".into()),
             owner_key_id: "key-a".into(),
         };
@@ -1449,6 +1742,10 @@ mod tests {
         assert_eq!(restored.owner_key_id, "key-a");
         assert_eq!(restored.content_url.as_deref(), Some("/v1/videos/video-test/content"));
         assert_eq!(restored.video_url, task.video_url);
+        assert_eq!(restored.billing, billing);
+        let public = serde_json::to_value(&task).unwrap();
+        assert_eq!(public["billing"]["status"], "verified");
+        assert_eq!(public["billing"]["actual_credits"], "12.500000");
     }
 
     #[test]
