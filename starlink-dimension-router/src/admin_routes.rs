@@ -44,6 +44,19 @@ pub struct LoginInput { pub username: String, pub password: String }
 #[derive(Debug, Deserialize)]
 pub struct PasswordChangeInput { pub current_password: String, pub new_password: String }
 
+#[derive(Debug, Deserialize)]
+pub struct VideoBillingUpdateInput {
+    pub mode: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VideoDiagnosticInput {
+    pub key_id: String,
+    pub request_hash: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SummaryResponse { pub core: CoreAdminSummary, pub bridge: serde_json::Value }
 
@@ -66,6 +79,8 @@ pub fn router() -> Router<Arc<StarlinkRouterState>> {
     Router::new()
         .route("/admin/v1/summary", get(summary))
         .route("/admin/v1/usage-trend", get(usage_trend))
+        .route("/admin/v1/video-billing", get(video_billing_status).put(update_video_billing))
+        .route("/admin/v1/video-billing/diagnostic", post(register_video_diagnostic))
         .route("/admin/v1/bridge/status", get(bridge_status))
         .route("/admin/v1/bridge/test", post(bridge_test))
         .route("/admin/v1/bridge/config", put(bridge_config_save))
@@ -205,6 +220,76 @@ async fn usage_trend(State(state): State<Arc<StarlinkRouterState>>, Query(query)
         bucket_ms,
         points,
     }))
+}
+
+fn video_billing_snapshot(state: &StarlinkRouterState) -> Result<serde_json::Value, aiwork_core::CoreError> {
+    let control = state.store.video_billing_control()?;
+    let jobs = state.jobs.lock().unwrap_or_else(|error| error.into_inner());
+    let held = jobs.values().filter(|job| job.billing_state == "held").count();
+    let reconcile_required = jobs.values().filter(|job| job.billing_state == "reconcile_required" || job.reconcile_required).count();
+    let verified_settled = jobs.values().filter(|job| job.billing_state == "settled" && job.actual_credits.is_some()).count();
+    let legacy_unverified = jobs.values().filter(|job| job.reservation_id.is_none() && job.billing_state != "settled" && job.billing_state != "released").count();
+    Ok(json!({
+        "mode": control.mode.as_str(),
+        "reason": control.reason,
+        "diagnostic": {
+            "armed": control.mode == aiwork_core::VideoBillingMode::DiagnosticOnce,
+            "claimed": control.diagnostic_claimed_at_ms.is_some(),
+            "claimed_at_ms": control.diagnostic_claimed_at_ms,
+        },
+        "counts": {
+            "held": held,
+            "reconcile_required": reconcile_required,
+            "verified_settled": verified_settled,
+            "legacy_unverified": legacy_unverified,
+        },
+        "updated_at_ms": control.updated_at_ms,
+    }))
+}
+
+async fn video_billing_status(State(state): State<Arc<StarlinkRouterState>>) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    video_billing_snapshot(&state).map(Json).map_err(internal)
+}
+
+async fn update_video_billing(
+    State(state): State<Arc<StarlinkRouterState>>,
+    Json(input): Json<VideoBillingUpdateInput>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let mode = match input.mode.trim().to_ascii_lowercase().as_str() {
+        "paused" => aiwork_core::VideoBillingMode::Paused,
+        "active" => aiwork_core::VideoBillingMode::Active,
+        "diagnostic_once" => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "invalid_video_billing_mode", "message": "一次性验收请使用登记一次性验收接口"}})))),
+        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "invalid_video_billing_mode", "message": "模式只能是 paused 或 active"}})))),
+    };
+    state.store.set_video_billing_control(aiwork_core::VideoBillingControlInput {
+        mode,
+        reason: input.reason,
+        diagnostic_key_id: None,
+        diagnostic_request_hash: None,
+    }).map_err(internal)?;
+    video_billing_snapshot(&state).map(Json).map_err(internal)
+}
+
+async fn register_video_diagnostic(
+    State(state): State<Arc<StarlinkRouterState>>,
+    Extension(principal): Extension<aiwork_core::Principal>,
+    Json(input): Json<VideoDiagnosticInput>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let current = state.store.video_billing_control().map_err(internal)?;
+    if current.mode == aiwork_core::VideoBillingMode::DiagnosticOnce || current.diagnostic_claimed_at_ms.is_some() {
+        return Err((StatusCode::CONFLICT, Json(json!({"error": {"type": "video_diagnostic_already_registered", "message": "已有一次性验收登记或已使用，请先保持暂停后再登记"}}))));
+    }
+    let known_key = state.store.list_api_keys_as_admin(&principal, None)
+        .map_err(internal)?.into_iter().any(|key| key.id == input.key_id);
+    if !known_key {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "video_diagnostic_key_not_found", "message": "只能登记已存在的普通 API Key 内部 ID"}}))));
+    }
+    state.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &input.key_id,
+        &input.request_hash,
+        &input.reason,
+    )).map_err(internal)?;
+    video_billing_snapshot(&state).map(Json).map_err(internal)
 }
 
 async fn bridge_status(State(state): State<Arc<StarlinkRouterState>>) -> Json<serde_json::Value> {
