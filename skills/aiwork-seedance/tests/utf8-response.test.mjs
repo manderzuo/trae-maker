@@ -36,3 +36,36 @@ test('status preserves UTF-8 task text when JSON response has no charset', async
     server.close();
   }
 });
+
+test('doctor preserves UTF-8 health text when JSON response has no charset', async () => {
+  const service = '星链维度分流系统';
+  const server = createServer((request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    if (request.url === '/health') {
+      response.end(JSON.stringify({ service, status: 'ok' }));
+    } else if (request.url === '/v1/models') {
+      response.end(JSON.stringify({ data: [{ id: 'seedance' }] }));
+    } else {
+      response.writeHead(404);
+      response.end();
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const child = spawn('powershell.exe', [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', runner, 'doctor',
+      '-GatewayBaseUrl', `http://127.0.0.1:${server.address().port}/v1`, '-ApiKey', 'test-key',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
+    child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+    const [exitCode] = await once(child, 'close');
+    assert.equal(exitCode, 0, stderr);
+    assert.equal(JSON.parse(stdout).health.service, service);
+  } finally {
+    server.close();
+  }
+});
