@@ -4,6 +4,7 @@ import { useAppStore } from '../store';
 import { Badge } from './ui';
 import { api } from '../lib/tauri';
 import type { AppLocate, WorkBuddyEnvCheck, WbCliStatus } from '../types';
+import { shouldIgnoreStaleGatewayToggle } from './gatewayStatus';
 
 /** API 网关启停（Trae/Buddy 顶栏共用）：直接调 api_server_start/stop 并同步 store */
 function useApiGatewayToggle() {
@@ -12,10 +13,24 @@ function useApiGatewayToggle() {
   const [busy, setBusy] = useState(false);
   const running = apiStatus?.running ?? false;
 
+  useEffect(() => {
+    // The tray and launcher can start the backend after the initial store refresh.
+    // Keep the badge in sync with the runtime, including while this page stays open.
+    void useAppStore.getState().refreshApiStatus();
+    const timer = setInterval(() => void useAppStore.getState().refreshApiStatus(), 3000);
+    return () => clearInterval(timer);
+  }, []);
+
   const toggle = async () => {
     if (busy) return;
     setBusy(true);
     try {
+      const current = await api.apiServer.status();
+      useAppStore.setState({ apiStatus: current });
+      if (shouldIgnoreStaleGatewayToggle(running, current.running)) {
+        pushToast('info', '网关状态已更新，请按需重新操作');
+        return;
+      }
       if (running) {
         await api.apiServer.stop();
         useAppStore.setState({ apiStatus: null });
