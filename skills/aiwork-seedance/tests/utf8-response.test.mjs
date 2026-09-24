@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import test from 'node:test';
 
-const runner = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../scripts/aiwork-seedance.ps1');
+const runner = process.env.AIWORK_SEEDANCE_RUNNER
+  || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../scripts/aiwork-seedance.ps1');
 
 test('status preserves UTF-8 task text when JSON response has no charset', async () => {
   const prompt = '你好，笔记本电脑';
