@@ -93,17 +93,18 @@ pub struct PoolEntry {
     pub global_region: bool,
 }
 
-/// 账号的双积分余额。余额单独存储，避免破坏旧的 `PoolEntry.credits` 取号语义；
-/// 目前 SOLO 文字通道仍按通用积分取号，Work/合计余额用于资源总览与后续资源级路由。
+/// 账号的双积分余额。余额单独存储，避免破坏旧的 `PoolEntry.credits` 取号语义。
 #[derive(Clone, Copy, Default)]
 pub struct CreditBalance {
     pub total: Option<f64>,
     pub general: Option<f64>,
+    /// 旧缓存可把 total 回填给 general；视频选号只能信任明确的 general 分类。
+    pub general_verified: bool,
     pub work: Option<f64>,
     pub observed_at_ms: Option<i64>,
 }
 
-/// 网关资源类型。通用积分与 Work 积分分开取号，避免资源额度串用。
+/// 网关资源类型。视频可消耗明确分类的通用积分或 Work 积分。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceKind {
     General,
@@ -347,6 +348,7 @@ impl ApiPool {
                     CreditBalance {
                         total,
                         general,
+                        general_verified: general_credits.contains_key(uid),
                         work,
                         observed_at_ms: None,
                     },
@@ -395,6 +397,7 @@ impl ApiPool {
             let balance = CreditBalance {
                 total: a.credits,
                 general: a.credits,
+                general_verified: false,
                 work: None,
                 observed_at_ms: None,
             };
@@ -445,6 +448,7 @@ impl ApiPool {
                 CreditBalance {
                     total,
                     general,
+                    general_verified: general_credits.contains_key(uid) || old.general_verified,
                     work,
                     observed_at_ms,
                 },
@@ -517,7 +521,7 @@ impl ApiPool {
         Some(picked)
     }
 
-    /// 按资源类型取号。Work 资源使用独立的 Work 积分余额；General 保持旧路径。
+    /// 按资源类型取号。视频可使用已分类的通用或 Work 积分；General 保持旧路径。
     pub fn pick_excluding_for(
         &self,
         tried: &HashSet<String>,
@@ -533,12 +537,8 @@ impl ApiPool {
         let candidates: Vec<&PoolEntry> = entries
             .values()
             .filter(|e| {
-                let work = balances
-                    .get(&e.uid)
-                    .and_then(|balance| balance.work)
-                    .filter(|credit| credit.is_finite())
-                    .unwrap_or(0.0);
-                selectable_with_credit(e, tried, now, Some(work))
+                let video_credit = balances.get(&e.uid).map(video_available_credit).unwrap_or(0.0);
+                selectable_with_credit(e, tried, now, Some(video_credit))
             })
             .collect();
         if candidates.is_empty() {
@@ -555,8 +555,8 @@ impl ApiPool {
             }).unwrap_or(candidates[0]),
             PoolStrategy::SequentialDrain => candidates.iter().copied().min_by(|a, b| a.uid.cmp(&b.uid)).unwrap_or(candidates[0]),
             _ => candidates.iter().copied().max_by(|a, b| {
-                let aw = balances.get(&a.uid).and_then(|v| v.work).unwrap_or(0.0);
-                let bw = balances.get(&b.uid).and_then(|v| v.work).unwrap_or(0.0);
+                let aw = balances.get(&a.uid).map(video_available_credit).unwrap_or(0.0);
+                let bw = balances.get(&b.uid).map(video_available_credit).unwrap_or(0.0);
                 aw.partial_cmp(&bw).unwrap_or(std::cmp::Ordering::Equal)
             }).unwrap_or(candidates[0]),
         };
@@ -763,7 +763,7 @@ impl ApiPool {
         entries.values().any(|e| selectable(e, &tried, now))
     }
 
-    /// 按资源类型判断池内是否存在可选账号。Work 资源使用独立的 Work 积分余额，
+    /// 按资源类型判断池内是否存在可选账号。视频使用明确分类的双积分余额，
     /// 与 `pick_excluding_for` 保持相同的候选过滤语义。
     pub fn has_selectable_for(&self, kind: ResourceKind) -> bool {
         if kind == ResourceKind::General {
@@ -774,12 +774,8 @@ impl ApiPool {
         let now = now_ts();
         let tried = HashSet::new();
         entries.values().any(|entry| {
-            let work = balances
-                .get(&entry.uid)
-                .and_then(|balance| balance.work)
-                .filter(|credit| credit.is_finite())
-                .unwrap_or(0.0);
-            selectable_with_credit(entry, &tried, now, Some(work))
+            let video_credit = balances.get(&entry.uid).map(video_available_credit).unwrap_or(0.0);
+            selectable_with_credit(entry, &tried, now, Some(video_credit))
         })
     }
 
@@ -862,6 +858,18 @@ pub struct WbSyncAccount {
     pub global_region: bool,
     pub credits: Option<f64>,
     pub needs_relogin: bool,
+}
+
+/// 视频可使用两类已知余额，但不能把旧版 total 缓存当作通用积分。
+fn video_available_credit(balance: &CreditBalance) -> f64 {
+    let general = if balance.general_verified {
+        balance.general.filter(|value| value.is_finite() && *value > 0.0).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let work = balance.work.filter(|value| value.is_finite() && *value > 0.0).unwrap_or(0.0);
+    let sum = general + work;
+    if sum.is_finite() { sum } else { f64::MAX }
 }
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
@@ -1541,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn has_selectable_for_uses_resource_specific_credit_balance() {
+    fn video_accepts_verified_general_or_work_credit_balance() {
         let pool = ApiPool::new();
         let accounts = vec![acct("uid_a", "uid_a")];
         let enabled = vec!["uid_a".to_string()];
@@ -1565,7 +1573,8 @@ mod tests {
         );
 
         assert!(pool.has_selectable_for(ResourceKind::General));
-        assert!(!pool.has_selectable_for(ResourceKind::Work));
+        assert!(pool.has_selectable_for(ResourceKind::Work));
+        assert_eq!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).unwrap().uid, "uid_a");
 
         work.insert("uid_a".to_string(), 2.0);
         pool.update_credit_balances(
@@ -1579,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_work_balance_never_makes_an_account_eligible_for_video() {
+    fn verified_general_balance_works_when_work_balance_is_missing() {
         let pool = ApiPool::new();
         let accounts = vec![acct("uid_a", "uid_a")];
         let enabled = vec!["uid_a".to_string()];
@@ -1599,12 +1608,12 @@ mod tests {
         );
 
         assert!(pool.has_selectable_for(ResourceKind::General));
-        assert!(!pool.has_selectable_for(ResourceKind::Work));
-        assert!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).is_none());
+        assert!(pool.has_selectable_for(ResourceKind::Work));
+        assert_eq!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).unwrap().uid, "uid_a");
     }
 
     #[test]
-    fn nonfinite_work_balance_never_makes_an_account_eligible_for_video() {
+    fn verified_general_balance_works_when_work_balance_is_nonfinite() {
         let pool = ApiPool::new();
         let accounts = vec![acct("uid_a", "uid_a")];
         let enabled = vec!["uid_a".to_string()];
@@ -1624,6 +1633,34 @@ mod tests {
             &HashMap::new(),
         );
 
+        assert!(pool.has_selectable_for(ResourceKind::Work));
+        assert_eq!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).unwrap().uid, "uid_a");
+    }
+
+    #[test]
+    fn video_rejects_unknown_or_nonfinite_general_and_work_balances() {
+        let pool = ApiPool::new();
+        let accounts = vec![acct("uid_a", "uid_a")];
+        let enabled = vec!["uid_a".to_string()];
+        let general = HashMap::from([("uid_a".to_string(), f64::NAN)]);
+        pool.sync_from_accounts_with_balances(
+            &accounts, &enabled, &[], &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &general, &HashMap::new(), &HashMap::new(), &HashMap::new(),
+        );
+        assert!(!pool.has_selectable_for(ResourceKind::Work));
+        assert!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).is_none());
+    }
+
+    #[test]
+    fn video_does_not_treat_legacy_total_as_verified_general_credit() {
+        let pool = ApiPool::new();
+        let accounts = vec![acct("uid_a", "uid_a")];
+        let enabled = vec!["uid_a".to_string()];
+        let total = HashMap::from([("uid_a".to_string(), 100.0)]);
+        pool.sync_from_accounts_with_balances(
+            &accounts, &enabled, &[], &HashMap::new(), &HashMap::new(),
+            &total, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(),
+        );
         assert!(!pool.has_selectable_for(ResourceKind::Work));
         assert!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).is_none());
     }
