@@ -11,7 +11,7 @@
     "set-version": "python scripts/sync_version.py",
     "test": "vitest run",
     "test:buttons": "node scripts/check-ui-buttons.mjs",
-    "test:skill": "node scripts/test-aiwork-skill.mjs && node scripts/test-aiwork-skill-integration.mjs"
+    "test:skill": "node scripts/test-aiwork-skill.mjs && node scripts/test-aiwork-skill-integration.mjs && node --test skills/aiwork-seedance/tests/utf8-response.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

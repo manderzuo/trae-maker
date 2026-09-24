@@ -93,7 +93,7 @@ function Get-CommonHeaders {
 }
 
 function Convert-ResponseBody($response) {
-    $raw = [string]$response.Content
+    $raw = [Text.Encoding]::UTF8.GetString($response.RawContentStream.ToArray())
     if ([string]::IsNullOrWhiteSpace($raw)) { return [pscustomobject]@{} }
     try { return $raw | ConvertFrom-Json } catch { return [pscustomobject]@{ message = $raw.Substring(0, [Math]::Min(500, $raw.Length)) } }
 }
