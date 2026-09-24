@@ -172,6 +172,8 @@ export default function InterfaceConfig() {
         listen_host: listenHost.trim() || '127.0.0.1',
         cors_origins: corsOrigins.trim(),
         asset_public_base_url: assetPublicBaseUrl.trim(),
+        core_mode: 'off',
+        scheduler_mode: 'off',
         updated_at: 0,
       };
       // 后端会规范化（空模型名回退默认值），前端展示以返回值为准（§5.3）。

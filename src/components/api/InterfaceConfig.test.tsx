@@ -14,6 +14,8 @@ const currentSettings: GatewaySettings = {
   listen_host: '0.0.0.0',
   cors_origins: 'https://example.com',
   asset_public_base_url: 'https://assets.example.com/v1',
+  core_mode: 'shadow',
+  scheduler_mode: 'off',
   updated_at: 123,
 };
 
@@ -49,6 +51,8 @@ describe('InterfaceConfig limit helpers', () => {
       listen_host: '0.0.0.0',
       cors_origins: 'https://example.com',
       asset_public_base_url: 'https://assets.example.com/v1',
+      core_mode: 'shadow',
+      scheduler_mode: 'off',
       updated_at: 123,
       limit_defaults: {
         ...DEFAULT_GATEWAY_LIMITS,
