@@ -41,6 +41,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tungstenite = "0.24"
 aiwork-core = { path = "../src-core" }
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Threading"] }
 

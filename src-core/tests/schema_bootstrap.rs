@@ -39,6 +39,10 @@ fn bootstrap_creates_authoritative_schema() {
         "job_attempts",
         "video_billing_control",
         "video_diagnostic_claims",
+        "billing_quotes",
+        "billing_receipts",
+        "billing_settlements",
+        "api_key_billing_blocks",
     ] {
         assert_eq!(store.table_count(table).unwrap(), 1, "missing table {table}");
     }
@@ -104,13 +108,16 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     fs::remove_dir_all(dir).unwrap();
 
     let future_dir = test_dir("future-version");
+    let future_version = CURRENT_SCHEMA_VERSION + 1;
     let database_dir = future_dir.join("data");
     fs::create_dir_all(&database_dir).unwrap();
     let connection = Connection::open(database_dir.join(CORE_DB_FILE)).unwrap();
     connection
         .execute_batch(
-            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
-             INSERT INTO schema_meta (key, value) VALUES ('schema_version', '17');",
+            &format!(
+                "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
+                 INSERT INTO schema_meta (key, value) VALUES ('schema_version', '{future_version}');"
+            ),
         )
         .unwrap();
     drop(connection);
@@ -118,7 +125,7 @@ fn migrate_is_idempotent_and_rejects_future_schema_versions() {
     let store = CoreStore::open(&future_dir).unwrap();
     assert!(matches!(
         store.migrate(),
-        Err(CoreError::UnsupportedSchemaVersion { version: 17 })
+        Err(CoreError::UnsupportedSchemaVersion { version }) if version == future_version
     ));
     drop(store);
     fs::remove_dir_all(future_dir).unwrap();
@@ -246,7 +253,7 @@ fn migrates_v1_requests_to_a_checked_state_machine_without_losing_data_or_indexe
         .unwrap();
     let idempotency_request_id: String = connection
         .query_row(
-            "SELECT request_id FROM idempotency_keys WHERE scope = 'u1:/v1/chat/completions' AND client_key = 'idem-1'",
+            "SELECT request_id FROM idempotency_keys WHERE scope = 'u1:key-1:/v1/chat/completions' AND client_key = 'idem-1'",
             [],
             |row| row.get(0),
         )

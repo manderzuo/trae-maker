@@ -2,6 +2,8 @@ pub mod api_keys;
 pub mod api_logger;
 pub mod assets;
 pub mod auth;
+pub mod bridge_api;
+pub mod bridge_billing;
 pub mod custom_models;
 pub mod custom_route;
 pub mod conversation;

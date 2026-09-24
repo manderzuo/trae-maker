@@ -227,6 +227,27 @@ pub struct UnifiedModel {
     pub manual: bool,
 }
 
+/// 公共/桌面模型目录中的 Seedance 视频模型项。
+/// 它不属于文字统一目录，因此由调用方按当前 Work 资源池健康状态追加。
+pub fn seedance_model(work_available: bool) -> UnifiedModel {
+    UnifiedModel {
+        id: "seedance".into(),
+        display: "Seedance 视频生成".into(),
+        vendor: "Trae Work".into(),
+        rate: None,
+        efforts: Vec::new(),
+        context_length: None,
+        max_tokens: None,
+        supports_image: Some(true),
+        sources: vec![UnifiedSource {
+            pool: "trae_work",
+            rate: None,
+            enabled: work_available,
+        }],
+        manual: false,
+    }
+}
+
 /// Trae 单源条目（四层兜底解析结果）
 struct TraeEntry {
     id: String,

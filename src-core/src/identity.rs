@@ -18,7 +18,8 @@ pub enum AuthError {
 }
 
 pub fn require_scope(principal: &Principal, scope: &str) -> Result<(), AuthError> {
-    if principal.scopes.contains(scope) {
+    let video_read_is_implied_by_submit = scope == "videos:read" && principal.scopes.contains("videos:submit");
+    if principal.scopes.contains(scope) || principal.scopes.contains("admin:*") || video_read_is_implied_by_submit {
         Ok(())
     } else {
         Err(AuthError::MissingScope {

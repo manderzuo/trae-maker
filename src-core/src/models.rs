@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, fmt, sync::Arc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{CoreStore, Principal};
+use crate::{CoreStore, CreditAmount, Principal};
 
 pub type SharedCoreStore = Arc<CoreStore>;
 
@@ -309,10 +309,23 @@ pub struct CoreUserAdminView {
 pub struct CoreApiKeyAdminView {
     pub id: String,
     pub user_id: String,
+    pub user_name: String,
     pub name: String,
     pub prefix: String,
     pub scopes: BTreeSet<String>,
     pub status: String,
+    /// Billing safety block raised after an over-quote or conflicting receipt.
+    pub billing_blocked: bool,
+    pub max_concurrency: i64,
+    pub current_concurrency: i64,
+    pub usage: Vec<CoreQuotaBalanceView>,
+    /// Raw balance assigned to this API key. This is separate from `usage`,
+    /// which remains the user-cap projection kept for compatibility.
+    pub key_quota: Vec<CoreQuotaBalanceView>,
+    /// Exact actual credits backed by a final request-scoped billing receipt.
+    pub verified_credit_spent: i64,
+    /// Remaining user-cap balance that is not already allocated to any key.
+    pub pool_allocatable: Vec<CoreQuotaBalanceView>,
     pub created_at_ms: i64,
     pub revoked_at_ms: Option<i64>,
 }
@@ -585,10 +598,94 @@ pub struct RequestHandle {
     pub result: Option<RequestResult>,
 }
 
+/// A quoted, held request whose authoritative receipt still needs querying.
+/// Recovery callers must only query by `request_id`; they must never resend
+/// the generation request represented by this record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverableBillingRequest {
+    pub request_id: String,
+    pub endpoint: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeginRequest {
     Created(RequestHandle),
     Existing(RequestHandle),
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BillingQuote {
+    pub request_id: String,
+    pub quote_id: String,
+    pub request_fingerprint: String,
+    pub endpoint: String,
+    pub model: String,
+    pub max_credits: CreditAmount,
+    pub unit: String,
+    pub expires_at_ms: i64,
+    pub source_ref: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingReceiptStatus {
+    Final,
+    FailedNoCharge,
+    Pending,
+    Unknown,
+    Unverified,
+}
+
+impl BillingReceiptStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Final => "final",
+            Self::FailedNoCharge => "failed_no_charge",
+            Self::Pending => "pending",
+            Self::Unknown => "unknown",
+            Self::Unverified => "unverified",
+        }
+    }
+
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BillingReceipt {
+    pub request_id: String,
+    pub status: BillingReceiptStatus,
+    pub actual_credits: Option<CreditAmount>,
+    pub unit: String,
+    pub source_ref: String,
+    pub task_ref: Option<String>,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BillingReservationResult {
+    Created {
+        request: RequestHandle,
+        reservation: Reservation,
+    },
+    Existing {
+        request: RequestHandle,
+        reservation: Reservation,
+    },
+    Insufficient {
+        available: i64,
+        required: i64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BillingReceiptResult {
+    Settled {
+        api_key_id: String,
+        actual_credits: CreditAmount,
+        over_quote: bool,
+    },
+    Pending,
+    Duplicate,
     Conflict,
 }
 
@@ -782,6 +879,16 @@ pub struct KeyQuotaGrant {
     pub reason: String,
 }
 
+/// Fresh AI Work unified credits total used as the global ceiling for all
+/// remaining Key allocations. `amount` is an exact decimal credit value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamCreditSnapshot {
+    pub total: CreditAmount,
+    pub updated_at_ms: i64,
+}
+
+pub const UPSTREAM_CREDIT_SNAPSHOT_MAX_AGE_MS: i64 = 5 * 60 * 1_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyQuotaAllocation {
     pub source_user_id: String,
@@ -909,6 +1016,13 @@ pub struct IssuedApiKey {
     pub prefix: String,
     pub user_id: String,
     pub scopes: BTreeSet<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKeySecretRecord {
+    pub key_id: String,
+    pub ciphertext: Vec<u8>,
+    pub key_version: u32,
 }
 
 impl fmt::Debug for IssuedApiKey {

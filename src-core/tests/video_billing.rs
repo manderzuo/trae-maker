@@ -84,6 +84,61 @@ fn diagnostic_claim_is_bound_to_key_and_request_hash_and_is_one_shot() {
 }
 
 #[test]
+fn diagnostic_registration_can_be_rearmed_with_the_same_key_and_request_hash() {
+    let dir = test_dir("rearm");
+    let store = CoreStore::open(&dir).unwrap();
+    store.migrate().unwrap();
+    store
+        .create_user(
+            NewUser {
+                id: "user-rearm".into(),
+                name: "周".into(),
+                role: UserRole::User,
+            },
+            "test",
+        )
+        .unwrap();
+    let issued = store
+        .issue_api_key(
+            "user-rearm",
+            "video-rearm",
+            BTreeSet::from(["videos:submit".to_owned()]),
+            "test",
+        )
+        .unwrap();
+    let request_hash = "c".repeat(64);
+
+    let diagnostic = || {
+        store
+            .set_video_billing_control(VideoBillingControlInput::diagnostic(
+                &issued.id,
+                &request_hash,
+                "真实验收",
+            ))
+            .unwrap();
+    };
+
+    diagnostic();
+    assert!(store
+        .claim_video_diagnostic(&issued.id, &request_hash)
+        .unwrap()
+        .is_some());
+
+    // A later controlled acceptance may intentionally use the same request
+    // contract. The previous claim remains audit history, while the new
+    // registration gets its own claim row.
+    diagnostic();
+    assert!(store
+        .claim_video_diagnostic(&issued.id, &request_hash)
+        .unwrap()
+        .is_some());
+
+    assert_eq!(store.count_rows("video_diagnostic_claims").unwrap(), 2);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn migration_preserves_existing_quota_rows_and_sets_versioned_gate() {
     let dir = test_dir("migration");
     let store = CoreStore::open(&dir).unwrap();

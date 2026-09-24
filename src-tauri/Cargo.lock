@@ -96,6 +96,7 @@ dependencies = [
  "tauri-plugin-stronghold",
  "tokio",
  "tokio-stream",
+ "tower",
  "tungstenite",
  "ureq 2.12.1",
  "url",

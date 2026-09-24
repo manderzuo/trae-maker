@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
@@ -8,8 +9,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     CostError, CostEstimate, CostPolicy, BeginRequest, BeginRequestInput, CoreError, CoreStore,
     LeaseOutcome, LeaseState, ObservationStatus, PreflightReserveInput, PreflightReserveResult,
-    CreateVideoJobInput, JobAttemptState, JobState, QuotaReserve, RequestHandle, RequestResult,
-    RequestState, ScheduleError, Settlement, SchedulerLeaseRequest, SchedulerLeaseResult,
+    CreateVideoJobInput, JobAttemptState, JobState, QuotaReserve, RecoverableBillingRequest,
+    RequestHandle, RequestResult, RequestState, ScheduleError, Settlement, SchedulerLeaseRequest, SchedulerLeaseResult,
     SelectionStrategy, UpstreamLease, UpstreamLeaseGrant, VideoJobEnqueueResult, VideoJobLeaseResult,
     upstream::LeaseSettlement,
     upstream::{
@@ -38,7 +39,7 @@ impl CoreStore {
         idempotency_key: &str,
     ) -> Result<Option<BeginRequest>, CoreError> {
         let request_hash = request_hash(endpoint, model, body);
-        let scope = format!("{user_id}:{endpoint}");
+        let scope = format!("{user_id}:{api_key_id}:{endpoint}");
         let connection = self.connection.lock().expect("core store mutex poisoned");
         let active_key = connection
             .query_row(
@@ -153,8 +154,10 @@ impl CoreStore {
             &input.preflight.request.body,
         );
         let scope = format!(
-            "{}:{}",
-            input.preflight.request.user_id, input.preflight.request.endpoint
+            "{}:{}:{}",
+            input.preflight.request.user_id,
+            input.preflight.request.api_key_id,
+            input.preflight.request.endpoint
         );
         let required_capabilities_json = serde_json::to_string(&input.required_capabilities).map_err(|_| {
             ScheduleError::Core(CoreError::InvalidConfiguration {
@@ -369,7 +372,12 @@ impl CoreStore {
             &input.preflight.request.model,
             &input.preflight.request.body,
         );
-        let scope = format!("{}:{}", input.preflight.request.user_id, input.preflight.request.endpoint);
+        let scope = format!(
+            "{}:{}:{}",
+            input.preflight.request.user_id,
+            input.preflight.request.api_key_id,
+            input.preflight.request.endpoint
+        );
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -770,6 +778,37 @@ impl CoreStore {
         })
     }
 
+    /// Lists a bounded batch of quoted requests whose quota is still held and
+    /// whose final receipt has not been recorded. This is for restart recovery:
+    /// callers may query the billing receipt, but must not repeat upstream work.
+    pub fn recoverable_billing_requests(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RecoverableBillingRequest>, CoreError> {
+        let limit = limit.clamp(1, 500) as i64;
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT r.id, r.endpoint
+             FROM requests r
+             JOIN billing_quotes q ON q.request_id = r.id
+             JOIN quota_reservations reservation ON reservation.request_id = r.id
+             LEFT JOIN billing_settlements settlement ON settlement.request_id = r.id
+             WHERE settlement.request_id IS NULL
+               AND reservation.resource_kind = 'credits'
+               AND reservation.state IN ('held', 'unknown')
+               AND r.state IN ('reserved', 'queued', 'dispatched', 'completing', 'unknown')
+             ORDER BY r.created_at_ms, r.id
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok(RecoverableBillingRequest {
+                request_id: row.get(0)?,
+                endpoint: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
+    }
+
     pub fn estimate_cost(
         &self,
         endpoint: &str,
@@ -805,8 +844,23 @@ impl CoreStore {
     }
 
     pub fn begin_request(&self, input: BeginRequestInput) -> Result<BeginRequest, CoreError> {
+        self.begin_request_internal(input, true)
+    }
+
+    /// Creates an authenticated, Core-numbered request before an upstream
+    /// quote is available. Callers must be behind the normal API-key auth
+    /// boundary; paid dispatch still requires `reserve_credit_quote`.
+    pub fn begin_billed_request(&self, input: BeginRequestInput) -> Result<BeginRequest, CoreError> {
+        self.begin_request_internal(input, false)
+    }
+
+    fn begin_request_internal(
+        &self,
+        input: BeginRequestInput,
+        require_local_cost_policy: bool,
+    ) -> Result<BeginRequest, CoreError> {
         let request_hash = request_hash(&input.endpoint, &input.model, &input.body);
-        let scope = format!("{}:{}", input.user_id, input.endpoint);
+        let scope = format!("{}:{}:{}", input.user_id, input.api_key_id, input.endpoint);
         let now = Utc::now().timestamp_millis();
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -842,7 +896,9 @@ impl CoreStore {
             };
         }
 
-        Self::estimate_in_transaction(&transaction, &input.endpoint, &input.model, &input.body)?;
+        if require_local_cost_policy {
+            Self::estimate_in_transaction(&transaction, &input.endpoint, &input.model, &input.body)?;
+        }
         let request_id = Self::new_id("request");
         transaction.execute(
             "INSERT INTO requests \
@@ -867,6 +923,29 @@ impl CoreStore {
         let handle = Self::request_handle_in_transaction(&transaction, &request_id)?;
         transaction.commit()?;
         Ok(BeginRequest::Created(handle))
+    }
+
+    /// Returns a stable, URL-safe digest of the stored request body and model.
+    /// The digest is safe to pass to the authenticated billing bridge and lets
+    /// Core reject a quote prepared for different request content.
+    pub fn request_fingerprint_for_billing(&self, request_id: &str) -> Result<String, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let fingerprint = connection
+            .query_row(
+                "SELECT request_hash FROM requests WHERE id = ?1",
+                [request_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::RequestNotFound {
+                request_id: request_id.to_owned(),
+            })?;
+        if fingerprint.len() != 32 {
+            return Err(CoreError::BillingQuoteMismatch {
+                request_id: request_id.to_owned(),
+            });
+        }
+        Ok(URL_SAFE_NO_PAD.encode(fingerprint))
     }
 
     pub fn upstream_lease_for_request(
@@ -902,24 +981,24 @@ impl CoreStore {
             &input.request.model,
             &input.request.body,
         );
-        let scope = format!("{}:{}", input.request.user_id, input.request.endpoint);
+        let scope = format!(
+            "{}:{}:{}",
+            input.request.user_id, input.request.api_key_id, input.request.endpoint
+        );
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let active_key = transaction
+        let max_concurrency = transaction
             .query_row(
-                "SELECT 1 FROM api_keys WHERE id = ?1 AND user_id = ?2 AND status = 'active'",
+                "SELECT max_concurrency FROM api_keys WHERE id = ?1 AND user_id = ?2 AND status = 'active'",
                 params![&input.request.api_key_id, &input.request.user_id],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?
-            .is_some();
-        if !active_key {
-            return Err(CoreError::InvalidRequestIdentity {
-                user_id: input.request.user_id,
-                api_key_id: input.request.api_key_id,
-            });
-        }
+            .ok_or_else(|| CoreError::InvalidRequestIdentity {
+                user_id: input.request.user_id.clone(),
+                api_key_id: input.request.api_key_id.clone(),
+            })?;
 
         if let Some((stored_hash, request_id)) = transaction
             .query_row(
@@ -938,6 +1017,21 @@ impl CoreStore {
             } else {
                 Ok(PreflightReserveResult::Conflict)
             };
+        }
+
+        let active_concurrency: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM requests
+             WHERE api_key_id = ?1
+               AND state IN ('received','validating','reserved','queued','dispatched','completing','unknown')",
+            [&input.request.api_key_id],
+            |row| row.get(0),
+        )?;
+        if active_concurrency >= max_concurrency {
+            return Err(CoreError::KeyConcurrencyExceeded {
+                api_key_id: input.request.api_key_id.clone(),
+                active_concurrency,
+                max_concurrency,
+            });
         }
 
         let request_id = Self::new_id("request");

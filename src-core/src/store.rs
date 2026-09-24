@@ -12,14 +12,14 @@ use crate::{
     schema::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
         SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
-        SCHEMA_V16,
+        SCHEMA_V16, SCHEMA_V17, SCHEMA_V19, SCHEMA_V20,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
         normalize_health_category, validate_observation_summary, validate_opaque_credentials_ref,
         validate_required,
     },
-    AuthError, CoreApiKeyAdminView, CoreError, CoreUserAdminView, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
+    ApiKeySecretRecord, AuthError, CoreApiKeyAdminView, CoreError, CoreQuotaBalanceView, CoreUserAdminView, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
     AdminCredentialRecord, AssetState, CoreAsset, CreateAssetInput, NewAdminCredential, NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
     UpstreamAccountState, QuotaMigrationState, VideoBillingControl, VideoBillingControlInput,
     VideoBillingMode, VideoDiagnosticClaim,
@@ -27,7 +27,7 @@ use crate::{
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 16;
+pub const CURRENT_SCHEMA_VERSION: u32 = 20;
 pub const DEFAULT_API_KEY_MAX_CONCURRENCY: i64 = 32;
 
 pub struct CoreStore {
@@ -254,7 +254,7 @@ impl CoreStore {
             11 => {}
             12 => {}
             13 => {}
-            14 | 15 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
+            14 | 15 | 16 | 17 | 18 | 19 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
                 version => return Err(CoreError::UnsupportedSchemaVersion { version }),
             }
 
@@ -272,6 +272,18 @@ impl CoreStore {
             }
             if version < 16 {
                 Self::migrate_v15_to_v16(&transaction)?;
+            }
+            if version < 17 {
+                Self::migrate_v16_to_v17(&transaction)?;
+            }
+            if version < 18 {
+                Self::migrate_v17_to_v18(&transaction)?;
+            }
+            if version < 19 {
+                Self::migrate_v18_to_v19(&transaction)?;
+            }
+            if version < 20 {
+                Self::migrate_v19_to_v20(&transaction)?;
             }
             if version < CURRENT_SCHEMA_VERSION {
                 transaction
@@ -1119,16 +1131,25 @@ impl CoreStore {
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
-        let keys = {
+        let key_records = {
             let mut statement = if user_id.is_some() {
                 transaction.prepare(
-                    "SELECT id, user_id, name, prefix, scopes_json, status, created_at_ms, revoked_at_ms
-                     FROM api_keys WHERE user_id = ?1 ORDER BY created_at_ms, id",
+                    "SELECT api_keys.id, api_keys.user_id, users.name, api_keys.name, api_keys.prefix,
+                            api_keys.scopes_json, api_keys.status, api_keys.max_concurrency,
+                            api_keys.created_at_ms, api_keys.revoked_at_ms,
+                            EXISTS(SELECT 1 FROM api_key_billing_blocks WHERE key_id = api_keys.id)
+                     FROM api_keys INNER JOIN users ON users.id = api_keys.user_id
+                     WHERE api_keys.user_id = ?1 ORDER BY api_keys.created_at_ms, api_keys.id",
                 )?
             } else {
                 transaction.prepare(
-                    "SELECT id, user_id, name, prefix, scopes_json, status, created_at_ms, revoked_at_ms
-                     FROM api_keys ORDER BY created_at_ms, id",
+                    "SELECT api_keys.id, api_keys.user_id, users.name, api_keys.name, api_keys.prefix,
+                            api_keys.scopes_json, api_keys.status, api_keys.max_concurrency,
+                            api_keys.created_at_ms, api_keys.revoked_at_ms,
+                            EXISTS(SELECT 1 FROM api_key_billing_blocks WHERE key_id = api_keys.id)
+                     FROM api_keys INNER JOIN users ON users.id = api_keys.user_id
+                     WHERE users.role <> 'admin'
+                     ORDER BY api_keys.created_at_ms, api_keys.id",
                 )?
             };
             let rows = if let Some(user_id) = user_id {
@@ -1137,29 +1158,503 @@ impl CoreStore {
                 statement.query([])?
             };
             rows.mapped(|row| {
-                let scopes_json: String = row.get(4)?;
+                let scopes_json: String = row.get(5)?;
                 let scopes = serde_json::from_str(&scopes_json).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        4,
+                        5,
                         rusqlite::types::Type::Text,
                         Box::new(error),
                     )
                 })?;
-                Ok(CoreApiKeyAdminView {
-                    id: row.get(0)?,
-                    user_id: row.get(1)?,
-                    name: row.get(2)?,
-                    prefix: row.get(3)?,
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                     scopes,
-                    status: row.get(5)?,
-                    created_at_ms: row.get(6)?,
-                    revoked_at_ms: row.get(7)?,
-                })
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, bool>(10)?,
+                ))
             })
             .collect::<Result<Vec<_>, _>>()?
         };
+        let keys = key_records
+            .into_iter()
+            .map(|(id, user_id, user_name, name, prefix, scopes, status, max_concurrency, created_at_ms, revoked_at_ms, billing_blocked)| {
+                let current_concurrency = transaction.query_row(
+                    "SELECT COUNT(*) FROM requests
+                     WHERE api_key_id = ?1
+                       AND state IN ('received','validating','reserved','queued','dispatched','completing','unknown')",
+                    [&id],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let resource_kinds = {
+                    let mut statement = transaction.prepare(
+                        "SELECT resource_kind FROM quota_ledger WHERE user_id = ?1
+                         UNION SELECT resource_kind FROM quota_reservations WHERE user_id = ?1
+                         ORDER BY resource_kind",
+                    )?;
+                    let rows = statement.query_map([&user_id], |row| row.get::<_, String>(0))?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                let usage = resource_kinds
+                    .into_iter()
+                    .map(|resource_kind| {
+                        let (available, held, settled) = transaction.query_row(
+                            "SELECT
+                               COALESCE((SELECT SUM(delta) FROM quota_ledger
+                                         WHERE user_id = ?1 AND resource_kind = ?2
+                                           AND (budget_account_id IS NULL OR budget_account_id IN
+                                                (SELECT id FROM quota_budget_accounts WHERE scope = 'user_cap'))), 0),
+                               COALESCE((SELECT SUM(amount) FROM quota_reservations
+                                         WHERE user_id = ?1 AND resource_kind = ?2
+                                           AND state IN ('held', 'unknown')
+                                           AND (key_budget_account_id IS NULL OR user_cap_account_id IS NOT NULL)), 0),
+                               COALESCE((SELECT SUM(amount) FROM quota_ledger
+                                         WHERE user_id = ?1 AND resource_kind = ?2 AND event_kind = 'commit'
+                                           AND (budget_account_id IS NULL OR budget_account_id IN
+                                                (SELECT id FROM quota_budget_accounts WHERE scope = 'user_cap'))), 0)",
+                            params![&user_id, &resource_kind],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?),),
+                        )?;
+                        Ok(CoreQuotaBalanceView { resource_kind, available, held, settled })
+                    })
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                let key_resource_kinds = {
+                    let mut statement = transaction.prepare(
+                        "SELECT resource_kind FROM quota_budget_accounts
+                         WHERE scope = 'key' AND api_key_id = ?1 AND user_id = ?2
+                         ORDER BY resource_kind",
+                    )?;
+                    let rows = statement.query_map(params![&id, &user_id], |row| row.get::<_, String>(0))?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                let key_quota = key_resource_kinds
+                    .iter()
+                    .map(|resource_kind| {
+                        let account_id = transaction.query_row(
+                            "SELECT id FROM quota_budget_accounts
+                             WHERE scope = 'key' AND api_key_id = ?1 AND user_id = ?2 AND resource_kind = ?3
+                             ORDER BY id LIMIT 1",
+                            params![&id, &user_id, resource_kind],
+                            |row| row.get::<_, String>(0),
+                        )?;
+                        Self::budget_balance_in_transaction(&transaction, &account_id)
+                            .map(|balance| CoreQuotaBalanceView {
+                                resource_kind: balance.resource_kind,
+                                available: balance.available,
+                                held: balance.held,
+                                settled: balance.settled,
+                            })
+                            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+                    })
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                let verified_credit_spent = transaction.query_row(
+                    "SELECT COALESCE(SUM(s.actual_credits), 0)
+                     FROM billing_settlements s
+                     INNER JOIN billing_receipts r ON r.receipt_id = s.receipt_id
+                     INNER JOIN requests q ON q.id = s.request_id
+                     WHERE q.api_key_id = ?1
+                       AND r.status IN ('final','failed_no_charge')",
+                    [&id],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let pool_allocatable = usage
+                    .iter()
+                    .map(|pool| {
+                        let allocated = Self::allocated_key_quota_in_transaction(
+                            &transaction,
+                            &user_id,
+                            &pool.resource_kind,
+                        )
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                        Ok(CoreQuotaBalanceView {
+                            resource_kind: pool.resource_kind.clone(),
+                            available: pool.available.saturating_sub(allocated).max(0),
+                            held: pool.held,
+                            settled: pool.settled,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                Ok(CoreApiKeyAdminView {
+                    id,
+                    user_id,
+                    user_name,
+                    name,
+                    prefix,
+                    scopes,
+                    status,
+                    billing_blocked,
+                    max_concurrency,
+                    current_concurrency,
+                    usage,
+                    key_quota,
+                    verified_credit_spent,
+                    pool_allocatable,
+                    created_at_ms,
+                    revoked_at_ms,
+                })
+            })
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
         transaction.commit()?;
         Ok(keys)
+    }
+
+    pub fn issue_api_key_for_new_user_as_admin(
+        &self,
+        principal: &Principal,
+        display_name: &str,
+        scopes: BTreeSet<String>,
+        max_concurrency: i64,
+    ) -> Result<IssuedApiKey, CoreError> {
+        self.issue_api_key_for_new_user_as_admin_inner(
+            principal,
+            display_name,
+            scopes,
+            max_concurrency,
+            Self::new_id("key"),
+            Self::new_api_key(),
+            None,
+        )
+    }
+
+    pub fn issue_api_key_for_new_user_as_admin_with_encrypted_copy<F>(
+        &self,
+        principal: &Principal,
+        display_name: &str,
+        scopes: BTreeSet<String>,
+        max_concurrency: i64,
+        encrypt_copy: F,
+    ) -> Result<IssuedApiKey, CoreError>
+    where
+        F: FnOnce(&str, &str) -> Result<(Vec<u8>, u32), CoreError>,
+    {
+        let key_id = Self::new_id("key");
+        let plaintext = Self::new_api_key();
+        let encrypted_copy = encrypt_copy(&key_id, &plaintext)?;
+        self.issue_api_key_for_new_user_as_admin_inner(
+            principal,
+            display_name,
+            scopes,
+            max_concurrency,
+            key_id,
+            plaintext,
+            Some(encrypted_copy),
+        )
+    }
+
+    fn issue_api_key_for_new_user_as_admin_inner(
+        &self,
+        principal: &Principal,
+        display_name: &str,
+        scopes: BTreeSet<String>,
+        max_concurrency: i64,
+        key_id: String,
+        plaintext: String,
+        encrypted_copy: Option<(Vec<u8>, u32)>,
+    ) -> Result<IssuedApiKey, CoreError> {
+        let display_name = display_name.trim();
+        if display_name.is_empty() {
+            return Err(CoreError::Validation { field: "display_name".into(), reason: "must not be empty".into() });
+        }
+        Self::validate_max_concurrency(max_concurrency)?;
+        let prefix = plaintext[..16].to_owned();
+        let key_digest = Self::digest_api_key(&plaintext);
+        let user_id = Self::new_id("user");
+        let scopes = Self::normalize_api_key_scopes(scopes);
+        let scopes_json = serde_json::to_string(&scopes)?;
+        let (secret_ciphertext, secret_key_version) = match encrypted_copy {
+            Some((ciphertext, version)) if !ciphertext.is_empty() && version > 0 => {
+                (Some(ciphertext), Some(i64::from(version)))
+            }
+            Some(_) => return Err(CoreError::ApiKeyEncryptionUnavailable),
+            None => (None, None),
+        };
+        let now = Utc::now().timestamp_millis();
+
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        Self::insert_user_in_transaction(
+            &transaction,
+            NewUser { id: user_id.clone(), name: display_name.to_owned(), role: crate::UserRole::User },
+            &principal.user_id,
+        )?;
+        transaction.execute(
+            "INSERT INTO api_keys (id, user_id, name, prefix, key_digest, scopes_json, max_concurrency, status, created_at_ms, secret_ciphertext, secret_key_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
+            params![&key_id, &user_id, display_name, &prefix, &key_digest, &scopes_json, max_concurrency, now, secret_ciphertext, secret_key_version],
+        )?;
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "api_key.issue_with_user",
+            "api_key",
+            &key_id,
+            serde_json::json!({ "id": key_id, "user_id": user_id, "scopes": scopes, "result": "issued" }),
+            now,
+        )?;
+        transaction.commit()?;
+
+        Ok(IssuedApiKey { id: key_id, plaintext, prefix, user_id, scopes })
+    }
+
+    pub fn update_api_key_as_admin(
+        &self,
+        principal: &Principal,
+        key_id: &str,
+        enabled: bool,
+        max_concurrency: i64,
+    ) -> Result<(), CoreError> {
+        Self::validate_max_concurrency(max_concurrency)?;
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let role: String = transaction
+            .query_row(
+                "SELECT users.role FROM api_keys INNER JOIN users ON users.id = api_keys.user_id WHERE api_keys.id = ?1",
+                [key_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::ApiKeyNotFound { api_key_id: key_id.into() })?;
+        if role == "admin" {
+            return Err(CoreError::AdminRequired);
+        }
+        let status = if enabled { "active" } else { "revoked" };
+        let now = Utc::now().timestamp_millis();
+        let changed = transaction.execute(
+            "UPDATE api_keys SET status = ?1, max_concurrency = ?2, revoked_at_ms = ?3 WHERE id = ?4",
+            params![status, max_concurrency, if enabled { None } else { Some(now) }, key_id],
+        )?;
+        if changed == 0 {
+            return Err(CoreError::ApiKeyNotFound { api_key_id: key_id.into() });
+        }
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "api_key.update",
+            "api_key",
+            key_id,
+            serde_json::json!({ "id": key_id, "status": status, "max_concurrency": max_concurrency }),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn rotate_api_key_as_admin(
+        &self,
+        principal: &Principal,
+        key_id: &str,
+    ) -> Result<IssuedApiKey, CoreError> {
+        self.rotate_api_key_as_admin_inner(
+            principal,
+            key_id,
+            Self::new_id("key"),
+            Self::new_api_key(),
+            None,
+        )
+    }
+
+    pub fn rotate_api_key_as_admin_with_encrypted_copy<F>(
+        &self,
+        principal: &Principal,
+        key_id: &str,
+        encrypt_copy: F,
+    ) -> Result<IssuedApiKey, CoreError>
+    where
+        F: FnOnce(&str, &str) -> Result<(Vec<u8>, u32), CoreError>,
+    {
+        let new_key_id = Self::new_id("key");
+        let plaintext = Self::new_api_key();
+        let encrypted_copy = encrypt_copy(&new_key_id, &plaintext)?;
+        self.rotate_api_key_as_admin_inner(
+            principal,
+            key_id,
+            new_key_id,
+            plaintext,
+            Some(encrypted_copy),
+        )
+    }
+
+    fn rotate_api_key_as_admin_inner(
+        &self,
+        principal: &Principal,
+        key_id: &str,
+        new_key_id: String,
+        plaintext: String,
+        encrypted_copy: Option<(Vec<u8>, u32)>,
+    ) -> Result<IssuedApiKey, CoreError> {
+        let prefix = plaintext[..16].to_owned();
+        let key_digest = Self::digest_api_key(&plaintext);
+        let (secret_ciphertext, secret_key_version) = match encrypted_copy {
+            Some((ciphertext, version)) if !ciphertext.is_empty() && version > 0 => {
+                (Some(ciphertext), Some(i64::from(version)))
+            }
+            Some(_) => return Err(CoreError::ApiKeyEncryptionUnavailable),
+            None => (None, None),
+        };
+        let now = Utc::now().timestamp_millis();
+
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let target = transaction
+            .query_row(
+                "SELECT api_keys.user_id, users.name, users.role, api_keys.scopes_json, api_keys.max_concurrency
+                 FROM api_keys INNER JOIN users ON users.id = api_keys.user_id
+                 WHERE api_keys.id = ?1",
+                [key_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::ApiKeyNotFound { api_key_id: key_id.into() })?;
+        if target.2 == "admin" {
+            return Err(CoreError::AdminRequired);
+        }
+        let scopes: BTreeSet<String> = Self::normalize_api_key_scopes(serde_json::from_str(&target.3)?);
+        let scopes_json = serde_json::to_string(&scopes)?;
+        transaction.execute(
+            "UPDATE api_keys SET status = 'revoked', revoked_at_ms = ?1 WHERE id = ?2",
+            params![now, key_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO api_keys (id, user_id, name, prefix, key_digest, scopes_json, max_concurrency, status, created_at_ms, secret_ciphertext, secret_key_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
+            params![&new_key_id, &target.0, &target.1, &prefix, &key_digest, &scopes_json, target.4, now, secret_ciphertext, secret_key_version],
+        )?;
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "api_key.rotate",
+            "api_key",
+            key_id,
+            serde_json::json!({ "old_id": key_id, "new_id": new_key_id, "user_id": target.0, "result": "rotated" }),
+            now,
+        )?;
+        transaction.commit()?;
+
+        Ok(IssuedApiKey { id: new_key_id, plaintext, prefix, user_id: target.0, scopes })
+    }
+
+    pub fn api_key_secret_as_admin(
+        &self,
+        principal: &Principal,
+        key_id: &str,
+    ) -> Result<ApiKeySecretRecord, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let secret = transaction
+            .query_row(
+                "SELECT secret_ciphertext, secret_key_version FROM api_keys WHERE id = ?1",
+                [key_id],
+                |row| Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::ApiKeyNotFound { api_key_id: key_id.into() })?;
+        let (Some(ciphertext), Some(version)) = secret else {
+            return Err(CoreError::ApiKeySecretUnavailable { api_key_id: key_id.into() });
+        };
+        let key_version = u32::try_from(version)
+            .ok()
+            .filter(|version| *version > 0)
+            .filter(|_| !ciphertext.is_empty())
+            .ok_or_else(|| CoreError::ApiKeySecretUnavailable { api_key_id: key_id.into() })?;
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "api_key.copy",
+            "api_key",
+            key_id,
+            serde_json::json!({ "key_id": key_id, "key_version": key_version, "result": "requested" }),
+            Utc::now().timestamp_millis(),
+        )?;
+        transaction.commit()?;
+        Ok(ApiKeySecretRecord {
+            key_id: key_id.into(),
+            ciphertext,
+            key_version,
+        })
+    }
+
+    pub fn rewrap_api_key_secrets_as_admin<F>(
+        &self,
+        principal: &Principal,
+        target_version: u32,
+        mut rewrap: F,
+    ) -> Result<usize, CoreError>
+    where
+        F: FnMut(&str, u32, &[u8]) -> Result<(Vec<u8>, u32), CoreError>,
+    {
+        if target_version == 0 {
+            return Err(CoreError::ApiKeyEncryptionUnavailable);
+        }
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT id, secret_ciphertext, secret_key_version FROM api_keys
+                 WHERE secret_ciphertext IS NOT NULL OR secret_key_version IS NOT NULL
+                 ORDER BY id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut rewrapped = 0_usize;
+        for (key_id, ciphertext, version) in rows {
+            let (Some(ciphertext), Some(version)) = (ciphertext, version) else {
+                return Err(CoreError::ApiKeySecretUnavailable { api_key_id: key_id });
+            };
+            let version = u32::try_from(version)
+                .ok()
+                .filter(|version| *version > 0)
+                .filter(|_| !ciphertext.is_empty())
+                .ok_or_else(|| CoreError::ApiKeySecretUnavailable { api_key_id: key_id.clone() })?;
+            if version == target_version {
+                continue;
+            }
+            let (new_ciphertext, new_version) = rewrap(&key_id, version, &ciphertext)?;
+            if new_ciphertext.is_empty() || new_version != target_version {
+                return Err(CoreError::ApiKeyEncryptionUnavailable);
+            }
+            transaction.execute(
+                "UPDATE api_keys SET secret_ciphertext = ?1, secret_key_version = ?2 WHERE id = ?3",
+                params![new_ciphertext, i64::from(new_version), &key_id],
+            )?;
+            rewrapped = rewrapped.saturating_add(1);
+        }
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "api_key.vault_rewrap",
+            "api_key_vault",
+            "all",
+            serde_json::json!({ "records_rewrapped": rewrapped, "key_version": target_version, "result": "rewrapped" }),
+            Utc::now().timestamp_millis(),
+        )?;
+        transaction.commit()?;
+        Ok(rewrapped)
     }
 
     pub fn set_user_status_as_admin(
@@ -1342,6 +1837,7 @@ impl CoreStore {
         let prefix = plaintext[..16].to_owned();
         let key_digest = Self::digest_api_key(&plaintext);
         let key_id = Self::new_id("key");
+        let scopes = Self::normalize_api_key_scopes(scopes);
         let scopes_json = serde_json::to_string(&scopes)?;
         let now = Utc::now().timestamp_millis();
 
@@ -1389,6 +1885,7 @@ impl CoreStore {
         let prefix = plaintext[..16].to_owned();
         let key_digest = Self::digest_api_key(&plaintext);
         let key_id = Self::new_id("key");
+        let scopes = Self::normalize_api_key_scopes(scopes);
         let scopes_json = serde_json::to_string(&scopes)?;
         let now = Utc::now().timestamp_millis();
 
@@ -1606,12 +2103,13 @@ impl CoreStore {
         )?;
 
         let mut issued_keys = Vec::with_capacity(batch.keys.len());
+        let scopes = Self::normalize_api_key_scopes(batch.scopes.clone());
         for key in &batch.keys {
             let plaintext = Self::new_api_key();
             let prefix = plaintext[..16].to_owned();
             let key_digest = Self::digest_api_key(&plaintext);
             let key_id = Self::new_id("key");
-            let scopes_json = serde_json::to_string(&batch.scopes)?;
+            let scopes_json = serde_json::to_string(&scopes)?;
             transaction.execute(
                 "INSERT INTO api_keys (id, user_id, name, prefix, key_digest, scopes_json, status, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
                 params![key_id, key.user_id, "legacy migration", prefix, key_digest, scopes_json, now],
@@ -1643,7 +2141,7 @@ impl CoreStore {
                 plaintext,
                 prefix,
                 user_id: key.user_id.clone(),
-                scopes: batch.scopes.clone(),
+                scopes: scopes.clone(),
             });
         }
 
@@ -2507,6 +3005,163 @@ impl CoreStore {
 
     fn migrate_v15_to_v16(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
         transaction.execute_batch(SCHEMA_V16).map_err(CoreError::migration)
+    }
+
+    fn migrate_v16_to_v17(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        transaction.execute_batch(SCHEMA_V17).map_err(CoreError::migration)
+    }
+
+    fn migrate_v17_to_v18(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        for (table, id_column, value_column, nullable) in [
+            ("quota_ledger", "entry_id", "amount", false),
+            ("quota_ledger", "entry_id", "delta", false),
+            ("quota_reservations", "id", "amount", false),
+            ("cost_policies", "id", "reserve_amount", false),
+            ("cost_policies", "id", "max_actual_amount", true),
+        ] {
+            Self::scale_credit_column_to_microcredits(
+                transaction,
+                table,
+                id_column,
+                value_column,
+                nullable,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v18_to_v19(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        transaction.execute_batch(SCHEMA_V19).map_err(CoreError::migration)?;
+        let idempotency_table_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'idempotency_keys')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let requests_table_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'requests')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if idempotency_table_exists && requests_table_exists {
+            let mappings = {
+                let mut statement = transaction.prepare(
+                    "SELECT idempotency_keys.scope, idempotency_keys.client_key,
+                            idempotency_keys.request_id, requests.user_id,
+                            requests.api_key_id, requests.endpoint
+                     FROM idempotency_keys
+                     INNER JOIN requests ON requests.id = idempotency_keys.request_id
+                     ORDER BY idempotency_keys.scope, idempotency_keys.client_key",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for (old_scope, client_key, request_id, user_id, api_key_id, endpoint) in mappings {
+                let new_scope = format!("{user_id}:{api_key_id}:{endpoint}");
+                if old_scope != new_scope {
+                    transaction.execute(
+                        "UPDATE idempotency_keys SET scope = ?1 WHERE scope = ?2 AND client_key = ?3",
+                        params![new_scope, old_scope, client_key],
+                    ).map_err(|error| {
+                        CoreError::MigrationValidation {
+                            reason: format!(
+                                "cannot re-key legacy idempotency record for request {request_id}: {error}"
+                            ),
+                        }
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn migrate_v19_to_v20(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        let api_keys_exists = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_keys'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !api_keys_exists {
+            return Ok(());
+        }
+        transaction.execute_batch(SCHEMA_V20).map_err(CoreError::migration)
+    }
+
+    fn scale_credit_column_to_microcredits(
+        transaction: &rusqlite::Transaction<'_>,
+        table: &str,
+        id_column: &str,
+        value_column: &str,
+        nullable: bool,
+    ) -> Result<(), CoreError> {
+        let table_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !table_exists {
+            return Ok(());
+        }
+
+        let rows = {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {id_column}, {value_column} FROM {table} \
+                 WHERE resource_kind = 'credits' ORDER BY {id_column}"
+            ))?;
+            let rows = statement
+                .query_map([], |row| {
+                    let (value_type, integer_value) = match row.get_ref(1)? {
+                        rusqlite::types::ValueRef::Null => ("null", None),
+                        rusqlite::types::ValueRef::Integer(value) => ("integer", Some(value)),
+                        rusqlite::types::ValueRef::Real(_) => ("real", None),
+                        rusqlite::types::ValueRef::Text(_) => ("text", None),
+                        rusqlite::types::ValueRef::Blob(_) => ("blob", None),
+                    };
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        value_type,
+                        integer_value,
+                    ))
+                })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        for (row_id, value_type, integer_value) in rows {
+            let amount = match (value_type, integer_value) {
+                ("null", _) if nullable => continue,
+                ("integer", Some(value)) => value,
+                _ => {
+                    return Err(CoreError::MigrationValidation {
+                        reason: format!(
+                            "cannot convert {table}.{value_column} for row {row_id}: expected an integer, found {value_type}"
+                        ),
+                    });
+                }
+            };
+            let scaled = amount.checked_mul(1_000_000).ok_or_else(|| {
+                CoreError::MigrationValidation {
+                    reason: format!(
+                        "cannot convert {table}.{value_column} for row {row_id}: microcredit scaling overflows"
+                    ),
+                }
+            })?;
+            transaction.execute(
+                &format!("UPDATE {table} SET {value_column} = ?1 WHERE {id_column} = ?2"),
+                rusqlite::params![scaled, row_id],
+            )?;
+        }
+
+        Ok(())
     }
 
     fn migrate_v5_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {

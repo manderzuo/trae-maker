@@ -1,4 +1,5 @@
 mod cost;
+mod credits;
 mod admin_summary;
 mod admin_credentials;
 mod error;
@@ -15,17 +16,20 @@ mod usage_trend;
 mod video_billing;
 
 pub use cost::{CostError, CostEstimate, CostPolicy};
+pub use credits::CreditAmount;
 pub use error::CoreError;
 pub use identity::{require_scope, AuthError, Principal};
 pub use models::{
-    AssetState, BeginRequest, BeginRequestInput, CoreAsset, CreateAssetInput, CreateVideoJobInput, CoreJob,
+    AssetState, BeginRequest, BeginRequestInput, BillingQuote, BillingReceipt, BillingReceiptResult,
+    BillingReceiptStatus, BillingReservationResult, CoreAsset, CreateAssetInput, CreateVideoJobInput, CoreJob,
     CoreJobAttempt, CoreApiKeyAdminView, CoreQuotaBalanceView, CoreQuotaLedgerView, CoreQuotaUsageView,
-    CoreUserAdminView, CoreVideoJobAdminView, IssuedApiKey, JobAttemptState, JobState, NewUser,
+    CoreUserAdminView, CoreVideoJobAdminView, IssuedApiKey, ApiKeySecretRecord, JobAttemptState, JobState, NewUser,
     QuotaBalance, QuotaBudgetAccount, QuotaBudgetBalance, QuotaBudgetScope, QuotaGrant,
-    QuotaMigrationState, KeyQuotaGrant, LegacyQuotaAllocation,
+    QuotaMigrationState, KeyQuotaGrant, LegacyQuotaAllocation, UpstreamCreditSnapshot,
+    UPSTREAM_CREDIT_SNAPSHOT_MAX_AGE_MS,
     LegacyMigrationAsset, LegacyMigrationBatch, LegacyMigrationJob, LegacyMigrationKey,
     LegacyMigrationObservation, LegacyMigrationResult,
-    PreflightReserveInput, PreflightReserveResult, QuotaReserve, RequestHandle, RequestResult,
+    PreflightReserveInput, PreflightReserveResult, QuotaReserve, RecoverableBillingRequest, RequestHandle, RequestResult,
     LeaseState, ObservationStatus, RegisterUpstreamAccount, RequestState, Reservation,
     ReservationState, ReserveResult, Settlement, SharedCoreStore, UpstreamAccount,
     UpstreamAccountState, UpstreamLease, UpstreamObservation, User, UserRole, VideoJobEnqueueResult,

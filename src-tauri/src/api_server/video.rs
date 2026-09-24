@@ -62,7 +62,7 @@ impl VideoBillingReceipt {
     fn unverified(observed_at_ms: u64) -> Self {
         Self {
             status: BillingStatus::Unverified,
-            source: Some("upstream_task_receipt".into()),
+            source: Some("upstream_candidate".into()),
             observed_at_ms,
             ..Self::default()
         }
@@ -249,13 +249,7 @@ where
             owner_key_id.trim()
         };
         let key_limits = restore_key_limits(data_dir, owner_key_id);
-        let Ok(permit) = limiter.acquire_video_job(owner_key_id, &key_limits) else {
-            // The limiter has already reached the effective per-Key or global
-            // cap. Leaving this persisted task without a new permit is
-            // fail-closed because the occupied limiter counters reject new
-            // submissions instead of treating recovery as unlimited.
-            continue;
-        };
+        let permit = limiter.restore_video_job(owner_key_id, &key_limits);
         if retain_job_permit(&task_id, permit) {
             restored += 1;
         }
@@ -1068,20 +1062,19 @@ fn extract_billing_candidate_value(
         if credit_value_has_exponent {
             return VideoBillingReceipt::unverified(observed_at_ms);
         }
-        let Some(actual_credits) = usage
+        let Some(_actual_credits) = usage
             .get("credits")
             .and_then(canonical_credit_amount)
         else {
             continue;
         };
-        return VideoBillingReceipt {
-            status: BillingStatus::Verified,
-            actual_credits: Some(actual_credits),
-            unit: Some("credits".into()),
-            source: Some("upstream_task_receipt".into()),
-            task_ref: Some(expected_task_id.to_string()),
-            observed_at_ms,
-        };
+        // A shaped `usage.credits` field is only a candidate until an
+        // authoritative per-task billing contract has been verified. Do not
+        // publish or persist it as a charge amount.
+        let mut candidate = VideoBillingReceipt::unverified(observed_at_ms);
+        candidate.unit = Some("credits".into());
+        candidate.task_ref = Some(expected_task_id.to_string());
+        return candidate;
     }
 
     if saw_billing_signal {
@@ -1234,6 +1227,7 @@ pub fn start_native_task(
     task_id: String,
     input: Value,
     owner_key_id: String,
+    core_attribution: Option<super::bridge_billing::CoreRequestAttribution>,
     account: PickedAccount,
     permit: Permit,
 ) {
@@ -1274,6 +1268,32 @@ pub fn start_native_task(
                     return;
                 }
             };
+            let mut body = body;
+            if let Some(attribution) = core_attribution.as_ref() {
+                let session_id = super::bridge_billing::core_usage_session_id(
+                    &attribution.request_id,
+                    &account.uid,
+                );
+                if super::payload::bind_upstream_session_id_value(&mut body, &session_id).is_err() {
+                    update_task(&task_id, |task| {
+                        task.status = "failed".into();
+                        task.error = Some("Core 请求无法建立独立的上游用量会话，已阻止未记录的上游调用".into());
+                    });
+                    return;
+                }
+            }
+            if super::bridge_billing::BridgeBillingStore::record_core_upstream_attempt_from_payload(
+                &state.data_dir,
+                core_attribution.as_ref(),
+                &account.uid,
+                &body,
+            ).is_err() {
+                update_task(&task_id, |task| {
+                    task.status = "failed".into();
+                    task.error = Some("Core 请求与上游会话归因暂不可用，已阻止未记录的上游调用".into());
+                });
+                return;
+            }
             let trace = now_id("trace");
             let url = format!("{}{}", AGENT_HOST, "/api/ide/v1/tool_text_to_video_stream");
             let referer = format!("{}{}", REFERER_BASE, "/api/ide/v1/tool_text_to_video_stream");
@@ -1481,8 +1501,22 @@ mod tests {
             "video-1",
         )
         .unwrap();
-        assert_eq!(candidate.status, BillingStatus::Verified);
-        assert_eq!(candidate.actual_credits, Some("12.500000".into()));
+        assert_eq!(candidate.status, BillingStatus::Unverified);
+        assert_eq!(candidate.actual_credits, None);
+        assert_eq!(candidate.unit.as_deref(), Some("credits"));
+        assert_eq!(candidate.task_ref.as_deref(), Some("video-1"));
+    }
+
+    #[test]
+    fn unverified_usage_shape_is_not_a_verified_billing_receipt() {
+        let candidate = extract_billing_candidate(
+            r#"{"task_id":"video-1","usage":{"credits":12.5,"unit":"credits"}}"#,
+            "video-1",
+        )
+        .unwrap();
+
+        assert_eq!(candidate.status, BillingStatus::Unverified);
+        assert_eq!(candidate.actual_credits, None);
     }
 
     #[test]
@@ -1670,12 +1704,12 @@ mod tests {
         .to_string();
         assert!(!parse_sse_event("result", &data, &task.id).unwrap());
         let updated = get(&task.id).unwrap();
-        assert_eq!(updated.billing.status, BillingStatus::Verified);
-        assert_eq!(updated.billing.actual_credits.as_deref(), Some("1.250000"));
+        assert_eq!(updated.billing.status, BillingStatus::Unverified);
+        assert_eq!(updated.billing.actual_credits, None);
         assert_eq!(updated.billing.task_ref.as_deref(), Some(task.id.as_str()));
         assert!(serde_json::to_string(&updated)
             .unwrap()
-            .contains("upstream_task_receipt"));
+            .contains("upstream_candidate"));
         assert!(!serde_json::to_string(&updated).unwrap().contains("private"));
     }
 
@@ -1744,8 +1778,8 @@ mod tests {
         assert_eq!(restored.video_url, task.video_url);
         assert_eq!(restored.billing, billing);
         let public = serde_json::to_value(&task).unwrap();
-        assert_eq!(public["billing"]["status"], "verified");
-        assert_eq!(public["billing"]["actual_credits"], "12.500000");
+        assert_eq!(public["billing"]["status"], "unverified");
+        assert!(public["billing"]["actual_credits"].is_null());
     }
 
     #[test]

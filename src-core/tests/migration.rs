@@ -77,6 +77,8 @@ fn prepare_v11_quota_database(prefix: &str, mismatched_reservation_key: bool) ->
                created_at_ms INTEGER NOT NULL,
                settled_at_ms INTEGER
              );
+             ALTER TABLE api_keys DROP COLUMN secret_key_version;
+             ALTER TABLE api_keys DROP COLUMN secret_ciphertext;
              UPDATE schema_meta SET value = '11' WHERE key = 'schema_version';
              INSERT INTO users (id, name, role, status, created_at_ms, updated_at_ms)
                VALUES ('quota-user-1', 'Quota User 1', 'user', 'active', 1, 1),
@@ -203,6 +205,48 @@ fn v12_migration_failure_rolls_back_budget_tables_and_columns() {
 
     drop(connection);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn v14_migration_backfills_video_read_scope_for_existing_keys() {
+    let (store, dir, _) = store();
+    let issued = store
+        .issue_api_key(
+            "user",
+            "video-key",
+            BTreeSet::from(["videos:submit".into()]),
+            "admin",
+        )
+        .unwrap();
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    connection
+        .execute(
+            "UPDATE api_keys SET scopes_json = '[\"videos:submit\"]' WHERE id = ?1",
+            [&issued.id],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE api_keys DROP COLUMN secret_key_version;
+             ALTER TABLE api_keys DROP COLUMN secret_ciphertext;
+             UPDATE schema_meta SET value = '14' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    drop(connection);
+
+    store.migrate().unwrap();
+
+    let scopes_json: String = Connection::open(dir.join("data").join("core.sqlite3"))
+        .unwrap()
+        .query_row(
+            "SELECT scopes_json FROM api_keys WHERE id = ?1",
+            [&issued.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let scopes: BTreeSet<String> = serde_json::from_str(&scopes_json).unwrap();
+    assert!(scopes.contains("videos:submit"));
+    assert!(scopes.contains("videos:read"));
 }
 
 fn batch(id: &str, admin_key_id: &str) -> LegacyMigrationBatch {

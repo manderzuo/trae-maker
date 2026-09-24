@@ -74,6 +74,14 @@ pub(super) fn core_stream_chat(
         Ok(_) => return scheduler_endpoint_not_enabled_response(),
         Err(error) => return core_lease_error_response(error),
     };
+    // Acquire the real request permit before Core preflight creates a lease or
+    // reservation. A saturated stream request must not create billable Core
+    // state that cannot be executed, and the guard remains owned by the worker
+    // for the whole stream lifecycle.
+    let guard = match state.core_request_guard(&principal.key_id) {
+        Ok(guard) => guard,
+        Err(error) => return super::routes::limit_error_response(error),
+    };
     let bound_account_refs = executor.bound_account_refs();
     let preflight = match bridge.preflight_chat_with_lease_for_accounts(
         &principal,
@@ -141,7 +149,6 @@ pub(super) fn core_stream_chat(
         heartbeat_failed.clone(),
         stop_heartbeat.clone(),
     );
-    let guard = state.inflight_guard();
     let worker_bridge = bridge.clone();
     let worker_principal = principal.clone();
     let worker_lease = lease.clone();

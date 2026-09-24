@@ -385,6 +385,10 @@ pub struct PoolStatus {
     /// 通用 + Work 的展示总余额。
     #[serde(default)]
     pub total_credits: Option<f64>,
+    /// Unix milliseconds when this account's balance was last successfully
+    /// fetched from upstream; disk-cached balances do not get a timestamp.
+    #[serde(default)]
+    pub credit_observed_at_ms: Option<i64>,
     pub credits_expire_at: Option<i64>,
     pub cooling: bool,
     pub cooldown_until: Option<i64>,

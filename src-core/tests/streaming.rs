@@ -271,6 +271,8 @@ fn downgrade_request_tables_to_v6(dir: &PathBuf) {
              DROP TABLE jobs;
              DROP TABLE assets;
              DROP TABLE dispatch_queue_cursors;
+             ALTER TABLE api_keys DROP COLUMN secret_key_version;
+             ALTER TABLE api_keys DROP COLUMN secret_ciphertext;
              UPDATE schema_meta SET value = '6' WHERE key = 'schema_version';",
         )
         .unwrap();

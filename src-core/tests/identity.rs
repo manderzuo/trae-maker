@@ -152,6 +152,22 @@ fn scope_check_rejects_a_scope_the_key_does_not_hold() {
 }
 
 #[test]
+fn video_submission_scope_also_allows_status_and_download_queries() {
+    let (store, _) = test_store();
+    create_admin(&store);
+    let user = store
+        .create_user(user("u-video", UserRole::User), "admin-1")
+        .unwrap();
+    let issued = store
+        .issue_api_key(&user.id, "video", scopes(&["videos:submit"]), "admin-1")
+        .unwrap();
+    let principal = store.authenticate_api_key(&issued.plaintext).unwrap();
+
+    assert!(issued.scopes.contains("videos:read"));
+    assert!(require_scope(&principal, "videos:read").is_ok());
+}
+
+#[test]
 fn key_identity_cannot_be_used_as_another_users_identity() {
     let (store, _) = test_store();
     create_admin(&store);

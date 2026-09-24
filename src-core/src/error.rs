@@ -52,6 +52,22 @@ pub enum CoreError {
     MissingScope { scope: String },
     #[error("quota is insufficient: available {available}, required {required}")]
     QuotaInsufficient { available: i64, required: i64 },
+    #[error("quota pool is not configured for user {user_id} and resource {resource_kind}")]
+    QuotaPoolNotConfigured { user_id: String, resource_kind: String },
+    #[error("quota pool is insufficient: available {available}, required {required}")]
+    QuotaPoolInsufficient { available: i64, required: i64 },
+    #[error("AI Work upstream credits are unavailable: {reason}")]
+    UpstreamCreditsUnavailable { reason: String },
+    #[error("AI Work upstream credits {upstream_total} are below existing Key commitments {committed}")]
+    UpstreamCommitmentsExceedBalance { upstream_total: i64, committed: i64 },
+    #[error("AI Work upstream allocatable credits are insufficient: available {available}, required {required}")]
+    UpstreamCreditLimitExceeded { available: i64, required: i64 },
+    #[error("api key {api_key_id} concurrency limit reached: {active_concurrency}/{max_concurrency}")]
+    KeyConcurrencyExceeded {
+        api_key_id: String,
+        active_concurrency: i64,
+        max_concurrency: i64,
+    },
     #[error("key quota is not configured for api key {api_key_id} and resource {resource_kind}")]
     KeyQuotaNotConfigured { api_key_id: String, resource_kind: String },
     #[error("quota budget account {account_id} requires migration reconciliation")]
@@ -80,12 +96,26 @@ pub enum CoreError {
     UserNotFound { user_id: String },
     #[error("api key {api_key_id} was not found")]
     ApiKeyNotFound { api_key_id: String },
+    #[error("API key encryption is unavailable")]
+    ApiKeyEncryptionUnavailable,
+    #[error("encrypted key material is unavailable for API key {api_key_id}")]
+    ApiKeySecretUnavailable { api_key_id: String },
     #[error("legacy migration validation failed: {reason}")]
     MigrationValidation { reason: String },
     #[error("reservation {reservation_id} is owned by another principal")]
     ReservationOwnerMismatch { reservation_id: String },
     #[error("request {request_id} was not found")]
     RequestNotFound { request_id: String },
+    #[error("billing quote does not match request {request_id}")]
+    BillingQuoteMismatch { request_id: String },
+    #[error("billing quote for request {request_id} has expired")]
+    BillingQuoteExpired { request_id: String },
+    #[error("billing quote conflicts with the existing quote for request {request_id}")]
+    BillingQuoteConflict { request_id: String },
+    #[error("billing receipt is invalid: {reason}")]
+    BillingReceiptInvalid { reason: String },
+    #[error("billing settlement is blocked for API key {api_key_id}")]
+    ApiKeyBillingBlocked { api_key_id: String },
     #[error("request {request_id} operation failed: {source}")]
     RequestContext {
         request_id: String,

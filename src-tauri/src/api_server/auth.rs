@@ -71,6 +71,60 @@ pub async fn bearer_auth(
     let presented = bearer.or(xkey);
     let bridge_required = is_bridge_required(&state.data_dir, request.uri().path());
 
+    // Internal bridge routes (and all /v1 routes in bridge-only mode) are
+    // authenticated by AI Work's dedicated bridge credential in every Core
+    // mode. Core API Keys must not inherit access to the bridge control plane.
+    if bridge_required {
+        let capability = capability_for_request(&mut request).await;
+        let data_dir = state.data_dir.clone();
+        let today = super::usage::key_quota_day();
+        let check = tokio::task::spawn_blocking(move || {
+            let Some(presented) = presented.as_deref() else {
+                return None;
+            };
+            let check = api_keys::verify_and_consume_locked_for_capability(
+                &data_dir,
+                presented,
+                &today,
+                capability,
+            );
+            Some(match check {
+                KeyCheck::Ok(resolved)
+                    if api_keys::is_active_bridge_key_id(&data_dir, &resolved.id) =>
+                {
+                    KeyCheck::Ok(resolved)
+                }
+                KeyCheck::Ok(_) | KeyCheck::Invalid => KeyCheck::Invalid,
+                other => other,
+            })
+        })
+        .await
+        .unwrap_or(Some(KeyCheck::Invalid));
+
+        return match check {
+            Some(KeyCheck::Ok(resolved)) => {
+                let attribution = match core_attribution_headers(&request) {
+                    Ok(attribution) => attribution,
+                    Err(response) => return response,
+                };
+                match persist_core_attribution(&state, attribution).await {
+                    Ok(Some(attribution)) => request.extensions_mut().insert(attribution),
+                    Ok(None) => None,
+                    Err(response) => return response,
+                };
+                let id = resolved.id.clone();
+                request.extensions_mut().insert(resolved);
+                request.extensions_mut().insert(KeyId(id));
+                next.run(request).await
+            }
+            Some(KeyCheck::QuotaExceeded { limit, kind }) => quota_exceeded(limit, kind),
+            Some(KeyCheck::CapabilityNotAllowed { capability }) => {
+                capability_not_allowed(&capability)
+            }
+            Some(KeyCheck::Invalid) | None => bridge_only_rejected(),
+        };
+    }
+
     match state
         .core
         .as_ref()
@@ -120,8 +174,20 @@ pub async fn bearer_auth(
 
     match check {
         Some(KeyCheck::Ok(rk)) => {
-            if bridge_required && !api_keys::is_active_bridge_key_id(&data_dir_for_auth(&state), &rk.id) {
+            let active_bridge = api_keys::is_active_bridge_key_id(&data_dir_for_auth(&state), &rk.id);
+            if bridge_required && !active_bridge {
                 return bridge_only_rejected();
+            }
+            if active_bridge {
+                let attribution = match core_attribution_headers(&request) {
+                    Ok(attribution) => attribution,
+                    Err(response) => return response,
+                };
+                match persist_core_attribution(&state, attribution).await {
+                    Ok(Some(attribution)) => request.extensions_mut().insert(attribution),
+                    Ok(None) => None,
+                    Err(response) => return response,
+                };
             }
             let id = rk.id.clone();
             request.extensions_mut().insert(rk);
@@ -151,6 +217,78 @@ pub async fn bearer_auth(
     }
 
     (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
+}
+
+/// Core attribution headers are trusted only after the dedicated AI Work
+/// bridge credential has been authenticated. A regular client API Key cannot
+/// forge a per-Core-Key association by supplying these headers itself.
+fn core_attribution_headers(
+    request: &Request,
+) -> Result<Option<super::bridge_billing::CoreRequestAttribution>, Response> {
+    if !matches!(request.uri().path(), "/v1/chat/completions" | "/v1/videos/generations") {
+        return Ok(None);
+    }
+    let request_header_count = request.headers().get_all("x-core-request-id").iter().count();
+    let key_header_count = request.headers().get_all("x-core-key-id").iter().count();
+    let quote_header_count = request.headers().get_all("x-core-quote-id").iter().count();
+    if request_header_count == 0 && key_header_count == 0 {
+        return Ok(None);
+    }
+    if request_header_count != 1 || key_header_count != 1 || quote_header_count > 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error":{"code":"invalid_core_attribution","message":"Core request attribution headers must be supplied exactly once as a pair"}})),
+        ).into_response());
+    }
+    let request_id = request.headers().get("x-core-request-id")
+        .and_then(|value| value.to_str().ok()).unwrap_or_default().to_string();
+    let key_id = request.headers().get("x-core-key-id")
+        .and_then(|value| value.to_str().ok()).unwrap_or_default().to_string();
+    let quote_id = request.headers().get("x-core-quote-id")
+        .and_then(|value| value.to_str().ok()).unwrap_or_default();
+    let one_shot_test = quote_id.starts_with("authorized-one-shot-test-");
+    if !super::bridge_billing::valid_request_id(&request_id)
+        || !super::bridge_billing::valid_core_key_id(&key_id)
+        || (one_shot_test && quote_id != format!("authorized-one-shot-test-{request_id}"))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error":{"code":"invalid_core_attribution","message":"Core request attribution identifiers are invalid"}})),
+        ).into_response());
+    }
+    Ok(Some(super::bridge_billing::CoreRequestAttribution {
+        request_id,
+        core_key_id: key_id,
+        one_shot_test,
+    }))
+}
+
+async fn persist_core_attribution(
+    state: &Arc<ApiSharedState>,
+    attribution: Option<super::bridge_billing::CoreRequestAttribution>,
+) -> Result<Option<super::bridge_billing::CoreRequestAttribution>, Response> {
+    let Some(attribution) = attribution else {
+        return Ok(None);
+    };
+    let data_dir = state.data_dir.clone();
+    let request_id = attribution.request_id.clone();
+    let key_id = attribution.core_key_id.clone();
+    let one_shot_test = attribution.one_shot_test;
+    let result = tokio::task::spawn_blocking(move || {
+        let mut store = super::bridge_billing::BridgeBillingStore::open(&data_dir)?;
+        store.record_core_request_with_mode(&request_id, &key_id, one_shot_test)
+    }).await;
+    match result {
+        Ok(Ok(super::bridge_billing::CoreRequestRecord::Created | super::bridge_billing::CoreRequestRecord::Duplicate)) => Ok(Some(attribution)),
+        Ok(Ok(super::bridge_billing::CoreRequestRecord::Conflict)) => Err((
+            StatusCode::CONFLICT,
+            axum::Json(json!({"error":{"code":"core_request_key_conflict","message":"Core request ID is already associated with a different API Key"}})),
+        ).into_response()),
+        Ok(Err(_)) | Err(_) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({"error":{"code":"core_attribution_store_unavailable","message":"Core request attribution is temporarily unavailable"}})),
+        ).into_response()),
+    }
 }
 
 fn data_dir_for_auth(state: &ApiSharedState) -> std::path::PathBuf {
@@ -363,7 +501,8 @@ mod tests {
     use std::{collections::BTreeSet, fs, sync::Arc};
 
     use aiwork_core::{CoreStore, NewUser, UserRole};
-    use axum::{body::Body, http::Request};
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
 
     use super::{
         authenticate_enforce_request, capability_for_request_body, is_public_asset_content_path,
@@ -407,6 +546,86 @@ mod tests {
 
     fn core_fixture() -> (Arc<CoreBridge>, String) {
         core_fixture_with_mode(CoreMode::Enforce)
+    }
+
+    fn bridge_auth_fixture() -> (Router, String, String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "twa-bridge-auth-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(CoreStore::open(&dir).unwrap());
+        store.migrate().unwrap();
+        store
+            .create_user(
+                NewUser {
+                    id: "regular-user".into(),
+                    name: "Regular user".into(),
+                    role: UserRole::User,
+                },
+                "bootstrap",
+            )
+            .unwrap();
+        let regular_key = store
+            .issue_api_key(
+                "regular-user",
+                "regular",
+                BTreeSet::from(["models:read".to_owned()]),
+                "bootstrap",
+            )
+            .unwrap()
+            .plaintext;
+        let bridge_key = super::api_keys::issue_bridge_key(&dir, "router bridge")
+            .unwrap()
+            .plaintext;
+        let state = Arc::new(crate::api_server::ApiSharedState {
+            core: Some(Arc::new(CoreBridge::new(store, CoreMode::Enforce))),
+            pool: crate::api_server::pool::ApiPool::new(),
+            wb_pool: crate::api_server::pool::ApiPool::new(),
+            wb_enabled: std::sync::atomic::AtomicBool::new(false),
+            wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+            wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+            wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+            wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_sticky: crate::api_server::wb_sticky::StickyStore::default(),
+            pool_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
+            model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            default_model: "test-model".into(),
+            data_dir: dir.clone(),
+            video_payloads: crate::api_server::video_payload::VideoPayloadStore::new(&dir),
+            cors_origins: String::new(),
+            total_requests: std::sync::atomic::AtomicU64::new(0),
+            inflight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            limiter: crate::api_server::limits::RateLimiter::with_config(
+                crate::api_server::limits::LimitConfig {
+                    max_inflight: 4,
+                    max_video_jobs: 2,
+                    asset_uploads_per_minute: 10,
+                    asset_bytes_per_hour: 1024,
+                    video_submissions_per_minute: 10,
+                },
+            ),
+            active_uid: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+            logger: crate::api_server::ApiLogger::new(dir.join("logs")),
+            debug_enabled: std::sync::atomic::AtomicBool::new(false),
+            usage: std::sync::Mutex::new(crate::api_server::usage::UsageFile::default()),
+            wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        });
+        let app = Router::new()
+            .route("/internal/bridge/test", get(|| async { axum::http::StatusCode::OK }))
+            .route("/v1/chat/completions", get(|attribution: Option<axum::Extension<crate::api_server::bridge_billing::CoreRequestAttribution>>| async move {
+                let body = attribution.map(|axum::Extension(value)| serde_json::json!({
+                    "request_id": value.request_id,
+                    "core_key_id": value.core_key_id,
+                })).unwrap_or(serde_json::Value::Null);
+                axum::Json(body)
+            }))
+            .layer(axum::middleware::from_fn_with_state(state.clone(), super::bearer_auth))
+            .with_state(state);
+        (app, regular_key, bridge_key, dir)
     }
 
     #[test]
@@ -536,6 +755,63 @@ mod tests {
         assert_eq!(payload["error"]["legacy_code"], "daily_quota_exceeded");
         assert_eq!(payload["error"]["param"], "daily_tokens");
         assert!(payload["error"]["message"].as_str().unwrap().contains("Token"));
+    }
+
+    #[tokio::test]
+    async fn internal_bridge_route_rejects_regular_core_keys_and_accepts_active_bridge_key() {
+        let (app, regular_key, bridge_key, dir) = bridge_auth_fixture();
+        let request = |key: &str| {
+            Request::builder()
+                .uri("/internal/bridge/test")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let regular_status = app
+            .clone()
+            .oneshot(request(&regular_key))
+            .await
+            .unwrap()
+            .status();
+        let bridge_status = app
+            .oneshot(request(&bridge_key))
+            .await
+            .unwrap()
+            .status();
+
+        assert_eq!(regular_status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(bridge_status, axum::http::StatusCode::OK);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn authenticated_bridge_attribution_is_injected_only_after_persistence() {
+        let (app, _regular_key, bridge_key, dir) = bridge_auth_fixture();
+        let request = Request::builder()
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {bridge_key}"))
+            .header("x-core-request-id", "core-request-17")
+            .header("x-core-key-id", "key_server_17")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["request_id"], "core-request-17");
+        assert_eq!(payload["core_key_id"], "key_server_17");
+
+        let db_path = dir.join("bridge-billing.sqlite3");
+        let connection = rusqlite::Connection::open(db_path).unwrap();
+        let persisted: (String, String) = connection.query_row(
+            "SELECT request_id, core_key_id FROM bridge_core_requests WHERE request_id = ?1",
+            ["core-request-17"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(persisted, ("core-request-17".into(), "key_server_17".into()));
+        let _ = fs::remove_dir_all(dir);
     }
 }
 

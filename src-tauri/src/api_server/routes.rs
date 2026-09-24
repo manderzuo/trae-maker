@@ -89,6 +89,7 @@ enum AggregateFail {
     NoHealthy { message: String },
     Incomplete { message: String },
     Upstream(u16, String),
+    Attribution { message: String },
 }
 
 struct CoreChatContext {
@@ -983,6 +984,7 @@ async fn seedance_chat_completions(
     key_id: Option<Extension<KeyId>>,
     resolved_key: Option<Extension<ResolvedKey>>,
     principal: Option<Extension<Principal>>,
+    core_attribution: Option<Extension<super::bridge_billing::CoreRequestAttribution>>,
     headers: HeaderMap,
     input: Value,
 ) -> Response {
@@ -1026,11 +1028,12 @@ async fn seedance_chat_completions(
         Ok(body) => bytes::Bytes::from(body),
         Err(_) => return internal_error_response(),
     };
-    let video_response = videos_generations(
+    let video_response = videos_generations_with_attribution(
         State(state),
         key_id,
         resolved_key,
         principal,
+        core_attribution,
         headers,
         body,
     )
@@ -1230,13 +1233,26 @@ async fn wrap_seedance_video_response(response: Response) -> Response {
 }
 
 pub async fn chat_completions(
-    State(state): State<Arc<ApiSharedState>>,
+    state: State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
     resolved_key: Option<Extension<ResolvedKey>>,
     principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    chat_completions_with_attribution(state, key_id, resolved_key, principal, None, headers, body).await
+}
+
+pub async fn chat_completions_with_attribution(
+    State(state): State<Arc<ApiSharedState>>,
+    key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
+    principal: Option<Extension<Principal>>,
+    core_attribution: Option<Extension<super::bridge_billing::CoreRequestAttribution>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let core_attribution = core_attribution.map(|Extension(value)| value);
     if body.len() > MAX_BODY_BYTES {
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1279,7 +1295,10 @@ pub async fn chat_completions(
         .unwrap_or(&state.default_model)
         .to_string();
     if is_seedance_model(&model) {
-        return seedance_chat_completions(state, key_id, resolved_key, principal, headers, peek).await;
+        return seedance_chat_completions(
+            state, key_id, resolved_key, principal,
+            core_attribution.map(Extension), headers, peek,
+        ).await;
     }
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
@@ -1486,9 +1505,9 @@ pub async fn chat_completions(
             }
             TargetPool::Trae => {
                 if stream {
-                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, conversation_id.clone())
+                    stream_chat_with_attribution(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, conversation_id.clone(), core_attribution.clone())
                 } else {
-                    aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, conversation_id.clone()).await
+                    aggregate_chat_with_attribution(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, conversation_id.clone(), core_attribution.clone()).await
                 }
             }
             TargetPool::Custom => {
@@ -2674,13 +2693,26 @@ fn video_outcome_releases_payload(outcome: &VideoAdapterOutcome) -> bool {
 /// W-02 Seedance 文生视频入口。Work 积分账号异步转发到 Trae Work CN
 /// 原生 SSE 接口，客户端通过任务查询接口获取最终资源地址。
 pub async fn videos_generations(
-    State(state): State<Arc<ApiSharedState>>,
+    state: State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
     resolved_key: Option<Extension<ResolvedKey>>,
     principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    videos_generations_with_attribution(state, key_id, resolved_key, principal, None, headers, body).await
+}
+
+pub async fn videos_generations_with_attribution(
+    State(state): State<Arc<ApiSharedState>>,
+    key_id: Option<Extension<KeyId>>,
+    resolved_key: Option<Extension<ResolvedKey>>,
+    principal: Option<Extension<Principal>>,
+    core_attribution: Option<Extension<super::bridge_billing::CoreRequestAttribution>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let core_attribution = core_attribution.map(|Extension(value)| value);
     if core_enforcing(&state) {
         let principal = match core_principal_or_unauthorized(principal.as_ref()) {
             Ok(principal) => principal,
@@ -2788,6 +2820,7 @@ pub async fn videos_generations(
         task.id.clone(),
         input,
         key_str.clone(),
+        core_attribution,
         account,
         video_job_permit,
     );
@@ -3275,6 +3308,10 @@ async fn images_entry(
 
 #[allow(clippy::too_many_arguments)]
 fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard, conversation_id: Option<String>) -> Response {
+    stream_chat_with_attribution(state, body_vec, model, stream, start_ts, proto, key_id, guard, conversation_id, None)
+}
+
+fn stream_chat_with_attribution(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard, conversation_id: Option<String>, core_attribution: Option<super::bridge_billing::CoreRequestAttribution>) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     // SSE keep-alive 15s（T2.7/F-34 §5.5 #7）：防中间层回收长流。
@@ -3336,6 +3373,28 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 conversation_id.as_deref(),
             );
+            let converted = match bind_core_usage_session(converted, core_attribution.as_ref(), &picked.uid) {
+                Ok(body) => body,
+                Err(_) => {
+                    let message = "Core 请求无法建立独立的上游用量会话，已阻止未记录的上游调用";
+                    send_stream_error(&tx, proto, 503, message);
+                    return;
+                }
+            };
+            if super::bridge_billing::BridgeBillingStore::record_core_upstream_attempt_from_payload(
+                &state.data_dir,
+                core_attribution.as_ref(),
+                &picked.uid,
+                &serde_json::from_slice::<Value>(&converted).unwrap_or(Value::Null),
+            ).is_err() {
+                let message = "Core 请求与上游会话归因暂不可用，已阻止未记录的上游调用";
+                state.logger.log_request(
+                    "trae", "POST", proto.log_path(), &model, stream,
+                    503, &picked.uid, start_ts.elapsed().as_millis() as u64, Some(message),
+                );
+                send_stream_error(&tx, proto, 503, message);
+                return;
+            }
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
             // 重试计数，换号后随新账号归零；总轮换上限为本次池内账号数
@@ -3641,6 +3700,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 // ==================== Non-streaming ====================
 
 async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard, conversation_id: Option<String>) -> Response {
+    aggregate_chat_with_attribution(state, body_vec, model, stream, start_ts, proto, key_id, guard, conversation_id, None).await
+}
+
+async fn aggregate_chat_with_attribution(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard, conversation_id: Option<String>, core_attribution: Option<super::bridge_billing::CoreRequestAttribution>) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         // inflight guard 随后台任务存续至聚合完成（§4.5）
         let mut guard = guard;
@@ -3659,6 +3722,24 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 conversation_id.as_deref(),
             );
+            let converted = match bind_core_usage_session(converted, core_attribution.as_ref(), &picked.uid) {
+                Ok(body) => body,
+                Err(_) => {
+                    return Err(AggregateFail::Attribution {
+                        message: "Core 请求无法建立独立的上游用量会话，已阻止未记录的上游调用".into(),
+                    });
+                }
+            };
+            if super::bridge_billing::BridgeBillingStore::record_core_upstream_attempt_from_payload(
+                &state.data_dir,
+                core_attribution.as_ref(),
+                &picked.uid,
+                &serde_json::from_slice::<Value>(&converted).unwrap_or(Value::Null),
+            ).is_err() {
+                return Err(AggregateFail::Attribution {
+                    message: "Core 请求与上游会话归因暂不可用，已阻止未记录的上游调用".into(),
+                });
+            }
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
             // 重试计数，换号后随新账号归零；总轮换上限为本次池内账号数
@@ -3926,6 +4007,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 _ => openai_error(sc, "upstream_error", &msg),
             }
         }
+        Ok(Err(AggregateFail::Attribution { message })) => match proto {
+            Protocol::Anthropic => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &message),
+            _ => openai_error(StatusCode::SERVICE_UNAVAILABLE, "core_attribution_unavailable", &message),
+        },
         Err(e) => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -4167,6 +4252,57 @@ mod tests {
     use axum::http::HeaderMap;
 
     use crate::api_server::{CoreBridge, CoreMode};
+
+    #[test]
+    fn core_session_binding_separates_requests_without_changing_conversation_context() {
+        let body = serde_json::to_vec(&json!({
+            "conversation_id": "shared-conversation",
+            "session_id": "conversation-session",
+            "messages": [{"role":"user","content":"hello"}]
+        })).unwrap();
+        let first = super::bind_core_usage_session(
+            body.clone(),
+            Some(&super::super::bridge_billing::CoreRequestAttribution {
+                request_id: "core-req-1".into(),
+                core_key_id: "key-1".into(),
+                one_shot_test: false,
+            }),
+            "uid-a",
+        ).unwrap();
+        let first_retry = super::bind_core_usage_session(
+            body.clone(),
+            Some(&super::super::bridge_billing::CoreRequestAttribution {
+                request_id: "core-req-1".into(),
+                core_key_id: "key-1".into(),
+                one_shot_test: false,
+            }),
+            "uid-a",
+        ).unwrap();
+        let second = super::bind_core_usage_session(
+            body.clone(),
+            Some(&super::super::bridge_billing::CoreRequestAttribution {
+                request_id: "core-req-2".into(),
+                core_key_id: "key-2".into(),
+                one_shot_test: false,
+            }),
+            "uid-a",
+        ).unwrap();
+        let ordinary = super::bind_core_usage_session(body.clone(), None, "uid-a").unwrap();
+        let first: Value = serde_json::from_slice(&first).unwrap();
+        let first_retry: Value = serde_json::from_slice(&first_retry).unwrap();
+        let second: Value = serde_json::from_slice(&second).unwrap();
+        let ordinary: Value = serde_json::from_slice(&ordinary).unwrap();
+
+        assert_eq!(first["session_id"], first_retry["session_id"]);
+        assert_ne!(first["session_id"], second["session_id"]);
+        assert_eq!(first["conversation_id"], "shared-conversation");
+        assert_eq!(first["messages"], body_value(&body)["messages"]);
+        assert_eq!(ordinary["session_id"], "conversation-session");
+    }
+
+    fn body_value(body: &[u8]) -> Value {
+        serde_json::from_slice(body).unwrap()
+    }
 
     struct CoreFixture {
         dir: PathBuf,
@@ -7009,4 +7145,16 @@ mod tests {
         assert_eq!(index["assets"].as_array().unwrap().len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
+}
+
+fn bind_core_usage_session(
+    body: Vec<u8>,
+    attribution: Option<&super::bridge_billing::CoreRequestAttribution>,
+    account_ref: &str,
+) -> Result<Vec<u8>, String> {
+    let Some(attribution) = attribution else {
+        return Ok(body);
+    };
+    let session_id = super::bridge_billing::core_usage_session_id(&attribution.request_id, account_ref);
+    super::payload::bind_upstream_session_id(&body, &session_id)
 }

@@ -100,6 +100,7 @@ pub struct CreditBalance {
     pub total: Option<f64>,
     pub general: Option<f64>,
     pub work: Option<f64>,
+    pub observed_at_ms: Option<i64>,
 }
 
 /// 网关资源类型。通用积分与 Work 积分分开取号，避免资源额度串用。
@@ -182,6 +183,22 @@ impl ApiPool {
             strategy: Arc::new(Mutex::new(PoolStrategy::ExpireFirst)),
             recent_pick: Arc::new(Mutex::new((String::new(), 0))),
         }
+    }
+
+    /// Copy credentials only for accounts explicitly referenced by pending
+    /// Core session attempts. The returned JWTs stay in process memory and
+    /// are passed directly to the read-only usage-history fetcher.
+    pub(crate) fn usage_credentials_for(
+        &self,
+        account_refs: &HashSet<String>,
+    ) -> Vec<(String, String, String)> {
+        let entries = safe_lock(&self.entries);
+        account_refs
+            .iter()
+            .filter_map(|uid| entries.get(uid))
+            .filter(|entry| !entry.jwt.trim().is_empty())
+            .map(|entry| (entry.uid.clone(), entry.name.clone(), entry.jwt.clone()))
+            .collect()
     }
 
     /// 设置调度策略（启动时由 api_pool.json 决定）
@@ -325,7 +342,15 @@ impl ApiPool {
                         global_region: false,
                     },
                 );
-                balances.insert(uid.clone(), CreditBalance { total, general, work });
+                balances.insert(
+                    uid.clone(),
+                    CreditBalance {
+                        total,
+                        general,
+                        work,
+                        observed_at_ms: None,
+                    },
+                );
             }
         }
     }
@@ -371,6 +396,7 @@ impl ApiPool {
                 total: a.credits,
                 general: a.credits,
                 work: None,
+                observed_at_ms: None,
             };
             safe_lock(&self.balances).insert(a.uid.clone(), balance);
         }
@@ -384,9 +410,14 @@ impl ApiPool {
         general_credits: &HashMap<String, f64>,
         work_credits: &HashMap<String, f64>,
         expire_times: &HashMap<String, i64>,
+        refreshed_uids: &HashSet<String>,
     ) {
         let mut entries = safe_lock(&self.entries);
         let mut balances = safe_lock(&self.balances);
+        let observed_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
         for (uid, entry) in entries.iter_mut() {
             if !total_credits.contains_key(uid)
                 && !general_credits.contains_key(uid)
@@ -400,11 +431,24 @@ impl ApiPool {
                 general.or(old.total)
             });
             let work = work_credits.get(uid).copied().or(old.work);
+            let observed_at_ms = if refreshed_uids.contains(uid) {
+                Some(observed_at_ms)
+            } else {
+                old.observed_at_ms
+            };
             entry.credits = general;
             if let Some(exp) = expire_times.get(uid).copied() {
                 entry.credits_expire_at = Some(exp);
             }
-            balances.insert(uid.clone(), CreditBalance { total, general, work });
+            balances.insert(
+                uid.clone(),
+                CreditBalance {
+                    total,
+                    general,
+                    work,
+                    observed_at_ms,
+                },
+            );
         }
     }
 
@@ -682,6 +726,9 @@ impl ApiPool {
                     .get(&e.uid)
                     .and_then(|b| b.total)
                     .or(e.credits),
+                credit_observed_at_ms: balances
+                    .get(&e.uid)
+                    .and_then(|balance| balance.observed_at_ms),
                 credits_expire_at: e.credits_expire_at,
                 cooling: e.until > 0 && now < e.until,
                 cooldown_until: if e.until > 0 { Some(e.until) } else { None },
@@ -707,6 +754,26 @@ impl ApiPool {
         let now = now_ts();
         let tried = HashSet::new();
         entries.values().any(|e| selectable(e, &tried, now))
+    }
+
+    /// 按资源类型判断池内是否存在可选账号。Work 资源使用独立的 Work 积分余额，
+    /// 与 `pick_excluding_for` 保持相同的候选过滤语义。
+    pub fn has_selectable_for(&self, kind: ResourceKind) -> bool {
+        if kind == ResourceKind::General {
+            return self.has_selectable();
+        }
+        let entries = safe_lock(&self.entries);
+        let balances = safe_lock(&self.balances);
+        let now = now_ts();
+        let tried = HashSet::new();
+        entries.values().any(|entry| {
+            selectable_with_credit(
+                entry,
+                &tried,
+                now,
+                balances.get(&entry.uid).and_then(|balance| balance.work),
+            )
+        })
     }
 
     /// 诊断：返回所有账号被过滤的原因（用于 "no healthy account" 排查）
@@ -1118,12 +1185,68 @@ mod tests {
         general.insert("uid_a".to_string(), 70.0);
         work.insert("uid_a".to_string(), 10.0);
         total.insert("uid_a".to_string(), 80.0);
-        pool.update_credit_balances(&total, &general, &work, &HashMap::new());
+        pool.update_credit_balances(
+            &total,
+            &general,
+            &work,
+            &HashMap::new(),
+            &HashSet::from(["uid_a".to_string()]),
+        );
         let updated = pool.status_list();
         let a = updated.iter().find(|s| s.uid == "uid_a").unwrap();
         assert_eq!(a.general_credits, Some(70.0));
         assert_eq!(a.work_credits, Some(10.0));
         assert_eq!(a.total_credits, Some(80.0));
+    }
+
+    #[test]
+    fn cached_balances_are_unobserved_until_successfully_refreshed() {
+        let pool = ApiPool::new();
+        let accounts = vec![acct("A", "uid_a"), acct("B", "uid_b")];
+        let enabled = vec!["uid_a".to_string(), "uid_b".to_string()];
+        let mut total = HashMap::new();
+        total.insert("uid_a".to_string(), 10.0);
+        total.insert("uid_b".to_string(), 20.0);
+        let general = total.clone();
+        let work = HashMap::new();
+        pool.sync_from_accounts_with_balances(
+            &accounts,
+            &enabled,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &total,
+            &general,
+            &work,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let cached = pool.status_list();
+        assert_eq!(
+            cached.iter().find(|row| row.uid == "uid_a").unwrap().credit_observed_at_ms,
+            None
+        );
+        assert_eq!(
+            cached.iter().find(|row| row.uid == "uid_b").unwrap().credit_observed_at_ms,
+            None
+        );
+
+        pool.update_credit_balances(
+            &total,
+            &general,
+            &work,
+            &HashMap::new(),
+            &HashSet::from(["uid_a".to_string()]),
+        );
+        let updated = pool.status_list();
+        assert!(
+            updated.iter().find(|row| row.uid == "uid_a").unwrap().credit_observed_at_ms.unwrap() > 0
+        );
+        assert_eq!(
+            updated.iter().find(|row| row.uid == "uid_b").unwrap().credit_observed_at_ms,
+            None
+        );
     }
 
     #[test]
@@ -1408,5 +1531,43 @@ mod tests {
             &["wb-x".to_string()],
         );
         assert!(pool2.pick_excluding(&HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn has_selectable_for_uses_resource_specific_credit_balance() {
+        let pool = ApiPool::new();
+        let accounts = vec![acct("uid_a", "uid_a")];
+        let enabled = vec!["uid_a".to_string()];
+        let mut total = HashMap::new();
+        total.insert("uid_a".to_string(), 1.0);
+        let mut general = HashMap::new();
+        general.insert("uid_a".to_string(), 1.0);
+        let mut work = HashMap::new();
+        work.insert("uid_a".to_string(), 0.0);
+        pool.sync_from_accounts_with_balances(
+            &accounts,
+            &enabled,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &total,
+            &general,
+            &work,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(pool.has_selectable_for(ResourceKind::General));
+        assert!(!pool.has_selectable_for(ResourceKind::Work));
+
+        work.insert("uid_a".to_string(), 2.0);
+        pool.update_credit_balances(
+            &total,
+            &general,
+            &work,
+            &HashMap::new(),
+            &HashSet::from(["uid_a".to_string()]),
+        );
+        assert!(pool.has_selectable_for(ResourceKind::Work));
     }
 }

@@ -1,11 +1,15 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
-    CoreError, CoreQuotaBalanceView, CoreQuotaLedgerView, CoreQuotaUsageView, CoreStore,
+    BillingQuote, BillingReceipt, BillingReceiptResult, BillingReceiptStatus,
+    BillingReservationResult, CoreError, CoreQuotaBalanceView, CoreQuotaLedgerView,
+    CoreQuotaUsageView, CoreStore, CreditAmount,
     KeyQuotaGrant, LegacyQuotaAllocation, Principal, QuotaBalance, QuotaBudgetBalance,
     QuotaBudgetScope, QuotaGrant, QuotaMigrationState, QuotaReserve, RequestResult, RequestState,
-    Reservation, ReservationState, ReserveResult, Settlement,
+    Reservation, ReservationState, ReserveResult, Settlement, UpstreamCreditSnapshot,
+    UPSTREAM_CREDIT_SNAPSHOT_MAX_AGE_MS,
 };
 
 struct BudgetAccountRecord {
@@ -238,6 +242,325 @@ impl CoreStore {
         let balance = Self::balance_in_transaction(&transaction, user_id, resource_kind)?;
         transaction.commit()?;
         Ok(balance)
+    }
+
+    /// Add credits to the user-cap pool that backs all of the user's API keys.
+    ///
+    /// Legacy user-level ledger rows are attached to the pool account on first
+    /// use. The old `grant_as_admin` API remains available for compatibility,
+    /// but the Core admin UI uses this method so every new allocation has a
+    /// bounded pool behind it.
+    pub fn quota_pool_grant_as_admin(
+        &self,
+        principal: &Principal,
+        input: QuotaGrant,
+    ) -> Result<QuotaBudgetBalance, CoreError> {
+        if input.amount <= 0 {
+            return Err(CoreError::InvalidQuotaAmount);
+        }
+        if input.resource_kind.trim().is_empty() {
+            return Err(CoreError::Validation {
+                field: "resource_kind".into(),
+                reason: "must not be empty".into(),
+            });
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        Self::ensure_active_user(&transaction, &input.user_id)?;
+        let (mut account, created) = Self::ensure_user_cap_account_for_admin(
+            &transaction,
+            &input.user_id,
+            &input.resource_kind,
+            now,
+            true,
+        )?;
+        Self::ensure_ready_budget_account(&account)?;
+        let budget_version = if created {
+            account.version
+        } else {
+            let version = Self::advance_budget_account(&transaction, &account.id, now)?;
+            account.version = version;
+            version
+        };
+        let entry_id = Self::new_id("quota");
+        let event_group_id = format!("admin-{entry_id}");
+        Self::insert_budget_ledger_entry(
+            &transaction,
+            &input.user_id,
+            &input.resource_kind,
+            "adjust",
+            input.amount,
+            input.amount,
+            None,
+            Some(&principal.user_id),
+            Some(&input.reason),
+            now,
+            Some(&account.id),
+            Some(&event_group_id),
+            None,
+            budget_version,
+        )?;
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "quota.pool_adjust",
+            "quota_budget_account",
+            &account.id,
+            serde_json::json!({
+                "user_id": input.user_id,
+                "resource_kind": input.resource_kind,
+                "amount": input.amount,
+                "reason": input.reason,
+                "event_group_id": event_group_id,
+            }),
+            now,
+        )?;
+        let balance = Self::budget_balance_in_transaction(&transaction, &account.id)?;
+        transaction.commit()?;
+        Ok(balance)
+    }
+
+    pub fn quota_pool_balance_as_admin(
+        &self,
+        principal: &Principal,
+        user_id: &str,
+        resource_kind: &str,
+    ) -> Result<QuotaBudgetBalance, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        Self::ensure_active_user(&transaction, user_id)?;
+        let (account, _) = Self::ensure_user_cap_account_for_admin(
+            &transaction,
+            user_id,
+            resource_kind,
+            Utc::now().timestamp_millis(),
+            false,
+        )?;
+        Self::ensure_ready_budget_account(&account)?;
+        let balance = Self::budget_balance_in_transaction(&transaction, &account.id)?;
+        transaction.commit()?;
+        Ok(balance)
+    }
+
+    pub fn quota_pool_allocatable_as_admin(
+        &self,
+        principal: &Principal,
+        user_id: &str,
+        resource_kind: &str,
+    ) -> Result<i64, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        Self::ensure_active_user(&transaction, user_id)?;
+        let (account, _) = Self::ensure_user_cap_account_for_admin(
+            &transaction,
+            user_id,
+            resource_kind,
+            Utc::now().timestamp_millis(),
+            false,
+        )?;
+        Self::ensure_ready_budget_account(&account)?;
+        let pool = Self::budget_balance_in_transaction(&transaction, &account.id)?;
+        let allocated = Self::allocated_key_quota_in_transaction(&transaction, user_id, resource_kind)?;
+        let available = pool.available.saturating_sub(allocated).max(0);
+        transaction.commit()?;
+        Ok(available)
+    }
+
+    /// Allocate from the user's pool to a specific API key in one transaction.
+    /// The pool ledger is not duplicated: requests later reserve/settle both
+    /// the key account and this user-cap account, while this adjustment only
+    /// establishes the key's upper bound.
+    pub fn key_quota_allocate_from_pool_as_admin(
+        &self,
+        principal: &Principal,
+        input: KeyQuotaGrant,
+    ) -> Result<QuotaBudgetBalance, CoreError> {
+        if input.amount <= 0 {
+            return Err(CoreError::InvalidQuotaAmount);
+        }
+        if input.resource_kind.trim().is_empty() {
+            return Err(CoreError::Validation {
+                field: "resource_kind".into(),
+                reason: "must not be empty".into(),
+            });
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        let user_id = Self::active_api_key_owner(&transaction, &input.api_key_id)?;
+        let (pool_account, _) = Self::ensure_user_cap_account_for_admin(
+            &transaction,
+            &user_id,
+            &input.resource_kind,
+            now,
+            false,
+        )?;
+        Self::ensure_ready_budget_account(&pool_account)?;
+        let pool_balance = Self::budget_balance_in_transaction(&transaction, &pool_account.id)?;
+        let allocated = Self::allocated_key_quota_in_transaction(
+            &transaction,
+            &user_id,
+            &input.resource_kind,
+        )?;
+        let allocatable = pool_balance.available.saturating_sub(allocated).max(0);
+        if input.amount > allocatable {
+            return Err(CoreError::QuotaPoolInsufficient {
+                available: allocatable,
+                required: input.amount,
+            });
+        }
+
+        let (mut account, created) = Self::ensure_key_budget_account(
+            &transaction,
+            &input.api_key_id,
+            &user_id,
+            &input.resource_kind,
+            now,
+        )?;
+        Self::ensure_ready_budget_account(&account)?;
+        let budget_version = if created {
+            account.version
+        } else {
+            let version = Self::advance_budget_account(&transaction, &account.id, now)?;
+            account.version = version;
+            version
+        };
+        let entry_id = Self::new_id("quota");
+        let event_group_id = format!("admin-{entry_id}");
+        Self::insert_budget_ledger_entry(
+            &transaction,
+            &user_id,
+            &input.resource_kind,
+            "adjust",
+            input.amount,
+            input.amount,
+            None,
+            Some(&principal.user_id),
+            Some(&input.reason),
+            now,
+            Some(&account.id),
+            Some(&event_group_id),
+            Some(&input.api_key_id),
+            budget_version,
+        )?;
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "quota.key_allocate",
+            "quota_budget_account",
+            &account.id,
+            serde_json::json!({
+                "api_key_id": input.api_key_id,
+                "resource_kind": input.resource_kind,
+                "amount": input.amount,
+                "pool_allocatable_before": allocatable,
+                "reason": input.reason,
+                "event_group_id": event_group_id,
+            }),
+            now,
+        )?;
+        let balance = Self::budget_balance_in_transaction(&transaction, &account.id)?;
+        transaction.commit()?;
+        Ok(balance)
+    }
+
+    /// Allocate one unified credits balance directly to a Key. The fresh
+    /// upstream snapshot is checked against every Key's remaining available
+    /// plus held amount inside the same immediate transaction as the grant.
+    pub fn key_quota_allocate_from_upstream_as_admin(
+        &self,
+        principal: &Principal,
+        input: KeyQuotaGrant,
+        snapshot: UpstreamCreditSnapshot,
+    ) -> Result<(QuotaBudgetBalance, i64), CoreError> {
+        if input.amount <= 0 {
+            return Err(CoreError::InvalidQuotaAmount);
+        }
+        if input.resource_kind != "credits" {
+            return Err(CoreError::Validation {
+                field: "resource_kind".into(),
+                reason: "only the unified credits balance can be allocated".into(),
+            });
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+        Self::ensure_fresh_upstream_credit_snapshot(&snapshot, now)?;
+        let (upstream_total, committed, allocatable) =
+            Self::upstream_credit_capacity_in_transaction(&transaction, &snapshot)?;
+        if input.amount > allocatable {
+            return Err(CoreError::UpstreamCreditLimitExceeded {
+                available: allocatable,
+                required: input.amount,
+            });
+        }
+
+        let user_id = Self::active_api_key_owner(&transaction, &input.api_key_id)?;
+        let (mut account, created) = Self::ensure_key_budget_account(
+            &transaction,
+            &input.api_key_id,
+            &user_id,
+            "credits",
+            now,
+        )?;
+        Self::ensure_ready_budget_account(&account)?;
+        let budget_version = if created {
+            account.version
+        } else {
+            let version = Self::advance_budget_account(&transaction, &account.id, now)?;
+            account.version = version;
+            version
+        };
+        let entry_id = Self::new_id("quota");
+        let event_group_id = format!("admin-{entry_id}");
+        Self::insert_budget_ledger_entry(
+            &transaction,
+            &user_id,
+            "credits",
+            "adjust",
+            input.amount,
+            input.amount,
+            None,
+            Some(&principal.user_id),
+            Some(&input.reason),
+            now,
+            Some(&account.id),
+            Some(&event_group_id),
+            Some(&input.api_key_id),
+            budget_version,
+        )?;
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "quota.key_allocate_upstream",
+            "quota_budget_account",
+            &account.id,
+            serde_json::json!({
+                "api_key_id": input.api_key_id,
+                "resource_kind": "credits",
+                "amount": input.amount,
+                "upstream_total": upstream_total,
+                "committed_before": committed,
+                "allocatable_before": allocatable,
+                "allocatable_after": allocatable - input.amount,
+                "reason": input.reason,
+                "event_group_id": event_group_id,
+            }),
+            now,
+        )?;
+        let balance = Self::budget_balance_in_transaction(&transaction, &account.id)?;
+        let remaining = allocatable - input.amount;
+        transaction.commit()?;
+        Ok((balance, remaining))
     }
 
     pub fn key_quota_grant_as_admin(
@@ -903,6 +1226,182 @@ impl CoreStore {
         ))
     }
 
+    fn ensure_user_cap_account_for_admin(
+        transaction: &Transaction<'_>,
+        user_id: &str,
+        resource_kind: &str,
+        now: i64,
+        create_if_missing: bool,
+    ) -> Result<(BudgetAccountRecord, bool), CoreError> {
+        let existing = transaction
+            .query_row(
+                "SELECT id, scope, user_id, api_key_id, resource_kind, enabled, version, migration_state
+                 FROM quota_budget_accounts
+                 WHERE scope = 'user_cap' AND user_id = ?1 AND resource_kind = ?2
+                 ORDER BY id LIMIT 1",
+                rusqlite::params![user_id, resource_kind],
+                Self::budget_account_from_row,
+            )
+            .optional()?;
+        if let Some(account) = existing {
+            if account.migration_state == QuotaMigrationState::LegacyUnassigned {
+                transaction.execute(
+                    "UPDATE quota_budget_accounts
+                     SET migration_state = 'ready', updated_at_ms = ?1
+                     WHERE id = ?2",
+                    rusqlite::params![now, &account.id],
+                )?;
+                let mut account = account;
+                account.migration_state = QuotaMigrationState::Ready;
+                return Ok((account, false));
+            }
+            return Ok((account, false));
+        }
+
+        let legacy_rows: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM quota_ledger
+             WHERE user_id = ?1 AND resource_kind = ?2
+               AND budget_account_id IS NULL AND api_key_id IS NULL",
+            rusqlite::params![user_id, resource_kind],
+            |row| row.get(0),
+        )?;
+        if legacy_rows == 0 && !create_if_missing {
+            return Err(CoreError::QuotaPoolNotConfigured {
+                user_id: user_id.into(),
+                resource_kind: resource_kind.into(),
+            });
+        }
+
+        let id = Self::new_id("budget");
+        transaction.execute(
+            "INSERT INTO quota_budget_accounts
+             (id, scope, user_id, api_key_id, resource_kind, enabled, version,
+              migration_state, created_at_ms, updated_at_ms)
+             VALUES (?1, 'user_cap', ?2, NULL, ?3, 1, 1, 'ready', ?4, ?4)",
+            rusqlite::params![&id, user_id, resource_kind, now],
+        )?;
+        if legacy_rows > 0 {
+            transaction.execute(
+                "UPDATE quota_ledger
+                 SET budget_account_id = ?1
+                 WHERE user_id = ?2 AND resource_kind = ?3
+                   AND budget_account_id IS NULL AND api_key_id IS NULL",
+                rusqlite::params![&id, user_id, resource_kind],
+            )?;
+            transaction.execute(
+                "UPDATE quota_reservations
+                 SET user_cap_account_id = ?1
+                 WHERE user_id = ?2 AND resource_kind = ?3
+                   AND key_budget_account_id IS NULL AND user_cap_account_id IS NULL",
+                rusqlite::params![&id, user_id, resource_kind],
+            )?;
+        }
+        Ok((
+            BudgetAccountRecord {
+                id,
+                scope: QuotaBudgetScope::UserCap,
+                user_id: user_id.into(),
+                api_key_id: None,
+                resource_kind: resource_kind.into(),
+                enabled: true,
+                version: 1,
+                migration_state: QuotaMigrationState::Ready,
+            },
+            true,
+        ))
+    }
+
+    pub(crate) fn allocated_key_quota_in_transaction(
+        transaction: &Transaction<'_>,
+        user_id: &str,
+        resource_kind: &str,
+    ) -> Result<i64, CoreError> {
+        let mut statement = transaction.prepare(
+            "SELECT quota_budget_accounts.id
+             FROM quota_budget_accounts
+             INNER JOIN api_keys
+               ON api_keys.id = quota_budget_accounts.api_key_id
+              AND api_keys.user_id = quota_budget_accounts.user_id
+              AND api_keys.status = 'active'
+             WHERE quota_budget_accounts.scope = 'key'
+               AND quota_budget_accounts.user_id = ?1
+               AND quota_budget_accounts.resource_kind = ?2
+               AND quota_budget_accounts.enabled = 1
+             ORDER BY quota_budget_accounts.id",
+        )?;
+        let account_ids = statement
+            .query_map(rusqlite::params![user_id, resource_kind], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        account_ids.into_iter().try_fold(0_i64, |total, account_id| {
+            let balance = Self::budget_balance_in_transaction(transaction, &account_id)?;
+            total
+                .checked_add(balance.available.saturating_add(balance.held))
+                .ok_or_else(|| CoreError::InvalidConfiguration {
+                    key: "quota_budget_accounts.total_allocated".into(),
+                    value: "overflow".into(),
+                })
+        })
+    }
+
+    fn ensure_fresh_upstream_credit_snapshot(
+        snapshot: &UpstreamCreditSnapshot,
+        now: i64,
+    ) -> Result<(), CoreError> {
+        let age_ms = now.saturating_sub(snapshot.updated_at_ms);
+        if snapshot.updated_at_ms <= 0
+            || age_ms < 0
+            || age_ms > UPSTREAM_CREDIT_SNAPSHOT_MAX_AGE_MS
+        {
+            return Err(CoreError::UpstreamCreditsUnavailable {
+                reason: "AI Work 积分快照缺失、来自未来或已过期，请先刷新 AI Work 积分".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn upstream_credit_capacity_in_transaction(
+        transaction: &Transaction<'_>,
+        snapshot: &UpstreamCreditSnapshot,
+    ) -> Result<(i64, i64, i64), CoreError> {
+        let mut statement = transaction.prepare(
+            "SELECT id FROM quota_budget_accounts
+             WHERE scope = 'key' AND resource_kind = 'credits'
+             ORDER BY id",
+        )?;
+        let account_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let committed = account_ids.into_iter().try_fold(0_i64, |total, account_id| {
+            let balance = Self::budget_balance_in_transaction(transaction, &account_id)?;
+            let account_commitment = balance
+                .available
+                .checked_add(balance.held)
+                .ok_or_else(|| CoreError::InvalidConfiguration {
+                    key: "quota_budget_accounts.total_committed".into(),
+                    value: "overflow".into(),
+                })?
+                .max(0);
+            total
+                .checked_add(account_commitment)
+                .ok_or_else(|| CoreError::InvalidConfiguration {
+                    key: "quota_budget_accounts.total_committed".into(),
+                    value: "overflow".into(),
+                })
+        })?;
+        let upstream_total = snapshot.total.as_microcredits();
+        if committed > upstream_total {
+            return Err(CoreError::UpstreamCommitmentsExceedBalance {
+                upstream_total,
+                committed,
+            });
+        }
+        Ok((upstream_total, committed, upstream_total - committed))
+    }
+
     fn ensure_ready_budget_account(account: &BudgetAccountRecord) -> Result<(), CoreError> {
         if account.version <= 0 {
             return Err(CoreError::InvalidConfiguration {
@@ -998,7 +1497,7 @@ impl CoreStore {
         })
     }
 
-    fn budget_balance_in_transaction(
+    pub(crate) fn budget_balance_in_transaction(
         transaction: &Transaction<'_>,
         account_id: &str,
     ) -> Result<QuotaBudgetBalance, CoreError> {
@@ -1249,6 +1748,609 @@ impl CoreStore {
             )
             .optional()
             .map_err(CoreError::from)
+    }
+
+    /// Atomically validates an AI Work quote against a Core-generated request,
+    /// reserves its maximum amount on that request's own Key, and stores the
+    /// immutable quote. This method must only be called after bridge
+    /// authentication has verified the quote source.
+    pub fn reserve_credit_quote(
+        &self,
+        quote: BillingQuote,
+    ) -> Result<BillingReservationResult, CoreError> {
+        self.reserve_credit_quote_inner(quote, None)
+    }
+
+    /// Reserve a paid request only while a fresh AI Work total still covers
+    /// the complete set of remaining Key commitments.
+    pub fn reserve_credit_quote_with_upstream_snapshot(
+        &self,
+        quote: BillingQuote,
+        snapshot: UpstreamCreditSnapshot,
+    ) -> Result<BillingReservationResult, CoreError> {
+        self.reserve_credit_quote_inner(quote, Some(snapshot))
+    }
+
+    fn reserve_credit_quote_inner(
+        &self,
+        quote: BillingQuote,
+        upstream_snapshot: Option<UpstreamCreditSnapshot>,
+    ) -> Result<BillingReservationResult, CoreError> {
+        if quote.unit != "credits"
+            || quote.max_credits.as_microcredits() <= 0
+            || quote.quote_id.trim().is_empty()
+            || quote.source_ref.trim().is_empty()
+        {
+            return Err(CoreError::BillingQuoteMismatch {
+                request_id: quote.request_id,
+            });
+        }
+        let supplied_fingerprint = URL_SAFE_NO_PAD
+            .decode(&quote.request_fingerprint)
+            .map_err(|_| CoreError::BillingQuoteMismatch {
+                request_id: quote.request_id.clone(),
+            })?;
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let request = transaction
+            .query_row(
+                "SELECT user_id, api_key_id, endpoint, model, request_hash, state
+                 FROM requests WHERE id = ?1",
+                [&quote.request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::RequestNotFound {
+                request_id: quote.request_id.clone(),
+            })?;
+        if request.2 != quote.endpoint
+            || request.3 != quote.model
+            || request.4 != supplied_fingerprint
+            || quote.expires_at_ms <= now
+        {
+            return Err(if quote.expires_at_ms <= now {
+                CoreError::BillingQuoteExpired {
+                    request_id: quote.request_id,
+                }
+            } else {
+                CoreError::BillingQuoteMismatch {
+                    request_id: quote.request_id,
+                }
+            });
+        }
+
+        let existing_quote = transaction
+            .query_row(
+                "SELECT quote_id, request_fingerprint, endpoint, model, max_credits, unit,
+                        source_ref, expires_at_ms
+                 FROM billing_quotes WHERE request_id = ?1",
+                [&quote.request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing_quote {
+            let exact_match = existing
+                == (
+                    quote.quote_id.clone(),
+                    quote.request_fingerprint.clone(),
+                    quote.endpoint.clone(),
+                    quote.model.clone(),
+                    quote.max_credits.as_microcredits(),
+                    quote.unit.clone(),
+                    quote.source_ref.clone(),
+                    quote.expires_at_ms,
+                );
+            if !exact_match {
+                return Err(CoreError::BillingQuoteConflict {
+                    request_id: quote.request_id,
+                });
+            }
+            let reservation = Self::reservation_by_request(&transaction, &quote.request_id)?
+                .ok_or_else(|| CoreError::BillingQuoteConflict {
+                    request_id: quote.request_id.clone(),
+                })?;
+            let request = Self::request_handle_in_transaction(&transaction, &quote.request_id)?;
+            transaction.commit()?;
+            return Ok(BillingReservationResult::Existing { request, reservation });
+        }
+
+        if let Some(snapshot) = upstream_snapshot.as_ref() {
+            Self::ensure_fresh_upstream_credit_snapshot(snapshot, now)?;
+            Self::upstream_credit_capacity_in_transaction(&transaction, snapshot)?;
+        }
+
+        let request_state = RequestState::from_db(&request.5).ok_or_else(|| {
+            CoreError::InvalidConfiguration {
+                key: "requests.state".into(),
+                value: request.5.clone(),
+            }
+        })?;
+        if request_state != RequestState::Received {
+            return Err(CoreError::InvalidTransition {
+                request_id: quote.request_id,
+                expected: request_state,
+                next: RequestState::Validating,
+            });
+        }
+
+        let active_key = transaction.query_row(
+            "SELECT max_concurrency FROM api_keys
+             WHERE id = ?1 AND user_id = ?2 AND status = 'active'",
+            params![&request.1, &request.0],
+            |row| row.get::<_, i64>(0),
+        ).optional()?.ok_or_else(|| CoreError::InvalidRequestIdentity {
+            user_id: request.0.clone(),
+            api_key_id: request.1.clone(),
+        })?;
+        let key_blocked = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM api_key_billing_blocks WHERE key_id = ?1)",
+            [&request.1],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if key_blocked {
+            return Err(CoreError::ApiKeyBillingBlocked {
+                api_key_id: request.1,
+            });
+        }
+
+        let active_concurrency: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM requests
+             WHERE api_key_id = ?1 AND id <> ?2
+               AND state IN ('received','validating','reserved','queued','dispatched','completing','unknown')",
+            params![&request.1, &quote.request_id],
+            |row| row.get(0),
+        )?;
+        if active_concurrency >= active_key {
+            return Err(CoreError::KeyConcurrencyExceeded {
+                api_key_id: request.1,
+                active_concurrency,
+                max_concurrency: active_key,
+            });
+        }
+
+        let ttl_ms = quote.expires_at_ms - now;
+        let expires_at_ms = quote.expires_at_ms;
+        let reserve = QuotaReserve {
+            user_id: request.0.clone(),
+            request_id: quote.request_id.clone(),
+            resource_kind: "credits".into(),
+            amount: quote.max_credits.as_microcredits(),
+            ttl_ms,
+        };
+        Self::transition_request_on_connection(
+            &transaction,
+            &quote.request_id,
+            RequestState::Received,
+            RequestState::Validating,
+            None,
+            now,
+        )?;
+        let reservation = match Self::reserve_dual_in_transaction(
+            &transaction,
+            &reserve,
+            &request.1,
+            now,
+            expires_at_ms,
+        )? {
+            ReserveResult::Created(reservation) => reservation,
+            ReserveResult::Existing(_) => {
+                return Err(CoreError::ReservationRequestConflict {
+                    request_id: quote.request_id,
+                });
+            }
+            ReserveResult::Insufficient { available } => {
+                return Err(CoreError::QuotaInsufficient {
+                    available,
+                    required: reserve.amount,
+                });
+            }
+        };
+        transaction.execute(
+            "INSERT INTO billing_quotes
+             (quote_id, request_id, request_fingerprint, endpoint, model, max_credits, unit,
+              source_ref, expires_at_ms, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                &quote.quote_id,
+                &quote.request_id,
+                &quote.request_fingerprint,
+                &quote.endpoint,
+                &quote.model,
+                quote.max_credits.as_microcredits(),
+                &quote.unit,
+                &quote.source_ref,
+                quote.expires_at_ms,
+                now,
+            ],
+        )?;
+        Self::transition_request_on_connection(
+            &transaction,
+            &quote.request_id,
+            RequestState::Validating,
+            RequestState::Reserved,
+            None,
+            now,
+        )?;
+        let request = Self::request_handle_in_transaction(&transaction, &quote.request_id)?;
+        transaction.commit()?;
+        Ok(BillingReservationResult::Created { request, reservation })
+    }
+
+    /// Applies a billing observation to the Key recorded locally for the
+    /// request. Receipt payloads never select a user or Key. Non-final and
+    /// unverifiable observations keep the reservation held for reconciliation.
+    pub fn apply_credit_receipt(
+        &self,
+        receipt: BillingReceipt,
+    ) -> Result<BillingReceiptResult, CoreError> {
+        if receipt.request_id.trim().is_empty()
+            || receipt.source_ref.trim().is_empty()
+            || receipt.observed_at_ms <= 0
+        {
+            return Err(CoreError::BillingReceiptInvalid {
+                reason: "request_id, source_ref, and observed_at_ms are required".into(),
+            });
+        }
+        let receipt_hash = crate::canonical_json_hash(&serde_json::to_value(&receipt)?).to_vec();
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (user_id, api_key_id, request_state_value) = transaction
+            .query_row(
+                "SELECT user_id, api_key_id, state FROM requests WHERE id = ?1",
+                [&receipt.request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::RequestNotFound {
+                request_id: receipt.request_id.clone(),
+            })?;
+
+        let duplicate = transaction
+            .query_row(
+                "SELECT status FROM billing_receipts WHERE request_id = ?1 AND receipt_hash = ?2",
+                params![&receipt.request_id, &receipt_hash],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(status) = duplicate {
+            transaction.commit()?;
+            return Ok(if matches!(status.as_str(), "final" | "failed_no_charge" | "conflict") {
+                BillingReceiptResult::Duplicate
+            } else {
+                BillingReceiptResult::Pending
+            });
+        }
+
+        let quote = transaction
+            .query_row(
+                "SELECT quote_id, max_credits FROM billing_quotes WHERE request_id = ?1",
+                [&receipt.request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::BillingQuoteMismatch {
+                request_id: receipt.request_id.clone(),
+            })?;
+        let reservation = Self::reservation_by_request(&transaction, &receipt.request_id)?
+            .ok_or_else(|| CoreError::ReservationNotFound {
+                reservation_id: receipt.request_id.clone(),
+            })?;
+        let key_account_matches = if let Some(account_id) = reservation.key_budget_account_id.as_ref() {
+            transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM quota_budget_accounts
+                    WHERE id = ?1 AND scope = 'key' AND user_id = ?2
+                      AND api_key_id = ?3 AND resource_kind = 'credits'
+                )",
+                params![account_id, &user_id, &api_key_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
+        let reservation_key_matches = reservation.user_id == user_id
+            && reservation.api_key_id.as_deref() == Some(api_key_id.as_str())
+            && reservation.resource_kind == "credits"
+            && reservation.amount == quote.1
+            && key_account_matches;
+        if !reservation_key_matches {
+            return Err(CoreError::BillingReceiptInvalid {
+                reason: "request, Key, quote, and reservation identity do not match".into(),
+            });
+        }
+
+        let mut normalized_status = receipt.status;
+        let mut actual_credits = receipt.actual_credits.map(CreditAmount::as_microcredits);
+        let valid_unit = receipt.unit == "credits";
+        let valid_final = match receipt.status {
+            BillingReceiptStatus::Final => valid_unit && actual_credits.is_some(),
+            BillingReceiptStatus::FailedNoCharge => {
+                valid_unit && actual_credits.map_or(true, |actual| actual == 0)
+            }
+            BillingReceiptStatus::Pending
+            | BillingReceiptStatus::Unknown
+            | BillingReceiptStatus::Unverified => false,
+        };
+        if !valid_unit
+            || (matches!(
+                receipt.status,
+                BillingReceiptStatus::Final | BillingReceiptStatus::FailedNoCharge
+            ) && !valid_final)
+        {
+            normalized_status = BillingReceiptStatus::Unverified;
+            actual_credits = None;
+        }
+
+        let settled = transaction
+            .query_row(
+                "SELECT actual_credits FROM billing_settlements WHERE request_id = ?1",
+                [&receipt.request_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(existing_actual) = settled {
+            if !valid_final || receipt.unit != "credits" {
+                transaction.commit()?;
+                return Ok(BillingReceiptResult::Duplicate);
+            }
+            let incoming_actual = if receipt.status == BillingReceiptStatus::FailedNoCharge {
+                0
+            } else {
+                actual_credits.unwrap_or(0)
+            };
+            if incoming_actual == existing_actual {
+                Self::insert_billing_receipt(
+                    &transaction,
+                    &receipt,
+                    &receipt_hash,
+                    normalized_status.as_str(),
+                    Some(incoming_actual),
+                    now,
+                )?;
+                transaction.commit()?;
+                return Ok(BillingReceiptResult::Duplicate);
+            }
+            Self::insert_billing_receipt(
+                &transaction,
+                &receipt,
+                &receipt_hash,
+                "conflict",
+                Some(incoming_actual),
+                now,
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO api_key_billing_blocks
+                 (key_id, request_id, reason, quote_max_credits, actual_credits,
+                  excess_credits, source_ref, blocked_at_ms)
+                 VALUES (?1, ?2, 'receipt_conflict', ?3, ?4, 0, ?5, ?6)",
+                params![
+                    &api_key_id,
+                    &receipt.request_id,
+                    quote.1,
+                    incoming_actual,
+                    &receipt.source_ref,
+                    now,
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE billing_settlements SET reconcile_required = 1 WHERE request_id = ?1",
+                [&receipt.request_id],
+            )?;
+            transaction.commit()?;
+            return Ok(BillingReceiptResult::Conflict);
+        }
+
+        let stored_actual = if normalized_status == BillingReceiptStatus::FailedNoCharge {
+            Some(0)
+        } else {
+            actual_credits
+        };
+        let receipt_id = Self::insert_billing_receipt(
+            &transaction,
+            &receipt,
+            &receipt_hash,
+            normalized_status.as_str(),
+            stored_actual,
+            now,
+        )?;
+
+        if !valid_final || normalized_status == BillingReceiptStatus::Unverified {
+            if reservation.state == ReservationState::Held {
+                Self::set_reservation_state(
+                    &transaction,
+                    &reservation.id,
+                    ReservationState::Unknown,
+                    now,
+                )?;
+            }
+            let request_state = RequestState::from_db(&request_state_value).ok_or_else(|| {
+                CoreError::InvalidConfiguration {
+                    key: "requests.state".into(),
+                    value: request_state_value.clone(),
+                }
+            })?;
+            if request_state != RequestState::Unknown {
+                Self::transition_request_on_connection(
+                    &transaction,
+                    &receipt.request_id,
+                    request_state,
+                    RequestState::Unknown,
+                    None,
+                    now,
+                )?;
+            }
+            transaction.commit()?;
+            return Ok(BillingReceiptResult::Pending);
+        }
+
+        if !matches!(reservation.state, ReservationState::Held | ReservationState::Unknown) {
+            return Err(CoreError::ReservationSettlementConflict {
+                reservation_id: reservation.id,
+            });
+        }
+        let actual = stored_actual.ok_or_else(|| CoreError::BillingReceiptInvalid {
+            reason: "final receipt has no actual credit amount".into(),
+        })?;
+        let over_quote = actual > quote.1;
+        let refund_delta = reservation
+            .amount
+            .checked_sub(actual)
+            .ok_or(CoreError::InvalidQuotaAmount)?;
+        Self::set_reservation_state(
+            &transaction,
+            &reservation.id,
+            ReservationState::Committed,
+            now,
+        )?;
+        if reservation.key_budget_account_id.is_some() {
+            Self::insert_reservation_budget_event(
+                &transaction,
+                &reservation,
+                "commit",
+                actual,
+                refund_delta,
+                None,
+                now,
+                reservation.event_group_id.as_deref().ok_or_else(|| {
+                    CoreError::InvalidConfiguration {
+                        key: "quota_reservations.event_group_id".into(),
+                        value: reservation.id.clone(),
+                    }
+                })?,
+            )?;
+        } else {
+            Self::insert_ledger_entry(
+                &transaction,
+                &user_id,
+                "credits",
+                "commit",
+                actual,
+                refund_delta,
+                Some(&receipt.request_id),
+                None,
+                None,
+                now,
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO billing_settlements
+             (request_id, quote_id, receipt_id, actual_credits, over_quote, reconcile_required, settled_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            params![
+                &receipt.request_id,
+                &quote.0,
+                &receipt_id,
+                actual,
+                i64::from(over_quote),
+                now,
+            ],
+        )?;
+        let request_state = RequestState::from_db(&request_state_value).ok_or_else(|| {
+            CoreError::InvalidConfiguration {
+                key: "requests.state".into(),
+                value: request_state_value,
+            }
+        })?;
+        let final_state = if normalized_status == BillingReceiptStatus::FailedNoCharge {
+            RequestState::Failed
+        } else {
+            RequestState::Succeeded
+        };
+        Self::settle_request_state(
+            &transaction,
+            &receipt.request_id,
+            request_state,
+            final_state,
+            None,
+            now,
+        )?;
+        if over_quote {
+            let excess = actual.checked_sub(quote.1).ok_or(CoreError::InvalidQuotaAmount)?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO api_key_billing_blocks
+                 (key_id, request_id, reason, quote_max_credits, actual_credits,
+                  excess_credits, source_ref, blocked_at_ms)
+                 VALUES (?1, ?2, 'over_quote', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    &api_key_id,
+                    &receipt.request_id,
+                    quote.1,
+                    actual,
+                    excess,
+                    &receipt.source_ref,
+                    now,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+
+        Ok(BillingReceiptResult::Settled {
+            api_key_id,
+            actual_credits: CreditAmount::try_from_microcredits(actual).ok_or_else(|| {
+                CoreError::BillingReceiptInvalid {
+                    reason: "final receipt amount is outside the supported range".into(),
+                }
+            })?,
+            over_quote,
+        })
+    }
+
+    fn insert_billing_receipt(
+        transaction: &Transaction<'_>,
+        receipt: &BillingReceipt,
+        receipt_hash: &[u8],
+        status: &str,
+        actual_credits: Option<i64>,
+        now: i64,
+    ) -> Result<String, CoreError> {
+        let receipt_id = Self::new_id("billing-receipt");
+        transaction.execute(
+            "INSERT INTO billing_receipts
+             (receipt_id, request_id, receipt_hash, status, actual_credits, unit,
+              source_ref, task_ref, observed_at_ms, received_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                &receipt_id,
+                &receipt.request_id,
+                receipt_hash,
+                status,
+                actual_credits,
+                &receipt.unit,
+                &receipt.source_ref,
+                receipt.task_ref.as_deref(),
+                receipt.observed_at_ms,
+                now,
+            ],
+        )?;
+        Ok(receipt_id)
     }
 
     pub fn settle(

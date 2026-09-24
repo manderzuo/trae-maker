@@ -199,6 +199,28 @@ pub fn prepare_llm_chat_body_with_conversation(
     serde_json::to_vec(&obj).unwrap_or_else(|_| src.to_vec())
 }
 
+/// Replace the session field while preserving the rest of an already-prepared
+/// upstream payload. Core requests use a request-scoped session so the
+/// upstream session-usage endpoint can distinguish separate Core requests;
+/// non-Core callers retain the conversation-scoped default above.
+pub fn bind_upstream_session_id(body: &[u8], session_id: &str) -> Result<Vec<u8>, String> {
+    let mut value: Value = serde_json::from_slice(body)
+        .map_err(|_| "prepared upstream request payload is invalid".to_string())?;
+    bind_upstream_session_id_value(&mut value, session_id)?;
+    serde_json::to_vec(&value).map_err(|_| "prepared upstream request payload cannot be encoded".into())
+}
+
+pub fn bind_upstream_session_id_value(value: &mut Value, session_id: &str) -> Result<(), String> {
+    if session_id.trim().is_empty() || session_id.len() > 256 {
+        return Err("upstream session identifier is invalid".into());
+    }
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "prepared upstream request payload is not an object".to_string())?;
+    object.insert("session_id".into(), json!(session_id));
+    Ok(())
+}
+
 fn normalize_tool_choice(obj: &mut serde_json::Map<String, Value>) {
     let suppress = |obj: &mut serde_json::Map<String, Value>| {
         obj.remove("tools");
@@ -547,5 +569,26 @@ mod tests {
         assert_eq!(a["session_id"], a2["session_id"]);
         assert_ne!(a["conversation_id"], b["conversation_id"]);
         assert_ne!(a["session_id"], b["session_id"]);
+    }
+
+    #[test]
+    fn core_request_session_override_keeps_conversation_and_messages() {
+        let src = json!({
+            "model": "glm-5.2",
+            "conversation_id": "local-session-1",
+            "messages": [{"role": "user", "content": "你好"}]
+        });
+        let bytes = serde_json::to_vec(&src).unwrap();
+        let prepared = prepare_llm_chat_body_with_conversation(
+            &bytes, "deepseek-v4-flash", "uid-a", "dev-a", "machine-a", Some("local-session-1"),
+        );
+        let session_id = super::super::bridge_billing::core_usage_session_id("core-req-a", "uid-a");
+        let rebound = bind_upstream_session_id(&prepared, &session_id).unwrap();
+        let original: Value = serde_json::from_slice(&prepared).unwrap();
+        let rebound: Value = serde_json::from_slice(&rebound).unwrap();
+
+        assert_eq!(rebound["session_id"], session_id);
+        assert_eq!(rebound["conversation_id"], original["conversation_id"]);
+        assert_eq!(rebound["messages"], original["messages"]);
     }
 }

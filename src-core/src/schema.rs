@@ -528,3 +528,73 @@ INSERT OR IGNORE INTO video_billing_control
   (id, mode, reason, diagnostic_key_id, diagnostic_request_hash, diagnostic_claimed_at_ms, updated_at_ms)
 VALUES (1, 'paused', '尚未取得可核验的单任务上游积分回执', NULL, NULL, NULL, 0);
 "#;
+
+pub(crate) const SCHEMA_V17: &str = r#"
+CREATE TABLE video_diagnostic_claims_next (
+  claim_id TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL REFERENCES api_keys(id),
+  request_hash TEXT NOT NULL,
+  claimed_at_ms INTEGER NOT NULL
+);
+INSERT INTO video_diagnostic_claims_next (claim_id, key_id, request_hash, claimed_at_ms)
+  SELECT claim_id, key_id, request_hash, claimed_at_ms
+  FROM video_diagnostic_claims;
+DROP TABLE video_diagnostic_claims;
+ALTER TABLE video_diagnostic_claims_next RENAME TO video_diagnostic_claims;
+CREATE INDEX video_diagnostic_claims_key_hash_idx
+  ON video_diagnostic_claims(key_id, request_hash);
+"#;
+
+pub(crate) const SCHEMA_V19: &str = r#"
+CREATE TABLE IF NOT EXISTS billing_quotes (
+  quote_id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL UNIQUE REFERENCES requests(id),
+  request_fingerprint TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  model TEXT NOT NULL,
+  max_credits INTEGER NOT NULL CHECK(max_credits >= 0),
+  unit TEXT NOT NULL CHECK(unit = 'credits'),
+  source_ref TEXT NOT NULL CHECK(length(trim(source_ref)) > 0),
+  expires_at_ms INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS billing_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL REFERENCES requests(id),
+  receipt_hash BLOB NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('final','failed_no_charge','pending','unknown','unverified','conflict')),
+  actual_credits INTEGER CHECK(actual_credits IS NULL OR actual_credits >= 0),
+  unit TEXT NOT NULL,
+  source_ref TEXT NOT NULL CHECK(length(trim(source_ref)) > 0),
+  task_ref TEXT,
+  observed_at_ms INTEGER NOT NULL,
+  received_at_ms INTEGER NOT NULL,
+  UNIQUE(request_id, receipt_hash)
+);
+CREATE INDEX IF NOT EXISTS billing_receipts_request_observed_idx
+  ON billing_receipts(request_id, observed_at_ms, receipt_id);
+CREATE TABLE IF NOT EXISTS billing_settlements (
+  request_id TEXT PRIMARY KEY REFERENCES requests(id),
+  quote_id TEXT NOT NULL REFERENCES billing_quotes(quote_id),
+  receipt_id TEXT NOT NULL UNIQUE REFERENCES billing_receipts(receipt_id),
+  actual_credits INTEGER NOT NULL CHECK(actual_credits >= 0),
+  over_quote INTEGER NOT NULL CHECK(over_quote IN (0,1)),
+  reconcile_required INTEGER NOT NULL CHECK(reconcile_required IN (0,1)),
+  settled_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_key_billing_blocks (
+  key_id TEXT PRIMARY KEY REFERENCES api_keys(id),
+  request_id TEXT NOT NULL REFERENCES requests(id),
+  reason TEXT NOT NULL CHECK(reason IN ('over_quote','receipt_conflict')),
+  quote_max_credits INTEGER NOT NULL CHECK(quote_max_credits >= 0),
+  actual_credits INTEGER NOT NULL CHECK(actual_credits >= 0),
+  excess_credits INTEGER NOT NULL CHECK(excess_credits >= 0),
+  source_ref TEXT NOT NULL,
+  blocked_at_ms INTEGER NOT NULL
+);
+"#;
+
+pub(crate) const SCHEMA_V20: &str = r#"
+ALTER TABLE api_keys ADD COLUMN secret_ciphertext BLOB;
+ALTER TABLE api_keys ADD COLUMN secret_key_version INTEGER CHECK(secret_key_version IS NULL OR secret_key_version > 0);
+"#;

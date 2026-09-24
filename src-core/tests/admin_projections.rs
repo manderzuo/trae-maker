@@ -68,6 +68,9 @@ fn admin_projections_are_redacted_and_reject_regular_principals() {
     let projected = keys.iter().find(|key| key.id == user_key.id).unwrap();
     assert_eq!(projected.prefix, user_key.prefix);
     assert_eq!(projected.user_id, "user-1");
+    assert_eq!(projected.user_name, "user-1 name");
+    assert_eq!(projected.max_concurrency, 32);
+    assert_eq!(projected.current_concurrency, 0);
     let serialized = serde_json::to_string(projected).unwrap();
     assert!(!serialized.contains(&user_key.plaintext));
     assert!(!serialized.contains("key_digest"));
@@ -80,6 +83,56 @@ fn admin_projections_are_redacted_and_reject_regular_principals() {
         store.list_api_keys_as_admin(&regular, None),
         Err(CoreError::AdminRequired)
     ));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn admin_can_create_a_display_name_key_and_update_its_runtime_policy() {
+    let (store, admin, _regular, dir) = setup();
+    let key = store
+        .issue_api_key_for_new_user_as_admin(
+            &admin,
+            "new display",
+            BTreeSet::from(["chat:invoke".to_owned()]),
+            3,
+        )
+        .unwrap();
+    assert!(key.user_id.starts_with("user_"));
+
+    store
+        .grant_as_admin(
+            QuotaGrant {
+                user_id: key.user_id.clone(),
+                resource_kind: "credits".into(),
+                amount: 100,
+                actor_user_id: String::new(),
+                reason: "admin test".into(),
+            },
+            &admin,
+        )
+        .unwrap();
+    let projected = store
+        .list_api_keys_as_admin(&admin, Some(&key.user_id))
+        .unwrap()
+        .into_iter()
+        .find(|view| view.id == key.id)
+        .unwrap();
+    assert_eq!(projected.user_name, "new display");
+    assert_eq!(projected.max_concurrency, 3);
+    assert_eq!(projected.usage.iter().find(|balance| balance.resource_kind == "credits").unwrap().available, 100);
+
+    store
+        .update_api_key_as_admin(&admin, &key.id, false, 5)
+        .unwrap();
+    let updated = store
+        .list_api_keys_as_admin(&admin, Some(&key.user_id))
+        .unwrap()
+        .into_iter()
+        .find(|view| view.id == key.id)
+        .unwrap();
+    assert_eq!(updated.status, "revoked");
+    assert_eq!(updated.max_concurrency, 5);
 
     let _ = fs::remove_dir_all(dir);
 }

@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashSet;
 use std::sync::Mutex;
 use tauri::State;
 
@@ -1281,6 +1282,7 @@ pub fn fetch_remaining_credits(
             &rc.general,
             &rc.work,
             &rc.expire_times,
+            &HashSet::from([user_id.clone()]),
         );
     }
     Ok(stats.total)
@@ -1297,6 +1299,7 @@ pub fn refresh_remaining_credits(
     let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
     let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
     let mut ok_count = 0usize;
+    let mut refreshed_uids = HashSet::new();
     let mut thawed_count = 0usize;
     let mut total_non_checkin_earned: f64 = 0.0;
     for a in &accounts.accounts {
@@ -1364,6 +1367,7 @@ pub fn refresh_remaining_credits(
                 }
                 total_non_checkin_earned += stats.today_non_checkin_earned;
                 ok_count += 1;
+                refreshed_uids.insert(uid.clone());
                 // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
                 if stats.total > 0.0 {
                     let thaw_type = cd.cooldowns.get(&uid).and_then(|e| {
@@ -1409,6 +1413,7 @@ pub fn refresh_remaining_credits(
             &rc.general,
             &rc.work,
             &rc.expire_times,
+            &refreshed_uids,
         );
     }
     Ok(ok_count)

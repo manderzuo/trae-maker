@@ -424,6 +424,45 @@ impl RateLimiter {
             },
         })
     }
+
+    /// Return live request/video occupancy for one Key without exposing the
+    /// Key value or the limiter's internal map to management callers.
+    pub fn usage_for_key(&self, key_id: &str) -> (usize, usize) {
+        let windows = self
+            .inner
+            .windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        windows
+            .get(key_id)
+            .map(|window| (window.inflight, window.video_jobs))
+            .unwrap_or((0, 0))
+    }
+
+    /// Restore a persisted non-terminal video job after process restart.
+    ///
+    /// Recovery must account for every persisted job, even if the number of
+    /// jobs already exceeds the current cap (for example after an operator
+    /// lowers the cap).  New submissions then remain rejected until enough
+    /// restored jobs reach a terminal state and release their permits.
+    pub(crate) fn restore_video_job(&self, key_id: &str, key_limits: &KeyLimits) -> Permit {
+        let _effective = key_limits.effective(&self.inner.config);
+        let mut windows = self
+            .inner
+            .windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let window = windows.entry(key_id.to_string()).or_default();
+        window.video_jobs = window.video_jobs.saturating_add(1);
+        self.inner.video_jobs.fetch_add(1, Ordering::AcqRel);
+        drop(windows);
+        Permit {
+            inner: self.inner.clone(),
+            kind: PermitKind::VideoJob {
+                key_id: key_id.to_string(),
+            },
+        }
+    }
 }
 
 fn release_request(inner: &RateLimiterInner, key_id: &str) {
@@ -563,6 +602,25 @@ mod tests {
             Err(LimitError::Concurrent)
         ));
         drop(first);
+        assert!(limiter.acquire_video_job("key-a", &key_limits()).is_ok());
+    }
+
+    #[test]
+    fn restored_video_jobs_remain_counted_even_when_persisted_count_exceeds_cap() {
+        let limiter = RateLimiter::with_config(LimitConfig {
+            max_inflight: 4,
+            max_video_jobs: 1,
+            asset_uploads_per_minute: 10,
+            asset_bytes_per_hour: 1024,
+            video_submissions_per_minute: 10,
+        });
+
+        let first = limiter.restore_video_job("key-a", &key_limits());
+        let second = limiter.restore_video_job("key-a", &key_limits());
+        assert!(limiter.acquire_video_job("key-a", &key_limits()).is_err());
+        drop(first);
+        assert!(limiter.acquire_video_job("key-a", &key_limits()).is_err());
+        drop(second);
         assert!(limiter.acquire_video_job("key-a", &key_limits()).is_ok());
     }
 
