@@ -749,6 +749,21 @@ impl ApiPool {
         out
     }
 
+    /// 桥接账务只暴露明确分类的余额；旧版 total→general 回填不得用于报价或展示可用额。
+    pub fn bridge_credit_snapshots(&self) -> Vec<(bool, Option<f64>, Option<f64>, Option<i64>)> {
+        let entries = safe_lock(&self.entries);
+        let balances = safe_lock(&self.balances);
+        entries.values().map(|entry| {
+            let balance = balances.get(&entry.uid);
+            (
+                !entry.disabled,
+                balance.and_then(|value| value.general_verified.then_some(value.general).flatten()),
+                balance.and_then(|value| value.work),
+                balance.and_then(|value| value.observed_at_ms),
+            )
+        }).collect()
+    }
+
     pub fn count(&self) -> usize {
         safe_lock(&self.entries).len()
     }
@@ -1663,5 +1678,6 @@ mod tests {
         );
         assert!(!pool.has_selectable_for(ResourceKind::Work));
         assert!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).is_none());
+        assert_eq!(pool.bridge_credit_snapshots(), vec![(true, None, None, None)]);
     }
 }

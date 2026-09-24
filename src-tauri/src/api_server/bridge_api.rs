@@ -273,16 +273,9 @@ pub async fn summary(State(state): State<Arc<ApiSharedState>>) -> Json<BridgeSum
     .into_iter()
     .filter(|model| model.sources.iter().any(|source| source.enabled))
     .count();
-    let mut snapshots = state
-        .pool
-        .status_list()
-        .into_iter()
-        .map(|status| (!status.disabled, status.general_credits, status.work_credits, status.credit_observed_at_ms))
-        .collect::<Vec<_>>();
+    let mut snapshots = state.pool.bridge_credit_snapshots();
     if state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-        snapshots.extend(state.wb_pool.status_list().into_iter().map(|status| {
-            (!status.disabled, status.general_credits, status.work_credits, status.credit_observed_at_ms)
-        }));
+        snapshots.extend(state.wb_pool.bridge_credit_snapshots());
     }
     Json(BridgeSummaryResponse::from_values_with_credits(
         active_models,
