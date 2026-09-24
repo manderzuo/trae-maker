@@ -532,7 +532,14 @@ impl ApiPool {
         let now = now_ts();
         let candidates: Vec<&PoolEntry> = entries
             .values()
-            .filter(|e| selectable_with_credit(e, tried, now, balances.get(&e.uid).and_then(|b| b.work)))
+            .filter(|e| {
+                let work = balances
+                    .get(&e.uid)
+                    .and_then(|balance| balance.work)
+                    .filter(|credit| credit.is_finite())
+                    .unwrap_or(0.0);
+                selectable_with_credit(e, tried, now, Some(work))
+            })
             .collect();
         if candidates.is_empty() {
             return None;
@@ -767,12 +774,12 @@ impl ApiPool {
         let now = now_ts();
         let tried = HashSet::new();
         entries.values().any(|entry| {
-            selectable_with_credit(
-                entry,
-                &tried,
-                now,
-                balances.get(&entry.uid).and_then(|balance| balance.work),
-            )
+            let work = balances
+                .get(&entry.uid)
+                .and_then(|balance| balance.work)
+                .filter(|credit| credit.is_finite())
+                .unwrap_or(0.0);
+            selectable_with_credit(entry, &tried, now, Some(work))
         })
     }
 
@@ -1569,5 +1576,55 @@ mod tests {
             &HashSet::from(["uid_a".to_string()]),
         );
         assert!(pool.has_selectable_for(ResourceKind::Work));
+    }
+
+    #[test]
+    fn missing_work_balance_never_makes_an_account_eligible_for_video() {
+        let pool = ApiPool::new();
+        let accounts = vec![acct("uid_a", "uid_a")];
+        let enabled = vec!["uid_a".to_string()];
+        let total = HashMap::from([("uid_a".to_string(), 100.0)]);
+        let general = HashMap::from([("uid_a".to_string(), 100.0)]);
+        pool.sync_from_accounts_with_balances(
+            &accounts,
+            &enabled,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &total,
+            &general,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(pool.has_selectable_for(ResourceKind::General));
+        assert!(!pool.has_selectable_for(ResourceKind::Work));
+        assert!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).is_none());
+    }
+
+    #[test]
+    fn nonfinite_work_balance_never_makes_an_account_eligible_for_video() {
+        let pool = ApiPool::new();
+        let accounts = vec![acct("uid_a", "uid_a")];
+        let enabled = vec!["uid_a".to_string()];
+        let total = HashMap::from([("uid_a".to_string(), 100.0)]);
+        let general = HashMap::from([("uid_a".to_string(), 100.0)]);
+        let work = HashMap::from([("uid_a".to_string(), f64::NAN)]);
+        pool.sync_from_accounts_with_balances(
+            &accounts,
+            &enabled,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &total,
+            &general,
+            &work,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(!pool.has_selectable_for(ResourceKind::Work));
+        assert!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).is_none());
     }
 }
