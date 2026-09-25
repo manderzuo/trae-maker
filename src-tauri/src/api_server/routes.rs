@@ -2690,7 +2690,7 @@ fn video_outcome_releases_payload(outcome: &VideoAdapterOutcome) -> bool {
     )
 }
 
-/// W-02 Seedance 文生视频入口。Work 积分账号异步转发到 Trae Work CN
+/// W-02 Seedance 文生视频入口。通用或 Work 积分账号异步转发到 Trae Work CN
 /// 原生 SSE 接口，客户端通过任务查询接口获取最终资源地址。
 pub async fn videos_generations(
     state: State<Arc<ApiSharedState>>,
@@ -2793,7 +2793,7 @@ pub async fn videos_generations_with_attribution(
             return openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_work_credits",
-                "没有可用的 Trae Work 账号或 Work 积分已耗尽",
+                "没有可用的 Trae Work 账号，或通用积分与 Work 积分均不可用",
             )
         }
     };
@@ -4649,6 +4649,30 @@ mod tests {
             api_keys::constraints_for(&state.data_dir, key_id)
                 .expect("legacy fixture must provide an auth snapshot"),
         ))
+    }
+
+    #[tokio::test]
+    async fn video_without_usable_account_explains_both_credit_types() {
+        let (state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_VIDEO]);
+        let response = videos_generations(
+            State(state.clone()),
+            Some(Extension(KeyId(key_id.clone()))),
+            legacy_snapshot(&state, &key_id),
+            None,
+            HeaderMap::new(),
+            Bytes::from(json!({"model": "seedance", "prompt": "hello"}).to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "no_work_credits");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("通用积分"), "{message}");
+        assert!(message.contains("Work 积分"), "{message}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
