@@ -197,8 +197,8 @@ impl BillingReceipt {
 pub(super) enum EvidenceTrust {
     CandidateOnly,
     VerifiedSourceContract,
-    AuthorizedOneShotSession,
-    AuthorizedOneShotChatSession,
+    AuthorizedCoreVideoSession,
+    AuthorizedCoreChatSession,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -421,6 +421,16 @@ impl BridgeBillingStore {
         if !authorized {
             return Ok(OneShotSessionLookup::Unauthorized);
         }
+        self.core_session_for_request(request_id)
+    }
+
+    pub(super) fn core_session_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<OneShotSessionLookup, String> {
+        if !valid_request_id(request_id) {
+            return Err("Core request attribution identifier is invalid".into());
+        }
         let request = self.connection.query_row(
             "SELECT core_key_id, conflict FROM bridge_core_requests WHERE request_id = ?1",
             params![request_id],
@@ -453,6 +463,36 @@ impl BridgeBillingStore {
         })
     }
 
+    pub(super) fn record_core_session_receipt(
+        &mut self,
+        receipt: &BillingReceipt,
+        account_ref: &str,
+        session_id: &str,
+        core_key_id: &str,
+    ) -> Result<PersistReceiptResult, String> {
+        let expected_source = format!("trae-usage-session:{session_id}");
+        if receipt.source_ref.as_deref() != Some(expected_source.as_str()) {
+            return Err("Core billing receipt source does not match its upstream session".into());
+        }
+        match self.core_session_for_request(&receipt.request_id)? {
+            OneShotSessionLookup::Unique {
+                core_key_id: stored_key,
+                account_ref: stored_account,
+                session_id: stored_session,
+                ..
+            } if stored_key == core_key_id
+                && stored_account == account_ref
+                && stored_session == session_id => {}
+            _ => return Err("Core billing receipt is not tied to one unique request session".into()),
+        }
+        let trust = if receipt.task_ref.is_some() {
+            EvidenceTrust::AuthorizedCoreVideoSession
+        } else {
+            EvidenceTrust::AuthorizedCoreChatSession
+        };
+        self.record_receipt(receipt, trust)
+    }
+
     pub(super) fn record_one_shot_session_receipt(
         &mut self,
         receipt: &BillingReceipt,
@@ -471,7 +511,7 @@ impl BridgeBillingStore {
                 && stored_session == session_id => {}
             _ => return Err("one-shot billing receipt is not tied to one authorized Core session".into()),
         }
-        self.record_receipt(receipt, EvidenceTrust::AuthorizedOneShotSession)
+        self.record_receipt(receipt, EvidenceTrust::AuthorizedCoreVideoSession)
     }
 
     pub(super) fn record_one_shot_chat_receipt(
@@ -495,7 +535,7 @@ impl BridgeBillingStore {
                 && stored_session == session_id => {}
             _ => return Err("chat billing receipt is not tied to one authorized Core session".into()),
         }
-        self.record_receipt(receipt, EvidenceTrust::AuthorizedOneShotChatSession)
+        self.record_receipt(receipt, EvidenceTrust::AuthorizedCoreChatSession)
     }
 
     /// Bind one actual upstream attempt to its Core request. Reusing the same
@@ -720,7 +760,7 @@ impl BridgeBillingStore {
                     receipt.actual_credits.map(CreditAmount::as_microcredits),
                 )
             }
-            EvidenceTrust::AuthorizedOneShotSession => {
+            EvidenceTrust::AuthorizedCoreVideoSession => {
                 if receipt.status != BillingReceiptStatus::Final
                     || receipt.unit.as_deref() != Some("credits")
                     || receipt.actual_credits.is_none()
@@ -728,14 +768,14 @@ impl BridgeBillingStore {
                     || receipt.task_ref.as_deref().map_or(true, str::is_empty)
                     || receipt.observed_at_ms <= 0
                 {
-                    return Err("authorized one-shot session receipt is incomplete".into());
+                    return Err("authorized Core video session receipt is incomplete".into());
                 }
                 (
                     BillingReceiptStatus::Final,
                     receipt.actual_credits.map(CreditAmount::as_microcredits),
                 )
             }
-            EvidenceTrust::AuthorizedOneShotChatSession => {
+            EvidenceTrust::AuthorizedCoreChatSession => {
                 if receipt.status != BillingReceiptStatus::Final
                     || receipt.unit.as_deref() != Some("credits")
                     || receipt.actual_credits.is_none()
@@ -743,7 +783,7 @@ impl BridgeBillingStore {
                     || receipt.task_ref.is_some()
                     || receipt.observed_at_ms <= 0
                 {
-                    return Err("authorized one-shot chat receipt is incomplete".into());
+                    return Err("authorized Core chat session receipt is incomplete".into());
                 }
                 (
                     BillingReceiptStatus::Final,
@@ -1228,6 +1268,110 @@ mod tests {
 
         store.record_core_session_attempt("req-test", "uid-a", "session-retry").unwrap();
         assert_eq!(store.one_shot_session_for_request("req-test").unwrap(), OneShotSessionLookup::Ambiguous);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ordinary_core_request_with_one_exact_session_can_promote_actual_video_credits() {
+        let dir = test_dir("regular-session-receipt");
+        let mut store = BridgeBillingStore::open(&dir).unwrap();
+        store.record_core_request("req-regular", "key_b").unwrap();
+        store.record_core_session_attempt("req-regular", "uid-b", "session-b").unwrap();
+        let receipt = BillingReceipt {
+            request_id: "req-regular".into(),
+            status: BillingReceiptStatus::Final,
+            actual_credits: Some(CreditAmount::parse("3.250000", "credits").unwrap()),
+            unit: Some("credits".into()),
+            source_ref: Some("trae-usage-session:session-b".into()),
+            task_ref: Some("video-task-b".into()),
+            observed_at_ms: 1_790_000_000_000,
+        };
+        assert_eq!(
+            store.record_core_session_receipt(&receipt, "uid-b", "session-b", "key_b").unwrap(),
+            PersistReceiptResult::Created,
+        );
+        assert_eq!(store.get_receipt("req-regular").unwrap().unwrap().actual_credits.unwrap().to_string(), "3.250000");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ordinary_core_receipt_rejects_wrong_key_account_and_session() {
+        let dir = test_dir("regular-receipt-mismatch");
+        let mut store = BridgeBillingStore::open(&dir).unwrap();
+        store.record_core_request("req-regular", "key_b").unwrap();
+        store.record_core_session_attempt("req-regular", "uid-b", "session-b").unwrap();
+        let receipt = BillingReceipt {
+            request_id: "req-regular".into(),
+            status: BillingReceiptStatus::Final,
+            actual_credits: Some(CreditAmount::parse("3.250000", "credits").unwrap()),
+            unit: Some("credits".into()),
+            source_ref: Some("trae-usage-session:session-b".into()),
+            task_ref: Some("video-task-b".into()),
+            observed_at_ms: 1_790_000_000_000,
+        };
+        assert!(store.record_core_session_receipt(&receipt, "uid-b", "session-b", "key_a").is_err());
+        assert!(store.record_core_session_receipt(&receipt, "uid-a", "session-b", "key_b").is_err());
+        assert!(store.record_core_session_receipt(&receipt, "uid-b", "session-a", "key_b").is_err());
+        let missing = BillingReceipt { request_id: "req-missing".into(), ..receipt.clone() };
+        assert!(store.record_core_session_receipt(&missing, "uid-b", "session-b", "key_b").is_err());
+        let wrong_source = BillingReceipt { source_ref: Some("trae-usage-session:session-other".into()), ..receipt };
+        assert!(store.record_core_session_receipt(&wrong_source, "uid-b", "session-b", "key_b").is_err());
+        assert!(store.get_receipt("req-regular").unwrap().is_none());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ordinary_core_receipt_rejects_shared_or_multiple_upstream_sessions() {
+        let dir = test_dir("regular-receipt-ambiguous");
+        let mut store = BridgeBillingStore::open(&dir).unwrap();
+        store.record_core_request("req-a", "key_a").unwrap();
+        store.record_core_request("req-b", "key_b").unwrap();
+        store.record_core_session_attempt("req-a", "uid-a", "session-shared").unwrap();
+        store.record_core_session_attempt("req-b", "uid-a", "session-shared").unwrap();
+        let receipt = BillingReceipt {
+            request_id: "req-a".into(),
+            status: BillingReceiptStatus::Final,
+            actual_credits: Some(CreditAmount::parse("3.250000", "credits").unwrap()),
+            unit: Some("credits".into()),
+            source_ref: Some("trae-usage-session:session-shared".into()),
+            task_ref: Some("video-task-a".into()),
+            observed_at_ms: 1_790_000_000_000,
+        };
+        assert!(store.record_core_session_receipt(&receipt, "uid-a", "session-shared", "key_a").is_err());
+        store.record_core_request("req-c", "key_c").unwrap();
+        store.record_core_session_attempt("req-c", "uid-c", "session-c1").unwrap();
+        store.record_core_session_attempt("req-c", "uid-c", "session-c2").unwrap();
+        let second = BillingReceipt { request_id: "req-c".into(), source_ref: Some("trae-usage-session:session-c1".into()), ..receipt };
+        assert!(store.record_core_session_receipt(&second, "uid-c", "session-c1", "key_c").is_err());
+        assert!(store.get_receipt("req-a").unwrap().is_none());
+        assert!(store.get_receipt("req-c").unwrap().is_none());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ordinary_chat_receipt_is_idempotent_and_conflicting_cost_stays_unsettled() {
+        let dir = test_dir("regular-chat-receipt");
+        let mut store = BridgeBillingStore::open(&dir).unwrap();
+        store.record_core_request("req-chat", "key_chat").unwrap();
+        store.record_core_session_attempt("req-chat", "uid-chat", "session-chat").unwrap();
+        let receipt = BillingReceipt {
+            request_id: "req-chat".into(),
+            status: BillingReceiptStatus::Final,
+            actual_credits: Some(CreditAmount::parse("0.050400", "credits").unwrap()),
+            unit: Some("credits".into()),
+            source_ref: Some("trae-usage-session:session-chat".into()),
+            task_ref: None,
+            observed_at_ms: 1_790_000_000_000,
+        };
+        assert_eq!(store.record_core_session_receipt(&receipt, "uid-chat", "session-chat", "key_chat").unwrap(), PersistReceiptResult::Created);
+        assert_eq!(store.record_core_session_receipt(&receipt, "uid-chat", "session-chat", "key_chat").unwrap(), PersistReceiptResult::Duplicate);
+        let conflicting = BillingReceipt { actual_credits: Some(CreditAmount::parse("0.050401", "credits").unwrap()), ..receipt };
+        assert_eq!(store.record_core_session_receipt(&conflicting, "uid-chat", "session-chat", "key_chat").unwrap(), PersistReceiptResult::Conflict);
+        assert_eq!(store.get_receipt("req-chat").unwrap().unwrap().status, BillingReceiptStatus::Conflict);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
