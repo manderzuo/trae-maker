@@ -853,6 +853,15 @@ fn retryable_account_error(kind: ErrKind) -> bool {
     matches!(kind, ErrKind::HardCredit | ErrKind::PlanLimit | ErrKind::SessionDead)
 }
 
+fn can_retry_account(
+    attribution: Option<&super::bridge_billing::CoreRequestAttribution>,
+    retryable: bool,
+) -> bool {
+    retryable && !attribution.is_some_and(|value| {
+        value.billing_mode == super::bridge_billing::CoreBillingMode::ControlledUnquoted
+    })
+}
+
 fn video_error_message(data: &str) -> String {
     serde_json::from_str::<Value>(data)
         .ok()
@@ -1253,7 +1262,7 @@ pub fn start_native_task(
             ) {
                 Ok(value) => build_request_body(&value),
                 Err(error) => {
-                    if error.retryable_account {
+                    if can_retry_account(core_attribution.as_ref(), error.retryable_account) {
                         state.pool.note_error(&account.uid, ErrKind::SessionDead);
                         if let Some(next) = state.pool.pick_excluding_for(&tried, ResourceKind::Work) {
                             tried.insert(next.uid.clone());
@@ -1336,7 +1345,7 @@ pub fn start_native_task(
                     let text = response.into_string().unwrap_or_default();
                     let kind = classify_video_error(status, &text);
                     state.pool.note_error(&account.uid, kind);
-                    if retryable_account_error(kind) {
+                    if can_retry_account(core_attribution.as_ref(), retryable_account_error(kind)) {
                         if let Some(next) = state.pool.pick_excluding_for(&tried, ResourceKind::Work) {
                             tried.insert(next.uid.clone());
                             account = next;
@@ -1356,7 +1365,7 @@ pub fn start_native_task(
                     let text = response.into_string().unwrap_or_default();
                     let kind = classify_video_error(status, &text);
                     state.pool.note_error(&account.uid, kind);
-                    if retryable_account_error(kind) {
+                    if can_retry_account(core_attribution.as_ref(), retryable_account_error(kind)) {
                         if let Some(next) = state.pool.pick_excluding_for(&tried, ResourceKind::Work) {
                             tried.insert(next.uid.clone());
                             account = next;
@@ -1467,6 +1476,18 @@ pub fn get(task_id: &str) -> Option<VideoTask> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_video_never_switches_account_after_preparation_or_submission_error() {
+        let attribution = super::super::bridge_billing::CoreRequestAttribution {
+            request_id: "req-video".into(), core_key_id: "key-video".into(),
+            billing_mode: super::super::bridge_billing::CoreBillingMode::ControlledUnquoted,
+            operation_id: Some("op-video".into()),
+        };
+        assert!(!can_retry_account(Some(&attribution), true));
+        assert!(can_retry_account(None, true));
+        assert!(!can_retry_account(None, false));
+    }
 
     #[test]
     fn reference_urls_allow_public_https_only_by_default() {

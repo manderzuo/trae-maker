@@ -25,6 +25,13 @@ AIWORK_CORS_ORIGINS=https://console.example.com
 
 ## 星链维度分流系统管理员登录
 
+### Core 受控无报价验收桥接
+
+在 Core 管理员一次性登记的受控 Seedance 验收中，AI Work 仅在已认证的桥接管理员 Key 下接受 `x-core-request-id`、`x-core-key-id` 与 `x-core-controlled-operation-id`。它记录每个请求对应的 Core Key、操作编号及真实上游会话/任务回执；普通客户端 Key 不能自行声明受控操作，受控头与报价头不能混用。此标记不是价格报价，不改变报价接口返回 `quote_unavailable` 的事实。部署顺序应为先更新 AI Work 桥接，再更新 Core，并在开放一次真实请求前核对两个版本和回执查询接口。
+
+受控视频若在任务创建、上游会话登记之前被本地校验拒绝，AI Work 会为该请求保存零扣费证明；Core 只能凭此证明释放视频部分持有，仍须按独立的文字辅助真实回执结算。若视频已经创建或上游调用结果不明，保持待对账，不自动重发、猜测零费用或根据 HTTP 错误直接退款。`GET /internal/bridge/requests/{request_id}/video-task` 仅供桥接管理员在重启后恢复既有任务，不能用它创建新任务。
+
+
 独立 Core 管理页面地址：本机为 `http://127.0.0.1:7865/admin`，公网为
 `https://api.gemstory.cn/admin`。页面使用 `admin` 账户登录和浏览器会话，不再要求在页面中
 填写或保存 Core 管理员 API Key；普通用户 API Key 仍在管理页面中创建并按作用域、积分和并发

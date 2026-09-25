@@ -230,6 +230,63 @@ pub(super) struct BridgeBillingStore {
 }
 
 impl BridgeBillingStore {
+    /// This can only be called on a route that is returning before video task
+    /// creation. The transaction also refuses zero-cost evidence if an upstream
+    /// session was already attributed to this request.
+    pub(super) fn record_controlled_pre_dispatch_no_charge(
+        &mut self,
+        request_id: &str,
+    ) -> Result<PersistReceiptResult, String> {
+        if !valid_request_id(request_id) { return Err("controlled request id is invalid".into()); }
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("pre-dispatch billing transaction unavailable: {error}"))?;
+        let controlled: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bridge_core_requests request
+             JOIN bridge_core_request_modes mode ON mode.request_id = request.request_id
+             WHERE request.request_id = ?1 AND request.conflict = 0
+             AND mode.billing_mode = 'controlled_unquoted' AND mode.operation_id IS NOT NULL)",
+            [request_id], |row| row.get(0),
+        ).map_err(|error| format!("controlled request lookup failed: {error}"))?;
+        let attempted: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bridge_core_upstream_sessions WHERE request_id = ?1)",
+            [request_id], |row| row.get(0),
+        ).map_err(|error| format!("upstream attempt lookup failed: {error}"))?;
+        if !controlled || attempted {
+            return Err("request is not an unattempted controlled operation".into());
+        }
+        let source_ref = format!("aiwork-pre-dispatch-no-charge:{request_id}");
+        let existing: Option<(String, Option<i64>, Option<String>)> = transaction.query_row(
+            "SELECT status, actual_microcredits, source_ref FROM bridge_billing_receipts WHERE request_id = ?1",
+            [request_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|error| format!("pre-dispatch receipt lookup failed: {error}"))?;
+        if let Some((status, actual, source)) = existing {
+            return if status == "final" && actual == Some(0) && source.as_deref() == Some(&source_ref) {
+                Ok(PersistReceiptResult::Duplicate)
+            } else {
+                Err("request already has a different billing receipt".into())
+            };
+        }
+        let receipt = BillingReceipt {
+            request_id: request_id.into(), status: BillingReceiptStatus::Final,
+            actual_credits: Some(CreditAmount::parse("0", "credits")
+                .map_err(|error| format!("zero credit amount invalid: {error}"))?),
+            unit: Some("credits".into()), source_ref: Some(source_ref), task_ref: None,
+            observed_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        insert_receipt(&transaction, &receipt, BillingReceiptStatus::Final, Some(0))?;
+        transaction.commit().map_err(|error| format!("pre-dispatch receipt commit failed: {error}"))?;
+        Ok(PersistReceiptResult::Created)
+    }
+    pub(super) fn controlled_request_key(&self, request_id: &str) -> Result<Option<String>, String> {
+        if !valid_request_id(request_id) { return Ok(None); }
+        self.connection.query_row(
+            "SELECT request.core_key_id FROM bridge_core_requests request
+             JOIN bridge_core_request_modes mode ON mode.request_id = request.request_id
+             WHERE request.request_id = ?1 AND request.conflict = 0
+             AND mode.billing_mode = 'controlled_unquoted' AND mode.operation_id IS NOT NULL",
+            [request_id], |row| row.get(0),
+        ).optional().map_err(|error| format!("controlled Core request lookup failed: {error}"))
+    }
     pub(super) fn open(data_dir: &Path) -> Result<Self, String> {
         fs::create_dir_all(data_dir)
             .map_err(|error| format!("bridge billing data directory unavailable: {error}"))?;
@@ -1295,6 +1352,36 @@ mod tests {
 
         assert!(store.record_core_session_attempt("req-test", "uid-a", "session-retry").is_err());
         assert!(matches!(store.core_session_for_request("req-test").unwrap(), CoreBillingSessionLookup::Unique { .. }));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn controlled_video_recovery_only_exposes_registered_unconflicted_request() {
+        let dir = test_dir("controlled-video-recovery-identity");
+        let mut store = BridgeBillingStore::open(&dir).unwrap();
+        store.record_core_request_with_billing_mode("req-video-a", "key_a", CoreBillingMode::ControlledUnquoted, Some("op-a")).unwrap();
+        assert_eq!(store.controlled_request_key("req-video-a").unwrap().as_deref(), Some("key_a"));
+        assert_eq!(store.controlled_request_key("missing").unwrap(), None);
+        store.record_core_request_with_billing_mode("req-video-a", "key_b", CoreBillingMode::ControlledUnquoted, Some("op-a")).unwrap();
+        assert_eq!(store.controlled_request_key("req-video-a").unwrap(), None);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pre_dispatch_rejection_records_zero_only_before_any_upstream_attempt() {
+        let dir = test_dir("controlled-pre-dispatch-no-charge");
+        let mut store = BridgeBillingStore::open(&dir).unwrap();
+        store.record_core_request_with_billing_mode("req-no-charge", "key_a", CoreBillingMode::ControlledUnquoted, Some("op-no-charge")).unwrap();
+        assert_eq!(store.record_controlled_pre_dispatch_no_charge("req-no-charge").unwrap(), PersistReceiptResult::Created);
+        let receipt = store.get_receipt("req-no-charge").unwrap().unwrap();
+        assert_eq!(receipt.status, BillingReceiptStatus::Final);
+        assert_eq!(receipt.actual_credits.unwrap().as_microcredits(), 0);
+        assert!(receipt.source_ref.unwrap().starts_with("aiwork-pre-dispatch-no-charge:"));
+        store.record_core_request_with_billing_mode("req-attempted", "key_a", CoreBillingMode::ControlledUnquoted, Some("op-attempted")).unwrap();
+        store.record_core_session_attempt("req-attempted", "uid-a", "session-a").unwrap();
+        assert!(store.record_controlled_pre_dispatch_no_charge("req-attempted").is_err());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

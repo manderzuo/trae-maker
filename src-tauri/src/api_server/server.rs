@@ -173,6 +173,10 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
             get(super::bridge_api::billing),
         )
         .route(
+            "/internal/bridge/requests/:request_id/video-task",
+            get(super::bridge_api::controlled_video_task),
+        )
+        .route(
             "/internal/bridge/requests/:request_id/billing/finalize",
             post(super::bridge_api::finalize_video_billing),
         )
@@ -344,6 +348,25 @@ mod tests {
         assert_eq!(body["request_id"], "request-unknown");
         assert_eq!(body["status"], "unknown");
         assert!(body["actual_credits"].is_null());
+    }
+
+    #[tokio::test]
+    async fn controlled_video_recovery_endpoint_requires_bridge_auth_and_registered_request() {
+        let mut fixture = BridgeFixture::new();
+        let mut store = super::super::bridge_billing::BridgeBillingStore::open(&fixture.dir).unwrap();
+        store.record_core_request_with_billing_mode("req-recovery", "key-user", super::super::bridge_billing::CoreBillingMode::ControlledUnquoted, Some("op-recovery")).unwrap();
+        drop(store);
+        let path = "/internal/bridge/requests/req-recovery/video-task";
+        let unauthenticated = fixture.app.as_ref().unwrap().clone().oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
+        let response = fixture.take_app().oneshot(Request::builder().uri(path)
+            .header("authorization", format!("Bearer {}", fixture.key))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["request_id"], "req-recovery");
+        assert!(value["task"].is_null());
     }
 
     #[tokio::test]

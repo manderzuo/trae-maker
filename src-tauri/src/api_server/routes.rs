@@ -27,6 +27,65 @@ use super::core_video::{VideoAdapterOutcome, VideoCancelOutcome, VideoExecutionR
 use super::core_stream::core_stream_chat;
 use super::dispatch::{self, DispatchError, TargetPool};
 use super::retry::{retry_plan, RetryAction};
+
+fn core_account_rotations(
+    attribution: Option<&super::bridge_billing::CoreRequestAttribution>,
+    pool_count: usize,
+) -> usize {
+    if attribution.is_some_and(|value| value.billing_mode == super::bridge_billing::CoreBillingMode::ControlledUnquoted) {
+        1
+    } else {
+        pool_count.max(1)
+    }
+}
+
+fn core_retry_plan(
+    attribution: Option<&super::bridge_billing::CoreRequestAttribution>,
+    status: u16,
+    body: &str,
+    attempt: u32,
+    retry_after: Option<u64>,
+) -> RetryAction {
+    if attribution.is_some_and(|value| value.billing_mode == super::bridge_billing::CoreBillingMode::ControlledUnquoted) {
+        // A transport or HTTP failure is not proof that the upstream did not
+        // charge. Never resend a controlled request; reconcile its session.
+        RetryAction::Fatal
+    } else {
+        retry_plan(status, body, attempt, retry_after)
+    }
+}
+
+fn video_idempotency_scope<'a>(
+    authenticated_key_id: &'a str,
+    attribution: Option<&'a super::bridge_billing::CoreRequestAttribution>,
+) -> &'a str {
+    attribution
+        .filter(|value| value.billing_mode == super::bridge_billing::CoreBillingMode::ControlledUnquoted)
+        .map_or(authenticated_key_id, |value| value.core_key_id.as_str())
+}
+
+fn controlled_video_pre_dispatch_rejection(
+    state: &ApiSharedState,
+    attribution: Option<&super::bridge_billing::CoreRequestAttribution>,
+    response: Response,
+) -> Response {
+    let Some(attribution) = attribution.filter(|value|
+        value.billing_mode == super::bridge_billing::CoreBillingMode::ControlledUnquoted) else {
+        return response;
+    };
+    let scoped_key = video::scoped_idempotency_key(&attribution.core_key_id, &attribution.request_id);
+    if video::find_idempotent(&scoped_key).is_some() {
+        return openai_error(StatusCode::SERVICE_UNAVAILABLE, "core_attribution_unavailable",
+            "已有视频任务，无法证明本次拒绝未产生费用");
+    }
+    let result = super::bridge_billing::BridgeBillingStore::open(&state.data_dir)
+        .and_then(|mut store| store.record_controlled_pre_dispatch_no_charge(&attribution.request_id));
+    match result {
+        Ok(_) => response,
+        Err(_) => openai_error(StatusCode::SERVICE_UNAVAILABLE, "core_attribution_unavailable",
+            "无法保存视频提交前的零扣费证明"),
+    }
+}
 use super::seedance_chat::{
     append_inline_image_asset_ids, is_seedance_model, project_chat_to_video, InlineImage,
 };
@@ -989,11 +1048,11 @@ async fn seedance_chat_completions(
     input: Value,
 ) -> Response {
     if input.get("stream").and_then(Value::as_bool).unwrap_or(false) {
-        return openai_error(
+        return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref().map(|Extension(value)| value), openai_error(
             StatusCode::BAD_REQUEST,
             "seedance_stream_unsupported",
             "Seedance Chat 兼容入口暂不支持 stream=true，请使用非流式请求",
-        );
+        ));
     }
     let idempotency_key = headers
         .get("idempotency-key")
@@ -1001,15 +1060,16 @@ async fn seedance_chat_completions(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     if idempotency_key.is_none() {
-        return openai_error(
+        return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref().map(|Extension(value)| value), openai_error(
             StatusCode::BAD_REQUEST,
             "idempotency_key_required",
             "Seedance Chat 请求必须提供 Idempotency-Key",
-        );
+        ));
     }
     let projection = match project_chat_to_video(&input) {
         Ok(projection) => projection,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.code(), error.message()),
+        Err(error) => return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref().map(|Extension(value)| value),
+            openai_error(StatusCode::BAD_REQUEST, error.code(), error.message())),
     };
     let mut video_input = projection.video_input;
     let idempotency_key = idempotency_key.expect("validated above");
@@ -1022,11 +1082,12 @@ async fn seedance_chat_completions(
         principal.as_ref().map(|Extension(value)| value),
         idempotency_key,
     ) {
-        return openai_error(StatusCode::BAD_REQUEST, "invalid_asset", &error);
+        return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref().map(|Extension(value)| value),
+            openai_error(StatusCode::BAD_REQUEST, "invalid_asset", &error));
     }
     let body = match serde_json::to_vec(&video_input) {
         Ok(body) => bytes::Bytes::from(body),
-        Err(_) => return internal_error_response(),
+        Err(_) => return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref().map(|Extension(value)| value), internal_error_response()),
     };
     let video_response = videos_generations_with_attribution(
         State(state),
@@ -2726,31 +2787,32 @@ pub async fn videos_generations_with_attribution(
     let resolved_key = resolved_key.map(|Extension(key)| key);
     let key_limits = match require_legacy_capability(&key_str, resolved_key.as_ref(), api_keys::CAPABILITY_VIDEO) {
         Ok(limits) => limits,
-        Err(response) => return response,
+        Err(response) => return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref(), response),
     };
     state
         .total_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if body.len() > MAX_BODY_BYTES {
-        return openai_error(
+        return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref(), openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
             "request body exceeds 8MB limit",
-        );
+        ));
     }
     let input: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => {
-            return openai_error(
+            return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref(), openai_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 &format!("invalid JSON body: {error}"),
-            )
+            ))
         }
     };
     let (model, prompt) = match video::validate_request(&input) {
         Ok(value) => value,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &error),
+        Err(error) => return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref(),
+            openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &error)),
     };
     let idempotency_key = headers
         .get("idempotency-key")
@@ -2761,7 +2823,7 @@ pub async fn videos_generations_with_attribution(
         .map(str::to_string);
     let scoped_idempotency_key = idempotency_key
         .as_deref()
-        .map(|key| video::scoped_idempotency_key(&key_str, key));
+        .map(|key| video::scoped_idempotency_key(video_idempotency_scope(&key_str, core_attribution.as_ref()), key));
     if let Some(key) = scoped_idempotency_key.as_deref() {
         if let Some(task) = video::find_idempotent(key) {
             let detail = json!({ "task": task, "request_key": key_str, "idempotent_replay": true });
@@ -2779,22 +2841,22 @@ pub async fn videos_generations_with_attribution(
         &key_limits,
     ) {
         Ok(permit) => permit,
-        Err(error) => return limit_error_response(error),
+        Err(error) => return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref(), limit_error_response(error)),
     };
     let guard = state.inflight_guard_with_permit(request_permit);
     let video_job_permit = match state.acquire_video_job(&key_str, &key_limits) {
         Ok(permit) => permit,
-        Err(error) => return limit_error_response(error),
+        Err(error) => return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref(), limit_error_response(error)),
     };
     let tried = HashSet::new();
     let account = match state.pool.pick_excluding_for(&tried, ResourceKind::Work) {
         Some(account) => account,
         None => {
-            return openai_error(
+            return controlled_video_pre_dispatch_rejection(&state, core_attribution.as_ref(), openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_work_credits",
                 "没有可用的 Trae Work 账号，或通用积分与 Work 积分均不可用",
-            )
+            ))
         }
     };
     let task = match video::create_pending_with_idempotency(
@@ -3360,7 +3422,7 @@ fn stream_chat_with_attribution(state: Arc<ApiSharedState>, body_vec: Vec<u8>, m
 
         // 每个请求最多尝试池内全部账号；`tried` 保证同一请求不会重复取号。
         // 旧实现固定只轮换 3 个账号，池规模超过 3 时会过早返回 no healthy account。
-        let max_rotate = state.pool.count().max(1);
+        let max_rotate = core_account_rotations(core_attribution.as_ref(), state.pool.count());
         for _ in 0..max_rotate {
             let picked = match state.pool.pick_excluding(&tried) {
                 Some(p) => p,
@@ -3539,7 +3601,7 @@ fn stream_chat_with_attribution(state: Arc<ApiSharedState>, body_vec: Vec<u8>, m
                     }
                     Err((status, resp_body, retry_after)) => {
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
-                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                        match core_retry_plan(core_attribution.as_ref(), status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
                                 // 同账号重试：不 note_error 不冷却
                                 same_attempt += 1;
@@ -3709,7 +3771,7 @@ async fn aggregate_chat_with_attribution(state: Arc<ApiSharedState>, body_vec: V
         let mut guard = guard;
         let mut tried = HashSet::new();
 
-        let max_rotate = state.pool.count().max(1);
+        let max_rotate = core_account_rotations(core_attribution.as_ref(), state.pool.count());
         for _ in 0..max_rotate {
             let picked = match state.pool.pick_excluding(&tried) {
                 Some(p) => p,
@@ -3856,7 +3918,7 @@ async fn aggregate_chat_with_attribution(state: Arc<ApiSharedState>, body_vec: V
                     }
                     Err((status, resp_body, retry_after)) => {
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
-                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                        match core_retry_plan(core_attribution.as_ref(), status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
                                 // 同账号重试：不 note_error 不冷却
                                 same_attempt += 1;
@@ -4252,6 +4314,54 @@ mod tests {
     use axum::http::HeaderMap;
 
     use crate::api_server::{CoreBridge, CoreMode};
+
+    #[test]
+    fn controlled_unquoted_chat_never_retries_or_switches_upstream_account() {
+        let attribution = super::super::bridge_billing::CoreRequestAttribution {
+            request_id: "req-controlled".into(), core_key_id: "key-controlled".into(),
+            billing_mode: super::super::bridge_billing::CoreBillingMode::ControlledUnquoted,
+            operation_id: Some("op-controlled".into()),
+        };
+        assert_eq!(super::core_account_rotations(Some(&attribution), 8), 1);
+        assert!(matches!(super::core_retry_plan(Some(&attribution), 503, "busy", 0, None), RetryAction::Fatal));
+        assert!(matches!(super::core_retry_plan(Some(&attribution), 429, "rate limited", 0, None), RetryAction::Fatal));
+        assert_eq!(super::core_account_rotations(None, 8), 8);
+    }
+
+    #[test]
+    fn controlled_video_idempotency_uses_core_key_not_shared_bridge_key() {
+        let attribution = super::super::bridge_billing::CoreRequestAttribution {
+            request_id: "req-video".into(), core_key_id: "key-user-a".into(),
+            billing_mode: super::super::bridge_billing::CoreBillingMode::ControlledUnquoted,
+            operation_id: Some("op-video".into()),
+        };
+        assert_eq!(super::video_idempotency_scope("shared-bridge", Some(&attribution)), "key-user-a");
+        assert_eq!(super::video_idempotency_scope("shared-bridge", None), "shared-bridge");
+    }
+
+    #[tokio::test]
+    async fn controlled_video_validation_rejection_has_verifiable_zero_cost_receipt() {
+        let (state, dir, key_id) = legacy_fixture_with_capabilities(&[api_keys::CAPABILITY_VIDEO]);
+        let attribution = super::super::bridge_billing::CoreRequestAttribution {
+            request_id: "req-pre-dispatch-route".into(), core_key_id: "key-user-a".into(),
+            billing_mode: super::super::bridge_billing::CoreBillingMode::ControlledUnquoted,
+            operation_id: Some("op-pre-dispatch-route".into()),
+        };
+        super::super::bridge_billing::BridgeBillingStore::open(&dir).unwrap()
+            .record_core_request_with_billing_mode(&attribution.request_id, &attribution.core_key_id,
+                attribution.billing_mode, attribution.operation_id.as_deref()).unwrap();
+        let response = videos_generations_with_attribution(
+            State(state.clone()), Some(Extension(KeyId(key_id.clone()))),
+            legacy_snapshot(&state, &key_id), None, Some(Extension(attribution.clone())),
+            HeaderMap::new(), Bytes::from(json!({"model":"seedance","prompt":""}).to_string()),
+        ).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let receipt = super::super::bridge_billing::BridgeBillingStore::open(&dir).unwrap()
+            .get_receipt(&attribution.request_id).unwrap().expect("pre-dispatch rejection must prove zero cost");
+        assert_eq!(receipt.actual_credits.unwrap().as_microcredits(), 0);
+        assert!(receipt.task_ref.is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn core_session_binding_separates_requests_without_changing_conversation_context() {

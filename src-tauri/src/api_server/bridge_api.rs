@@ -318,6 +318,32 @@ pub async fn quote(
         .into_response()
 }
 
+/// Read-only recovery of an already accepted controlled video. This never
+/// creates a task or sends another upstream request.
+pub async fn controlled_video_task(
+    State(state): State<Arc<ApiSharedState>>,
+    Path(request_id): Path<String>,
+) -> Response {
+    if !super::bridge_billing::valid_request_id(&request_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let data_dir = state.data_dir.clone();
+    let request_for_lookup = request_id.clone();
+    let key = tokio::task::spawn_blocking(move || {
+        super::bridge_billing::BridgeBillingStore::open(&data_dir)?
+            .controlled_request_key(&request_for_lookup)
+    }).await;
+    let key = match key {
+        Ok(Ok(Some(key))) => key,
+        Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
+        _ => return bridge_billing_unavailable(),
+    };
+    let scoped = super::video::scoped_idempotency_key(&key, &request_id);
+    let task = super::video::find_idempotent(&scoped)
+        .map(|task| serde_json::json!({"id":task.id,"status":task.status}));
+    Json(serde_json::json!({"request_id":request_id,"task":task})).into_response()
+}
+
 /// Returns a persisted request-scoped receipt; absence is `unknown`, never zero.
 pub async fn billing(
     State(state): State<Arc<ApiSharedState>>,
