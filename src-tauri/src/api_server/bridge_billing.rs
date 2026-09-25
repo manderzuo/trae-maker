@@ -116,6 +116,23 @@ pub(crate) enum CoreRequestRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoreBillingMode {
+    Quoted,
+    LegacyOneShot,
+    ControlledUnquoted,
+}
+
+impl CoreBillingMode {
+    fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Quoted => "quoted",
+            Self::LegacyOneShot => "legacy_one_shot",
+            Self::ControlledUnquoted => "controlled_unquoted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CoreSessionLinkResult {
     Created,
     Duplicate,
@@ -146,7 +163,8 @@ pub(super) enum CoreBillingSessionLookup {
 pub(crate) struct CoreRequestAttribution {
     pub request_id: String,
     pub core_key_id: String,
-    pub one_shot_test: bool,
+    pub billing_mode: CoreBillingMode,
+    pub operation_id: Option<String>,
 }
 
 /// TRAE usage history aggregates credits by session, so Core traffic gets a
@@ -256,6 +274,13 @@ impl BridgeBillingStore {
                    request_id TEXT PRIMARY KEY NOT NULL,
                    authorized_at_ms INTEGER NOT NULL
                  );
+                 CREATE TABLE IF NOT EXISTS bridge_core_request_modes (
+                   request_id TEXT PRIMARY KEY NOT NULL REFERENCES bridge_core_requests(request_id),
+                   billing_mode TEXT NOT NULL CHECK(billing_mode IN ('quoted', 'legacy_one_shot', 'controlled_unquoted')),
+                   operation_id TEXT,
+                   CHECK((billing_mode = 'controlled_unquoted' AND operation_id IS NOT NULL)
+                      OR (billing_mode != 'controlled_unquoted' AND operation_id IS NULL))
+                 );
                  CREATE TABLE IF NOT EXISTS bridge_core_upstream_sessions (
                    request_id TEXT NOT NULL,
                    account_ref TEXT NOT NULL,
@@ -350,8 +375,24 @@ impl BridgeBillingStore {
         core_key_id: &str,
         one_shot_test: bool,
     ) -> Result<CoreRequestRecord, String> {
+        let mode = if one_shot_test { CoreBillingMode::LegacyOneShot } else { CoreBillingMode::Quoted };
+        self.record_core_request_with_billing_mode(request_id, core_key_id, mode, None)
+    }
+
+    pub(super) fn record_core_request_with_billing_mode(
+        &mut self,
+        request_id: &str,
+        core_key_id: &str,
+        mode: CoreBillingMode,
+        operation_id: Option<&str>,
+    ) -> Result<CoreRequestRecord, String> {
         if !valid_request_id(request_id) || !valid_core_key_id(core_key_id) {
             return Err("Core request attribution identifiers are invalid".into());
+        }
+        if (mode == CoreBillingMode::ControlledUnquoted && !operation_id.is_some_and(valid_request_id))
+            || (mode != CoreBillingMode::ControlledUnquoted && operation_id.is_some())
+        {
+            return Err("Core controlled operation identifier is invalid".into());
         }
         let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("Core request attribution transaction unavailable: {error}"))?;
@@ -365,31 +406,44 @@ impl BridgeBillingStore {
              VALUES (?1, ?2, ?3)",
             params![request_id, core_key_id, chrono::Utc::now().timestamp_millis()],
         ).map_err(|error| format!("Core request attribution insert failed: {error}"))?;
-        let existing_one_shot = if inserted == 1 {
-            false
-        } else {
-            transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM bridge_core_one_shot_test_requests WHERE request_id = ?1)",
-                params![request_id],
-                |row| row.get::<_, bool>(0),
-            ).map_err(|error| format!("Core one-shot request authorization lookup failed: {error}"))?
-        };
         let result = if inserted == 1 {
-            if one_shot_test {
+            if mode == CoreBillingMode::LegacyOneShot {
                 transaction.execute(
                     "INSERT INTO bridge_core_one_shot_test_requests(request_id, authorized_at_ms)
                      VALUES (?1, ?2)",
                     params![request_id, chrono::Utc::now().timestamp_millis()],
                 ).map_err(|error| format!("Core one-shot request authorization insert failed: {error}"))?;
             }
+            transaction.execute(
+                "INSERT INTO bridge_core_request_modes(request_id, billing_mode, operation_id) VALUES (?1, ?2, ?3)",
+                params![request_id, mode.as_db_value(), operation_id],
+            ).map_err(|error| format!("Core request billing mode insert failed: {error}"))?;
             CoreRequestRecord::Created
         } else {
-            let existing = transaction.query_row(
-                "SELECT core_key_id FROM bridge_core_requests WHERE request_id = ?1",
+            let (existing_key, conflicted) = transaction.query_row(
+                "SELECT core_key_id, conflict FROM bridge_core_requests WHERE request_id = ?1",
                 params![request_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
             ).map_err(|error| format!("Core request attribution lookup failed: {error}"))?;
-            if existing == core_key_id && existing_one_shot == one_shot_test {
+            let stored_mode: Option<(String, Option<String>)> = transaction.query_row(
+                "SELECT billing_mode, operation_id FROM bridge_core_request_modes WHERE request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(|error| format!("Core request billing mode lookup failed: {error}"))?;
+            let (existing_mode, existing_operation) = match stored_mode {
+                Some(values) => values,
+                None => {
+                    let legacy_one_shot: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM bridge_core_one_shot_test_requests WHERE request_id = ?1)",
+                        params![request_id],
+                        |row| row.get(0),
+                    ).map_err(|error| format!("Core one-shot request authorization lookup failed: {error}"))?;
+                    (if legacy_one_shot { "legacy_one_shot" } else { "quoted" }.into(), None)
+                }
+            };
+            if !conflicted && existing_key == core_key_id && existing_mode == mode.as_db_value()
+                && existing_operation.as_deref() == operation_id
+            {
                 CoreRequestRecord::Duplicate
             } else {
                 CoreRequestRecord::Conflict
@@ -1082,6 +1136,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn core_controlled_attribution_rejects_operation_or_mode_rebinding() {
+        let dir = test_dir("core-controlled-attribution");
+        let mut store = BridgeBillingStore::open(&dir).unwrap();
+        assert_eq!(
+            store.record_core_request_with_billing_mode(
+                "req-controlled", "key_a", CoreBillingMode::ControlledUnquoted, Some("op-a")
+            ).unwrap(),
+            CoreRequestRecord::Created
+        );
+        assert_eq!(
+            store.record_core_request_with_billing_mode(
+                "req-controlled", "key_a", CoreBillingMode::ControlledUnquoted, Some("op-a")
+            ).unwrap(),
+            CoreRequestRecord::Duplicate
+        );
+        assert_eq!(
+            store.record_core_request_with_billing_mode(
+                "req-controlled", "key_a", CoreBillingMode::ControlledUnquoted, Some("op-b")
+            ).unwrap(),
+            CoreRequestRecord::Conflict
+        );
+        assert_eq!(
+            store.record_core_request_with_billing_mode(
+                "req-controlled", "key_a", CoreBillingMode::Quoted, None
+            ).unwrap(),
+            CoreRequestRecord::Conflict
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn core_key_registry_is_atomic_idempotent_and_retains_only_safe_metadata() {
         let dir = test_dir("core-key-registry");
         let mut store = BridgeBillingStore::open(&dir).unwrap();
@@ -1364,7 +1450,8 @@ mod tests {
         let attribution = CoreRequestAttribution {
             request_id: "req-a".into(),
             core_key_id: "key_a".into(),
-            one_shot_test: false,
+            billing_mode: CoreBillingMode::Quoted,
+            operation_id: None,
         };
         assert!(BridgeBillingStore::record_core_upstream_attempt_from_payload(
             &dir, Some(&attribution), "uid-1", &serde_json::json!({"model":"seedance"})

@@ -231,10 +231,13 @@ fn core_attribution_headers(
     let request_header_count = request.headers().get_all("x-core-request-id").iter().count();
     let key_header_count = request.headers().get_all("x-core-key-id").iter().count();
     let quote_header_count = request.headers().get_all("x-core-quote-id").iter().count();
-    if request_header_count == 0 && key_header_count == 0 {
+    let operation_header_count = request.headers().get_all("x-core-controlled-operation-id").iter().count();
+    if request_header_count == 0 && key_header_count == 0 && operation_header_count == 0 {
         return Ok(None);
     }
-    if request_header_count != 1 || key_header_count != 1 || quote_header_count > 1 {
+    if request_header_count != 1 || key_header_count != 1 || quote_header_count > 1
+        || operation_header_count > 1 || (quote_header_count != 0 && operation_header_count != 0)
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             axum::Json(json!({"error":{"code":"invalid_core_attribution","message":"Core request attribution headers must be supplied exactly once as a pair"}})),
@@ -246,20 +249,31 @@ fn core_attribution_headers(
         .and_then(|value| value.to_str().ok()).unwrap_or_default().to_string();
     let quote_id = request.headers().get("x-core-quote-id")
         .and_then(|value| value.to_str().ok()).unwrap_or_default();
+    let operation_id = request.headers().get("x-core-controlled-operation-id")
+        .and_then(|value| value.to_str().ok());
     let one_shot_test = quote_id.starts_with("authorized-one-shot-test-");
     if !super::bridge_billing::valid_request_id(&request_id)
         || !super::bridge_billing::valid_core_key_id(&key_id)
         || (one_shot_test && quote_id != format!("authorized-one-shot-test-{request_id}"))
+        || (operation_header_count != 0 && !operation_id.is_some_and(super::bridge_billing::valid_request_id))
     {
         return Err((
             StatusCode::BAD_REQUEST,
             axum::Json(json!({"error":{"code":"invalid_core_attribution","message":"Core request attribution identifiers are invalid"}})),
         ).into_response());
     }
+    let billing_mode = if operation_id.is_some() {
+        super::bridge_billing::CoreBillingMode::ControlledUnquoted
+    } else if one_shot_test {
+        super::bridge_billing::CoreBillingMode::LegacyOneShot
+    } else {
+        super::bridge_billing::CoreBillingMode::Quoted
+    };
     Ok(Some(super::bridge_billing::CoreRequestAttribution {
         request_id,
         core_key_id: key_id,
-        one_shot_test,
+        billing_mode,
+        operation_id: operation_id.map(str::to_owned),
     }))
 }
 
@@ -273,16 +287,17 @@ async fn persist_core_attribution(
     let data_dir = state.data_dir.clone();
     let request_id = attribution.request_id.clone();
     let key_id = attribution.core_key_id.clone();
-    let one_shot_test = attribution.one_shot_test;
+    let billing_mode = attribution.billing_mode;
+    let operation_id = attribution.operation_id.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut store = super::bridge_billing::BridgeBillingStore::open(&data_dir)?;
-        store.record_core_request_with_mode(&request_id, &key_id, one_shot_test)
+        store.record_core_request_with_billing_mode(&request_id, &key_id, billing_mode, operation_id.as_deref())
     }).await;
     match result {
         Ok(Ok(super::bridge_billing::CoreRequestRecord::Created | super::bridge_billing::CoreRequestRecord::Duplicate)) => Ok(Some(attribution)),
         Ok(Ok(super::bridge_billing::CoreRequestRecord::Conflict)) => Err((
             StatusCode::CONFLICT,
-            axum::Json(json!({"error":{"code":"core_request_key_conflict","message":"Core request ID is already associated with a different API Key"}})),
+            axum::Json(json!({"error":{"code":"core_request_key_conflict","message":"Core request ID already has conflicting Key or billing authorization"}})),
         ).into_response()),
         Ok(Err(_)) | Err(_) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -811,6 +826,34 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
         assert_eq!(persisted, ("core-request-17".into(), "key_server_17".into()));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn core_controlled_attribution_requires_bridge_credential() {
+        let (app, regular_key, bridge_key, dir) = bridge_auth_fixture();
+        let request = |key: &str| Request::builder()
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {key}"))
+            .header("x-core-request-id", "req-controlled-auth")
+            .header("x-core-key-id", "key_server_17")
+            .header("x-core-controlled-operation-id", "op-controlled-auth")
+            .body(Body::empty())
+            .unwrap();
+        let rejected = app.clone().oneshot(request(&regular_key)).await.unwrap();
+        assert_ne!(rejected.status(), axum::http::StatusCode::OK);
+        assert!(!dir.join("bridge-billing.sqlite3").exists());
+
+        let accepted = app.oneshot(request(&bridge_key)).await.unwrap();
+        assert_eq!(accepted.status(), axum::http::StatusCode::OK);
+        let db = rusqlite::Connection::open(dir.join("bridge-billing.sqlite3")).unwrap();
+        let persisted: (String, String) = db.query_row(
+            "SELECT billing_mode, operation_id FROM bridge_core_request_modes WHERE request_id = ?1",
+            ["req-controlled-auth"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(persisted, ("controlled_unquoted".into(), "op-controlled-auth".into()));
+        drop(db);
         let _ = fs::remove_dir_all(dir);
     }
 }

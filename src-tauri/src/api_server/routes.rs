@@ -4265,7 +4265,8 @@ mod tests {
             Some(&super::super::bridge_billing::CoreRequestAttribution {
                 request_id: "core-req-1".into(),
                 core_key_id: "key-1".into(),
-                one_shot_test: false,
+                billing_mode: super::super::bridge_billing::CoreBillingMode::Quoted,
+                operation_id: None,
             }),
             "uid-a",
         ).unwrap();
@@ -4274,7 +4275,8 @@ mod tests {
             Some(&super::super::bridge_billing::CoreRequestAttribution {
                 request_id: "core-req-1".into(),
                 core_key_id: "key-1".into(),
-                one_shot_test: false,
+                billing_mode: super::super::bridge_billing::CoreBillingMode::Quoted,
+                operation_id: None,
             }),
             "uid-a",
         ).unwrap();
@@ -4283,7 +4285,8 @@ mod tests {
             Some(&super::super::bridge_billing::CoreRequestAttribution {
                 request_id: "core-req-2".into(),
                 core_key_id: "key-2".into(),
-                one_shot_test: false,
+                billing_mode: super::super::bridge_billing::CoreBillingMode::Quoted,
+                operation_id: None,
             }),
             "uid-a",
         ).unwrap();
