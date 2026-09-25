@@ -503,6 +503,16 @@ impl BridgeBillingStore {
             Some(false) => {}
         }
 
+        let settled: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bridge_billing_receipts
+             WHERE request_id = ?1 AND status IN ('final', 'conflict'))",
+            params![request_id],
+            |row| row.get(0),
+        ).map_err(|error| format!("upstream session receipt lookup failed: {error}"))?;
+        if settled {
+            return Err("Core request already has a terminal billing receipt".into());
+        }
+
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO bridge_core_upstream_sessions
              (request_id, account_ref, session_id, associated_at_ms)
@@ -1197,8 +1207,8 @@ mod tests {
         assert_eq!(stored.actual_credits.unwrap().to_string(), "245.850000");
         assert_eq!(stored.task_ref.as_deref(), Some("video-task-a"));
 
-        store.record_core_session_attempt("req-test", "uid-a", "session-retry").unwrap();
-        assert_eq!(store.core_session_for_request("req-test").unwrap(), CoreBillingSessionLookup::Ambiguous);
+        assert!(store.record_core_session_attempt("req-test", "uid-a", "session-retry").is_err());
+        assert!(matches!(store.core_session_for_request("req-test").unwrap(), CoreBillingSessionLookup::Unique { .. }));
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1303,6 +1313,30 @@ mod tests {
         let conflicting = BillingReceipt { actual_credits: Some(CreditAmount::parse("0.050401", "credits").unwrap()), ..receipt };
         assert_eq!(store.record_core_session_receipt(&conflicting, "uid-chat", "session-chat", "key_chat").unwrap(), PersistReceiptResult::Conflict);
         assert_eq!(store.get_receipt("req-chat").unwrap().unwrap().status, BillingReceiptStatus::Conflict);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settled_core_request_cannot_start_another_upstream_attempt() {
+        let dir = test_dir("settled-request-no-redispatch");
+        let mut store = BridgeBillingStore::open(&dir).unwrap();
+        store.record_core_request("req-final", "key_a").unwrap();
+        store.record_core_session_attempt("req-final", "uid-a", "session-a").unwrap();
+        let receipt = BillingReceipt {
+            request_id: "req-final".into(),
+            status: BillingReceiptStatus::Final,
+            actual_credits: Some(CreditAmount::parse("1.250000", "credits").unwrap()),
+            unit: Some("credits".into()),
+            source_ref: Some("trae-usage-session:session-a".into()),
+            task_ref: None,
+            observed_at_ms: 1_790_000_000_000,
+        };
+        store.record_core_session_receipt(&receipt, "uid-a", "session-a", "key_a").unwrap();
+
+        assert!(store.record_core_session_attempt("req-final", "uid-a", "session-a").is_err());
+        assert!(store.record_core_session_attempt("req-final", "uid-b", "session-b").is_err());
+        assert!(matches!(store.core_session_for_request("req-final").unwrap(), CoreBillingSessionLookup::Unique { .. }));
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
