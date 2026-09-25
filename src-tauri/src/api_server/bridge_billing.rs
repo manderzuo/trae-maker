@@ -129,8 +129,7 @@ pub(super) enum CoreSessionLookup {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum OneShotSessionLookup {
-    Unauthorized,
+pub(super) enum CoreBillingSessionLookup {
     Missing,
     Ambiguous,
     Unique {
@@ -406,28 +405,10 @@ impl BridgeBillingStore {
         Ok(result)
     }
 
-    pub(super) fn one_shot_session_for_request(
-        &self,
-        request_id: &str,
-    ) -> Result<OneShotSessionLookup, String> {
-        if !valid_request_id(request_id) {
-            return Err("Core request attribution identifier is invalid".into());
-        }
-        let authorized: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM bridge_core_one_shot_test_requests WHERE request_id = ?1)",
-            params![request_id],
-            |row| row.get(0),
-        ).map_err(|error| format!("Core one-shot authorization lookup failed: {error}"))?;
-        if !authorized {
-            return Ok(OneShotSessionLookup::Unauthorized);
-        }
-        self.core_session_for_request(request_id)
-    }
-
     pub(super) fn core_session_for_request(
         &self,
         request_id: &str,
-    ) -> Result<OneShotSessionLookup, String> {
+    ) -> Result<CoreBillingSessionLookup, String> {
         if !valid_request_id(request_id) {
             return Err("Core request attribution identifier is invalid".into());
         }
@@ -436,8 +417,10 @@ impl BridgeBillingStore {
             params![request_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
         ).optional().map_err(|error| format!("Core request lookup failed: {error}"))?;
-        let Some((core_key_id, false)) = request else {
-            return Ok(OneShotSessionLookup::Ambiguous);
+        let core_key_id = match request {
+            Some((core_key_id, false)) => core_key_id,
+            Some((_, true)) => return Ok(CoreBillingSessionLookup::Ambiguous),
+            None => return Ok(CoreBillingSessionLookup::Missing),
         };
         let mut statement = self.connection.prepare(
             "SELECT account_ref, session_id, conflict, associated_at_ms
@@ -452,13 +435,13 @@ impl BridgeBillingStore {
             sessions.push(row.map_err(|error| format!("Core request session row invalid: {error}"))?);
         }
         if sessions.is_empty() {
-            return Ok(OneShotSessionLookup::Missing);
+            return Ok(CoreBillingSessionLookup::Missing);
         }
         if sessions.len() != 1 || sessions[0].2 {
-            return Ok(OneShotSessionLookup::Ambiguous);
+            return Ok(CoreBillingSessionLookup::Ambiguous);
         }
         let (account_ref, session_id, _, associated_at_ms) = sessions.pop().unwrap();
-        Ok(OneShotSessionLookup::Unique {
+        Ok(CoreBillingSessionLookup::Unique {
             core_key_id, account_ref, session_id, associated_at_ms,
         })
     }
@@ -475,7 +458,7 @@ impl BridgeBillingStore {
             return Err("Core billing receipt source does not match its upstream session".into());
         }
         match self.core_session_for_request(&receipt.request_id)? {
-            OneShotSessionLookup::Unique {
+            CoreBillingSessionLookup::Unique {
                 core_key_id: stored_key,
                 account_ref: stored_account,
                 session_id: stored_session,
@@ -491,51 +474,6 @@ impl BridgeBillingStore {
             EvidenceTrust::AuthorizedCoreChatSession
         };
         self.record_receipt(receipt, trust)
-    }
-
-    pub(super) fn record_one_shot_session_receipt(
-        &mut self,
-        receipt: &BillingReceipt,
-        account_ref: &str,
-        session_id: &str,
-        core_key_id: &str,
-    ) -> Result<PersistReceiptResult, String> {
-        match self.one_shot_session_for_request(&receipt.request_id)? {
-            OneShotSessionLookup::Unique {
-                core_key_id: stored_key,
-                account_ref: stored_account,
-                session_id: stored_session,
-                ..
-            } if stored_key == core_key_id
-                && stored_account == account_ref
-                && stored_session == session_id => {}
-            _ => return Err("one-shot billing receipt is not tied to one authorized Core session".into()),
-        }
-        self.record_receipt(receipt, EvidenceTrust::AuthorizedCoreVideoSession)
-    }
-
-    pub(super) fn record_one_shot_chat_receipt(
-        &mut self,
-        receipt: &BillingReceipt,
-        account_ref: &str,
-        session_id: &str,
-        core_key_id: &str,
-    ) -> Result<PersistReceiptResult, String> {
-        if receipt.task_ref.is_some() {
-            return Err("chat billing receipt cannot carry a video task reference".into());
-        }
-        match self.one_shot_session_for_request(&receipt.request_id)? {
-            OneShotSessionLookup::Unique {
-                core_key_id: stored_key,
-                account_ref: stored_account,
-                session_id: stored_session,
-                ..
-            } if stored_key == core_key_id
-                && stored_account == account_ref
-                && stored_session == session_id => {}
-            _ => return Err("chat billing receipt is not tied to one authorized Core session".into()),
-        }
-        self.record_receipt(receipt, EvidenceTrust::AuthorizedCoreChatSession)
     }
 
     /// Bind one actual upstream attempt to its Core request. Reusing the same
@@ -1231,14 +1169,14 @@ mod tests {
     }
 
     #[test]
-    fn only_authorized_one_shot_request_with_one_exact_session_can_promote_usage_to_final() {
+    fn one_shot_request_uses_the_same_unique_session_evidence_as_regular_requests() {
         let dir = test_dir("one-shot-session-receipt");
         let mut store = BridgeBillingStore::open(&dir).unwrap();
         store.record_core_request_with_mode("req-test", "key_a", true).unwrap();
         store.record_core_session_attempt("req-test", "uid-a", "session-a").unwrap();
         assert!(matches!(
-            store.one_shot_session_for_request("req-test").unwrap(),
-            OneShotSessionLookup::Unique { ref core_key_id, ref account_ref, ref session_id, .. }
+            store.core_session_for_request("req-test").unwrap(),
+            CoreBillingSessionLookup::Unique { ref core_key_id, ref account_ref, ref session_id, .. }
                 if core_key_id == "key_a" && account_ref == "uid-a" && session_id == "session-a"
         ));
 
@@ -1252,22 +1190,15 @@ mod tests {
             observed_at_ms: 1_790_000_000_000,
         };
         assert_eq!(
-            store.record_one_shot_session_receipt(&receipt, "uid-a", "session-a", "key_a").unwrap(),
+            store.record_core_session_receipt(&receipt, "uid-a", "session-a", "key_a").unwrap(),
             PersistReceiptResult::Created,
         );
         let stored = store.get_receipt("req-test").unwrap().unwrap();
         assert_eq!(stored.actual_credits.unwrap().to_string(), "245.850000");
         assert_eq!(stored.task_ref.as_deref(), Some("video-task-a"));
 
-        store.record_core_request("req-regular", "key_b").unwrap();
-        store.record_core_session_attempt("req-regular", "uid-b", "session-b").unwrap();
-        assert!(store.record_one_shot_session_receipt(
-            &BillingReceipt { request_id: "req-regular".into(), ..receipt.clone() },
-            "uid-b", "session-b", "key_b",
-        ).is_err());
-
         store.record_core_session_attempt("req-test", "uid-a", "session-retry").unwrap();
-        assert_eq!(store.one_shot_session_for_request("req-test").unwrap(), OneShotSessionLookup::Ambiguous);
+        assert_eq!(store.core_session_for_request("req-test").unwrap(), CoreBillingSessionLookup::Ambiguous);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

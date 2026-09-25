@@ -374,8 +374,8 @@ pub struct FinalizeVideoBillingRequest {
 }
 
 /// Core calls this only after it has observed a terminal video task state.
-/// The one-shot test path promotes usage only from the unique session that was
-/// created for that request and Key; until the read-only poller sees the row,
+/// Promote usage only from the unique session created for the authenticated
+/// Core request and Key; until the read-only poller sees the row,
 /// the response stays unknown and the Core reservation remains held.
 pub async fn finalize_video_billing(
     State(state): State<Arc<ApiSharedState>>,
@@ -400,7 +400,7 @@ pub async fn finalize_video_billing(
         let store = super::bridge_billing::BridgeBillingStore::open(&data_dir)?;
         Ok::<_, String>((
             store.get_receipt(&request_for_lookup)?,
-            store.one_shot_session_for_request(&request_for_lookup)?,
+            store.core_session_for_request(&request_for_lookup)?,
         ))
     }).await;
     let (existing, session_lookup) = match snapshot {
@@ -423,12 +423,11 @@ pub async fn finalize_video_billing(
     }
 
     let (core_key_id, account_ref, session_id) = match session_lookup {
-        super::bridge_billing::OneShotSessionLookup::Unique {
+        super::bridge_billing::CoreBillingSessionLookup::Unique {
             core_key_id, account_ref, session_id, ..
         } => (core_key_id, account_ref, session_id),
-        super::bridge_billing::OneShotSessionLookup::Unauthorized
-        | super::bridge_billing::OneShotSessionLookup::Missing
-        | super::bridge_billing::OneShotSessionLookup::Ambiguous => {
+        super::bridge_billing::CoreBillingSessionLookup::Missing
+        | super::bridge_billing::CoreBillingSessionLookup::Ambiguous => {
             return Json(super::bridge_billing::unknown_receipt(request_id)).into_response();
         }
     };
@@ -457,7 +456,7 @@ pub async fn finalize_video_billing(
     let receipt_for_write = receipt.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut store = super::bridge_billing::BridgeBillingStore::open(&data_dir)?;
-        store.record_one_shot_session_receipt(
+        store.record_core_session_receipt(
             &receipt_for_write,
             &account_ref,
             &session_id,
@@ -471,7 +470,7 @@ pub async fn finalize_video_billing(
     }
 }
 
-/// Confirm a one-shot text helper only from the unique, attributed upstream
+/// Confirm a Core text request only from its unique, attributed upstream
 /// usage session. Unlike video finalization, no video task reference is valid.
 pub async fn finalize_chat_billing(
     State(state): State<Arc<ApiSharedState>>,
@@ -489,7 +488,7 @@ pub async fn finalize_chat_billing(
         let store = super::bridge_billing::BridgeBillingStore::open(&data_dir)?;
         Ok::<_, String>((
             store.get_receipt(&request_for_lookup)?,
-            store.one_shot_session_for_request(&request_for_lookup)?,
+            store.core_session_for_request(&request_for_lookup)?,
         ))
     }).await;
     let (existing, session_lookup) = match snapshot {
@@ -509,7 +508,7 @@ pub async fn finalize_chat_billing(
         ).into_response();
     }
     let (core_key_id, account_ref, session_id, associated_at_ms) = match session_lookup {
-        super::bridge_billing::OneShotSessionLookup::Unique {
+        super::bridge_billing::CoreBillingSessionLookup::Unique {
             core_key_id, account_ref, session_id, associated_at_ms,
         } => (core_key_id, account_ref, session_id, associated_at_ms),
         _ => return Json(super::bridge_billing::unknown_receipt(request_id)).into_response(),
@@ -567,7 +566,7 @@ pub async fn finalize_chat_billing(
     let receipt_for_write = receipt.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut store = super::bridge_billing::BridgeBillingStore::open(&data_dir)?;
-        store.record_one_shot_chat_receipt(
+        store.record_core_session_receipt(
             &receipt_for_write, &account_ref, &session_id, &core_key_id,
         )?;
         store.get_receipt(&receipt_for_write.request_id)

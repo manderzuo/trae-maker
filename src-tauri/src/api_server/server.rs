@@ -347,6 +347,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regular_chat_finalization_records_only_its_exact_session_credits() {
+        let mut fixture = BridgeFixture::new();
+        let request_id = "request-chat-regular";
+        let account_ref = "uid-chat";
+        let session_id = "session-chat-regular";
+        super::super::bridge_billing::persist_core_request_attribution(
+            &fixture.dir, request_id, "key_chat",
+        ).unwrap();
+        super::super::bridge_billing::persist_core_session_attempt(
+            &fixture.dir, request_id, account_ref, session_id,
+        ).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let usage_cache = serde_json::json!({
+            "fetched_at": now,
+            "accounts": {
+                account_ref: {
+                    "name":"测试账号", "last_fetch_end_ts":now, "daily":{},
+                    "session_usage": {
+                        session_id: {
+                            "session_id":session_id, "usage_time":now, "date":"2026-09-25",
+                            "model_name":"DeepSeek", "credits_float":"0.050400",
+                            "ambiguous":false, "core_request_id":request_id,
+                            "core_key_id":"key_chat", "core_attribution_ambiguous":false
+                        }
+                    }
+                }
+            }
+        });
+        let cache_path = fixture.dir.join("data").join("usage_history.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, serde_json::to_vec(&usage_cache).unwrap()).unwrap();
+        let app = fixture.take_app();
+        let finalize = || Request::builder()
+            .method("POST")
+            .uri(format!("/internal/bridge/requests/{request_id}/billing/finalize-chat"))
+            .header("authorization", format!("Bearer {}", fixture.key))
+            .body(Body::empty())
+            .unwrap();
+        for _ in 0..2 {
+            let response = app.clone().oneshot(finalize()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(receipt["request_id"], request_id);
+            assert_eq!(receipt["status"], "final");
+            assert_eq!(receipt["actual_credits"], "0.050400");
+            assert_eq!(receipt["source_ref"], "trae-usage-session:session-chat-regular");
+            assert!(receipt["task_ref"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn regular_video_finalization_records_only_its_exact_session_credits() {
+        let mut fixture = BridgeFixture::new();
+        let request_id = "request-video-regular";
+        let account_ref = "uid-video";
+        let session_id = "session-video-regular";
+        super::super::bridge_billing::persist_core_request_attribution(
+            &fixture.dir, request_id, "key_video",
+        ).unwrap();
+        super::super::bridge_billing::persist_core_session_attempt(
+            &fixture.dir, request_id, account_ref, session_id,
+        ).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let usage_cache = serde_json::json!({
+            "fetched_at": now,
+            "accounts": {
+                account_ref: {
+                    "name":"测试账号", "last_fetch_end_ts":now, "daily":{},
+                    "session_usage": {
+                        session_id: {
+                            "session_id":session_id, "usage_time":now, "date":"2026-09-25",
+                            "model_name":"Seedance", "credits_float":"3.250000",
+                            "ambiguous":false, "core_request_id":request_id,
+                            "core_key_id":"key_video", "core_attribution_ambiguous":false
+                        }
+                    }
+                }
+            }
+        });
+        let cache_path = fixture.dir.join("data").join("usage_history.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, serde_json::to_vec(&usage_cache).unwrap()).unwrap();
+        let app = fixture.take_app();
+        let finalize = || Request::builder()
+            .method("POST")
+            .uri(format!("/internal/bridge/requests/{request_id}/billing/finalize"))
+            .header("authorization", format!("Bearer {}", fixture.key))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"task_ref":"video-task-regular"}"#))
+            .unwrap();
+        for _ in 0..2 {
+            let response = app.clone().oneshot(finalize()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(receipt["request_id"], request_id);
+            assert_eq!(receipt["status"], "final");
+            assert_eq!(receipt["actual_credits"], "3.250000");
+            assert_eq!(receipt["source_ref"], "trae-usage-session:session-video-regular");
+            assert_eq!(receipt["task_ref"], "video-task-regular");
+        }
+    }
+
+    #[tokio::test]
+    async fn regular_video_finalization_keeps_ambiguous_session_usage_unknown() {
+        let mut fixture = BridgeFixture::new();
+        let request_id = "request-video-ambiguous";
+        let account_ref = "uid-video";
+        let session_id = "session-first";
+        super::super::bridge_billing::persist_core_request_attribution(
+            &fixture.dir, request_id, "key_video",
+        ).unwrap();
+        super::super::bridge_billing::persist_core_session_attempt(
+            &fixture.dir, request_id, account_ref, session_id,
+        ).unwrap();
+        super::super::bridge_billing::persist_core_session_attempt(
+            &fixture.dir, request_id, account_ref, "session-second",
+        ).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let usage_cache = serde_json::json!({
+            "fetched_at": now,
+            "accounts": {
+                account_ref: {
+                    "name":"测试账号", "last_fetch_end_ts":now, "daily":{},
+                    "session_usage": {
+                        session_id: {
+                            "session_id":session_id, "usage_time":now, "date":"2026-09-25",
+                            "model_name":"Seedance", "credits_float":"3.250000",
+                            "ambiguous":false, "core_request_id":request_id,
+                            "core_key_id":"key_video", "core_attribution_ambiguous":false
+                        }
+                    }
+                }
+            }
+        });
+        let cache_path = fixture.dir.join("data").join("usage_history.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, serde_json::to_vec(&usage_cache).unwrap()).unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/internal/bridge/requests/{request_id}/billing/finalize"))
+            .header("authorization", format!("Bearer {}", fixture.key))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"task_ref":"video-task-ambiguous"}"#))
+            .unwrap();
+        let response = fixture.take_app().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(receipt["status"], "unknown");
+        assert!(receipt["actual_credits"].is_null());
+    }
+
+    #[tokio::test]
     async fn one_shot_video_finalization_waits_for_then_records_exact_session_credits() {
         let mut fixture = BridgeFixture::new();
         let request_id = "request-one-shot-test";

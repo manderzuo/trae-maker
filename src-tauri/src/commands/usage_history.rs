@@ -219,8 +219,9 @@ fn fetch_account_usage(
 }
 
 /// Return actual credits from one exact, uniquely attributed upstream session.
-/// This is only a candidate; the caller must additionally verify the Core
-/// one-shot authorization and that the video task reached a terminal state.
+/// This is only a candidate; the caller must additionally verify the unique
+/// authenticated Core request/session association. For video, the Core
+/// caller must also verify that its task reached a terminal state.
 pub(crate) fn core_usage_receipt_candidate(
     data_dir: &std::path::Path,
     account_ref: &str,
