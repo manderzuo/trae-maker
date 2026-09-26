@@ -812,6 +812,81 @@ mod tests {
         worker.join().unwrap();
     }
 
+    #[test]
+    fn scheduler_retries_a_failed_initial_pending_loader_without_restarting_workers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = BridgeFixture::new();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fake_now = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let clock_now = fake_now.clone();
+        let clock = move || *clock_now.lock().unwrap();
+
+        let (wait_requested_tx, wait_requested_rx) = std::sync::mpsc::channel();
+        let (advance_tx, advance_rx) = std::sync::mpsc::channel::<std::time::Duration>();
+        let advance_rx = Arc::new(std::sync::Mutex::new(advance_rx));
+        let waiter_now = fake_now.clone();
+        let waiter = move |requested: std::time::Duration| {
+            wait_requested_tx.send(requested).unwrap();
+            let advance = advance_rx.lock().unwrap().recv().unwrap();
+            let mut now = waiter_now.lock().unwrap();
+            *now = *now + advance;
+        };
+
+        let (first_failure_tx, first_failure_rx) = std::sync::mpsc::channel();
+        let (recovered_tx, recovered_rx) = std::sync::mpsc::channel();
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+        let loader_call_count = loader_calls.clone();
+        let pending_loader = move || {
+            if loader_call_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                first_failure_tx.send(()).unwrap();
+                Err("injected temporary pending-index failure".into())
+            } else {
+                recovered_tx.send(()).unwrap();
+                Ok(vec![("uid-recovered".to_string(), 42000)])
+            }
+        };
+        let (processed_tx, processed_rx) = std::sync::mpsc::channel();
+        let scheduler = super::super::usage_refresh::start_with_timing(
+            fixture.state.clone(),
+            stop.clone(),
+            pending_loader,
+            move |item| {
+                processed_tx.send(item.account_ref.clone()).unwrap();
+                false
+            },
+            clock,
+            waiter,
+        )
+        .unwrap()
+        .expect("four workers and their supervisor should start");
+
+        first_failure_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        for _ in 0..8 {
+            let requested = wait_requested_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert!(requested <= std::time::Duration::from_millis(250));
+            advance_tx.send(requested).unwrap();
+        }
+        recovered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            processed_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            "uid-recovered"
+        );
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 2);
+
+        stop.store(true, Ordering::Release);
+        let _ = advance_tx.send(std::time::Duration::ZERO);
+        scheduler.join().unwrap();
+    }
+
     #[tokio::test]
     async fn authenticated_bridge_can_sync_and_read_redacted_core_key_usage() {
         let mut fixture = BridgeFixture::new();

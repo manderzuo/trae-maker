@@ -105,6 +105,9 @@ struct CachedSessionUsage {
     core_attribution_ambiguous: bool,
 }
 
+type CoreUsageSessionMatches =
+    HashMap<(String, String), crate::api_server::bridge_billing::CoreUsageSessionMatch>;
+
 pub(crate) struct CoreUsageReceiptCandidate {
     pub session_id: String,
     pub credits: CreditAmount,
@@ -450,12 +453,38 @@ fn refresh_pending_core_usage_with_stop_and_clock<C, F>(
     credentials: &[(String, String, String)],
     clock: C,
     stop: &std::sync::atomic::AtomicBool,
-    mut fetch: F,
+    fetch: F,
 ) -> Result<usize, String>
 where
     C: Fn() -> i64,
     F: FnMut(&str, &str, i64, i64, &std::sync::atomic::AtomicBool)
         -> Result<FetchedAccountUsage, String>,
+{
+    refresh_pending_core_usage_with_stop_and_clock_and_matcher(
+        data_dir,
+        pending_accounts,
+        credentials,
+        clock,
+        stop,
+        fetch,
+        crate::api_server::bridge_billing::match_core_usage_sessions,
+    )
+}
+
+fn refresh_pending_core_usage_with_stop_and_clock_and_matcher<C, F, M>(
+    data_dir: &std::path::Path,
+    pending_accounts: &[(String, i64)],
+    credentials: &[(String, String, String)],
+    clock: C,
+    stop: &std::sync::atomic::AtomicBool,
+    mut fetch: F,
+    matcher: M,
+) -> Result<usize, String>
+where
+    C: Fn() -> i64,
+    F: FnMut(&str, &str, i64, i64, &std::sync::atomic::AtomicBool)
+        -> Result<FetchedAccountUsage, String>,
+    M: Fn(&std::path::Path, &[(String, String)]) -> Result<CoreUsageSessionMatches, String>,
 {
     if pending_accounts.is_empty() {
         return Ok(0);
@@ -481,7 +510,7 @@ where
         let floor_date = local_date_of(poll_floor).unwrap_or_default();
         let attempt_date = local_date_of(attempt_at_ms.div_euclid(1000)).unwrap_or_else(|| floor_date.clone());
         let cache_path = data_dir.join("data").join("usage_history.json");
-        let cached_date = {
+        let (cached_date, mut attribution_session_ids) = {
             let _cache_guard = usage_cache_merge_lock()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -492,8 +521,14 @@ where
                     continue;
                 }
             };
-            let cached_end = cache.accounts.get(uid).and_then(|account| account.last_fetch_end_ts);
-            cached_end.and_then(local_date_of)
+            let account = cache.accounts.get(uid);
+            let cached_date = account
+                .and_then(|account| account.last_fetch_end_ts)
+                .and_then(local_date_of);
+            let session_ids = account
+                .map(|account| account.session_usage.keys().cloned().collect::<HashSet<_>>())
+                .unwrap_or_default();
+            (cached_date, session_ids)
         };
         let requested_date = cached_date.map_or(attempt_date.clone(), |date| date.min(attempt_date));
         let start_date = requested_date.max(floor_date.clone());
@@ -510,6 +545,17 @@ where
                 }
                 let completed_at_ts = clock();
                 let end_date = local_date_of(query_end_ts).unwrap_or_else(|| start_date.clone());
+                attribution_session_ids.extend(fetched.sessions.keys().cloned());
+                let attribution_pairs: Vec<(String, String)> = attribution_session_ids.into_iter()
+                    .map(|session_id| (uid.clone(), session_id))
+                    .collect();
+                let attribution = if attribution_pairs.is_empty() {
+                    None
+                } else {
+                    matcher(data_dir, &attribution_pairs)
+                        .ok()
+                        .map(|matches| (attribution_pairs, matches))
+                };
                 let _cache_guard = usage_cache_merge_lock()
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -534,7 +580,9 @@ where
                     completed_at_ts,
                     fetched,
                 );
-                let _ = annotate_core_usage_candidates(data_dir, &mut cache, Some(&HashSet::from([uid.clone()])));
+                if let Some((pairs, matches)) = attribution {
+                    apply_core_usage_matches(&mut cache, &pairs, &matches);
+                }
                 if let Some(parent) = cache_path.parent() {
                     if std::fs::create_dir_all(parent).is_err() {
                         failed = true;
@@ -833,11 +881,36 @@ fn refresh_manual_account_with_clock<C, F>(
     name: &str,
     jwt: &str,
     clock: C,
-    mut fetch: F,
+    fetch: F,
 ) -> Result<(), String>
 where
     C: Fn() -> i64,
     F: FnMut(&str, i64, i64) -> Result<FetchedAccountUsage, String>,
+{
+    refresh_manual_account_with_clock_and_matcher(
+        data_dir,
+        uid,
+        name,
+        jwt,
+        clock,
+        fetch,
+        crate::api_server::bridge_billing::match_core_usage_sessions,
+    )
+}
+
+fn refresh_manual_account_with_clock_and_matcher<C, F, M>(
+    data_dir: &std::path::Path,
+    uid: &str,
+    name: &str,
+    jwt: &str,
+    clock: C,
+    mut fetch: F,
+    matcher: M,
+) -> Result<(), String>
+where
+    C: Fn() -> i64,
+    F: FnMut(&str, i64, i64) -> Result<FetchedAccountUsage, String>,
+    M: Fn(&std::path::Path, &[(String, String)]) -> Result<CoreUsageSessionMatches, String>,
 {
     let account_lock = account_refresh_lock(data_dir, uid);
     let _account_guard = account_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -845,28 +918,38 @@ where
     // poll. Capture its time and cache window only after taking the account lock.
     let now_ts = clock();
     let cache_path = data_dir.join("data").join("usage_history.json");
-    let (start_ts, start_date, full_sync) = {
+    let (start_ts, start_date, full_sync, mut attribution_session_ids) = {
         let _cache_guard = usage_cache_merge_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let cache = read_usage_cache_for_merge(&cache_path)?;
         let account = cache.accounts.get(uid);
         let full_sync = account.and_then(|account| account.manual_full_sync_at).is_none();
+        let session_ids = account
+            .map(|account| account.session_usage.keys().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
         if full_sync {
             let start = now_ts - FULL_PULL_DAYS * 86400;
-            (start, local_date_of(start).unwrap_or_default(), true)
+            (start, local_date_of(start).unwrap_or_default(), true, session_ids)
         } else {
             match account.and_then(|account| account.last_fetch_end_ts) {
                 Some(last_end) => {
-                    let date = local_date_of(last_end)
-                        .or_else(|| local_date_of(now_ts))
-                        .unwrap_or_default();
+                    let date = match (local_date_of(last_end), local_date_of(now_ts)) {
+                        // Background polls may query five minutes ahead. If
+                        // that crosses midnight, a manual refresh before
+                        // midnight must still cover the current day instead
+                        // of producing a start later than its end.
+                        (Some(last_date), Some(now_date)) if last_date > now_date => now_date,
+                        (Some(last_date), _) => last_date,
+                        (_, Some(now_date)) => now_date,
+                        _ => String::new(),
+                    };
                     let start = local_midnight_ts(&date).unwrap_or(now_ts - 86400);
-                    (start, date, false)
+                    (start, date, false, session_ids)
                 }
                 None => {
                     let start = now_ts - FULL_PULL_DAYS * 86400;
-                    (start, local_date_of(start).unwrap_or_default(), true)
+                    (start, local_date_of(start).unwrap_or_default(), true, session_ids)
                 }
             }
         }
@@ -875,6 +958,17 @@ where
     let fetched = fetch(jwt, start_ts, query_end_ts)?;
     let completed_at_ts = clock();
     let end_date = local_date_of(query_end_ts).unwrap_or_else(|| start_date.clone());
+    attribution_session_ids.extend(fetched.sessions.keys().cloned());
+    let attribution_pairs: Vec<(String, String)> = attribution_session_ids.into_iter()
+        .map(|session_id| (uid.to_string(), session_id))
+        .collect();
+    let attribution = if attribution_pairs.is_empty() {
+        None
+    } else {
+        matcher(data_dir, &attribution_pairs)
+            .ok()
+            .map(|matches| (attribution_pairs, matches))
+    };
 
     let _cache_guard = usage_cache_merge_lock()
         .lock()
@@ -897,7 +991,9 @@ where
             account.manual_full_sync_at.unwrap_or(i64::MIN).max(completed_at_ts),
         );
     }
-    let _ = annotate_core_usage_candidates(data_dir, &mut cache, Some(&HashSet::from([uid.to_string()])));
+    if let Some((pairs, matches)) = attribution {
+        apply_core_usage_matches(&mut cache, &pairs, &matches);
+    }
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|_| "usage history cache directory unavailable".to_string())?;
@@ -1246,6 +1342,103 @@ mod tests {
     }
 
     #[test]
+    fn slow_core_attribution_does_not_block_another_accounts_cache_merge() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-slow-usage-attribution-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let now_ts = chrono::Local::now().timestamp();
+        let (matcher_started_tx, matcher_started_rx) = std::sync::mpsc::channel();
+        let (release_matcher_tx, release_matcher_rx) = std::sync::mpsc::channel();
+        let (account_b_attempting_tx, account_b_attempting_rx) = std::sync::mpsc::channel();
+        let (account_b_done_tx, account_b_done_rx) = std::sync::mpsc::channel();
+
+        let account_a = {
+            let data_dir = data_dir.clone();
+            std::thread::spawn(move || {
+                let stop = std::sync::atomic::AtomicBool::new(false);
+                refresh_pending_core_usage_with_stop_and_clock_and_matcher(
+                    &data_dir,
+                    &[("uid-a".to_string(), now_ts * 1000)],
+                    &[("uid-a".to_string(), "A".to_string(), "fixture-jwt".to_string())],
+                    || now_ts,
+                    &stop,
+                    |_, _, _, _, _| {
+                        let mut fetched = FetchedAccountUsage::default();
+                        fetched.sessions.insert(
+                            "session-a".to_string(),
+                            CachedSessionUsage {
+                                session_id: "session-a".to_string(),
+                                usage_time: now_ts,
+                                date: local_date_of(now_ts).unwrap(),
+                                model_name: "fixture-model".to_string(),
+                                credits_float: Some("1.000000".to_string()),
+                                ..Default::default()
+                            },
+                        );
+                        Ok(fetched)
+                    },
+                    move |_, pairs| {
+                        assert_eq!(pairs, &[("uid-a".to_string(), "session-a".to_string())]);
+                        matcher_started_tx.send(()).unwrap();
+                        release_matcher_rx.recv().unwrap();
+                        Ok(HashMap::new())
+                    },
+                )
+            })
+        };
+        matcher_started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+
+        let account_b = {
+            let data_dir = data_dir.clone();
+            std::thread::spawn(move || {
+                let stop = std::sync::atomic::AtomicBool::new(false);
+                account_b_attempting_tx.send(()).unwrap();
+                let result = refresh_pending_core_usage_with_stop_and_clock_and_matcher(
+                    &data_dir,
+                    &[("uid-b".to_string(), now_ts * 1000)],
+                    &[("uid-b".to_string(), "B".to_string(), "fixture-jwt".to_string())],
+                    || now_ts,
+                    &stop,
+                    |_, _, _, _, _| Ok(FetchedAccountUsage::default()),
+                    |_, _| Ok(HashMap::new()),
+                );
+                account_b_done_tx.send(result).unwrap();
+            })
+        };
+        account_b_attempting_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let completed_while_attribution_blocked = account_b_done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .ok();
+        let completed_before_release = completed_while_attribution_blocked.is_some();
+
+        release_matcher_tx.send(()).unwrap();
+        assert_eq!(account_a.join().unwrap().unwrap(), 1);
+        let account_b_result = match completed_while_attribution_blocked {
+            Some(result) => result,
+            None => account_b_done_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+        };
+        assert_eq!(account_b_result.unwrap(), 1);
+        account_b.join().unwrap();
+
+        let cache: CacheFile = crate::fs_utils::read_json(
+            &data_dir.join("data").join("usage_history.json"),
+        );
+        assert!(cache.accounts.contains_key("uid-a"));
+        assert!(cache.accounts.contains_key("uid-b"));
+        let _ = std::fs::remove_dir_all(data_dir);
+        assert!(
+            completed_before_release,
+            "another account must merge while the first account's injected attribution lookup is blocked"
+        );
+    }
+
+    #[test]
     fn overlapping_pending_refreshes_for_one_account_are_serialized() {
         let data_dir = std::env::temp_dir().join(format!(
             "aiwork-same-account-usage-test-{}-{}",
@@ -1464,6 +1657,53 @@ mod tests {
             "first manual refresh after a background cache must request the full year");
         let cache: CacheFile = crate::fs_utils::read_json(&data_dir.join("data").join("usage_history.json"));
         assert!(cache.accounts["uid-a"].manual_full_sync_at.is_some());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn manual_increment_after_background_crosses_midnight_covers_current_day() {
+        use std::cell::Cell;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-manual-midnight-window-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let today = chrono::Local::now().date_naive();
+        let today_start = local_midnight_ts(&today.format("%Y-%m-%d").to_string()).unwrap();
+        let tomorrow = today.succ_opt().unwrap();
+        let tomorrow_start = local_midnight_ts(&tomorrow.format("%Y-%m-%d").to_string()).unwrap();
+        let background_now = tomorrow_start - 2 * 60;
+        let background_query_end = background_now + 5 * 60;
+        let manual_now = background_now + 60;
+
+        let cache_path = data_dir.join("data").join("usage_history.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        let mut cache = CacheFile::default();
+        let account = cache.accounts.entry("uid-a".into()).or_default();
+        account.last_fetch_end_ts = Some(background_query_end);
+        account.manual_full_sync_at = Some(background_now);
+        crate::fs_utils::write_json(&cache_path, &cache).unwrap();
+
+        let observed_window = Cell::new(None);
+        refresh_manual_account_with_clock(
+            &data_dir,
+            "uid-a",
+            "A",
+            "jwt",
+            || manual_now,
+            |_, start_ts, end_ts| {
+                observed_window.set(Some((start_ts, end_ts)));
+                Ok(FetchedAccountUsage::default())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed_window.get(),
+            Some((today_start, manual_now)),
+            "a 23:59 manual refresh after a 23:58 background query must fetch today's elapsed window, not a reversed next-day range"
+        );
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -1936,11 +2176,30 @@ fn parse_session_usage_row(value: &Value) -> Option<CachedSessionUsage> {
     })
 }
 
+#[cfg(test)]
 fn annotate_core_usage_candidates(
     data_dir: &std::path::Path,
     cache: &mut CacheFile,
     account_filter: Option<&HashSet<String>>,
 ) -> Result<(), String> {
+    annotate_core_usage_candidates_with_matcher(
+        data_dir,
+        cache,
+        account_filter,
+        &crate::api_server::bridge_billing::match_core_usage_sessions,
+    )
+}
+
+#[cfg(test)]
+fn annotate_core_usage_candidates_with_matcher<M>(
+    data_dir: &std::path::Path,
+    cache: &mut CacheFile,
+    account_filter: Option<&HashSet<String>>,
+    matcher: &M,
+) -> Result<(), String>
+where
+    M: Fn(&std::path::Path, &[(String, String)]) -> Result<CoreUsageSessionMatches, String>,
+{
     let pairs: Vec<(String, String)> = cache.accounts.iter()
         .filter(|(uid, _)| account_filter.map_or(true, |filter| filter.contains(*uid)))
         .flat_map(|(uid, account)| account.session_usage.keys()
@@ -1949,38 +2208,45 @@ fn annotate_core_usage_candidates(
     if pairs.is_empty() {
         return Ok(());
     }
-    let matches = crate::api_server::bridge_billing::match_core_usage_sessions(data_dir, &pairs)?;
-    for (uid, account) in &mut cache.accounts {
-        if account_filter.map_or(false, |filter| !filter.contains(uid)) {
+    let matches = matcher(data_dir, &pairs)?;
+    apply_core_usage_matches(cache, &pairs, &matches);
+    Ok(())
+}
+
+fn apply_core_usage_matches(
+    cache: &mut CacheFile,
+    pairs: &[(String, String)],
+    matches: &CoreUsageSessionMatches,
+) {
+    for (uid, session_id) in pairs {
+        let Some(session) = cache.accounts.get_mut(uid)
+            .and_then(|account| account.session_usage.get_mut(session_id)) else {
+            continue;
+        };
+        if session.ambiguous {
+            session.core_request_id = None;
+            session.core_key_id = None;
+            session.core_attribution_ambiguous = true;
             continue;
         }
-        for session in account.session_usage.values_mut() {
-            if session.ambiguous {
+        match matches.get(&(uid.clone(), session_id.clone())) {
+            Some(crate::api_server::bridge_billing::CoreUsageSessionMatch::Unique { request_id, core_key_id }) => {
+                session.core_request_id = Some(request_id.clone());
+                session.core_key_id = Some(core_key_id.clone());
+                session.core_attribution_ambiguous = false;
+            }
+            Some(crate::api_server::bridge_billing::CoreUsageSessionMatch::Ambiguous) => {
                 session.core_request_id = None;
                 session.core_key_id = None;
                 session.core_attribution_ambiguous = true;
-                continue;
             }
-            match matches.get(&(uid.clone(), session.session_id.clone())) {
-                Some(crate::api_server::bridge_billing::CoreUsageSessionMatch::Unique { request_id, core_key_id }) => {
-                    session.core_request_id = Some(request_id.clone());
-                    session.core_key_id = Some(core_key_id.clone());
-                    session.core_attribution_ambiguous = false;
-                }
-                Some(crate::api_server::bridge_billing::CoreUsageSessionMatch::Ambiguous) => {
-                    session.core_request_id = None;
-                    session.core_key_id = None;
-                    session.core_attribution_ambiguous = true;
-                }
-                None => {
-                    session.core_request_id = None;
-                    session.core_key_id = None;
-                    session.core_attribution_ambiguous = false;
-                }
+            None => {
+                session.core_request_id = None;
+                session.core_key_id = None;
+                session.core_attribution_ambiguous = false;
             }
         }
     }
-    Ok(())
 }
 
 fn merge_session_usage(

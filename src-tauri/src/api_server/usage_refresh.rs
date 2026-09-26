@@ -35,6 +35,55 @@ struct RefreshQueue {
     stop: Arc<AtomicBool>,
 }
 
+struct PendingDiscovery {
+    due_at: Option<Instant>,
+    failures: usize,
+}
+
+impl PendingDiscovery {
+    fn new(now: Instant) -> Self {
+        Self { due_at: Some(now), failures: 0 }
+    }
+
+    fn try_load_due<C>(
+        &mut self,
+        queue: &RefreshQueue,
+        loader: &PendingLoader,
+        now: Instant,
+        completion_clock: C,
+    ) -> Option<Result<(), String>>
+    where
+        C: Fn() -> Instant,
+    {
+        match self.due_at {
+            Some(due_at) if due_at <= now => {}
+            _ => return None,
+        }
+        self.due_at = None;
+        match loader() {
+            Ok(pending) => {
+                let completed_at = completion_clock();
+                if !queue.stop.load(Ordering::Acquire) {
+                    for (account_ref, attempt_at_ms) in pending {
+                        queue.enqueue(account_ref, attempt_at_ms, None);
+                    }
+                }
+                self.failures = 0;
+                self.due_at = Some(completed_at + Duration::from_secs(COMPENSATION_SECONDS));
+                Some(Ok(()))
+            }
+            Err(error) => {
+                let failed_at = completion_clock();
+                let delay = RETRY_SECONDS.get(self.failures).copied()
+                    .unwrap_or(COMPENSATION_SECONDS);
+                self.failures = self.failures.saturating_add(1);
+                self.due_at = Some(failed_at + Duration::from_secs(delay));
+                Some(Err(error))
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct WorkItem {
     pub(super) account_ref: String,
@@ -44,6 +93,8 @@ pub(super) struct WorkItem {
 
 type PendingLoader = dyn Fn() -> Result<Vec<(String, i64)>, String> + Send + Sync;
 type RefreshHandler = dyn Fn(&WorkItem) -> bool + Send + Sync;
+type SchedulerClock = dyn Fn() -> Instant + Send + Sync;
+type SchedulerWaiter = dyn Fn(Duration) + Send + Sync;
 type WorkerSpawner = dyn Fn(
         usize,
         Arc<RefreshQueue>,
@@ -58,6 +109,8 @@ struct SchedulerRequest {
     pending_loader: Arc<PendingLoader>,
     refresh: Arc<RefreshHandler>,
     worker_spawner: Arc<WorkerSpawner>,
+    clock: Arc<SchedulerClock>,
+    waiter: Arc<SchedulerWaiter>,
 }
 
 struct SchedulerRegistration {
@@ -236,13 +289,22 @@ fn start_inner(
     pending_loader: Arc<PendingLoader>,
     refresh: Arc<RefreshHandler>,
 ) -> Result<Option<JoinHandle<()>>, String> {
-    let worker_spawner: Arc<WorkerSpawner> = Arc::new(|worker_id, queue, refresh| {
+    start_inner_with_worker_spawner(
+        state,
+        stop,
+        pending_loader,
+        refresh,
+        default_worker_spawner(),
+    )
+}
+
+fn default_worker_spawner() -> Arc<WorkerSpawner> {
+    Arc::new(|worker_id, queue, refresh| {
         let name = format!("aiwork-core-usage-{worker_id}");
         std::thread::Builder::new().name(name).spawn(move || {
             run_worker(queue, move |item| refresh(item));
         })
-    });
-    start_inner_with_worker_spawner(state, stop, pending_loader, refresh, worker_spawner)
+    })
 }
 
 fn start_inner_with_worker_spawner(
@@ -252,8 +314,36 @@ fn start_inner_with_worker_spawner(
     refresh: Arc<RefreshHandler>,
     worker_spawner: Arc<WorkerSpawner>,
 ) -> Result<Option<JoinHandle<()>>, String> {
+    start_inner_with_worker_spawner_and_timing(
+        state,
+        stop,
+        pending_loader,
+        refresh,
+        worker_spawner,
+        Arc::new(Instant::now),
+        Arc::new(std::thread::sleep),
+    )
+}
+
+fn start_inner_with_worker_spawner_and_timing(
+    state: Arc<ApiSharedState>,
+    stop: Arc<AtomicBool>,
+    pending_loader: Arc<PendingLoader>,
+    refresh: Arc<RefreshHandler>,
+    worker_spawner: Arc<WorkerSpawner>,
+    clock: Arc<SchedulerClock>,
+    waiter: Arc<SchedulerWaiter>,
+) -> Result<Option<JoinHandle<()>>, String> {
     let key = data_dir_key(&state.data_dir);
-    let request = SchedulerRequest { state, stop: stop.clone(), pending_loader, refresh, worker_spawner };
+    let request = SchedulerRequest {
+        state,
+        stop: stop.clone(),
+        pending_loader,
+        refresh,
+        worker_spawner,
+        clock,
+        waiter,
+    };
     let mut running = schedulers().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     running.retain(|_, registration| {
         registration.queue.strong_count() > 0
@@ -388,18 +478,31 @@ fn run_scheduler(
         if let Some(ready) = ready_tx.take() {
             let _ = ready.send(Ok(()));
         }
-        if !queue.stop.load(Ordering::Acquire) {
-            match (request.pending_loader)() {
-                Ok(pending) => {
-                    for (account_ref, attempt_at_ms) in pending {
-                        queue.enqueue(account_ref, attempt_at_ms, None);
-                    }
-                }
-                Err(_) => crate::fs_utils::app_log(
+        let mut discovery = PendingDiscovery::new((request.clock)());
+        while !queue.stop.load(Ordering::Acquire) {
+            if matches!(
+                discovery.try_load_due(
+                    &queue,
+                    request.pending_loader.as_ref(),
+                    (request.clock)(),
+                    || (request.clock)(),
+                ),
+                Some(Err(_))
+            ) {
+                crate::fs_utils::app_log(
                     &request.state.data_dir,
                     "Core 用量轮询失败：待核验请求索引不可用",
-                ),
+                );
             }
+            if queue.stop.load(Ordering::Acquire) {
+                break;
+            }
+            let now = (request.clock)();
+            let sleep_for = discovery.due_at
+                .map(|due_at| due_at.saturating_duration_since(now))
+                .unwrap_or(STOP_POLL)
+                .min(STOP_POLL);
+            (request.waiter)(sleep_for);
         }
         for worker in workers {
             let _ = worker.join();
@@ -530,6 +633,34 @@ where
 }
 
 #[cfg(test)]
+pub(super) fn start_with_timing<L, F, C, W>(
+    state: Arc<ApiSharedState>,
+    stop: Arc<AtomicBool>,
+    pending_loader: L,
+    refresh: F,
+    clock: C,
+    waiter: W,
+) -> Result<Option<JoinHandle<()>>, String>
+where
+    L: Fn() -> Result<Vec<(String, i64)>, String> + Send + Sync + 'static,
+    F: Fn(&WorkItem) -> bool + Send + Sync + 'static,
+    C: Fn() -> Instant + Send + Sync + 'static,
+    W: Fn(Duration) + Send + Sync + 'static,
+{
+    let pending_loader: Arc<PendingLoader> = Arc::new(pending_loader);
+    let refresh: Arc<RefreshHandler> = Arc::new(refresh);
+    start_inner_with_worker_spawner_and_timing(
+        state,
+        stop,
+        pending_loader,
+        refresh,
+        default_worker_spawner(),
+        Arc::new(clock),
+        Arc::new(waiter),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -547,6 +678,57 @@ mod tests {
         let item = queue.claim_ready(Instant::now()).expect("immediate first attempt");
         assert_eq!(item.account_ref, "uid-a");
         assert_eq!(item.generation, 1);
+    }
+
+    #[test]
+    fn pending_index_failure_recovers_and_processes_work_without_scheduler_restart() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let queue = Arc::new(RefreshQueue::new(stop.clone()));
+        let (worker_ready_tx, worker_ready_rx) = std::sync::mpsc::channel();
+        let (processed_tx, processed_rx) = std::sync::mpsc::channel();
+        let worker_queue = queue.clone();
+        let worker = std::thread::spawn(move || {
+            worker_ready_tx.send(()).unwrap();
+            run_worker(worker_queue, move |item| {
+                processed_tx.send(item.account_ref.clone()).unwrap();
+                false
+            });
+        });
+        worker_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let loader_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_call_count = loader_calls.clone();
+        let loader: Arc<PendingLoader> = Arc::new(move || {
+            if loader_call_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("injected temporary index failure".into())
+            } else {
+                Ok(vec![("uid-recovered".to_string(), 42000)])
+            }
+        });
+        let now = Instant::now();
+        let mut discovery = PendingDiscovery::new(now);
+        let first_load = discovery.try_load_due(&queue, loader.as_ref(), now, || now);
+        let retry_at = now + Duration::from_secs(2);
+        let recovered_load = discovery.try_load_due(
+            &queue,
+            loader.as_ref(),
+            retry_at,
+            || retry_at,
+        );
+        let processed = if matches!(recovered_load, Some(Ok(()))) {
+            processed_rx.recv_timeout(Duration::from_secs(2)).ok()
+        } else {
+            None
+        };
+
+        stop.store(true, Ordering::Release);
+        queue.wake_all();
+        worker.join().unwrap();
+
+        assert!(matches!(first_load, Some(Err(_))));
+        assert!(matches!(recovered_load, Some(Ok(()))), "the retry should discover pending work on the same scheduler state");
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(processed.as_deref(), Some("uid-recovered"));
     }
 
     #[test]
