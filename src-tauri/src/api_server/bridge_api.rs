@@ -2,7 +2,7 @@
 //! 这里刻意只返回能力目录、执行聚合和来源新鲜度，不暴露账号池行、UID、JWT、Cookie
 //! 或单账号积分；桥接 Key 由 auth middleware 在业务路由进入前校验。
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
@@ -401,8 +401,7 @@ pub struct FinalizeVideoBillingRequest {
 
 /// Core calls this only after it has observed a terminal video task state.
 /// Promote usage only from the unique session created for the authenticated
-/// Core request and Key; until the read-only poller sees the row,
-/// the response stays unknown and the Core reservation remains held.
+/// Core request and Key. A cache miss queues a background read and stays unknown.
 pub async fn finalize_video_billing(
     State(state): State<Arc<ApiSharedState>>,
     Path(request_id): Path<String>,
@@ -466,7 +465,10 @@ pub async fn finalize_video_billing(
         &core_key_id,
     ) {
         Ok(Some(candidate)) => candidate,
-        Ok(None) => return Json(super::bridge_billing::unknown_receipt(request_id)).into_response(),
+        Ok(None) => {
+            let _ = super::usage_refresh::request_refresh(state.clone(), &request_id);
+            return Json(super::bridge_billing::unknown_receipt(request_id)).into_response();
+        }
         Err(_) => return bridge_billing_unavailable(),
     };
     let receipt = super::bridge_billing::BillingReceipt {
@@ -533,48 +535,20 @@ pub async fn finalize_chat_billing(
             Json(serde_json::json!({"error":{"code":"billing_task_ref_conflict"}})),
         ).into_response();
     }
-    let (core_key_id, account_ref, session_id, associated_at_ms) = match session_lookup {
+    let (core_key_id, account_ref, session_id) = match session_lookup {
         super::bridge_billing::CoreBillingSessionLookup::Unique {
-            core_key_id, account_ref, session_id, associated_at_ms,
-        } => (core_key_id, account_ref, session_id, associated_at_ms),
+            core_key_id, account_ref, session_id, ..
+        } => (core_key_id, account_ref, session_id),
         _ => return Json(super::bridge_billing::unknown_receipt(request_id)).into_response(),
     };
-    let mut candidate = match crate::commands::usage_history::core_usage_receipt_candidate(
+    let candidate = match crate::commands::usage_history::core_usage_receipt_candidate(
         &state.data_dir, &account_ref, &session_id, &request_id, &core_key_id,
     ) {
         Ok(candidate) => candidate,
         Err(_) => return bridge_billing_unavailable(),
     };
     if candidate.is_none() {
-        let account_refs = HashSet::from([account_ref.clone()]);
-        let credentials = state.pool.usage_credentials_for(&account_refs);
-        if !credentials.is_empty() {
-            for attempt in 0..3 {
-                if attempt > 0 {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                let data_dir = state.data_dir.clone();
-                let pending = vec![(account_ref.clone(), associated_at_ms)];
-                let credentials = credentials.clone();
-                let refreshed = tokio::task::spawn_blocking(move || {
-                    crate::commands::usage_history::refresh_pending_core_usage(
-                        &data_dir, &pending, &credentials,
-                    )
-                }).await;
-                if !matches!(refreshed, Ok(Ok(_))) {
-                    break;
-                }
-                candidate = match crate::commands::usage_history::core_usage_receipt_candidate(
-                    &state.data_dir, &account_ref, &session_id, &request_id, &core_key_id,
-                ) {
-                    Ok(candidate) => candidate,
-                    Err(_) => return bridge_billing_unavailable(),
-                };
-                if candidate.is_some() {
-                    break;
-                }
-            }
-        }
+        let _ = super::usage_refresh::request_refresh(state.clone(), &request_id);
     }
     let Some(candidate) = candidate else {
         return Json(super::bridge_billing::unknown_receipt(request_id)).into_response();

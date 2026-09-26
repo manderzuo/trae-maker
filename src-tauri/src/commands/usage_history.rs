@@ -5,9 +5,10 @@
 //! 自然日聚合落盘 data/usage_history.json，供积分趋势图查询展示。
 //!
 //! 增量语义（避免重复计数）：
-//! - 首次拉取（无缓存）：全量拉取近一年（FULL_PULL_DAYS）；
-//! - 后续拉取（fresh=true）：从「上次拉取 end_time 所在本地日的 00:00」起重拉，
-//!   并**替换**缓存中该日期及之后的日聚合（当天多次拉取不叠加；更早的历史保持不动）；
+//! - 首次手动完整同步（包括已有后台短期缓存）：全量拉取近一年（FULL_PULL_DAYS）；
+//! - 后续拉取（fresh=true）：从「上次查询上界所在本地日的 00:00」起重拉；仅当查询起点
+//!   覆盖整日且查询上界不早于已成功上界时才替换日快照，同范围重查可纳入迟到账单；
+//!   更早的历史保持不动；
 //! - fresh=false：纯缓存读取，零网络。
 //!
 //! 请求形态（2026-09-13 代理日志实测）：
@@ -21,7 +22,7 @@ use chrono::TimeZone;
 use aiwork_core::CreditAmount;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tauri::State;
 
 use crate::state::AppState;
@@ -75,6 +76,9 @@ struct CachedAccount {
     name: String,
     /// 上次拉取的 end_time（Unix 秒）——增量起点 = 该时刻所在本地日的 00:00
     last_fetch_end_ts: Option<i64>,
+    /// Set only after a successful manual 365-day sync; absent in older caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual_full_sync_at: Option<i64>,
     daily: BTreeMap<String, UsageDayStat>,
     /// Per-session candidates retained internally for exact request attribution.
     /// This field is intentionally not included in `UsageHistoryAccount` responses.
@@ -123,6 +127,36 @@ fn cache_path(state: &AppState) -> std::path::PathBuf {
     state.data_dir.join("data").join("usage_history.json")
 }
 
+fn account_refresh_lock(data_dir: &std::path::Path, uid: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    type LockMap = HashMap<(std::path::PathBuf, String), std::sync::Weak<std::sync::Mutex<()>>>;
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<LockMap>> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let data_key = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let mut locks = locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let key = (data_key, uid.to_string());
+    if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    locks.insert(key, std::sync::Arc::downgrade(&lock));
+    lock
+}
+
+fn usage_cache_merge_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn read_usage_cache_for_merge(path: &std::path::Path) -> Result<CacheFile, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(CacheFile::default()),
+        Err(_) => return Err("usage history cache read failed".into()),
+    };
+    serde_json::from_slice(&bytes).map_err(|_| "usage history cache is invalid".into())
+}
+
 fn account_summary(name: String, uid: String, daily: &BTreeMap<String, UsageDayStat>) -> UsageHistoryAccount {
     // 防御：date 一律从映射键回填（旧缓存条目的 date 字段可能为空串）
     let daily = daily
@@ -158,6 +192,24 @@ fn local_midnight_ts(date: &str) -> Option<i64> {
         chrono::LocalResult::Ambiguous(dt, _) => Some(dt.timestamp()),
         chrono::LocalResult::None => None,
     }
+}
+
+/// A daily snapshot can replace an existing value only if this query starts at
+/// the local day's beginning and does not precede the successful query high-water.
+/// Equal bounds are allowed: a later serialized read may observe delayed upstream rows.
+fn query_can_replace_daily(
+    date: &str,
+    query_start_ts: i64,
+    query_end_ts: i64,
+    previous_query_end_ts: Option<i64>,
+) -> bool {
+    if previous_query_end_ts.is_some_and(|previous_end| query_end_ts < previous_end) {
+        return false;
+    }
+    let Some(day_start_ts) = local_midnight_ts(date) else {
+        return false;
+    };
+    query_start_ts <= day_start_ts
 }
 
 /// 官网控制台（Web 端）形态请求：对齐 2026-09-13 代理抓包的成功请求——
@@ -203,17 +255,81 @@ fn fetch_account_usage(
     end_ts: i64,
 ) -> Result<FetchedAccountUsage, String> {
     let agent = crate::commands::accounts::pay_status_agent();
+    fetch_account_usage_with_pages(start_ts, end_ts, || false, |start, end, page| {
+        web_usage_post(
+            &agent,
+            jwt,
+            json!({
+                "start_time": start,
+                "end_time": end,
+                "page_size": PAGE_SIZE,
+                "page_num": page,
+                "usage_type": [USAGE_TYPE],
+            }),
+        )
+    })
+}
 
+fn fetch_account_usage_with_stop(
+    jwt: &str,
+    start_ts: i64,
+    end_ts: i64,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<FetchedAccountUsage, String> {
+    let agent = crate::commands::accounts::pay_status_agent();
+    fetch_account_usage_with_pages(
+        start_ts,
+        end_ts,
+        || stop.load(std::sync::atomic::Ordering::Acquire),
+        |start, end, page| {
+            web_usage_post(
+                &agent,
+                jwt,
+                json!({
+                    "start_time": start,
+                    "end_time": end,
+                    "page_size": PAGE_SIZE,
+                    "page_num": page,
+                    "usage_type": [USAGE_TYPE],
+                }),
+            )
+        },
+    )
+}
+
+fn fetch_account_usage_with_pages<C, F>(
+    start_ts: i64,
+    end_ts: i64,
+    cancelled: C,
+    mut request_page: F,
+) -> Result<FetchedAccountUsage, String>
+where
+    C: Fn() -> bool,
+    F: FnMut(i64, i64, u32) -> Result<Value, String>,
+{
     let mut agg: BTreeMap<String, UsageDayStat> = BTreeMap::new();
     let mut sessions = BTreeMap::new();
     let mut chunk_end = end_ts;
     loop {
+        if cancelled() {
+            return Err("usage refresh cancelled".into());
+        }
         let chunk_start = (chunk_end - CHUNK_DAYS * 86400 + 1).max(start_ts);
-        fetch_chunk(&agent, jwt, chunk_start, chunk_end, &mut agg, &mut sessions)?;
+        fetch_chunk_with_pages(
+            chunk_start,
+            chunk_end,
+            &cancelled,
+            &mut request_page,
+            &mut agg,
+            &mut sessions,
+        )?;
         if chunk_start <= start_ts {
             break;
         }
         chunk_end = chunk_start - 1;
+    }
+    if cancelled() {
+        return Err("usage refresh cancelled".into());
     }
     Ok(FetchedAccountUsage { daily: agg, sessions })
 }
@@ -261,13 +377,30 @@ pub(crate) fn core_usage_receipt_candidate(
 /// Periodically refresh usage only for accounts that have an outstanding,
 /// uniquely attributable Core session attempt. This path never issues a
 /// generation request; it only calls the existing read-only usage-history API.
+#[allow(dead_code)] // Preserve the existing non-cancellable crate interface; background workers use the stop-aware sibling.
 pub(crate) fn refresh_pending_core_usage(
     data_dir: &std::path::Path,
     pending_accounts: &[(String, i64)],
     credentials: &[(String, String, String)],
 ) -> Result<usize, String> {
-    refresh_pending_core_usage_with(data_dir, pending_accounts, credentials, chrono::Local::now().timestamp(),
-        |_, jwt, start, end| fetch_account_usage(jwt, start, end))
+    let never_stop = std::sync::atomic::AtomicBool::new(false);
+    refresh_pending_core_usage_with_stop(data_dir, pending_accounts, credentials, &never_stop)
+}
+
+pub(crate) fn refresh_pending_core_usage_with_stop(
+    data_dir: &std::path::Path,
+    pending_accounts: &[(String, i64)],
+    credentials: &[(String, String, String)],
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<usize, String> {
+    refresh_pending_core_usage_with_stop_and_clock(
+        data_dir,
+        pending_accounts,
+        credentials,
+        || chrono::Local::now().timestamp(),
+        stop,
+        |_, jwt, start, end, stop| fetch_account_usage_with_stop(jwt, start, end, stop),
+    )
 }
 
 fn refresh_pending_core_usage_with<F>(
@@ -275,29 +408,93 @@ fn refresh_pending_core_usage_with<F>(
     pending_accounts: &[(String, i64)],
     credentials: &[(String, String, String)],
     now_ts: i64,
-    mut fetch: F,
+    fetch: F,
 ) -> Result<usize, String>
 where
     F: FnMut(&str, &str, i64, i64) -> Result<FetchedAccountUsage, String>,
 {
+    refresh_pending_core_usage_with_clock(
+        data_dir,
+        pending_accounts,
+        credentials,
+        || now_ts,
+        fetch,
+    )
+}
+
+fn refresh_pending_core_usage_with_clock<C, F>(
+    data_dir: &std::path::Path,
+    pending_accounts: &[(String, i64)],
+    credentials: &[(String, String, String)],
+    clock: C,
+    mut fetch: F,
+) -> Result<usize, String>
+where
+    C: Fn() -> i64,
+    F: FnMut(&str, &str, i64, i64) -> Result<FetchedAccountUsage, String>,
+{
+    let never_stop = std::sync::atomic::AtomicBool::new(false);
+    refresh_pending_core_usage_with_stop_and_clock(
+        data_dir,
+        pending_accounts,
+        credentials,
+        clock,
+        &never_stop,
+        |uid, jwt, start, end, _| fetch(uid, jwt, start, end),
+    )
+}
+
+fn refresh_pending_core_usage_with_stop_and_clock<C, F>(
+    data_dir: &std::path::Path,
+    pending_accounts: &[(String, i64)],
+    credentials: &[(String, String, String)],
+    clock: C,
+    stop: &std::sync::atomic::AtomicBool,
+    mut fetch: F,
+) -> Result<usize, String>
+where
+    C: Fn() -> i64,
+    F: FnMut(&str, &str, i64, i64, &std::sync::atomic::AtomicBool)
+        -> Result<FetchedAccountUsage, String>,
+{
     if pending_accounts.is_empty() {
         return Ok(0);
     }
-    let mut cache: CacheFile = crate::fs_utils::read_json(&data_dir.join("data").join("usage_history.json"));
-    let poll_floor = now_ts.saturating_sub(7 * 86400);
-    let floor_date = local_date_of(poll_floor).unwrap_or_default();
     let mut refreshed = 0usize;
     let mut failed = false;
-    let mut refreshed_uids = HashSet::new();
 
     for (uid, attempt_at_ms) in pending_accounts {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("pending Core usage refresh stopped".into());
+        }
         let Some((_, name, jwt)) = credentials.iter().find(|(account_uid, _, jwt)| account_uid == uid && !jwt.trim().is_empty()) else {
             continue;
         };
+        let account_lock = account_refresh_lock(data_dir, uid);
+        let _account_guard = account_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("pending Core usage refresh stopped".into());
+        }
+        // Capture the read window only after acquiring the per-account lock.
+        let now_ts = clock();
+        let poll_floor = now_ts.saturating_sub(7 * 86400);
+        let floor_date = local_date_of(poll_floor).unwrap_or_default();
         let attempt_date = local_date_of(attempt_at_ms.div_euclid(1000)).unwrap_or_else(|| floor_date.clone());
-        let cached_date = cache.accounts.get(uid)
-            .and_then(|account| account.last_fetch_end_ts)
-            .and_then(local_date_of);
+        let cache_path = data_dir.join("data").join("usage_history.json");
+        let cached_date = {
+            let _cache_guard = usage_cache_merge_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cache = match read_usage_cache_for_merge(&cache_path) {
+                Ok(cache) => cache,
+                Err(_) => {
+                    failed = true;
+                    continue;
+                }
+            };
+            let cached_end = cache.accounts.get(uid).and_then(|account| account.last_fetch_end_ts);
+            cached_end.and_then(local_date_of)
+        };
         let requested_date = cached_date.map_or(attempt_date.clone(), |date| date.min(attempt_date));
         let start_date = requested_date.max(floor_date.clone());
         let start_ts = local_midnight_ts(&start_date).unwrap_or(poll_floor);
@@ -305,40 +502,116 @@ where
         // The local Windows clock may lag the upstream clock by several minutes.
         // Only widen this read-only query window; attribution still requires an
         // exact Core request, key, account and upstream session match.
-        match fetch(uid, jwt, start_ts, now_ts.saturating_add(5 * 60)) {
+        let query_end_ts = now_ts.saturating_add(5 * 60);
+        match fetch(uid, jwt, start_ts, query_end_ts, stop) {
             Ok(fetched) => {
-                let entry = cache.accounts.entry(uid.clone()).or_default();
-                entry.name = name.clone();
-                entry.daily.retain(|date, _| date < &start_date);
-                entry.session_usage.retain(|_, session| session.date < start_date);
-                for (date, stat) in fetched.daily {
-                    entry.daily.insert(date, stat);
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err("pending Core usage refresh stopped".into());
                 }
-                for (_, session) in fetched.sessions {
-                    merge_session_usage(&mut entry.session_usage, session);
+                let completed_at_ts = clock();
+                let end_date = local_date_of(query_end_ts).unwrap_or_else(|| start_date.clone());
+                let _cache_guard = usage_cache_merge_lock()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err("pending Core usage refresh stopped".into());
                 }
-                entry.last_fetch_end_ts = Some(now_ts);
-                refreshed += 1;
-                refreshed_uids.insert(uid.clone());
+                let mut cache = match read_usage_cache_for_merge(&cache_path) {
+                    Ok(cache) => cache,
+                    Err(_) => {
+                        failed = true;
+                        continue;
+                    }
+                };
+                merge_fetched_account(
+                    &mut cache,
+                    uid,
+                    name,
+                    &start_date,
+                    &end_date,
+                    start_ts,
+                    query_end_ts,
+                    completed_at_ts,
+                    fetched,
+                );
+                let _ = annotate_core_usage_candidates(data_dir, &mut cache, Some(&HashSet::from([uid.clone()])));
+                if let Some(parent) = cache_path.parent() {
+                    if std::fs::create_dir_all(parent).is_err() {
+                        failed = true;
+                        continue;
+                    }
+                }
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err("pending Core usage refresh stopped".into());
+                }
+                match crate::fs_utils::write_json(&cache_path, &cache) {
+                    Ok(()) => refreshed += 1,
+                    Err(_) => failed = true,
+                }
+            }
+            Err(_) if stop.load(std::sync::atomic::Ordering::Acquire) => {
+                return Err("pending Core usage refresh stopped".into());
             }
             Err(_) => failed = true,
         }
     }
 
-    if refreshed > 0 {
-        let _ = annotate_core_usage_candidates(data_dir, &mut cache, Some(&refreshed_uids));
-        cache.fetched_at = Some(now_ts);
-        let path = data_dir.join("data").join("usage_history.json");
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|_| "usage history cache directory unavailable".to_string())?;
-        }
-        crate::fs_utils::write_json(&path, &cache)
-            .map_err(|_| "usage history cache write failed".to_string())?;
+    if stop.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("pending Core usage refresh stopped".into());
     }
     if failed && refreshed == 0 {
         return Err("pending Core usage source query failed".into());
     }
     Ok(refreshed)
+}
+
+fn merge_fetched_account(
+    cache: &mut CacheFile,
+    uid: &str,
+    name: &str,
+    start_date: &str,
+    end_date: &str,
+    query_start_ts: i64,
+    query_end_ts: i64,
+    completed_at_ts: i64,
+    fetched: FetchedAccountUsage,
+) {
+    let entry = cache.accounts.entry(uid.to_string()).or_default();
+    entry.name = name.to_string();
+    let previous_query_end_ts = entry.last_fetch_end_ts;
+    entry.daily.retain(|date, _| {
+        date.as_str() < start_date
+            || date.as_str() > end_date
+            || !query_can_replace_daily(
+                date,
+                query_start_ts,
+                query_end_ts,
+                previous_query_end_ts,
+            )
+    });
+    for (date, mut stat) in fetched.daily {
+        if date.as_str() >= start_date
+            && date.as_str() <= end_date
+            && !query_can_replace_daily(
+                &date,
+                query_start_ts,
+                query_end_ts,
+                previous_query_end_ts,
+            )
+            && entry.daily.contains_key(&date)
+        {
+            continue;
+        }
+        stat.date = date.clone();
+        entry.daily.insert(date, stat);
+    }
+    // Session rows are evidence, not a replaceable aggregate snapshot. Keep
+    // rows absent from this response and let merge_session_usage mark conflicts.
+    for (_, session) in fetched.sessions {
+        merge_session_usage(&mut entry.session_usage, session);
+    }
+    entry.last_fetch_end_ts = Some(entry.last_fetch_end_ts.unwrap_or(i64::MIN).max(query_end_ts));
+    cache.fetched_at = Some(cache.fetched_at.unwrap_or(i64::MIN).max(completed_at_ts));
 }
 
 fn ingest_usage_row(
@@ -383,28 +656,28 @@ fn ingest_usage_row(
     }
 }
 
-/// 单分块（≤30 天）分页拉取并聚合进 agg
-fn fetch_chunk(
-    agent: &ureq::Agent,
-    jwt: &str,
+/// 单分块（≤30 天）分页拉取并聚合进 agg；每次实际 HTTP 发起前检查停止信号。
+fn fetch_chunk_with_pages<C, F>(
     start_ts: i64,
     end_ts: i64,
+    cancelled: &C,
+    request_page: &mut F,
     agg: &mut BTreeMap<String, UsageDayStat>,
     sessions: &mut BTreeMap<String, CachedSessionUsage>,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    C: Fn() -> bool,
+    F: FnMut(i64, i64, u32) -> Result<Value, String>,
+{
     let mut page: u32 = 1;
     let mut got: usize = 0;
     let mut total: Option<usize> = None;
 
     loop {
-        let body = json!({
-            "start_time": start_ts,
-            "end_time": end_ts,
-            "page_size": PAGE_SIZE,
-            "page_num": page,
-            "usage_type": [USAGE_TYPE],
-        });
-        let resp = web_usage_post(agent, jwt, body)?;
+        if cancelled() {
+            return Err("usage refresh cancelled".into());
+        }
+        let resp = request_page(start_ts, end_ts, page)?;
         if total.is_none() {
             total = Some(resp.get("total").and_then(Value::as_u64).unwrap_or(0) as usize);
         }
@@ -440,9 +713,13 @@ pub fn usage_history_fetch(
     fresh: Option<bool>,
 ) -> Result<UsageHistoryResult, String> {
     let fresh = fresh.unwrap_or(false);
-    let now_ts = chrono::Local::now().timestamp();
     let accounts = crate::vault::load_accounts(&state);
-    let mut cache: CacheFile = crate::fs_utils::read_json(&cache_path(&state));
+    let mut cache: CacheFile = {
+        let _cache_guard = usage_cache_merge_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::fs_utils::read_json(&cache_path(&state))
+    };
 
     // 纯缓存读取（零网络；尚未拉取过的账号如实提示）
     if !fresh {
@@ -469,8 +746,8 @@ pub fn usage_history_fetch(
         });
     }
 
-    // 增量拉取：无缓存账号全量近一年；已有账号从上次拉取日 00:00 重拉并替换该日及之后
-    let full_start = now_ts - FULL_PULL_DAYS * 86400;
+    // Refresh each account through the same account guard and write-time cache
+    // merge used by the background Core poller.
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
     for a in &accounts.accounts {
         let Some(uid) = a.user_id.clone().filter(|u| !u.is_empty()) else {
@@ -481,50 +758,24 @@ pub fn usage_history_fetch(
             // 占位账号（无 JWT）：保留既有缓存，不发起请求
             continue;
         }
-        let (start_ts, refetch_from) =
-            match cache.accounts.get(&uid).and_then(|c| c.last_fetch_end_ts) {
-                Some(last_end) => {
-                    let from_date = local_date_of(last_end)
-                        .or_else(|| local_date_of(now_ts))
-                        .unwrap_or_default();
-                    let midnight = local_midnight_ts(&from_date).unwrap_or(now_ts - 86400);
-                    (midnight, from_date)
-                }
-                None => (full_start, String::new()),
-            };
-        match fetch_account_usage(&a.jwt, start_ts, now_ts) {
-            Ok(new_agg) => {
-                let entry = cache.accounts.entry(uid.clone()).or_default();
-                entry.name = name;
-                if refetch_from.is_empty() {
-                    // 全量：整体替换
-                    entry.daily = new_agg.daily;
-                    entry.session_usage = new_agg.sessions;
-                } else {
-                    // 增量：替换 refetch_from 及之后的日聚合（当天多次拉取不叠加）
-                    entry
-                        .daily
-                        .retain(|d, _| d.as_str() < refetch_from.as_str());
-                    entry.session_usage.retain(|_, session| session.date < refetch_from);
-                    for (d, v) in new_agg.daily {
-                        entry.daily.insert(d, v);
-                    }
-                    for (_, session) in new_agg.sessions {
-                        merge_session_usage(&mut entry.session_usage, session);
-                    }
-                }
-                entry.last_fetch_end_ts = Some(now_ts);
-            }
-            Err(e) => {
-                // 拉取失败：保留旧缓存，错误在结果中注明
-                errors.insert(uid, e);
-            }
+        if let Err(error) = refresh_manual_account_with(
+            &state.data_dir,
+            &uid,
+            &name,
+            &a.jwt,
+            fetch_account_usage,
+        ) {
+            // 拉取失败：保留旧缓存，错误在结果中注明
+            errors.insert(uid, error);
         }
     }
 
-    cache.fetched_at = Some(now_ts);
-    let _ = annotate_core_usage_candidates(&state.data_dir, &mut cache, None);
-    let _ = crate::fs_utils::write_json(&cache_path(&state), &cache);
+    cache = {
+        let _cache_guard = usage_cache_merge_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::fs_utils::read_json(&cache_path(&state))
+    };
 
     let mut out = Vec::new();
     for a in &accounts.accounts {
@@ -550,10 +801,109 @@ pub fn usage_history_fetch(
         }
     }
     Ok(UsageHistoryResult {
-        fetched_at: now_ts,
+        fetched_at: cache.fetched_at.unwrap_or(0),
         cached: false,
         accounts: out,
     })
+}
+
+fn refresh_manual_account_with<F>(
+    data_dir: &std::path::Path,
+    uid: &str,
+    name: &str,
+    jwt: &str,
+    fetch: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, i64, i64) -> Result<FetchedAccountUsage, String>,
+{
+    refresh_manual_account_with_clock(
+        data_dir,
+        uid,
+        name,
+        jwt,
+        || chrono::Local::now().timestamp(),
+        fetch,
+    )
+}
+
+fn refresh_manual_account_with_clock<C, F>(
+    data_dir: &std::path::Path,
+    uid: &str,
+    name: &str,
+    jwt: &str,
+    clock: C,
+    mut fetch: F,
+) -> Result<(), String>
+where
+    C: Fn() -> i64,
+    F: FnMut(&str, i64, i64) -> Result<FetchedAccountUsage, String>,
+{
+    let account_lock = account_refresh_lock(data_dir, uid);
+    let _account_guard = account_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A queued refresh may have waited behind the same account's background
+    // poll. Capture its time and cache window only after taking the account lock.
+    let now_ts = clock();
+    let cache_path = data_dir.join("data").join("usage_history.json");
+    let (start_ts, start_date, full_sync) = {
+        let _cache_guard = usage_cache_merge_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = read_usage_cache_for_merge(&cache_path)?;
+        let account = cache.accounts.get(uid);
+        let full_sync = account.and_then(|account| account.manual_full_sync_at).is_none();
+        if full_sync {
+            let start = now_ts - FULL_PULL_DAYS * 86400;
+            (start, local_date_of(start).unwrap_or_default(), true)
+        } else {
+            match account.and_then(|account| account.last_fetch_end_ts) {
+                Some(last_end) => {
+                    let date = local_date_of(last_end)
+                        .or_else(|| local_date_of(now_ts))
+                        .unwrap_or_default();
+                    let start = local_midnight_ts(&date).unwrap_or(now_ts - 86400);
+                    (start, date, false)
+                }
+                None => {
+                    let start = now_ts - FULL_PULL_DAYS * 86400;
+                    (start, local_date_of(start).unwrap_or_default(), true)
+                }
+            }
+        }
+    };
+    let query_end_ts = now_ts;
+    let fetched = fetch(jwt, start_ts, query_end_ts)?;
+    let completed_at_ts = clock();
+    let end_date = local_date_of(query_end_ts).unwrap_or_else(|| start_date.clone());
+
+    let _cache_guard = usage_cache_merge_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cache = read_usage_cache_for_merge(&cache_path)?;
+    merge_fetched_account(
+        &mut cache,
+        uid,
+        name,
+        &start_date,
+        &end_date,
+        start_ts,
+        query_end_ts,
+        completed_at_ts,
+        fetched,
+    );
+    if full_sync {
+        let account = cache.accounts.get_mut(uid).expect("merged account exists");
+        account.manual_full_sync_at = Some(
+            account.manual_full_sync_at.unwrap_or(i64::MIN).max(completed_at_ts),
+        );
+    }
+    let _ = annotate_core_usage_candidates(data_dir, &mut cache, Some(&HashSet::from([uid.to_string()])));
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|_| "usage history cache directory unavailable".to_string())?;
+    }
+    crate::fs_utils::write_json(&cache_path, &cache)
+        .map_err(|_| "usage history cache write failed".to_string())
 }
 
 #[cfg(test)]
@@ -772,6 +1122,680 @@ mod tests {
         ).unwrap();
         assert_eq!(result, 0);
         assert!(!data_dir.join("data").join("usage_history.json").exists());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn stopping_after_first_usage_page_skips_later_http_and_preserves_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-cancel-usage-pagination-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let now_ts = chrono::Local::now().timestamp();
+        let date = local_date_of(now_ts).unwrap();
+        let cache_path = data_dir.join("data").join("usage_history.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        let mut cached = CacheFile::default();
+        cached.fetched_at = Some(now_ts - 100);
+        let account = cached.accounts.entry("uid-a".into()).or_default();
+        account.last_fetch_end_ts = Some(now_ts - 100);
+        account.daily.insert(date.clone(), UsageDayStat {
+            date, credits: 7.0, sessions: 1, ..Default::default()
+        });
+        crate::fs_utils::write_json(&cache_path, &cached).unwrap();
+        let original_bytes = std::fs::read(&cache_path).unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (page_started_tx, page_started_rx) = std::sync::mpsc::channel();
+        let (release_page_tx, release_page_rx) = std::sync::mpsc::channel();
+        let page_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let worker_stop = stop.clone();
+        let worker_calls = page_calls.clone();
+        let worker_dir = data_dir.clone();
+        let worker = std::thread::spawn(move || {
+            refresh_pending_core_usage_with_stop_and_clock(
+                &worker_dir,
+                &[("uid-a".to_string(), now_ts * 1000)],
+                &[("uid-a".to_string(), "A".to_string(), "fixture-jwt".to_string())],
+                || now_ts,
+                &worker_stop,
+                |_, _, start_ts, end_ts, stop| {
+                    fetch_account_usage_with_pages(
+                        start_ts,
+                        end_ts,
+                        || stop.load(Ordering::Acquire),
+                        |_, _, page| {
+                            assert_eq!(page, 1, "no second page request may start after stop");
+                            worker_calls.fetch_add(1, Ordering::SeqCst);
+                            page_started_tx.send(()).unwrap();
+                            release_page_rx.recv().unwrap();
+                            let rows = (0..PAGE_SIZE).map(|index| json!({
+                                "session_id": format!("partial-session-{index}"),
+                                "usage_time": now_ts,
+                                "credits_float": "1.000000",
+                                "model_name": "fixture-model",
+                            })).collect::<Vec<_>>();
+                            Ok(json!({
+                                "total": PAGE_SIZE * 2,
+                                "user_usage_group_by_sessions": rows,
+                            }))
+                        },
+                    )
+                },
+            )
+        });
+
+        page_started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        stop.store(true, Ordering::Release);
+        release_page_tx.send(()).unwrap();
+        let result = worker.join().unwrap();
+
+        assert!(result.is_err(), "an interrupted multi-page window is not successful");
+        assert_eq!(page_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&cache_path).unwrap(), original_bytes,
+            "partial first-page evidence must not replace the prior cache");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn concurrent_pending_refreshes_merge_the_latest_cache_instead_of_overwriting_other_accounts() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-concurrent-usage-merge-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let fetch_barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let now_ts = chrono::Local::now().timestamp();
+        let mut workers = Vec::new();
+
+        for uid in ["uid-a", "uid-b"] {
+            let data_dir = data_dir.clone();
+            let fetch_barrier = fetch_barrier.clone();
+            let uid = uid.to_string();
+            workers.push(std::thread::spawn(move || {
+                let pending = vec![(uid.clone(), now_ts * 1000)];
+                let credentials = vec![(uid.clone(), uid.clone(), "fixture-jwt".to_string())];
+                refresh_pending_core_usage_with(
+                    &data_dir,
+                    &pending,
+                    &credentials,
+                    now_ts,
+                    |_, _, _, _| {
+                        // Both calls have already read the same initial cache before
+                        // either fetch can complete.
+                        fetch_barrier.wait();
+                        Ok(FetchedAccountUsage::default())
+                    },
+                )
+                .unwrap()
+            }));
+        }
+
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), 1);
+        }
+        let cache: CacheFile = crate::fs_utils::read_json(
+            &data_dir.join("data").join("usage_history.json"),
+        );
+        assert!(cache.accounts.contains_key("uid-a"));
+        assert!(cache.accounts.contains_key("uid-b"));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn overlapping_pending_refreshes_for_one_account_are_serialized() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-same-account-usage-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let now_ts = chrono::Local::now().timestamp();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+
+        let first = {
+            let data_dir = data_dir.clone();
+            let active = active.clone();
+            let maximum = maximum.clone();
+            let entered_tx = entered_tx.clone();
+            let release_rx = release_rx.clone();
+            std::thread::spawn(move || {
+                let pending = vec![("uid-a".to_string(), now_ts * 1000)];
+                let credentials = vec![("uid-a".to_string(), "A".to_string(), "jwt".to_string())];
+                refresh_pending_core_usage_with(
+                    &data_dir,
+                    &pending,
+                    &credentials,
+                    now_ts,
+                    |_, _, _, _| {
+                        let current = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                        entered_tx.send(()).unwrap();
+                        release_rx.lock().unwrap().recv().unwrap();
+                        active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(FetchedAccountUsage::default())
+                    },
+                )
+            })
+        };
+        entered_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let second = {
+            let data_dir = data_dir.clone();
+            let active = active.clone();
+            let maximum = maximum.clone();
+            let entered_tx = entered_tx.clone();
+            std::thread::spawn(move || {
+                second_started_tx.send(()).unwrap();
+                let pending = vec![("uid-a".to_string(), now_ts * 1000)];
+                let credentials = vec![("uid-a".to_string(), "A".to_string(), "jwt".to_string())];
+                refresh_pending_core_usage_with(
+                    &data_dir,
+                    &pending,
+                    &credentials,
+                    now_ts,
+                    |_, _, _, _| {
+                        let current = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                        entered_tx.send(()).unwrap();
+                        active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(FetchedAccountUsage::default())
+                    },
+                )
+            })
+        };
+        second_started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let entered_before_release = entered_rx
+            .recv_timeout(std::time::Duration::from_millis(150))
+            .is_ok();
+        release_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+
+        assert!(!entered_before_release, "same-account network reads must not overlap");
+        assert_eq!(maximum.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn conflicting_rows_for_an_existing_session_remain_ambiguous_after_refresh() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-session-conflict-usage-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let now_ts = chrono::Local::now().timestamp();
+        let date = local_date_of(now_ts).unwrap();
+        let session_id = "session-conflict";
+        let mut cache = CacheFile::default();
+        cache.accounts.entry("uid-a".into()).or_default().session_usage.insert(
+            session_id.into(),
+            CachedSessionUsage {
+                session_id: session_id.into(),
+                usage_time: now_ts,
+                date: date.clone(),
+                model_name: "Seedance".into(),
+                credits_float: Some("1.000000".into()),
+                ambiguous: false,
+                core_request_id: None,
+                core_key_id: None,
+                core_attribution_ambiguous: false,
+            },
+        );
+        let cache_path = data_dir.join("data").join("usage_history.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        crate::fs_utils::write_json(&cache_path, &cache).unwrap();
+
+        let pending = vec![("uid-a".to_string(), now_ts * 1000)];
+        let credentials = vec![("uid-a".to_string(), "A".to_string(), "jwt".to_string())];
+        refresh_pending_core_usage_with(
+            &data_dir,
+            &pending,
+            &credentials,
+            now_ts,
+            |_, _, _, _| {
+                let mut fetched = FetchedAccountUsage::default();
+                fetched.sessions.insert(session_id.into(), CachedSessionUsage {
+                    session_id: session_id.into(),
+                    usage_time: now_ts,
+                    date: date.clone(),
+                    model_name: "Seedance".into(),
+                    credits_float: Some("2.000000".into()),
+                    ambiguous: false,
+                    core_request_id: None,
+                    core_key_id: None,
+                    core_attribution_ambiguous: false,
+                });
+                Ok(fetched)
+            },
+        ).unwrap();
+
+        let cache: CacheFile = crate::fs_utils::read_json(&cache_path);
+        assert!(cache.accounts["uid-a"].session_usage[session_id].ambiguous);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn all_failed_pending_refreshes_preserve_the_previous_success_timestamp() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-failed-usage-timestamp-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let cache_path = data_dir.join("data").join("usage_history.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        let mut cache = CacheFile::default();
+        cache.fetched_at = Some(1234);
+        crate::fs_utils::write_json(&cache_path, &cache).unwrap();
+
+        let now_ts = chrono::Local::now().timestamp();
+        let pending = vec![("uid-a".to_string(), now_ts * 1000)];
+        let credentials = vec![("uid-a".to_string(), "A".to_string(), "jwt".to_string())];
+        let result = refresh_pending_core_usage_with(
+            &data_dir,
+            &pending,
+            &credentials,
+            now_ts,
+            |_, _, _, _| Err("fixture source unavailable".into()),
+        );
+
+        assert!(result.is_err());
+        let cache: CacheFile = crate::fs_utils::read_json(&cache_path);
+        assert_eq!(cache.fetched_at, Some(1234));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn manual_first_full_window_waits_for_background_refresh_and_still_covers_one_year() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-manual-full-after-background-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let now_ts = chrono::Local::now().timestamp();
+        let (background_started_tx, background_started_rx) = std::sync::mpsc::channel();
+        let (release_background_tx, release_background_rx) = std::sync::mpsc::channel();
+        let background_dir = data_dir.clone();
+        let background = std::thread::spawn(move || {
+            refresh_pending_core_usage_with(
+                &background_dir,
+                &[("uid-a".to_string(), now_ts * 1000)],
+                &[("uid-a".to_string(), "A".to_string(), "jwt".to_string())],
+                now_ts,
+                |_, _, _, _| {
+                    background_started_tx.send(()).unwrap();
+                    release_background_rx.recv().unwrap();
+                    Ok(FetchedAccountUsage::default())
+                },
+            ).unwrap()
+        });
+        background_started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+        let (manual_started_tx, manual_started_rx) = std::sync::mpsc::channel();
+        let (manual_start_tx, manual_start_rx) = std::sync::mpsc::channel();
+        let manual_dir = data_dir.clone();
+        let manual = std::thread::spawn(move || {
+            manual_started_tx.send(()).unwrap();
+            refresh_manual_account_with(
+                &manual_dir,
+                "uid-a",
+                "A",
+                "jwt",
+                |_, start_ts, _| {
+                    manual_start_tx.send(start_ts).unwrap();
+                    Ok(FetchedAccountUsage::default())
+                },
+            ).unwrap()
+        });
+        manual_started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        release_background_tx.send(()).unwrap();
+        background.join().unwrap();
+        let manual_start_ts = manual_start_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        manual.join().unwrap();
+
+        assert!(now_ts - manual_start_ts >= 364 * 86400,
+            "first manual refresh after a background cache must request the full year");
+        let cache: CacheFile = crate::fs_utils::read_json(&data_dir.join("data").join("usage_history.json"));
+        assert!(cache.accounts["uid-a"].manual_full_sync_at.is_some());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn late_old_background_refresh_preserves_manual_history_and_success_times() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-manual-background-window-order-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let manual_started_at = chrono::Local::now().timestamp();
+        let stale_background_now = manual_started_at - 30 * 86400;
+        let (manual_fetch_started_tx, manual_fetch_started_rx) = std::sync::mpsc::channel();
+        let (manual_dates_tx, manual_dates_rx) = std::sync::mpsc::channel();
+        let (release_manual_tx, release_manual_rx) = std::sync::mpsc::channel();
+        let manual_dir = data_dir.clone();
+        let manual = std::thread::spawn(move || {
+            refresh_manual_account_with(
+                &manual_dir,
+                "uid-a",
+                "A",
+                "jwt",
+                move |_, start_ts, end_ts| {
+                    manual_fetch_started_tx.send(()).unwrap();
+                    release_manual_rx.recv().unwrap();
+                    let history_date = local_date_of(start_ts + 86400).unwrap();
+                    let current_date = local_date_of(end_ts).unwrap();
+                    manual_dates_tx.send((history_date.clone(), current_date.clone())).unwrap();
+                    let mut fetched = FetchedAccountUsage::default();
+                    for (date, credits) in [(history_date, 1.0), (current_date, 2.0)] {
+                        fetched.daily.insert(date.clone(), UsageDayStat {
+                            date, credits, sessions: 1, ..Default::default()
+                        });
+                    }
+                    Ok(fetched)
+                },
+            ).unwrap()
+        });
+        manual_fetch_started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+        let (background_attempting_tx, background_attempting_rx) = std::sync::mpsc::channel();
+        let background_dir = data_dir.clone();
+        let background = std::thread::spawn(move || {
+            background_attempting_tx.send(()).unwrap();
+            refresh_pending_core_usage_with_clock(
+                &background_dir,
+                &[("uid-a".to_string(), stale_background_now * 1000)],
+                &[("uid-a".to_string(), "A".to_string(), "jwt".to_string())],
+                || stale_background_now,
+                |_, _, _, _| {
+                    let date = local_date_of(stale_background_now).unwrap();
+                    let mut fetched = FetchedAccountUsage::default();
+                    fetched.daily.insert(date.clone(), UsageDayStat {
+                        date, credits: 3.0, sessions: 1, ..Default::default()
+                    });
+                    Ok(fetched)
+                },
+            ).unwrap()
+        });
+        background_attempting_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        release_manual_tx.send(()).unwrap();
+        manual.join().unwrap();
+        background.join().unwrap();
+
+        let cache: CacheFile = crate::fs_utils::read_json(&data_dir.join("data").join("usage_history.json"));
+        let account = &cache.accounts["uid-a"];
+        let (history_date, current_date) = manual_dates_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let stale_date = local_date_of(stale_background_now).unwrap();
+        assert_eq!(account.daily[&current_date].credits, 2.0);
+        assert!(account.daily.contains_key(&history_date), "manual year history must survive the later short poll");
+        assert_eq!(account.daily[&stale_date].credits, 3.0);
+        assert!(account.last_fetch_end_ts.unwrap() >= manual_started_at);
+        assert!(cache.fetched_at.unwrap() >= manual_started_at);
+        assert!(account.manual_full_sync_at.is_some());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn older_refresh_preserves_days_after_its_query_end_and_never_moves_success_times_backwards() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-usage-monotonic-window-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let now_ts = chrono::Local::now().timestamp();
+        let now_date = local_date_of(now_ts).unwrap();
+        let future_date = local_date_of(now_ts + 2 * 86400).unwrap();
+        let later_success = now_ts + 2 * 86400;
+        let mut cache = CacheFile::default();
+        cache.fetched_at = Some(later_success);
+        let account = cache.accounts.entry("uid-a".into()).or_default();
+        account.last_fetch_end_ts = Some(later_success);
+        account.daily.insert(future_date.clone(), UsageDayStat {
+            date: future_date.clone(), credits: 9.0, sessions: 1,
+            ..Default::default()
+        });
+        let cache_path = data_dir.join("data").join("usage_history.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        crate::fs_utils::write_json(&cache_path, &cache).unwrap();
+
+        refresh_pending_core_usage_with(
+            &data_dir,
+            &[("uid-a".to_string(), now_ts * 1000)],
+            &[("uid-a".to_string(), "A".to_string(), "jwt".to_string())],
+            now_ts,
+            |_, _, _, _| {
+                let mut fetched = FetchedAccountUsage::default();
+                fetched.daily.insert(now_date.clone(), UsageDayStat {
+                    date: now_date.clone(), credits: 2.0, sessions: 1,
+                    ..Default::default()
+                });
+                Ok(fetched)
+            },
+        ).unwrap();
+
+        let merged: CacheFile = crate::fs_utils::read_json(&cache_path);
+        assert!(merged.accounts["uid-a"].daily.contains_key(&future_date));
+        assert_eq!(merged.accounts["uid-a"].last_fetch_end_ts, Some(later_success));
+        assert_eq!(merged.fetched_at, Some(later_success));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn query_end_timestamp_does_not_advance_to_completion_across_midnight() {
+        use std::cell::Cell;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-query-end-across-midnight-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let query_date = chrono::Local::now().date_naive().pred_opt().unwrap();
+        let current_day = query_date.succ_opt().unwrap();
+        let current_midnight = local_midnight_ts(&current_day.format("%Y-%m-%d").to_string()).unwrap();
+        let query_now = current_midnight - 20 * 60;
+        let query_end = query_now + 5 * 60;
+        let completed_at = current_midnight + 10 * 60;
+        assert_ne!(local_date_of(query_end), local_date_of(completed_at));
+        let calls = Cell::new(0);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+
+        refresh_pending_core_usage_with_stop_and_clock(
+            &data_dir,
+            &[("uid-a".to_string(), query_now * 1000)],
+            &[("uid-a".to_string(), "A".to_string(), "jwt".to_string())],
+            || {
+                if calls.replace(calls.get() + 1) == 0 { query_now } else { completed_at }
+            },
+            &stop,
+            |_, _, _, end_ts, _| {
+                assert_eq!(end_ts, query_end);
+                Ok(FetchedAccountUsage::default())
+            },
+        ).unwrap();
+
+        let cache: CacheFile = crate::fs_utils::read_json(
+            &data_dir.join("data").join("usage_history.json"),
+        );
+        assert_eq!(cache.accounts["uid-a"].last_fetch_end_ts, Some(query_end));
+        assert_eq!(cache.fetched_at, Some(completed_at));
+
+        let next_query_now = current_midnight + 3600;
+        let observed_start = Cell::new(None);
+        refresh_pending_core_usage_with_stop_and_clock(
+            &data_dir,
+            &[("uid-a".to_string(), next_query_now * 1000)],
+            &[("uid-a".to_string(), "A".to_string(), "jwt".to_string())],
+            || next_query_now,
+            &stop,
+            |_, _, start_ts, _, _| {
+                observed_start.set(Some(start_ts));
+                Ok(FetchedAccountUsage::default())
+            },
+        ).unwrap();
+        assert_eq!(observed_start.get().map(local_date_of).flatten(), local_date_of(query_end),
+            "the next range must use the query-end date, not the later completion date");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn earlier_manual_empty_result_preserves_same_day_data_seen_by_clock_ahead_background_query() {
+        use std::cell::Cell;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-same-day-clock-skew-merge-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let today = chrono::Local::now().date_naive();
+        let today_midnight = local_midnight_ts(&today.format("%Y-%m-%d").to_string()).unwrap();
+        let background_now = today_midnight + 12 * 3600;
+        let background_query_end = background_now + 5 * 60;
+        let background_completed_at = background_now + 30;
+        let manual_now = background_now + 60;
+        let manual_completed_at = background_now + 90;
+        let date = local_date_of(background_query_end).unwrap();
+        let fetched_date = date.clone();
+        let background_calls = Cell::new(0);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+
+        refresh_pending_core_usage_with_stop_and_clock(
+            &data_dir,
+            &[("uid-a".to_string(), background_now * 1000)],
+            &[("uid-a".to_string(), "A".to_string(), "jwt".to_string())],
+            || {
+                if background_calls.replace(background_calls.get() + 1) == 0 {
+                    background_now
+                } else {
+                    background_completed_at
+                }
+            },
+            &stop,
+            move |_, _, _, end_ts, _| {
+                assert_eq!(end_ts, background_query_end);
+                let mut fetched = FetchedAccountUsage::default();
+                fetched.daily.insert(fetched_date.clone(), UsageDayStat {
+                    date: fetched_date.clone(), credits: 7.0, sessions: 1, ..Default::default()
+                });
+                Ok(fetched)
+            },
+        ).unwrap();
+
+        let manual_calls = Cell::new(0);
+        refresh_manual_account_with_clock(
+            &data_dir,
+            "uid-a",
+            "A",
+            "jwt",
+            || {
+                if manual_calls.replace(manual_calls.get() + 1) == 0 {
+                    manual_now
+                } else {
+                    manual_completed_at
+                }
+            },
+            |_, _, end_ts| {
+                assert_eq!(end_ts, manual_now);
+                Ok(FetchedAccountUsage::default())
+            },
+        ).unwrap();
+
+        let cache: CacheFile = crate::fs_utils::read_json(
+            &data_dir.join("data").join("usage_history.json"),
+        );
+        let account = &cache.accounts["uid-a"];
+        assert_eq!(account.daily[&date].credits, 7.0,
+            "an earlier empty partial-day query cannot erase data returned by a later query end");
+        assert_eq!(account.last_fetch_end_ts, Some(background_query_end));
+        assert_eq!(cache.fetched_at, Some(manual_completed_at));
+        assert!(account.manual_full_sync_at.is_some());
+
+        // Re-read the exact same query window after it has completed. The
+        // upstream may have delivered a late row without advancing its end bound.
+        let later_background_now = background_now;
+        let later_background_query_end = background_query_end;
+        let later_background_completed_at = background_now + 700;
+        let later_background_calls = Cell::new(0);
+        refresh_pending_core_usage_with_stop_and_clock(
+            &data_dir,
+            &[("uid-a".to_string(), later_background_now * 1000)],
+            &[("uid-a".to_string(), "A".to_string(), "jwt".to_string())],
+            || {
+                if later_background_calls.replace(later_background_calls.get() + 1) == 0 {
+                    later_background_now
+                } else {
+                    later_background_completed_at
+                }
+            },
+            &stop,
+            |_, _, _, end_ts, _| {
+                assert_eq!(end_ts, later_background_query_end);
+                let mut fetched = FetchedAccountUsage::default();
+                fetched.daily.insert(date.clone(), UsageDayStat {
+                    date: date.clone(), credits: 11.0, sessions: 2, ..Default::default()
+                });
+                fetched.sessions.insert("late-session".into(), CachedSessionUsage {
+                    session_id: "late-session".into(),
+                    usage_time: background_now + 100,
+                    date: date.clone(),
+                    model_name: "fixture-model".into(),
+                    credits_float: Some("4.000000".into()),
+                    ambiguous: false,
+                    core_request_id: None,
+                    core_key_id: None,
+                    core_attribution_ambiguous: false,
+                });
+                Ok(fetched)
+            },
+        ).unwrap();
+
+        let cache: CacheFile = crate::fs_utils::read_json(
+            &data_dir.join("data").join("usage_history.json"),
+        );
+        let account = &cache.accounts["uid-a"];
+        assert_eq!(account.daily[&date].credits, 11.0,
+            "a later same-window read must incorporate delayed upstream usage even at an equal query end");
+        assert_eq!(account.session_usage["late-session"].credits_float.as_deref(), Some("4.000000"),
+            "a later same-range response must merge newly arrived session evidence");
+        assert_eq!(account.last_fetch_end_ts, Some(later_background_query_end));
+        assert_eq!(cache.fetched_at, Some(later_background_completed_at));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn successful_fetch_does_not_replace_cache_corrupted_before_write_time_merge() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "aiwork-corrupt-usage-cache-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let cache_path = data_dir.join("data").join("usage_history.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        let original = b"{not-json";
+        crate::fs_utils::write_json(&cache_path, &CacheFile::default()).unwrap();
+        let fetch_called = std::sync::atomic::AtomicBool::new(false);
+        let now_ts = chrono::Local::now().timestamp();
+
+        let result = refresh_pending_core_usage_with(
+            &data_dir,
+            &[("uid-a".to_string(), now_ts * 1000)],
+            &[("uid-a".to_string(), "A".to_string(), "jwt".to_string())],
+            now_ts,
+            |_, _, _, _| {
+                fetch_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::fs::write(&cache_path, original).unwrap();
+                Ok(FetchedAccountUsage::default())
+            },
+        );
+
+        assert!(fetch_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(result.is_err(), "invalid write-time cache must stop the merge");
+        assert_eq!(std::fs::read(&cache_path).unwrap(), original);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

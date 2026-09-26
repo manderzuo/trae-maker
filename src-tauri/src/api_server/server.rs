@@ -75,7 +75,7 @@ pub async fn start_api_server(
     let app = build_router(state.clone());
     spawn_wb_health_probe(state.clone());
     let background_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_core_usage_reconciler(state.clone(), background_stop.clone());
+    super::usage_refresh::start(state.clone(), background_stop.clone());
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -93,51 +93,6 @@ pub async fn start_api_server(
         join_handle: Some(join_handle),
         background_stop,
     })
-}
-
-/// Poll linked Core usage sessions once per minute. The worker does nothing
-/// until an authenticated Core request has produced a persisted upstream
-/// account/session association, and then fetches only those accounts.
-fn spawn_core_usage_reconciler(
-    state: Arc<ApiSharedState>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-) {
-    let _ = std::thread::Builder::new()
-        .name("aiwork-core-usage-poll".into())
-        .spawn(move || loop {
-            for _ in 0..60 {
-                if stop.load(std::sync::atomic::Ordering::Acquire) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            if stop.load(std::sync::atomic::Ordering::Acquire) {
-                return;
-            }
-
-            let pending = match super::bridge_billing::pending_core_session_accounts_for_poll(&state.data_dir) {
-                Ok(pending) => pending,
-                Err(_) => {
-                    crate::fs_utils::app_log(&state.data_dir, "Core 用量轮询失败：待核验请求索引不可用");
-                    continue;
-                }
-            };
-            if pending.is_empty() {
-                continue;
-            }
-            let account_refs = pending.iter().map(|(uid, _)| uid.clone()).collect();
-            let credentials = state.pool.usage_credentials_for(&account_refs);
-            if credentials.is_empty() {
-                continue;
-            }
-            if crate::commands::usage_history::refresh_pending_core_usage(
-                &state.data_dir,
-                &pending,
-                &credentials,
-            ).is_err() {
-                crate::fs_utils::app_log(&state.data_dir, "Core 用量轮询失败：上游只读用量查询或本地缓存不可用");
-            }
-        });
 }
 
 fn build_router(state: Arc<ApiSharedState>) -> Router {
@@ -207,6 +162,7 @@ mod tests {
         app: Option<Router>,
         key: String,
         dir: PathBuf,
+        state: Arc<ApiSharedState>,
     }
 
     impl BridgeFixture {
@@ -258,9 +214,10 @@ mod tests {
                 wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             });
             Self {
-                app: Some(build_router(state)),
+                app: Some(build_router(state.clone())),
                 key: issued.plaintext,
                 dir,
+                state,
             }
         }
 
@@ -649,6 +606,210 @@ mod tests {
         assert_eq!(receipt["actual_credits"], "0.050400");
         assert_eq!(receipt["source_ref"], "trae-usage-session:session-chat");
         assert!(receipt["task_ref"].is_null());
+    }
+
+    #[tokio::test]
+    async fn chat_finalization_returns_unknown_while_the_background_refresh_is_blocked() {
+        let mut fixture = BridgeFixture::new();
+        let request_id = "request-chat-blocked-refresh";
+        super::super::bridge_billing::persist_core_request_attribution(
+            &fixture.dir, request_id, "key_chat",
+        ).unwrap();
+        super::super::bridge_billing::persist_core_session_attempt(
+            &fixture.dir, request_id, "uid-chat", "session-chat-blocked",
+        ).unwrap();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let release_first_rx = Arc::new(std::sync::Mutex::new(release_first_rx));
+        let (follow_up_tx, follow_up_rx) = std::sync::mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_calls = calls.clone();
+        let worker_release_rx = release_first_rx.clone();
+        let state = fixture.state.clone();
+        let data_dir = fixture.dir.clone();
+        let worker = super::super::usage_refresh::start_with(
+            state,
+            stop.clone(),
+            move || super::super::bridge_billing::pending_core_session_accounts_for_poll(&data_dir),
+            move |_| {
+                let call = worker_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    first_started_tx.send(()).unwrap();
+                    worker_release_rx.lock().unwrap().recv().unwrap();
+                } else {
+                    follow_up_tx.send(()).unwrap();
+                }
+                false
+            },
+        );
+        first_started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/internal/bridge/requests/{request_id}/billing/finalize-chat"))
+            .header("authorization", format!("Bearer {}", fixture.key))
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.take_app().oneshot(request),
+        ).await.expect("finalize must not wait for the blocked upstream fetch").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(receipt["status"], "unknown");
+        assert!(receipt["actual_credits"].is_null());
+
+        release_first_tx.send(()).unwrap();
+        follow_up_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn restart_during_stopping_fetch_hands_pending_work_to_one_bounded_successor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = BridgeFixture::new();
+        let old_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let new_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (old_started_tx, old_started_rx) = std::sync::mpsc::channel();
+        let (release_old_tx, release_old_rx) = std::sync::mpsc::channel();
+        let release_old_rx = Arc::new(std::sync::Mutex::new(release_old_rx));
+        let old_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let all_active = Arc::new(AtomicUsize::new(0));
+        let max_all_active = Arc::new(AtomicUsize::new(0));
+        let per_account = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, usize>::new()));
+        let max_per_account = Arc::new(AtomicUsize::new(0));
+
+        let old_state = fixture.state.clone();
+        let old_release = release_old_rx.clone();
+        let old_active = all_active.clone();
+        let old_max_active = max_all_active.clone();
+        let old_per_account = per_account.clone();
+        let old_max_per_account = max_per_account.clone();
+        let old_started_flag = old_started.clone();
+        let old_worker = super::super::usage_refresh::start_with_result(
+            old_state,
+            old_stop.clone(),
+            || Ok(vec![("uid-a".to_string(), 1000)]),
+            move |item| {
+                let active = old_active.fetch_add(1, Ordering::SeqCst) + 1;
+                old_max_active.fetch_max(active, Ordering::SeqCst);
+                let account_active = {
+                    let mut counts = old_per_account.lock().unwrap();
+                    let count = counts.entry(item.account_ref.clone()).or_default();
+                    *count += 1;
+                    *count
+                };
+                old_max_per_account.fetch_max(account_active, Ordering::SeqCst);
+                old_started_flag.store(true, Ordering::SeqCst);
+                old_started_tx.send(()).unwrap();
+                old_release.lock().unwrap().recv().unwrap();
+                *old_per_account.lock().unwrap().get_mut(&item.account_ref).unwrap() -= 1;
+                old_active.fetch_sub(1, Ordering::SeqCst);
+                true
+            },
+        ).unwrap().expect("first scheduler starts");
+        old_started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+        old_stop.store(true, Ordering::Release);
+        let (new_started_tx, new_started_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let new_gate = gate.clone();
+        let new_active = all_active.clone();
+        let new_max_active = max_all_active.clone();
+        let new_per_account = per_account.clone();
+        let new_max_per_account = max_per_account.clone();
+        let state = fixture.state.clone();
+        let pending = (b'a'..=b'h')
+            .map(|suffix| (format!("uid-{}", suffix as char), 2000))
+            .collect::<Vec<_>>();
+        let deferred = super::super::usage_refresh::start_with_result(
+            state,
+            new_stop.clone(),
+            move || Ok(pending.clone()),
+            move |item| {
+                let active = new_active.fetch_add(1, Ordering::SeqCst) + 1;
+                new_max_active.fetch_max(active, Ordering::SeqCst);
+                let account_active = {
+                    let mut counts = new_per_account.lock().unwrap();
+                    let count = counts.entry(item.account_ref.clone()).or_default();
+                    *count += 1;
+                    *count
+                };
+                new_max_per_account.fetch_max(account_active, Ordering::SeqCst);
+                new_started_tx.send(item.account_ref.clone()).unwrap();
+                let (released, changed) = &*new_gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+                *new_per_account.lock().unwrap().get_mut(&item.account_ref).unwrap() -= 1;
+                new_active.fetch_sub(1, Ordering::SeqCst);
+                false
+            },
+        ).unwrap();
+
+        release_old_tx.send(()).unwrap();
+        let mut started = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for _ in 0..4 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { break; }
+            match new_started_rx.recv_timeout(remaining) {
+                Ok(account_ref) => started.push(account_ref),
+                Err(_) => break,
+            }
+        }
+        let fifth_started_while_four_blocked = new_started_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok();
+        {
+            let (released, changed) = &*gate;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        while started.len() < 8 {
+            match new_started_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(account_ref) => started.push(account_ref),
+                Err(_) => break,
+            }
+        }
+        new_stop.store(true, Ordering::Release);
+        old_worker.join().unwrap();
+
+        assert_eq!(started.len(), 8, "successor must discover and process every persisted pending account");
+        assert!(!fifth_started_while_four_blocked, "successor must not exceed four in-flight reads");
+        assert!(old_started.load(Ordering::SeqCst));
+        assert!(max_all_active.load(Ordering::SeqCst) <= 4);
+        assert_eq!(max_per_account.load(Ordering::SeqCst), 1, "old and successor reads for uid-a must not overlap");
+        assert!(deferred.is_none(), "restart during draining must be explicitly deferred to the existing supervisor");
+    }
+
+    #[test]
+    fn zero_worker_startup_reports_failure_and_releases_its_registry_entry() {
+        let fixture = BridgeFixture::new();
+        let failed = super::super::usage_refresh::start_with_no_workers(
+            fixture.state.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            || Ok(Vec::new()),
+            |_| false,
+        );
+        let error = failed.expect_err("a scheduler with no workers must not report successful startup");
+        assert!(error.contains("no background usage worker"));
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = super::super::usage_refresh::start_with_result(
+            fixture.state.clone(),
+            stop.clone(),
+            || Ok(Vec::new()),
+            |_| false,
+        ).unwrap().expect("failed startup must leave the registry available for a retry");
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        worker.join().unwrap();
     }
 
     #[tokio::test]

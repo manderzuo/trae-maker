@@ -30,6 +30,7 @@ pub mod trae_resource_upload;
 pub mod unified_catalog;
 pub mod upstream_observation;
 pub mod usage;
+pub(crate) mod usage_refresh;
 pub mod video;
 pub mod video_payload;
 pub mod video_store;
