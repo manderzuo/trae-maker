@@ -38,7 +38,21 @@ impl ApiServerHandle {
                 h.abort();
             }
         }
-        self.budget_runtime.take();
+        if let Some(runtime)=self.budget_runtime.take() {
+            // Tauri terminates the process immediately after its Exit callback.
+            // The HTTP task finishing does not mean the billing refresh workers
+            // have released their Arc. Give bounded reads time to drain so the
+            // last owner can persist a clean lease before process teardown.
+            // Never force a clean marker while a paid worker still owns it.
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(20);
+            while Arc::strong_count(&runtime)>1 && std::time::Instant::now()<deadline {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            if Arc::strong_count(&runtime)>1 {
+                eprintln!("[bridge-v2] shutdown drain timed out; retaining recovery marker and financial holds");
+            }
+            drop(runtime);
+        }
     }
 }
 
@@ -254,6 +268,31 @@ mod tests {
     }
 
     // ==================== P2 修复9：优雅停机轮询 ====================
+
+    #[cfg(windows)]
+    #[test]
+    fn stop_waits_for_background_lease_owner_before_desktop_exit() {
+        use super::super::{bridge_runtime::BridgeBudgetRuntime,bridge_billing::BridgeBillingStore,bridge_budget_lease::BridgeBudgetLease};
+        let fixture=BridgeFixture::new();
+        let runtime=BridgeBudgetRuntime::start(&fixture.dir).unwrap();
+        let worker_runtime=runtime.clone();
+        let worker_done=Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done=worker_done.clone();
+        let worker=std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            done.store(true,std::sync::atomic::Ordering::Release);
+            drop(worker_runtime);
+        });
+        let mut handle=ApiServerHandle {shutdown_tx:None,join_handle:None,background_stop:Arc::new(std::sync::atomic::AtomicBool::new(false)),budget_runtime:Some(runtime)};
+        handle.stop();
+        let drained=worker_done.load(std::sync::atomic::Ordering::Acquire);
+        worker.join().unwrap();
+        assert!(drained,"desktop process may exit immediately after stop returns; background owners must drain first");
+        let store=BridgeBillingStore::open(&fixture.dir).unwrap();
+        let lease=BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
+        assert!(lease.charge_ready(),"normal idle restart must not require manual financial recovery");
+        drop(lease);drop(store);
+    }
 
     #[cfg(windows)]
     #[tokio::test]
