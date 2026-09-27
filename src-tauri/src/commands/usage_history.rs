@@ -84,6 +84,20 @@ struct CachedAccount {
     /// This field is intentionally not included in `UsageHistoryAccount` responses.
     #[serde(default)]
     session_usage: BTreeMap<String, CachedSessionUsage>,
+    /// Actual source reads for each returned row, not account/global cache reads.
+    #[serde(default)]
+    session_observations: BTreeMap<String, SessionObservation>,
+}
+
+#[derive(serde::Serialize,serde::Deserialize,Clone,PartialEq,Eq)]
+struct SessionObservation {
+    read_started_at_ms:i64,
+    completed_at_ms:i64,
+    query_end_ms:i64,
+    #[serde(default)]
+    complete:bool,
+    #[serde(default)]
+    row:Option<CachedSessionUsage>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -124,10 +138,56 @@ struct CacheFile {
 struct FetchedAccountUsage {
     daily: BTreeMap<String, UsageDayStat>,
     sessions: BTreeMap<String, CachedSessionUsage>,
+    source_complete: bool,
 }
 
 fn cache_path(state: &AppState) -> std::path::PathBuf {
     state.data_dir.join("data").join("usage_history.json")
+}
+
+pub(crate) struct BudgetUsageReceiptEvidence {
+    pub session_id: String,
+    pub credits: CreditAmount,
+    pub read_started_at_ms: i64,
+    pub observed_at_ms: i64,
+    pub query_end_ms: i64,
+}
+
+#[derive(Clone,Debug,serde::Serialize,serde::Deserialize)]
+pub(crate) struct BudgetUsageSourceConflict {
+    pub source_ref:String,
+    pub evidence_hash:String,
+    pub observed_at_ms:i64,
+    pub reason:String,
+}
+pub(crate) fn budget_usage_source_conflict(data_dir:&std::path::Path,account_ref:&str,session_id:&str,finished_at_ms:i64)->Result<Option<BudgetUsageSourceConflict>,String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD,Engine};
+    let cache=read_usage_cache_for_merge(&data_dir.join("data").join("usage_history.json"))?;
+    let Some(account)=cache.accounts.get(account_ref) else {return Ok(None)};
+    let Some(source)=account.session_observations.get(session_id) else {return Ok(None)};
+    let Some(row)=source.row.as_ref() else {return Ok(None)};
+    if !source.complete || row.session_id!=session_id || !row.ambiguous || finished_at_ms<=0 || source.read_started_at_ms<finished_at_ms || source.completed_at_ms<source.read_started_at_ms {return Ok(None);}
+    let hash=URL_SAFE_NO_PAD.encode(aiwork_core::canonical_json_hash(&serde_json::json!({"account_ref":account_ref,"session_id":session_id,
+        "reason":"conflicting_source_rows","usage_time":row.usage_time,"model":row.model_name,"credits":row.credits_float})));
+    Ok(Some(BudgetUsageSourceConflict {source_ref:format!("trae-usage-session:{session_id}"),evidence_hash:hash,
+        observed_at_ms:source.completed_at_ms,reason:"conflicting_source_rows".into()}))
+}
+
+pub(crate) fn budget_usage_receipt_evidence(
+    data_dir: &std::path::Path, account_ref: &str, session_id: &str,
+    request_id: &str, core_key_id: &str, finished_at_ms: i64,
+) -> Result<Option<BudgetUsageReceiptEvidence>, String> {
+    let cache=read_usage_cache_for_merge(&data_dir.join("data").join("usage_history.json"))?;
+    let Some(account)=cache.accounts.get(account_ref) else {return Ok(None)};
+    let Some(source)=account.session_observations.get(session_id) else {return Ok(None)};
+    let Some(row)=source.row.as_ref() else {return Ok(None)};
+    if !source.complete || row.session_id!=session_id || finished_at_ms<=0 || source.read_started_at_ms<finished_at_ms || source.completed_at_ms<source.read_started_at_ms
+        || source.query_end_ms<finished_at_ms || row.usage_time<=0 || row.ambiguous || row.core_attribution_ambiguous
+        || row.core_request_id.as_deref()!=Some(request_id) || row.core_key_id.as_deref()!=Some(core_key_id) {return Ok(None);}
+    let Some(text)=row.credits_float.as_deref() else {return Ok(None)};
+    let Ok(credits)=CreditAmount::parse(text,"credits") else {return Ok(None)};
+    Ok(Some(BudgetUsageReceiptEvidence {session_id:row.session_id.clone(),credits,read_started_at_ms:source.read_started_at_ms,
+        observed_at_ms:source.completed_at_ms,query_end_ms:source.query_end_ms}))
 }
 
 fn account_refresh_lock(data_dir: &std::path::Path, uid: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
@@ -313,12 +373,13 @@ where
     let mut agg: BTreeMap<String, UsageDayStat> = BTreeMap::new();
     let mut sessions = BTreeMap::new();
     let mut chunk_end = end_ts;
+    let mut source_complete=true;
     loop {
         if cancelled() {
             return Err("usage refresh cancelled".into());
         }
         let chunk_start = (chunk_end - CHUNK_DAYS * 86400 + 1).max(start_ts);
-        fetch_chunk_with_pages(
+        source_complete &= fetch_chunk_with_pages(
             chunk_start,
             chunk_end,
             &cancelled,
@@ -334,7 +395,7 @@ where
     if cancelled() {
         return Err("usage refresh cancelled".into());
     }
-    Ok(FetchedAccountUsage { daily: agg, sessions })
+    Ok(FetchedAccountUsage { daily: agg, sessions, source_complete })
 }
 
 /// Return actual credits from one exact, uniquely attributed upstream session.
@@ -578,6 +639,7 @@ where
                     start_ts,
                     query_end_ts,
                     completed_at_ts,
+                    now_ts,
                     fetched,
                 );
                 if let Some((pairs, matches)) = attribution {
@@ -622,6 +684,7 @@ fn merge_fetched_account(
     query_start_ts: i64,
     query_end_ts: i64,
     completed_at_ts: i64,
+    read_started_at_ts: i64,
     fetched: FetchedAccountUsage,
 ) {
     let entry = cache.accounts.entry(uid.to_string()).or_default();
@@ -656,6 +719,13 @@ fn merge_fetched_account(
     // Session rows are evidence, not a replaceable aggregate snapshot. Keep
     // rows absent from this response and let merge_session_usage mark conflicts.
     for (_, session) in fetched.sessions {
+        if let (Some(started),Some(completed),Some(end))=(read_started_at_ts.checked_mul(1000),completed_at_ts.checked_mul(1000),query_end_ts.checked_mul(1000)) {
+            if fetched.source_complete && started>0 && completed>=started && end>=started {
+                let source=SessionObservation {read_started_at_ms:started,completed_at_ms:completed,query_end_ms:end,complete:true,row:Some(session.clone())};
+                let newer=entry.session_observations.get(&session.session_id).map_or(true,|old|started>=old.read_started_at_ms && completed>=old.completed_at_ms);
+                if newer {entry.session_observations.insert(session.session_id.clone(),source);}
+            }
+        }
         merge_session_usage(&mut entry.session_usage, session);
     }
     entry.last_fetch_end_ts = Some(entry.last_fetch_end_ts.unwrap_or(i64::MIN).max(query_end_ts));
@@ -712,7 +782,7 @@ fn fetch_chunk_with_pages<C, F>(
     request_page: &mut F,
     agg: &mut BTreeMap<String, UsageDayStat>,
     sessions: &mut BTreeMap<String, CachedSessionUsage>,
-) -> Result<(), String>
+) -> Result<bool, String>
 where
     C: Fn() -> bool,
     F: FnMut(i64, i64, u32) -> Result<Value, String>,
@@ -720,35 +790,36 @@ where
     let mut page: u32 = 1;
     let mut got: usize = 0;
     let mut total: Option<usize> = None;
+    let mut complete=true;
 
     loop {
         if cancelled() {
             return Err("usage refresh cancelled".into());
         }
         let resp = request_page(start_ts, end_ts, page)?;
-        if total.is_none() {
-            total = Some(resp.get("total").and_then(Value::as_u64).unwrap_or(0) as usize);
-        }
+        let page_total=resp.get("total").and_then(Value::as_u64).and_then(|value|usize::try_from(value).ok());
+        if page_total.is_none() || (total.is_some() && page_total!=total) {complete=false;}
+        if total.is_none() {total=page_total;}
+        if resp.get("user_usage_group_by_sessions").and_then(Value::as_array).is_none() {complete=false;}
         let arr = resp
             .get("user_usage_group_by_sessions")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
         if arr.is_empty() {
-            break;
+            return Ok(complete && total==Some(got));
         }
         for row in &arr {
             ingest_usage_row(row, agg, sessions);
         }
-        got += arr.len();
+        got=got.checked_add(arr.len()).ok_or("usage pagination count overflow")?;
         let total_n = total.unwrap_or(0);
         // 终止条件：已取满 total / 本页不满页大小（服务端截断页）/ 超过安全页数上限
         if got >= total_n || (arr.len() as u32) < PAGE_SIZE || page >= MAX_PAGES {
-            break;
+            return Ok(complete && total==Some(got));
         }
         page += 1;
     }
-    Ok(())
 }
 
 /// 拉取全部账号的积分消耗历史（按本地日聚合），落盘缓存供查询展示。
@@ -983,6 +1054,7 @@ where
         start_ts,
         query_end_ts,
         completed_at_ts,
+        now_ts,
         fetched,
     );
     if full_sync {
@@ -2132,6 +2204,87 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod budget_evidence_tests {
+    use super::*;
+    #[test]
+    fn old_cache_without_source_read_time_cannot_be_finalized_by_reading_it_now() {
+        let dir=std::env::temp_dir().join(format!("budget-evidence-{:032x}",rand::random::<u128>()));
+        let mut cache=CacheFile::default();
+        let mut row=parse_session_usage_row(&serde_json::json!({"session_id":"session","usage_time":1790000000,"model_name":"seedance","credits_float":"12.345678"})).unwrap();
+        row.core_request_id=Some("request".into());row.core_key_id=Some("key".into());
+        cache.accounts.entry("account".into()).or_default().session_usage.insert("session".into(),row);
+        let path=dir.join("data").join("usage_history.json");std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::fs_utils::write_json(&path,&cache).unwrap();
+        let result=budget_usage_receipt_evidence(&dir,"account","session","request","key",1790000001000).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(result.is_none(),"reading old cached evidence now is not a new post-execution source observation");
+    }
+    #[test]
+    fn row_observation_is_post_terminal_and_not_advanced_by_absent_row_refresh() {
+        let dir=std::env::temp_dir().join(format!("budget-source-row-{:032x}",rand::random::<u128>()));
+        let mut cache=CacheFile::default();
+        let mut row=parse_session_usage_row(&serde_json::json!({"session_id":"session","usage_time":1790000000,"model_name":"seedance","credits_float":"12.345678"})).unwrap();
+        row.core_request_id=Some("request".into());row.core_key_id=Some("key".into());
+        let fetched=|| {let mut value=FetchedAccountUsage::default();value.source_complete=true;value.sessions.insert("session".into(),row.clone());value};
+        let path=dir.join("data").join("usage_history.json");std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let finished=1790000001500_i64;
+        // Query upper bound may be five minutes ahead; it is not observation time.
+        merge_fetched_account(&mut cache,"account","A","2026-09-21","2026-09-21",1790000000,1790000300,1790000003,1790000000,fetched());
+        crate::fs_utils::write_json(&path,&cache).unwrap();
+        assert!(budget_usage_receipt_evidence(&dir,"account","session","request","key",finished).unwrap().is_none());
+        merge_fetched_account(&mut cache,"account","A","2026-09-21","2026-09-21",1790000000,1790000305,1790000006,1790000005,fetched());
+        crate::fs_utils::write_json(&path,&cache).unwrap();
+        let evidence=budget_usage_receipt_evidence(&dir,"account","session","request","key",finished).unwrap().unwrap();
+        assert_eq!(evidence.credits.to_string(),"12.345678");assert_eq!(evidence.read_started_at_ms,1790000005000);assert_eq!(evidence.observed_at_ms,1790000006000);
+        merge_fetched_account(&mut cache,"account","A","2026-09-21","2026-09-21",1790000000,1790000310,1790000011,1790000010,FetchedAccountUsage::default());
+        crate::fs_utils::write_json(&path,&cache).unwrap();
+        let replay=budget_usage_receipt_evidence(&dir,"account","session","request","key",finished).unwrap().unwrap();
+        assert_eq!(replay.observed_at_ms,evidence.observed_at_ms);
+        assert!(budget_usage_receipt_evidence(&dir,"account","session","request","key",1790000007000).unwrap().is_none());
+        assert!(budget_usage_receipt_evidence(&dir,"account","session","request","wrong-key",finished).unwrap().is_none());
+        cache.accounts.get_mut("account").unwrap().session_observations.get_mut("session").unwrap().row.as_mut().unwrap().session_id="different-session".into();
+        crate::fs_utils::write_json(&path,&cache).unwrap();
+        let mismatched=budget_usage_receipt_evidence(&dir,"account","session","request","key",finished).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(mismatched.is_none(),"map key is not proof of the source row session identity");
+    }
+    #[test]
+    fn completed_unique_observation_replaces_inflight_candidate_without_clearing_legacy_conflict() {
+        let dir=std::env::temp_dir().join(format!("budget-inflight-{:032x}",rand::random::<u128>()));let mut cache=CacheFile::default();
+        let fetched=|amount:&str| {let mut value=FetchedAccountUsage::default();value.source_complete=true;
+            let mut row=parse_session_usage_row(&serde_json::json!({"session_id":"session","usage_time":1790000000,"model_name":"seedance","credits_float":amount})).unwrap();
+            row.core_request_id=Some("request".into());row.core_key_id=Some("key".into());value.sessions.insert("session".into(),row);value};
+        merge_fetched_account(&mut cache,"account","A","2026-09-21","2026-09-21",1790000000,1790000300,1790000001,1790000000,fetched("0.01"));
+        merge_fetched_account(&mut cache,"account","A","2026-09-21","2026-09-21",1790000000,1790000305,1790000006,1790000005,fetched("0.08"));
+        assert!(cache.accounts["account"].session_usage["session"].ambiguous,"legacy audit evidence remains unchanged");
+        let path=dir.join("data").join("usage_history.json");std::fs::create_dir_all(path.parent().unwrap()).unwrap();crate::fs_utils::write_json(&path,&cache).unwrap();
+        let result=budget_usage_receipt_evidence(&dir,"account","session","request","key",1790000002000).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();assert_eq!(result.expect("post-terminal raw observation").credits.as_microcredits(),80_000);
+    }
+    #[test]
+    fn only_complete_pagination_is_eligible_as_billing_source() {
+        let row=serde_json::json!({"session_id":"session","usage_time":1790000000,"model_name":"seedance","credits_float":"1"});
+        for (response,expected) in [
+            (serde_json::json!({"total":1,"user_usage_group_by_sessions":[row.clone()]}),true),
+            (serde_json::json!({"user_usage_group_by_sessions":[row.clone()]}),false),
+            (serde_json::json!({"total":1}),false),
+            (serde_json::json!({"total":2,"user_usage_group_by_sessions":[row]}),false),
+        ] {
+            let result=fetch_account_usage_with_pages(1790000000,1790000010,||false,|_,_,_|Ok(response.clone())).unwrap();
+            assert_eq!(result.source_complete,expected);
+        }
+    }
+    #[test]
+    fn equivalent_decimal_rows_are_not_conflicts_but_different_same_query_amounts_are() {
+        let row=|amount:&str|serde_json::json!({"session_id":"session","usage_time":1790000000,"model_name":"seedance","credits_float":amount});
+        for (other,ambiguous) in [("1.000000",false),("1.1",true)] {
+            let result=fetch_account_usage_with_pages(1790000000,1790000010,||false,|_,_,_|Ok(serde_json::json!({"total":2,"user_usage_group_by_sessions":[row("1.0"),row(other)]}))).unwrap();
+            assert!(result.source_complete);assert_eq!(result.sessions["session"].ambiguous,ambiguous);
+        }
+    }
+}
+
 /// Parse one upstream per-session usage row without inventing an identifier or amount.
 /// The result is only a candidate until the source contract is verified.
 fn parse_session_usage_row(value: &Value) -> Option<CachedSessionUsage> {
@@ -2219,17 +2372,20 @@ fn apply_core_usage_matches(
     matches: &CoreUsageSessionMatches,
 ) {
     for (uid, session_id) in pairs {
-        let Some(session) = cache.accounts.get_mut(uid)
-            .and_then(|account| account.session_usage.get_mut(session_id)) else {
-            continue;
-        };
+        let Some(account)=cache.accounts.get_mut(uid) else {continue};
+        let relation=matches.get(&(uid.clone(),session_id.clone()));
+        if let Some(session)=account.session_usage.get_mut(session_id) {apply_one_core_usage_match(session,relation);}
+        if let Some(session)=account.session_observations.get_mut(session_id).and_then(|source|source.row.as_mut()) {apply_one_core_usage_match(session,relation);}
+    }
+}
+fn apply_one_core_usage_match(session:&mut CachedSessionUsage,relation:Option<&crate::api_server::bridge_billing::CoreUsageSessionMatch>) {
         if session.ambiguous {
             session.core_request_id = None;
             session.core_key_id = None;
             session.core_attribution_ambiguous = true;
-            continue;
+            return;
         }
-        match matches.get(&(uid.clone(), session_id.clone())) {
+        match relation {
             Some(crate::api_server::bridge_billing::CoreUsageSessionMatch::Unique { request_id, core_key_id }) => {
                 session.core_request_id = Some(request_id.clone());
                 session.core_key_id = Some(core_key_id.clone());
@@ -2246,7 +2402,6 @@ fn apply_core_usage_matches(
                 session.core_attribution_ambiguous = false;
             }
         }
-    }
 }
 
 fn merge_session_usage(
@@ -2263,7 +2418,7 @@ fn merge_session_usage(
                 && existing.usage_time == incoming.usage_time
                 && existing.date == incoming.date
                 && existing.model_name == incoming.model_name
-                && existing.credits_float == incoming.credits_float;
+                && same_credit_text(existing.credits_float.as_deref(),incoming.credits_float.as_deref());
             if !same_source_row {
                 existing.ambiguous = true;
                 existing.core_request_id = None;
@@ -2271,5 +2426,16 @@ fn merge_session_usage(
                 existing.core_attribution_ambiguous = true;
             }
         }
+    }
+}
+
+fn same_credit_text(left:Option<&str>,right:Option<&str>)->bool {
+    match (left,right) {
+        (Some(left),Some(right))=>match (CreditAmount::parse(left,"credits"),CreditAmount::parse(right,"credits")) {
+            (Ok(left),Ok(right))=>left==right,
+            _=>left==right,
+        },
+        (None,None)=>true,
+        _=>false,
     }
 }

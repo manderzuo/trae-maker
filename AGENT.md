@@ -487,7 +487,7 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 
 ## 22. 桥接预算账号容量基础
 
-- `bridge-billing.sqlite3` 显式升级到 schema v4，旧 Key 映射、模式和回执保留；各版本增量迁移事务失败完整回滚。已最新版本开库只读校验完整新表定义，不自动补齐损坏布局。
+- `bridge-billing.sqlite3` 显式升级到 schema v5，旧 Key 映射、模式和回执保留；各版本增量迁移事务失败完整回滚。已最新版本开库只读校验完整新表定义，不自动补齐损坏布局。
 - `bridge_capacity_accounts` 为每个实际上游账号保存一份通用/Work 快照；`bridge_capacity_slots` 按 budget 唯一记录 P（仍可能收费）、R（执行已终止待账）、D（已核验未证明包含在快照）或 released。不同 Core Key 不复制账号余额。
 - 所有容量写入需要当前有效实例 lease；整数 microcredits 溢出拒绝。通用积分可用于视频；仍承诺给普通文字的通用容量按最坏扣包来源保护。真实金额超过预估时照实保存，不能截断。
 - 普通更晚余额不能清除 D；容量取消与计费互斥。容量原语尚需与准备/派发状态在同一事务接入，不能仅因容量单测通过就启用收费路由。
@@ -506,3 +506,11 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 - 结果与执行终态、P→R 同事务提交，DPAPI 结果绑定完整预算归属；视频成功要求不可变 task_ref。已实扣 D 不会因随后执行终态再次占 R；账单未到时仍可读回已保存结果，失败执行不是免费证明。
 - 禁用 Key/关闭新收费准入不妨碍在途结果或真实金额保存；只接受持有本实例活动栅栏的事实写入。旧世代结果/实扣可以恢复，旧 token 不获得新的发送许可。
 - 结果损坏、移植或重复终态内容不一致必须报错，不能返回空成功或再次生成。当前真实 HTTP 执行器和回执 outbox 尚待接入，库与缓存回归通过不代表公网已修复。
+
+## 25. V2 回执事实与事件
+
+- `bridge_budget_receipts`、账号 P/R→D、`bridge_budget_receipt_events` 同一事务写入；事件按 generation/sequence 有界读取，代际不符须先恢复请求，不能重置游标掩盖丢事件。实际金额允许超过 H，重复语义只产生一次金额与事件，时间变化不构成新费用。
+- 来源采用明确的内部 `post-terminal-session-observation-v1` 确认政策：已持久执行终态、唯一 Key/account/session、实际开始于终态之后的完整查询、该次唯一精确金额；这不是上游提供官方 Final 字段的声明。旧缓存的当前读取时间、未来查询上界或多次稳定数值都不能代替这些证据。
+- 用量缓存保留每次完整查询的原始会话观察和查询起止；执行中候选变化不会永久污染终态后唯一观察，旧审计缓存冲突仍保留。缺 total/明细、分页截断、总数变化或触及上限而未完整覆盖时不具备结算资格。同次查询冲突拒绝，等值小数按 microcredits 比较。
+- `failed_no_charge` 只来自持久取消/no-send 决定，不能由 HTTP 错误、任务失败或空账单产生。未知金额不造 0。冲突事件保留原账并隔离该账号的新派发容量，不影响已保存结果读取；Core 消费者必须按事件 kind 分流到冲突接口，不能把 conflict 携带的候选 receipt 当新 Final。
+- v2 Final/FailedNoCharge/Conflict 不再占普通待结账号轮询；不同 Key 始终按 budget/request 唯一关联。禁止把 v2 记录写成旧 mode 或用假旧 Final 使轮询退队。真实运行器、自动确认驱动、HTTP 路由及 Core 事件消费尚待接入，本节原语测试不等于公网交付。

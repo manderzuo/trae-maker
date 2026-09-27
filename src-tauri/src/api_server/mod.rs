@@ -8,6 +8,7 @@ pub(crate) mod bridge_budget;
 pub mod bridge_budget_lease;
 pub(crate) mod bridge_prepared;
 pub(crate) mod bridge_execution;
+pub(crate) mod bridge_receipts;
 pub mod custom_models;
 pub mod custom_route;
 pub mod conversation;

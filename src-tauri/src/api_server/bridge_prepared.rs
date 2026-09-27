@@ -233,6 +233,15 @@ pub(super) fn sent_execution_identity(connection:&Connection,budget_id:&str)->Re
     if row.state!="send_intent" {return Err("budget has no durable send intent".into());}
     Ok(row.decrypt()?.execution_identity())
 }
+pub(super) fn budget_no_send_disposition(connection:&Connection,budget_id:&str)->Result<(PreparedAuthorization,NoSendProof),String> {
+    let row=required_row(connection,budget_id)?;
+    let envelope=row.decrypt()?;
+    let proof=row.proof()?;
+    Ok((envelope.authorization,proof))
+}
+pub(super) fn stored_budget_authorization(connection:&Connection,budget_id:&str)->Result<PreparedAuthorization,String> {
+    Ok(required_row(connection,budget_id)?.decrypt()?.authorization)
+}
 struct PreparedRow {
     budget_id:String,request_id:String,core_key_id:String,account_ref:String,revision:i64,generation:String,
     authorization_json:String,ciphertext:Vec<u8>,token_hash:Vec<u8>,state:String,consume_epoch:Option<String>,disposition_ref:Option<String>,decided_at:Option<i64>,created_at:i64,

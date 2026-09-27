@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn migration_recovers_existing_send_as_unknown_and_keeps_capacity() {
         let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"request-video");
-        store.connection.execute_batch("DROP TABLE bridge_budget_executions; UPDATE bridge_schema_meta SET schema_version=3").unwrap();
+        store.connection.execute_batch("DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; DROP TABLE bridge_budget_executions; UPDATE bridge_schema_meta SET schema_version=3").unwrap();
         drop(store);let store=BridgeBillingStore::open(&dir).unwrap();
         let execution=store.budget_execution(&id).unwrap().unwrap();
         assert_eq!(execution.state,ExecutionState::Unknown);assert!(!execution.result_available);
