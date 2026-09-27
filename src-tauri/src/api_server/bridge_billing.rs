@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 const BILLING_DB_FILE: &str = "bridge-billing.sqlite3";
 const BRIDGE_SCHEMA_META_TABLE: &str = "bridge_schema_meta";
 const BRIDGE_SCHEMA_VERSION: i64 = 1;
+const BRIDGE_ACTIVE_OWNER_PREFIX: &str = "bridge-active-v1-";
+const BRIDGE_RECOVERY_REQUIRED_PREFIX: &str = "bridge-recovery-required-v1-";
 
 /// The caller may identify a request, but can never supply the quote amount.
 #[derive(Clone, Debug, Deserialize)]
@@ -298,10 +300,17 @@ impl BridgeBillingStore {
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(|error| format!("bridge billing database busy: {error}"))?;
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(|error| format!("bridge billing journal mode unavailable: {error}"))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            connection
+                .execute_batch("PRAGMA journal_mode = WAL;")
+                .map_err(|error| format!("bridge billing WAL mode unavailable: {error}"))?;
+        }
         connection
             .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = FULL;
+                "PRAGMA synchronous = FULL;
                  PRAGMA foreign_keys = ON;",
             )
             .map_err(|error| format!("bridge billing database pragmas unavailable: {error}"))?;
@@ -324,6 +333,115 @@ impl BridgeBillingStore {
         Ok((instance_id, generation))
     }
 
+    pub(super) fn mark_recovery_required(
+        &self,
+        expected_instance_id: &str,
+        expected_generation: &str,
+    ) -> Result<String, String> {
+        let (instance_id, current_generation) = self.bridge_identity()?;
+        if instance_id != expected_instance_id {
+            return Err("bridge instance changed before recovery marker could be written".into());
+        }
+        if is_recovery_required_generation(&current_generation) {
+            return Ok(current_generation);
+        }
+        if current_generation != expected_generation {
+            return Err("bridge generation changed before recovery marker could be written".into());
+        }
+
+        let recovery_generation = format!(
+            "{BRIDGE_RECOVERY_REQUIRED_PREFIX}{:032x}",
+            rand::random::<u128>()
+        );
+        let updated = self.connection.execute(
+            "UPDATE bridge_schema_meta SET event_generation = ?1
+             WHERE singleton = 1 AND schema_version = ?2
+               AND bridge_instance_id = ?3 AND event_generation = ?4",
+            params![
+                recovery_generation,
+                BRIDGE_SCHEMA_VERSION,
+                expected_instance_id,
+                expected_generation,
+            ],
+        ).map_err(|error| format!("bridge recovery marker write failed: {error}"))?;
+        if updated == 1 {
+            return Ok(recovery_generation);
+        }
+
+        let (instance_id, current_generation) = self.bridge_identity()?;
+        if instance_id == expected_instance_id
+            && is_recovery_required_generation(&current_generation)
+        {
+            return Ok(current_generation);
+        }
+        Err("bridge recovery marker lost its identity compare-and-swap".into())
+    }
+
+    pub(super) fn mark_active_owner(
+        &self,
+        expected_instance_id: &str,
+        expected_generation: &str,
+    ) -> Result<String, String> {
+        let (instance_id, current_generation) = self.bridge_identity()?;
+        if instance_id != expected_instance_id
+            || current_generation != expected_generation
+            || is_dirty_bridge_generation(&current_generation)
+        {
+            return Err("bridge identity is not clean before active-owner marker write".into());
+        }
+        let active_generation = new_active_owner_generation();
+        let updated = self.connection.execute(
+            "UPDATE bridge_schema_meta SET event_generation = ?1
+             WHERE singleton = 1 AND schema_version = ?2
+               AND bridge_instance_id = ?3 AND event_generation = ?4",
+            params![
+                active_generation,
+                BRIDGE_SCHEMA_VERSION,
+                expected_instance_id,
+                expected_generation,
+            ],
+        ).map_err(|error| format!("bridge active-owner marker write failed: {error}"))?;
+        if updated != 1 {
+            return Err("bridge active-owner marker lost its identity compare-and-swap".into());
+        }
+        Ok(active_generation)
+    }
+
+    pub(super) fn finish_activity_lease_cleanly<F>(
+        &self,
+        lease: &mut super::bridge_budget_lease::BridgeBudgetLease,
+        confirm_workers_stopped: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        let (instance_id, generation) = self.bridge_identity()?;
+        if !lease.is_active()
+            || lease.is_closed()
+            || lease.recovery_required()
+            || lease.instance_id() != instance_id
+            || lease.generation() != generation
+            || !is_active_owner_generation(&generation)
+        {
+            return Err("clean close requires this active lease's persisted owner marker".into());
+        }
+        lease.begin_clean_close();
+        confirm_workers_stopped()?;
+
+        let idle_generation = format!("bridge-generation-v1-{:032x}", rand::random::<u128>());
+        let updated = self.connection.execute(
+            "UPDATE bridge_schema_meta SET event_generation = ?1
+             WHERE singleton = 1 AND schema_version = ?2
+               AND bridge_instance_id = ?3 AND event_generation = ?4",
+            params![idle_generation, BRIDGE_SCHEMA_VERSION, instance_id, generation],
+        ).map_err(|error| format!("bridge clean-close marker update failed: {error}"))?;
+        if updated != 1 {
+            return Err("bridge clean close lost its identity compare-and-swap".into());
+        }
+        lease.record_cleanly_closed_generation(idle_generation.clone());
+        Ok(idle_generation)
+    }
+
     pub(super) fn rotate_event_generation_for_recovery<F>(
         &mut self,
         lease: &mut super::bridge_budget_lease::BridgeBudgetLease,
@@ -334,10 +452,13 @@ impl BridgeBillingStore {
     {
         let (instance_id, generation) = self.bridge_identity()?;
         if !lease.is_active()
+            || lease.charge_ready()
+            || !lease.recovery_required()
+            || !is_recovery_required_generation(&generation)
             || lease.instance_id() != instance_id
             || lease.generation() != generation
         {
-            return Err("recovery requires an active lease for this instance and generation".into());
+            return Err("recovery requires an active lease with a persisted recovery marker".into());
         }
         // The caller must have stopped and joined the old charging workers.
         // This internal confirmation is explicit; 3b must supply the real join.
@@ -352,12 +473,7 @@ impl BridgeBillingStore {
         {
             return Err("bridge generation changed before recovery could commit".into());
         }
-        let next_generation = loop {
-            let candidate = format!("bridge-generation-v1-{:032x}", rand::random::<u128>());
-            if candidate != generation {
-                break candidate;
-            }
-        };
+        let next_generation = new_active_owner_generation();
         let updated = transaction.execute(
             "UPDATE bridge_schema_meta SET event_generation = ?1
              WHERE singleton = 1 AND schema_version = ?2
@@ -369,7 +485,7 @@ impl BridgeBillingStore {
         }
         transaction.commit()
             .map_err(|error| format!("bridge generation recovery commit failed: {error}"))?;
-        lease.record_generation(next_generation.clone());
+        lease.record_recovered_generation(next_generation.clone());
         Ok(next_generation)
     }
 
@@ -1202,6 +1318,22 @@ fn initialize_bridge_schema<F>(connection: &mut Connection, migration_hook: F) -
 where
     F: Fn(&Transaction<'_>) -> Result<(), String>,
 {
+    let has_metadata_object: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1 AND name NOT GLOB 'sqlite_*')",
+        [BRIDGE_SCHEMA_META_TABLE],
+        |row| row.get(0),
+    ).map_err(|error| format!("bridge schema metadata inventory unavailable: {error}"))?;
+    if has_metadata_object {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| format!("bridge billing read-only validation transaction unavailable: {error}"))?;
+        validate_versioned_bridge_schema(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("bridge billing schema validation commit failed: {error}"))?;
+        return Ok(());
+    }
+
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| format!("bridge billing schema transaction unavailable: {error}"))?;
@@ -1211,33 +1343,46 @@ where
             if kind != "table" {
                 return Err("bridge billing schema metadata object is not a table".into());
             }
-            validate_bridge_metadata_table(&transaction)?;
-            let (version, instance_id, generation) = read_bridge_schema_metadata(&transaction)?;
-            if version > BRIDGE_SCHEMA_VERSION {
-                return Err(format!("bridge billing schema version {version} is newer than supported"));
-            }
-            if version != BRIDGE_SCHEMA_VERSION {
-                return Err(format!("bridge billing schema version {version} is unsupported"));
-            }
-            validate_bridge_schema(&transaction, true)?;
-            validate_bridge_identity(&instance_id, &generation)?;
-            validate_foreign_key_integrity(&transaction)?;
+            validate_versioned_bridge_schema(&transaction)?;
         }
         None if objects.is_empty() => {
             create_legacy_bridge_schema(&transaction)?;
-            validate_bridge_schema(&transaction, false)?;
+            validate_bridge_schema(&transaction, false, true)?;
             validate_foreign_key_integrity(&transaction)?;
             create_bridge_schema_metadata(&transaction, &migration_hook)?;
+            validate_versioned_bridge_schema(&transaction)?;
         }
         None => {
-            validate_bridge_schema(&transaction, false)?;
+            validate_bridge_schema(&transaction, false, true)?;
             validate_foreign_key_integrity(&transaction)?;
             create_bridge_schema_metadata(&transaction, &migration_hook)?;
+            validate_versioned_bridge_schema(&transaction)?;
         }
     }
     transaction
         .commit()
         .map_err(|error| format!("bridge billing schema commit failed: {error}"))?;
+    Ok(())
+}
+
+fn validate_versioned_bridge_schema(transaction: &Transaction<'_>) -> Result<(), String> {
+    let objects = bridge_schema_objects(transaction)?;
+    match objects.iter().find(|(_, name)| name == BRIDGE_SCHEMA_META_TABLE) {
+        Some((kind, _)) if kind == "table" => {}
+        Some(_) => return Err("bridge billing schema metadata object is not a table".into()),
+        None => return Err("versioned bridge billing schema metadata is missing".into()),
+    }
+    validate_bridge_metadata_table(transaction)?;
+    let (version, instance_id, generation) = read_bridge_schema_metadata(transaction)?;
+    if version > BRIDGE_SCHEMA_VERSION {
+        return Err(format!("bridge billing schema version {version} is newer than supported"));
+    }
+    if version != BRIDGE_SCHEMA_VERSION {
+        return Err(format!("bridge billing schema version {version} is unsupported"));
+    }
+    validate_bridge_schema(transaction, true, false)?;
+    validate_bridge_identity(&instance_id, &generation)?;
+    validate_foreign_key_integrity(transaction)?;
     Ok(())
 }
 
@@ -1268,7 +1413,11 @@ fn bridge_table_columns(
     columns
 }
 
-fn validate_bridge_schema(transaction: &Transaction<'_>, versioned: bool) -> Result<(), String> {
+fn validate_bridge_schema(
+    transaction: &Transaction<'_>,
+    versioned: bool,
+    check_constraints_by_write_probe: bool,
+) -> Result<(), String> {
     const LEGACY_OBJECTS: &[(&str, &str)] = &[
         ("index", "bridge_core_upstream_sessions_lookup_idx"),
         ("table", "bridge_billing_receipts"),
@@ -1292,42 +1441,47 @@ fn validate_bridge_schema(transaction: &Transaction<'_>, versioned: bool) -> Res
         return Err("bridge billing schema layout is incomplete or contains unknown objects".into());
     }
 
-    let required_columns: &[(&str, &[(&str, &str)])] = &[
+    let required_columns: &[(&str, &[(&str, &str, bool)])] = &[
         ("bridge_billing_receipts", &[
-            ("request_id", "TEXT"), ("status", "TEXT"), ("actual_microcredits", "INTEGER"),
-            ("unit", "TEXT"), ("source_ref", "TEXT"), ("task_ref", "TEXT"),
-            ("observed_at_ms", "INTEGER"), ("updated_at_ms", "INTEGER"),
+            ("request_id", "TEXT", true), ("status", "TEXT", true),
+            ("actual_microcredits", "INTEGER", false), ("unit", "TEXT", false),
+            ("source_ref", "TEXT", false), ("task_ref", "TEXT", false),
+            ("observed_at_ms", "INTEGER", true), ("updated_at_ms", "INTEGER", true),
         ]),
         ("bridge_core_key_registry_state", &[
-            ("singleton", "INTEGER"), ("version", "INTEGER"), ("updated_at_ms", "INTEGER"),
+            ("singleton", "INTEGER", false), ("version", "INTEGER", true),
+            ("updated_at_ms", "INTEGER", true),
         ]),
         ("bridge_core_api_keys", &[
-            ("key_id", "TEXT"), ("display_name", "TEXT"), ("active", "INTEGER"),
-            ("snapshot_version", "INTEGER"),
+            ("key_id", "TEXT", true), ("display_name", "TEXT", true),
+            ("active", "INTEGER", true), ("snapshot_version", "INTEGER", true),
         ]),
         ("bridge_core_requests", &[
-            ("request_id", "TEXT"), ("core_key_id", "TEXT"),
-            ("associated_at_ms", "INTEGER"), ("conflict", "INTEGER"),
+            ("request_id", "TEXT", true), ("core_key_id", "TEXT", true),
+            ("associated_at_ms", "INTEGER", true), ("conflict", "INTEGER", true),
         ]),
         ("bridge_core_one_shot_test_requests", &[
-            ("request_id", "TEXT"), ("authorized_at_ms", "INTEGER"),
+            ("request_id", "TEXT", true), ("authorized_at_ms", "INTEGER", true),
         ]),
         ("bridge_core_request_modes", &[
-            ("request_id", "TEXT"), ("billing_mode", "TEXT"), ("operation_id", "TEXT"),
+            ("request_id", "TEXT", true), ("billing_mode", "TEXT", true),
+            ("operation_id", "TEXT", false),
         ]),
         ("bridge_core_upstream_sessions", &[
-            ("request_id", "TEXT"), ("account_ref", "TEXT"), ("session_id", "TEXT"),
-            ("conflict", "INTEGER"), ("associated_at_ms", "INTEGER"),
+            ("request_id", "TEXT", true), ("account_ref", "TEXT", true),
+            ("session_id", "TEXT", true), ("conflict", "INTEGER", true),
+            ("associated_at_ms", "INTEGER", true),
         ]),
     ];
     for (table, columns) in required_columns {
         let actual = bridge_table_columns(transaction, table)?;
-        if actual.len() != columns.len() || columns.iter().any(|(name, kind)| {
-            !actual.iter().any(|(found_name, found_kind, _, _)| {
+        if actual.len() != columns.len() || columns.iter().any(|(name, kind, not_null)| {
+            !actual.iter().any(|(found_name, found_kind, found_not_null, _)| {
                 found_name == name && found_kind.eq_ignore_ascii_case(kind)
+                    && (*found_not_null != 0) == *not_null
             })
         }) {
-            return Err(format!("bridge billing {table} columns do not match the legacy layout"));
+            return Err(format!("bridge billing {table} columns or NOT NULL constraints do not match the legacy layout"));
         }
     }
     let required_primary_keys: &[(&str, &[(&str, i64)])] = &[
@@ -1371,10 +1525,394 @@ fn validate_bridge_schema(transaction: &Transaction<'_>, versioned: bool) -> Res
     ) {
         return Err("bridge request-mode foreign key does not match the legacy layout".into());
     }
+    validate_bridge_lookup_index(transaction)?;
+    if check_constraints_by_write_probe {
+        validate_legacy_check_constraints(transaction)?;
+    } else {
+        validate_bridge_check_constraint_structure(transaction, versioned)?;
+    }
     if versioned {
         validate_bridge_metadata_table(transaction)?;
     }
     Ok(())
+}
+
+fn validate_bridge_check_constraint_structure(
+    transaction: &Transaction<'_>,
+    versioned: bool,
+) -> Result<(), String> {
+    let mut required = vec![
+        ("bridge_billing_receipts", "status IN ('pending','final','unknown','unverified','conflict')"),
+        ("bridge_billing_receipts", "actual_microcredits IS NULL OR actual_microcredits >= 0"),
+        ("bridge_core_key_registry_state", "singleton = 1"),
+        ("bridge_core_key_registry_state", "version >= 0"),
+        ("bridge_core_api_keys", "active IN (0, 1)"),
+        ("bridge_core_api_keys", "snapshot_version >= 0"),
+        ("bridge_core_requests", "conflict IN (0, 1)"),
+        ("bridge_core_request_modes", "billing_mode IN ('quoted', 'legacy_one_shot', 'controlled_unquoted')"),
+        ("bridge_core_request_modes", "(billing_mode = 'controlled_unquoted' AND operation_id IS NOT NULL) OR (billing_mode != 'controlled_unquoted' AND operation_id IS NULL)"),
+        ("bridge_core_upstream_sessions", "conflict IN (0, 1)"),
+    ];
+    if versioned {
+        required.extend([
+            (BRIDGE_SCHEMA_META_TABLE, "singleton = 1"),
+            (BRIDGE_SCHEMA_META_TABLE, "schema_version > 0"),
+            (BRIDGE_SCHEMA_META_TABLE, "length(bridge_instance_id) BETWEEN 1 AND 128"),
+            (BRIDGE_SCHEMA_META_TABLE, "length(event_generation) BETWEEN 1 AND 128"),
+        ]);
+    }
+
+    for (table, required_expression) in required {
+        let sql: Option<String> = transaction.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        ).optional().map_err(|error| format!("bridge {table} CHECK definition unavailable: {error}"))?;
+        let sql = sql.ok_or_else(|| format!("bridge {table} CHECK definition is missing"))?;
+        let actual = extract_sqlite_check_expressions(&sql)?;
+        let expected = tokenize_sqlite_schema_sql(required_expression)?;
+        if !actual.iter().any(|expression| expression == &expected) {
+            return Err(format!("bridge {table} CHECK constraint is missing or altered"));
+        }
+    }
+    Ok(())
+}
+
+fn extract_sqlite_check_expressions(sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let tokens = tokenize_sqlite_schema_sql(sql)?;
+    let mut checks = Vec::new();
+    let mut index = 0;
+    while index + 1 < tokens.len() {
+        if tokens[index] != "I:check" || tokens[index + 1] != "P:(" {
+            index += 1;
+            continue;
+        }
+        let mut depth = 1usize;
+        let mut expression = Vec::new();
+        let mut cursor = index + 2;
+        while cursor < tokens.len() && depth != 0 {
+            match tokens[cursor].as_str() {
+                "P:(" => {
+                    depth += 1;
+                    expression.push(tokens[cursor].clone());
+                }
+                "P:)" => {
+                    depth -= 1;
+                    if depth != 0 {
+                        expression.push(tokens[cursor].clone());
+                    }
+                }
+                _ => expression.push(tokens[cursor].clone()),
+            }
+            cursor += 1;
+        }
+        if depth != 0 {
+            return Err("bridge table CHECK expression has unbalanced parentheses".into());
+        }
+        checks.push(expression);
+        index = cursor;
+    }
+    Ok(checks)
+}
+
+fn tokenize_sqlite_schema_sql(sql: &str) -> Result<Vec<String>, String> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if byte == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' { index += 1; }
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            if index + 1 >= bytes.len() {
+                return Err("bridge table SQL has an unterminated comment".into());
+            }
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' {
+            let start = index;
+            index += 1;
+            let mut closed = false;
+            while index < bytes.len() {
+                if bytes[index] == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            if !closed { return Err("bridge table SQL has an unterminated string".into()); }
+            tokens.push(format!("S:{}", &sql[start..index]));
+            continue;
+        }
+        if matches!(byte, b'"' | b'`' | b'[') {
+            let start = index;
+            let close = if byte == b'[' { b']' } else { byte };
+            index += 1;
+            let mut closed = false;
+            while index < bytes.len() {
+                if bytes[index] == close {
+                    if bytes.get(index + 1) == Some(&close) {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            if !closed { return Err("bridge table SQL has an unterminated identifier".into()); }
+            let quoted = &sql[start + 1..index - 1];
+            let unescaped = if close == b']' {
+                quoted.replace("]]", "]")
+            } else {
+                let delimiter = close as char;
+                quoted.replace(&format!("{delimiter}{delimiter}"), &delimiter.to_string())
+            };
+            tokens.push(format!("I:{}", unescaped.to_ascii_lowercase()));
+            continue;
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
+            {
+                index += 1;
+            }
+            tokens.push(format!("I:{}", sql[start..index].to_ascii_lowercase()));
+            continue;
+        }
+        if byte.is_ascii_digit() {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_digit() { index += 1; }
+            tokens.push(format!("N:{}", &sql[start..index]));
+            continue;
+        }
+        if byte >= 0x80 {
+            let character = sql[index..].chars().next().unwrap();
+            tokens.push(format!("U:{character}"));
+            index += character.len_utf8();
+            continue;
+        }
+        if index + 1 < bytes.len()
+            && matches!(&bytes[index..index + 2], b">=" | b"<=" | b"!=" | b"<>" | b"==")
+        {
+            tokens.push(format!("P:{}", &sql[index..index + 2]));
+            index += 2;
+        } else {
+            tokens.push(format!("P:{}", byte as char));
+            index += 1;
+        }
+    }
+    Ok(tokens)
+}
+
+fn validate_bridge_lookup_index(transaction: &Transaction<'_>) -> Result<(), String> {
+    let mut statement = transaction
+        .prepare("PRAGMA index_list('bridge_core_upstream_sessions')")
+        .map_err(|error| format!("bridge session lookup index unavailable: {error}"))?;
+    let indexes = statement
+        .query_map([], |row| Ok((
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+        )))
+        .map_err(|error| format!("bridge session lookup index unreadable: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("bridge session lookup index unreadable: {error}"))?;
+    if !indexes.iter().any(|(name, unique, origin, partial)| {
+        name == "bridge_core_upstream_sessions_lookup_idx"
+            && *unique == 0 && origin == "c" && *partial == 0
+    }) {
+        return Err("bridge session lookup index properties do not match the legacy layout".into());
+    }
+
+    let mut statement = transaction
+        .prepare("PRAGMA index_xinfo('bridge_core_upstream_sessions_lookup_idx')")
+        .map_err(|error| format!("bridge session lookup index columns unavailable: {error}"))?;
+    let index_columns = statement
+        .query_map([], |row| Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+        )))
+        .map_err(|error| format!("bridge session lookup index columns unreadable: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("bridge session lookup index columns unreadable: {error}"))?;
+    let key_columns: Vec<_> = index_columns
+        .iter()
+        .filter(|(_, _, _, _, _, key)| *key == 1)
+        .collect();
+    if key_columns.len() != 2 || !matches!(
+        (key_columns[0], key_columns[1]),
+        ((0, cid_a, Some(name_a), 0, coll_a, 1), (1, cid_b, Some(name_b), 0, coll_b, 1))
+            if *cid_a >= 0 && name_a == "account_ref" && coll_a.eq_ignore_ascii_case("BINARY")
+                && *cid_b >= 0 && name_b == "session_id" && coll_b.eq_ignore_ascii_case("BINARY")
+    ) {
+        return Err("bridge session lookup index columns do not match the legacy layout".into());
+    }
+    Ok(())
+}
+
+fn validate_legacy_check_constraints(transaction: &Transaction<'_>) -> Result<(), String> {
+    let nonce = rand::random::<u128>();
+    require_legacy_check_rejection(
+        transaction,
+        "receipt status",
+        |transaction| transaction.execute(
+            "INSERT INTO bridge_billing_receipts
+             (request_id, status, actual_microcredits, unit, observed_at_ms, updated_at_ms)
+             VALUES (?1, 'invalid_status', NULL, 'credits', 0, 0)",
+            [format!("bridge-schema-probe-{nonce}-receipt-status")],
+        ),
+    )?;
+    require_legacy_check_rejection(
+        transaction,
+        "receipt amount",
+        |transaction| transaction.execute(
+            "INSERT INTO bridge_billing_receipts
+             (request_id, status, actual_microcredits, unit, observed_at_ms, updated_at_ms)
+             VALUES (?1, 'pending', -1, 'credits', 0, 0)",
+            [format!("bridge-schema-probe-{nonce}-receipt-amount")],
+        ),
+    )?;
+    require_legacy_check_rejection(
+        transaction,
+        "key registry singleton",
+        |transaction| transaction.execute(
+            "INSERT INTO bridge_core_key_registry_state(singleton, version, updated_at_ms)
+             VALUES (2, 0, 0)",
+            [],
+        ),
+    )?;
+    require_legacy_check_rejection(
+        transaction,
+        "key registry version",
+        |transaction| transaction.execute(
+            "INSERT OR REPLACE INTO bridge_core_key_registry_state(singleton, version, updated_at_ms)
+             VALUES (1, -1, 0)",
+            [],
+        ),
+    )?;
+    require_legacy_check_rejection(
+        transaction,
+        "Core Key active flag",
+        |transaction| transaction.execute(
+            "INSERT INTO bridge_core_api_keys(key_id, display_name, active, snapshot_version)
+             VALUES (?1, 'probe', 2, 0)",
+            [format!("bridge-schema-probe-{nonce}-active")],
+        ),
+    )?;
+    require_legacy_check_rejection(
+        transaction,
+        "Core Key snapshot version",
+        |transaction| transaction.execute(
+            "INSERT INTO bridge_core_api_keys(key_id, display_name, active, snapshot_version)
+             VALUES (?1, 'probe', 0, -1)",
+            [format!("bridge-schema-probe-{nonce}-snapshot")],
+        ),
+    )?;
+    require_legacy_check_rejection(
+        transaction,
+        "request conflict flag",
+        |transaction| transaction.execute(
+            "INSERT INTO bridge_core_requests(request_id, core_key_id, associated_at_ms, conflict)
+             VALUES (?1, 'probe-key', 0, 2)",
+            [format!("bridge-schema-probe-{nonce}-request-conflict")],
+        ),
+    )?;
+    require_legacy_check_rejection(
+        transaction,
+        "request billing mode",
+        |transaction| {
+            let request_id = format!("bridge-schema-probe-{nonce}-mode-value");
+            transaction.execute(
+                "INSERT INTO bridge_core_requests(request_id, core_key_id, associated_at_ms, conflict)
+                 VALUES (?1, 'probe-key', 0, 0)",
+                [&request_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO bridge_core_request_modes(request_id, billing_mode, operation_id)
+                 VALUES (?1, 'invalid_mode', NULL)",
+                [&request_id],
+            )
+        },
+    )?;
+    require_legacy_check_rejection(
+        transaction,
+        "request operation binding",
+        |transaction| {
+            let request_id = format!("bridge-schema-probe-{nonce}-operation");
+            transaction.execute(
+                "INSERT INTO bridge_core_requests(request_id, core_key_id, associated_at_ms, conflict)
+                 VALUES (?1, 'probe-key', 0, 0)",
+                [&request_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO bridge_core_request_modes(request_id, billing_mode, operation_id)
+                 VALUES (?1, 'quoted', 'unexpected-operation')",
+                [&request_id],
+            )
+        },
+    )?;
+    require_legacy_check_rejection(
+        transaction,
+        "upstream session conflict flag",
+        |transaction| transaction.execute(
+            "INSERT INTO bridge_core_upstream_sessions
+             (request_id, account_ref, session_id, conflict, associated_at_ms)
+             VALUES (?1, 'probe-account', 'probe-session', 2, 0)",
+            [format!("bridge-schema-probe-{nonce}-session-conflict")],
+        ),
+    )?;
+    Ok(())
+}
+
+fn require_legacy_check_rejection<F>(
+    transaction: &Transaction<'_>,
+    constraint: &str,
+    probe: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&Transaction<'_>) -> rusqlite::Result<usize>,
+{
+    transaction.execute_batch("SAVEPOINT bridge_schema_check_probe")
+        .map_err(|error| format!("bridge schema {constraint} probe unavailable: {error}"))?;
+    let probe_result = probe(transaction);
+    transaction.execute_batch(
+        "ROLLBACK TO bridge_schema_check_probe; RELEASE bridge_schema_check_probe",
+    ).map_err(|error| format!("bridge schema {constraint} probe rollback failed: {error}"))?;
+    match probe_result {
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK => Ok(()),
+        Err(error) => Err(format!("bridge schema {constraint} probe failed unexpectedly: {error}")),
+        Ok(_) => Err(format!("bridge billing legacy {constraint} CHECK constraint is missing")),
+    }
 }
 
 fn validate_bridge_metadata_table(transaction: &Transaction<'_>) -> Result<(), String> {
@@ -1425,6 +1963,26 @@ fn validate_bridge_identity(instance_id: &str, generation: &str) -> Result<(), S
         return Err("bridge billing instance or generation metadata is invalid".into());
     }
     Ok(())
+}
+
+pub(super) fn is_recovery_required_generation(generation: &str) -> bool {
+    generation.starts_with(BRIDGE_RECOVERY_REQUIRED_PREFIX)
+}
+
+fn is_active_owner_generation(generation: &str) -> bool {
+    generation.starts_with(BRIDGE_ACTIVE_OWNER_PREFIX)
+}
+
+pub(super) fn is_dirty_bridge_generation(generation: &str) -> bool {
+    is_active_owner_generation(generation) || is_recovery_required_generation(generation)
+}
+
+fn new_active_owner_generation() -> String {
+    format!(
+        "{BRIDGE_ACTIVE_OWNER_PREFIX}{}-{:032x}",
+        std::process::id(),
+        rand::random::<u128>()
+    )
 }
 
 fn validate_foreign_key_integrity(transaction: &Transaction<'_>) -> Result<(), String> {
@@ -1532,6 +2090,94 @@ fn test_dir(label: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versioned_open_does_not_wait_for_or_take_a_writer_reservation() {
+        let dir = test_dir("versioned-open-read-only");
+        drop(BridgeBillingStore::open(&dir).unwrap());
+        let blocker = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        blocker.busy_timeout(Duration::ZERO).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let started = std::time::Instant::now();
+        let reopened = BridgeBillingStore::open(&dir);
+        let elapsed = started.elapsed();
+        let opened = reopened.is_ok();
+        drop(reopened);
+        blocker.execute_batch("ROLLBACK;").unwrap();
+        drop(blocker);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(opened, "read-only versioned validation should coexist with a WAL writer reservation");
+        assert!(elapsed < Duration::from_millis(750),
+            "ordinary versioned open should not wait on a writer, took {elapsed:?}");
+    }
+
+    #[test]
+    fn versioned_open_rejects_a_removed_check_constraint() {
+        let dir = test_dir("versioned-check-removed");
+        drop(BridgeBillingStore::open(&dir).unwrap());
+
+        let tamper = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        tamper.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             ALTER TABLE bridge_billing_receipts RENAME TO bridge_billing_receipts_with_checks;
+             CREATE TABLE bridge_billing_receipts (
+               request_id TEXT PRIMARY KEY NOT NULL,
+               status TEXT NOT NULL,
+               actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+               unit TEXT, source_ref TEXT, task_ref TEXT,
+               observed_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO bridge_billing_receipts SELECT * FROM bridge_billing_receipts_with_checks;
+             DROP TABLE bridge_billing_receipts_with_checks;",
+        ).unwrap();
+        drop(tamper);
+
+        let result = BridgeBillingStore::open(&dir);
+        let validation_error = result.as_ref().err().cloned();
+        drop(result);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert!(
+            validation_error.as_deref().is_some_and(|error| error.contains("CHECK constraint is missing or altered")),
+            "versioned open must structurally reject a missing receipt-status CHECK, got {validation_error:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_migration_does_not_accept_unique_failure_as_missing_check_evidence() {
+        let dir = test_dir("legacy-check-masked-by-unique");
+        let legacy = create_legacy_v0_database(&dir);
+        legacy.execute_batch(
+            "ALTER TABLE bridge_billing_receipts RENAME TO old_bridge_billing_receipts;
+             CREATE TABLE bridge_billing_receipts (
+               request_id TEXT PRIMARY KEY NOT NULL,
+               status TEXT NOT NULL UNIQUE,
+               actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+               unit TEXT, source_ref TEXT, task_ref TEXT,
+               observed_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO bridge_billing_receipts SELECT * FROM old_bridge_billing_receipts;
+             INSERT INTO bridge_billing_receipts
+               (request_id, status, actual_microcredits, unit, observed_at_ms, updated_at_ms)
+               VALUES ('check-probe-blocker', 'invalid_status', NULL, 'credits', 0, 0);
+             DROP TABLE old_bridge_billing_receipts;",
+        ).unwrap();
+        drop(legacy);
+
+        let opened = BridgeBillingStore::open(&dir);
+        let accepted = opened.is_ok();
+        drop(opened);
+        let reopened = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        let metadata = bridge_metadata(&reopened).unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(!accepted,
+            "v0 migration must require SQLITE_CONSTRAINT_CHECK for the receipt-status probe, not UNIQUE");
+        assert_eq!(metadata, None, "a masked missing CHECK must never receive the v1 marker");
+    }
 
     fn create_legacy_v0_database(dir: &Path) -> Connection {
         let connection = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
@@ -1705,6 +2351,62 @@ mod tests {
         assert_eq!(after, Some(before), "migration must retain every legacy row and field");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn pre_migration_v0_wal_snapshot_clones_allow_only_one_host_activity_lease() {
+        use super::super::bridge_budget_lease::BridgeBudgetLease;
+
+        let root = test_dir("legacy-v0-wal-clones");
+        let primary_dir = root.join("primary");
+        let replica_dir = root.join("replica");
+        std::fs::create_dir_all(&primary_dir).unwrap();
+        std::fs::create_dir_all(&replica_dir).unwrap();
+
+        let legacy = create_legacy_v0_database(&primary_dir);
+        legacy.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             UPDATE bridge_core_key_registry_state
+             SET updated_at_ms = updated_at_ms + 1 WHERE singleton = 1;",
+        ).unwrap();
+        let wal_path = std::path::PathBuf::from(format!(
+            "{}-wal",
+            primary_dir.join(BILLING_DB_FILE).display()
+        ));
+        let had_uncheckpointed_wal = std::fs::metadata(&wal_path)
+            .is_ok_and(|metadata| metadata.len() > 32);
+        let replica_path = replica_dir.join(BILLING_DB_FILE);
+        legacy.execute(
+            "VACUUM INTO ?1",
+            [replica_path.to_string_lossy().as_ref()],
+        ).unwrap();
+        drop(legacy);
+
+        let first = BridgeBillingStore::open(&primary_dir).unwrap();
+        let second = BridgeBillingStore::open(&replica_dir).unwrap();
+        let first_instance = first.bridge_identity().unwrap().0;
+        let second_instance = second.bridge_identity().unwrap().0;
+        let first_lease = BridgeBudgetLease::try_acquire(&first).unwrap().unwrap();
+        let second_attempt = BridgeBudgetLease::try_acquire(&second).unwrap();
+        let second_was_denied = second_attempt.is_none();
+        drop(second_attempt);
+        drop(first_lease);
+        let second_acquired_after_release = BridgeBudgetLease::try_acquire(&second)
+            .unwrap()
+            .is_some();
+        drop(second);
+        drop(first);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(had_uncheckpointed_wal, "the v0 clone fixture must include committed WAL state");
+        assert_ne!(first_instance, second_instance,
+            "each first migration currently assigns an independent v1 identity");
+        assert!(second_was_denied,
+            "two pre-migration v0 snapshot clones must not both hold host activity leases");
+        assert!(second_acquired_after_release,
+            "dropping the first two-level activity guard must release the host lock");
+    }
+
     #[test]
     fn fresh_database_persists_instance_and_generation_across_reopen() {
         let dir = test_dir("fresh-v1-stability");
@@ -1870,6 +2572,108 @@ mod tests {
     }
 
     #[test]
+    fn legacy_layout_without_request_mode_checks_is_refused_without_mutation() {
+        let dir = test_dir("legacy-missing-mode-checks");
+        let legacy = create_legacy_v0_database(&dir);
+        legacy.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE bridge_core_request_modes_rebuilt (
+               request_id TEXT PRIMARY KEY NOT NULL REFERENCES bridge_core_requests(request_id),
+               billing_mode TEXT NOT NULL,
+               operation_id TEXT
+             );
+             INSERT INTO bridge_core_request_modes_rebuilt SELECT * FROM bridge_core_request_modes;
+             DROP TABLE bridge_core_request_modes;
+             ALTER TABLE bridge_core_request_modes_rebuilt RENAME TO bridge_core_request_modes;
+             PRAGMA foreign_keys = ON;",
+        ).unwrap();
+        let before_schema = schema_objects(&legacy);
+        let before_rows = snapshot_legacy_rows(&legacy);
+        drop(legacy);
+
+        let opened = BridgeBillingStore::open(&dir);
+        let accepted = opened.is_ok();
+        drop(opened);
+        let reopened = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        let after_schema = schema_objects(&reopened);
+        let after_rows = snapshot_legacy_rows(&reopened);
+        let metadata = bridge_metadata(&reopened).unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(!accepted, "v0 request-mode CHECK constraints must be required");
+        assert_eq!(metadata, None, "rejected v0 must not gain a version marker");
+        assert_eq!(after_schema, before_schema, "rejection must retain every legacy object");
+        assert_eq!(after_rows, before_rows, "rejection must preserve every legacy row");
+    }
+
+    #[test]
+    fn legacy_layout_without_non_primary_key_not_null_is_refused_without_mutation() {
+        let dir = test_dir("legacy-missing-request-key-not-null");
+        let legacy = create_legacy_v0_database(&dir);
+        legacy.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE bridge_core_requests_rebuilt (
+               request_id TEXT PRIMARY KEY NOT NULL,
+               core_key_id TEXT,
+               associated_at_ms INTEGER NOT NULL,
+               conflict INTEGER NOT NULL DEFAULT 0 CHECK(conflict IN (0, 1))
+             );
+             INSERT INTO bridge_core_requests_rebuilt SELECT * FROM bridge_core_requests;
+             DROP TABLE bridge_core_requests;
+             ALTER TABLE bridge_core_requests_rebuilt RENAME TO bridge_core_requests;
+             PRAGMA foreign_keys = ON;",
+        ).unwrap();
+        let before_schema = schema_objects(&legacy);
+        let before_rows = snapshot_legacy_rows(&legacy);
+        drop(legacy);
+
+        let opened = BridgeBillingStore::open(&dir);
+        let accepted = opened.is_ok();
+        drop(opened);
+        let reopened = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        let after_schema = schema_objects(&reopened);
+        let after_rows = snapshot_legacy_rows(&reopened);
+        let metadata = bridge_metadata(&reopened).unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(!accepted, "v0 request attribution must retain its non-null Core key");
+        assert_eq!(metadata, None, "rejected v0 must not gain a version marker");
+        assert_eq!(after_schema, before_schema, "rejection must retain every legacy object");
+        assert_eq!(after_rows, before_rows, "rejection must preserve every legacy row");
+    }
+
+    #[test]
+    fn legacy_layout_with_same_named_but_wrong_lookup_index_is_refused() {
+        let dir = test_dir("legacy-wrong-session-index");
+        let legacy = create_legacy_v0_database(&dir);
+        legacy.execute_batch(
+            "DROP INDEX bridge_core_upstream_sessions_lookup_idx;
+             CREATE INDEX bridge_core_upstream_sessions_lookup_idx
+               ON bridge_core_upstream_sessions(request_id, session_id);",
+        ).unwrap();
+        let before_schema = schema_objects(&legacy);
+        let before_rows = snapshot_legacy_rows(&legacy);
+        drop(legacy);
+
+        let opened = BridgeBillingStore::open(&dir);
+        let accepted = opened.is_ok();
+        drop(opened);
+        let reopened = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        let after_schema = schema_objects(&reopened);
+        let after_rows = snapshot_legacy_rows(&reopened);
+        let metadata = bridge_metadata(&reopened).unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(!accepted, "a matching index name cannot replace the legacy lookup semantics");
+        assert_eq!(metadata, None, "rejected v0 must not gain a version marker");
+        assert_eq!(after_schema, before_schema, "rejection must retain every legacy object");
+        assert_eq!(after_rows, before_rows, "rejection must preserve every legacy row");
+    }
+
+    #[test]
     fn failed_legacy_migration_rolls_back_schema_and_keeps_legacy_rows() {
         let dir = test_dir("migration-write-failure");
         let legacy = create_legacy_v0_database(&dir);
@@ -1930,7 +2734,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn explicit_recovery_rotates_only_after_worker_stop_confirmation() {
+    fn active_lease_is_not_recovery_confirmation_and_drop_stays_dirty() {
         use super::super::bridge_budget_lease::BridgeBudgetLease;
 
         let dir = test_dir("explicit-generation-recovery");
@@ -1938,12 +2742,12 @@ mod tests {
         let before = store.bridge_identity().unwrap().1;
         let mut lease = BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
         let after_acquire = store.bridge_identity().unwrap().1;
-        let denied = store.rotate_event_generation_for_recovery(&mut lease, || {
-            Err("old charging workers are still active".into())
+        let confirmed = std::cell::Cell::new(false);
+        let recovery = store.rotate_event_generation_for_recovery(&mut lease, || {
+            confirmed.set(true);
+            Ok(())
         });
-        let after_denied = store.bridge_identity().unwrap().1;
-        let rotated = store.rotate_event_generation_for_recovery(&mut lease, || Ok(()));
-        let after_rotation = store.bridge_identity().unwrap().1;
+        let after_recovery = store.bridge_identity().unwrap().1;
         drop(lease);
         drop(store);
         let reopened = BridgeBillingStore::open(&dir).unwrap();
@@ -1951,13 +2755,14 @@ mod tests {
         drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
 
-        assert_eq!(after_acquire, before, "acquiring a lease must not rotate generation");
-        assert!(denied.is_err(), "workers still active must block recovery");
-        assert_eq!(after_denied, before, "failed recovery must retain the old generation");
-        assert!(rotated.is_ok(), "confirmed worker shutdown should permit explicit recovery");
-        assert_eq!(rotated.unwrap(), after_rotation);
-        assert_ne!(after_rotation, before, "explicit recovery must mint a new generation");
-        assert_eq!(after_reopen, after_rotation, "reopening must retain the recovered generation");
+        assert!(after_acquire.starts_with("bridge-active-v1-"),
+            "acquisition must persist the active owner before making the lease charge-ready");
+        assert!(recovery.is_err(), "an ordinary successful mutex acquisition is not recovery evidence");
+        assert!(!confirmed.get(), "recovery callback must not run without a persisted pending marker");
+        assert_eq!(after_recovery, after_acquire, "rejected recovery must retain the active owner marker");
+        assert_eq!(after_reopen, after_acquire,
+            "dropping a lease without explicit clean close must leave the database dirty");
+        assert!(before.starts_with("bridge-generation-v1-"), "fixture starts from a clean generation");
     }
 
     #[test]
