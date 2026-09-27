@@ -49,6 +49,26 @@ fn media_time(mdhd:&[u8])->Result<(u64,u64),String> {
     let ticks=if wide {u64_at(mdhd,offset+4)?} else {u64::from(u32_at(mdhd,offset+4)?)};
     if scale==0 || ticks==0 {return Err(INVALID.into());} Ok((scale,ticks))
 }
+fn edit_duration_ms(edts:&[u8],movie_scale:u64,media_ticks:u64)->Result<u64,String> {
+    let edit=boxes(edts)?;let list=one(&edit,b"elst")?;
+    let wide=match list.first() {Some(0)=>false,Some(1)=>true,_=>return Err(INVALID.into())};
+    if list.get(1..4)!=Some(&[0,0,0]) {return Err(INVALID.into());}
+    let count=u32_at(list,4)? as usize;let width=if wide {20} else {12};
+    if count==0 || count>10000 || list.len()!=8+count*width {return Err(INVALID.into());}
+    let mut ticks=0u64;
+    for index in 0..count {
+        let offset=8+index*width;
+        let (duration,start,rate)=if wide {(u64_at(list,offset)?,u64_at(list,offset+8)? as i64,offset+16)}
+            else {(u32_at(list,offset)? as u64,u32_at(list,offset+4)? as i32 as i64,offset+8)};
+        // Empty edits use -1. Offset+duration may exceed mdhd due to video
+        // composition timestamps; budget the larger complete timeline instead
+        // of incorrectly rejecting ordinary B-frame output.
+        if duration==0 || start< -1 || start>=0 && start as u64>media_ticks || u32_at(list,rate)?!=0x00010000 {return Err(INVALID.into());}
+        ticks=ticks.checked_add(duration).ok_or(INVALID)?;
+    }
+    let ms=ticks.checked_mul(1000).and_then(|n|n.checked_add(movie_scale-1)).ok_or(INVALID)?/movie_scale;
+    if ms==0 || ms>60_000 {return Err(INVALID.into());}Ok(ms)
+}
 pub(super) fn duration_ms(bytes: &[u8]) -> Result<u64, String> {
     if bytes.len()>super::assets::MAX_ASSET_BYTES {return Err(INVALID.into());}
     let top=boxes(bytes)?;
@@ -59,9 +79,6 @@ pub(super) fn duration_ms(bytes: &[u8]) -> Result<u64, String> {
     let mut video_count=0;let mut total=0;
     for (_,track) in movie.iter().filter(|(k,_)|*k==b"trak") {
         let track=boxes(track)?;
-        // Edit lists can repeat/retime samples; do not infer price from an
-        // unverified presentation timeline. This profile is non-fragmented MP4.
-        if track.iter().any(|(k,_)|*k==b"edts") {return Err(INVALID.into());}
         let media=boxes(one(&track,b"mdia")?)?;
         let handler=one(&media,b"hdlr")?.get(8..12).ok_or(INVALID)?;
         if handler==b"vide" {video_count+=1;} else if handler!=b"soun" {return Err(INVALID.into());}
@@ -79,8 +96,18 @@ pub(super) fn duration_ms(bytes: &[u8]) -> Result<u64, String> {
             samples=samples.checked_add(count).ok_or(INVALID)?;
             measured=measured.checked_add(count.checked_mul(delta).ok_or(INVALID)?).ok_or(INVALID)?;
         }
-        if samples>1_000_000 || measured!=ticks {return Err(INVALID.into());}
-        let ms=ticks.checked_mul(1000).and_then(|v|v.checked_add(scale-1)).ok_or(INVALID)?/scale;
+        // Audio priming/padding can make stts longer than mdhd when an edit
+        // list trims playback. Never reduce the reservation to the trimmed
+        // duration; retain the whole decoded sample timeline. Video timing
+        // mismatches and audio mismatches without an edit remain unsupported.
+        let edited_audio_padding=handler==b"soun" && measured>=ticks
+            && track.iter().any(|(k,_)|*k==b"edts");
+        if samples>1_000_000 || measured!=ticks && !edited_audio_padding {return Err(INVALID.into());}
+        let mut ms=ticks.max(measured).checked_mul(1000).and_then(|v|v.checked_add(scale-1)).ok_or(INVALID)?/scale;
+        if track.iter().any(|(k,_)|*k==b"edts") {
+            let (movie_scale,_)=media_time(one(&movie,b"mvhd")?)?;
+            ms=ms.max(edit_duration_ms(one(&track,b"edts")?,movie_scale,ticks)?);
+        }
         if ms==0 || ms>60_000 {return Err(INVALID.into());} total=total.max(ms);
     }
     if video_count!=1 {return Err(INVALID.into());} Ok(total)
@@ -123,5 +150,46 @@ mod tests {
         assert!(owned_reference_seconds(&root,"owner",&json!({"image_asset_ids":[video.id]})).is_err());
         assert!(owned_reference_seconds(&root,"owner",&json!({"video_urls":["tos://unknown"]})).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn edited_sample(segment_ms:u32,rate:u16)->Vec<u8> {
+        let source=sample(121000,121,1000);let top=boxes(&source).unwrap();
+        let movie=boxes(one(&top,b"moov").unwrap()).unwrap();
+        let track=one(&movie,b"trak").unwrap();
+        let mut mvhd=vec![0;12];mvhd.extend(1000u32.to_be_bytes());mvhd.extend(segment_ms.to_be_bytes());
+        let mut elst=vec![0;4];elst.extend(1u32.to_be_bytes());elst.extend(segment_ms.to_be_bytes());elst.extend(1024u32.to_be_bytes());elst.extend(rate.to_be_bytes());elst.extend(0u16.to_be_bytes());
+        [bx(b"ftyp",one(&top,b"ftyp").unwrap().to_vec()),bx(b"moov",[bx(b"mvhd",mvhd),bx(b"trak",[bx(b"edts",bx(b"elst",elst)),track.to_vec()].concat())].concat()),bx(b"mdat",vec![0;4])].concat()
+    }
+    #[test]
+    fn normal_mp4_edit_list_uses_conservative_decode_and_presentation_duration() {
+        assert_eq!(duration_ms(&edited_sample(5000,1)).unwrap(),5042);
+        assert_eq!(duration_ms(&edited_sample(6000,1)).unwrap(),6000);
+        assert!(duration_ms(&edited_sample(5000,2)).is_err(),"unverified retiming is not a supported budget profile");
+        assert!(duration_ms(&edited_sample(61000,1)).is_err());
+    }
+
+    #[test]
+    fn edited_audio_priming_is_budgeted_instead_of_rejecting_generated_mp4() {
+        let source=edited_sample(5000,1);let top=boxes(&source).unwrap();
+        let movie=one(&top,b"moov").unwrap();
+        let mut mdhd=vec![0;12];mdhd.extend(32000u32.to_be_bytes());mdhd.extend(162816u32.to_be_bytes());
+        let mut hdlr=vec![0;8];hdlr.extend(b"soun");
+        let mut timing=vec![0;4];timing.extend(1u32.to_be_bytes());timing.extend(160u32.to_be_bytes());timing.extend(1024u32.to_be_bytes());
+        let mdia=bx(b"mdia",[bx(b"mdhd",mdhd),bx(b"hdlr",hdlr),bx(b"minf",bx(b"stbl",bx(b"stts",timing)))].concat());
+        let mut edit=vec![0;4];edit.extend(1u32.to_be_bytes());edit.extend(5088u32.to_be_bytes());edit.extend(1024u32.to_be_bytes());edit.extend(0x10000u32.to_be_bytes());
+        let assemble=|audio:Vec<u8>| [bx(b"ftyp",one(&top,b"ftyp").unwrap().to_vec()),bx(b"moov",[movie.to_vec(),bx(b"trak",audio)].concat()),bx(b"mdat",vec![0;4])].concat();
+        assert_eq!(duration_ms(&assemble([bx(b"edts",bx(b"elst",edit)),mdia.clone()].concat())).unwrap(),5120);
+        assert!(duration_ms(&assemble(mdia)).is_err(),"unexplained timing mismatch must remain rejected");
+    }
+
+    #[test]
+    #[ignore="explicit local generated-media metadata probe; no upstream request"]
+    fn generated_acceptance_mp4_metadata_probe() {
+        assert_eq!(std::env::var("BRIDGE_MEDIA_PROBE_ACK").as_deref(),Ok("1"));
+        let path=std::env::var("BRIDGE_MEDIA_PROBE_PATH").unwrap();
+        assert!(std::path::Path::new(&path).is_absolute());
+        let bytes=std::fs::read(path).unwrap();
+        // Includes AAC priming: sample table is 5.120s, edited playback 5.088s.
+        assert_eq!(duration_ms(&bytes).unwrap(),5120);
     }
 }

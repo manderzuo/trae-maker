@@ -8,9 +8,14 @@ bridge credential after Core has checked the ordinary user's ownership.
 Image and video IDs cannot be interchanged. Reference videos require local
 uploaded MP4 bytes, not an arbitrary URL, TOS URI or caller-supplied duration.
 The initial metadata adapter accepts non-fragmented MP4 with one video track
-(and optional audio), checks box boundaries and matching mdhd/stts durations,
-and conservatively includes the longest track. Fragmented media, edit lists,
-WebM, ambiguous/malformed timing and over-60-second aggregate references are
+(and optional audio), checks box boundaries and matching video mdhd/stts durations,
+and conservatively includes the longest decode or presentation timeline.
+Normal unit-rate edit lists (including leading empty edits) are supported;
+their movie timescale and aggregate durations are bounded independently.
+Edited audio may include priming/padding in its sample table; its full decoded
+duration is retained even when the edit list trims playback. Audio timing
+mismatches without an edit list and shorter sample tables remain rejected.
+Fragmented media, retimed edit lists, WebM, ambiguous/malformed timing and over-60-second aggregate references are
 rejected explicitly before paid dispatch. This is a bounded container metadata
 adapter, not a general-purpose media decoder.
 
