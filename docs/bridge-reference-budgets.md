@@ -42,4 +42,9 @@ The native uploader uses `override_resource_id` when provided, falling back to
 `store_uri` and removing the query suffix, matching the installed native
 remote-attachment uploader. The PUT storage location is not necessarily the
 generation service's resource identifier. Images retain their raw-image upload
-contract; remote video attachments retain the native Magic V2 envelope.
+contract. Generation reference videos use `biz_type=video` and raw MP4 bytes,
+not the generic `remote_resource` Magic V2 envelope. A real non-generating
+probe confirmed that the video namespace resolves through the default resource
+lookup to an MP4; the generic attachment namespace did not return an HTTPS
+resource through that lookup. A retrievable chat attachment alone does not
+prove that the generation backend can consume it.

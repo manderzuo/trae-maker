@@ -5,9 +5,12 @@ use super::assets::AssetRecord;
 use super::pool::PickedAccount;
 use super::{streaming_agent, APP_ID, AGENT_HOST, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
+#[cfg(test)]
 const RESOURCE_BIZ_TYPE: &str = "remote_resource";
 const IMAGE_BIZ_TYPE: &str = "image";
+#[cfg(test)]
 const MAGIC_V2_HEADER: &[u8; 8] = &[0, 0, 0, 0, 27, 198, 174, 134];
+#[cfg(test)]
 const MAGIC_V2_XOR_KEY: &[u8; 37] = &[
     234, 159, 186, 198, 149, 201, 133, 234, 157, 137, 32, 225, 181, 187, 194, 167, 32, 234,
     157, 137, 198, 149, 226, 130, 172, 32, 195, 159, 226, 130, 172, 194, 167, 234, 157,
@@ -51,6 +54,7 @@ fn crc32_value(bytes: &[u8]) -> u32 {
     !crc
 }
 
+#[cfg(test)]
 fn crc32_hex(bytes: &[u8]) -> String {
     // The current Trae remote-attachment uploader emits the native
     // JavaScript `crc32.toString(16)` representation (no forced padding).
@@ -62,13 +66,6 @@ fn crc32_padded_hex(bytes: &[u8]) -> String {
     format!("{:08x}", crc32_value(bytes))
 }
 
-fn build_upload_payload(target: &str) -> Value {
-    serde_json::json!({
-        "targets": [target],
-        "biz_type": RESOURCE_BIZ_TYPE
-    })
-}
-
 fn build_image_upload_payload(target: &str, width: u32, height: u32) -> Value {
     serde_json::json!({
         "targets": [target],
@@ -77,11 +74,13 @@ fn build_image_upload_payload(target: &str, width: u32, height: u32) -> Value {
     })
 }
 
+#[cfg(test)]
 fn native_upload_method() -> &'static str {
     // The current ai-modules-chat remote attachment uploader uses PUT.
     "PUT"
 }
 
+#[cfg(test)]
 fn build_upload_headers(
     auth: &str,
     crc32: &str,
@@ -119,6 +118,7 @@ fn build_image_upload_headers(
     headers
 }
 
+#[cfg(test)]
 fn encode_remote_attachment(bytes: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(MAGIC_V2_HEADER.len() + bytes.len());
     encoded.extend_from_slice(MAGIC_V2_HEADER);
@@ -133,6 +133,12 @@ fn encode_remote_attachment(bytes: &[u8]) -> Vec<u8> {
 
 fn native_target_path() -> String {
     format!("{}.trae", crate::commands::oauth::random_hex(32))
+}
+
+fn video_upload_contract(bytes: &[u8]) -> (Value, Vec<u8>, &'static str) {
+    // Generation resolves the video namespace. Generic remote_resource objects
+    // use a different bucket and a Magic envelope that the video tool cannot read.
+    (serde_json::json!({"targets":[native_target_path()],"biz_type":"video"}), bytes.to_vec(), "video")
 }
 
 fn generation_resource_uri(plan:UploadPlan)->String {
@@ -152,6 +158,7 @@ fn image_target_path(width: u32, height: u32) -> String {
     )
 }
 
+#[cfg(test)]
 fn build_commit_payload(store_uri: &str, session_key: Option<&str>) -> Value {
     build_commit_payload_for(store_uri, session_key, RESOURCE_BIZ_TYPE)
 }
@@ -287,13 +294,6 @@ fn common_request(account: &PickedAccount, path: &str) -> ureq::Request {
         .set("referer", &referer)
 }
 
-fn request_upload_plan(
-    account: &PickedAccount,
-    target: &str,
-) -> Result<UploadPlan, NativeUploadError> {
-    request_upload_plan_with_payload(account, build_upload_payload(target))
-}
-
 fn request_upload_plan_with_payload(
     account: &PickedAccount,
     payload: Value,
@@ -315,6 +315,7 @@ fn request_upload_plan_with_payload(
     }
 }
 
+#[cfg(test)]
 fn upload_bytes(plan: &UploadPlan, bytes: &[u8]) -> Result<(), NativeUploadError> {
     let host = plan
         .upload_host
@@ -391,13 +392,6 @@ fn upload_image_bytes(
     }
 }
 
-fn commit_upload(
-    account: &PickedAccount,
-    plan: &UploadPlan,
-) -> Result<(), NativeUploadError> {
-    commit_upload_for(account, plan, RESOURCE_BIZ_TYPE)
-}
-
 fn commit_upload_for(
     account: &PickedAccount,
     plan: &UploadPlan,
@@ -447,11 +441,10 @@ pub fn upload_asset(
         commit_upload_for(account, &plan, IMAGE_BIZ_TYPE)?;
         return Ok(generation_resource_uri(plan));
     }
-    let target = native_target_path();
-    let plan = request_upload_plan(account, &target)?;
-    let encoded = encode_remote_attachment(bytes);
-    upload_bytes(&plan, &encoded)?;
-    commit_upload(account, &plan)?;
+    let (payload, content, biz_type) = video_upload_contract(bytes);
+    let plan = request_upload_plan_with_payload(account, payload)?;
+    upload_image_bytes(&plan, &content, &record.mime_type)?;
+    commit_upload_for(account, &plan, biz_type)?;
     Ok(generation_resource_uri(plan))
 }
 
@@ -525,6 +518,62 @@ fn detect_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_video_uses_video_namespace_and_unwrapped_mp4() {
+        let bytes=b"\0\0\0\x18ftypisom\0\0\0\0";
+        let (payload,content,biz_type)=video_upload_contract(bytes);
+        assert_eq!(payload["biz_type"],"video", "generic attachments are not resolvable by generation");
+        assert_eq!(biz_type,"video");
+        assert_eq!(content,bytes,"generation must read raw media, not the attachment Magic envelope");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore="explicit one-asset native upload probe; never calls generation"]
+    fn live_reference_resource_upload_probe() {
+        assert_eq!(std::env::var("BRIDGE_UPLOAD_PROBE_ACK").as_deref(),Ok("1"));
+        let root=std::path::PathBuf::from(std::env::var("BRIDGE_UPLOAD_PROBE_DATA").unwrap());
+        let file=std::path::PathBuf::from(std::env::var("BRIDGE_UPLOAD_PROBE_FILE").unwrap());
+        assert!(root.is_absolute() && file.is_absolute());
+        let paths=["conf/vault_key.bin","conf/vault.stronghold","data/checkin_accounts.json","data/device_map.json"].map(|p|root.join(p));
+        let before=paths.iter().map(|p|std::fs::read(p).unwrap()).collect::<Vec<_>>();
+        let state=crate::state::AppState {data_dir:root,python_dir:Default::default(),python_exe:String::new(),jwt_refresh_lock:Default::default()};
+        let accounts=crate::vault::load_accounts(&state);
+        let devices:crate::models::DeviceMap=serde_json::from_slice(&before[3]).unwrap();
+        let uid=std::env::var("BRIDGE_UPLOAD_PROBE_UID").expect("explicit existing account ID required");
+        let raw=accounts.accounts.iter().find(|a|a.user_id.as_deref()==Some(uid.as_str())).unwrap();
+        let device=devices.get(raw.user_id.as_ref().unwrap()).unwrap();
+        let account=PickedAccount {uid:raw.user_id.clone().unwrap(),jwt:raw.jwt.strip_prefix("Cloud-IDE-JWT ").unwrap_or(&raw.jwt).trim().into(),device_id:device.device_id.clone(),machine_id:device.device_id.clone(),domain:String::new(),enterprise_id:String::new(),global_region:false};
+        assert!(!account.jwt.is_empty());
+        let bytes=std::fs::read(file).unwrap();assert!(bytes.len()<2*1024*1024 && &bytes[4..8]==b"ftyp");
+        let probe_biz=std::env::var("BRIDGE_UPLOAD_PROBE_BIZ").unwrap_or_else(|_|RESOURCE_BIZ_TYPE.into());
+        assert!([RESOURCE_BIZ_TYPE,"video"].contains(&probe_biz.as_str()));
+        let plan=request_upload_plan_with_payload(&account,serde_json::json!({"targets":[native_target_path()],"biz_type":probe_biz})).unwrap();
+        println!("native upload identity: override_present={}, differs={}",plan.resource_id.is_some(),plan.resource_id.as_deref().is_some_and(|r|r!=plan.store_uri));
+        if probe_biz==RESOURCE_BIZ_TYPE {upload_bytes(&plan,&encode_remote_attachment(&bytes)).unwrap();}
+        else {upload_image_bytes(&plan,&bytes,"video/mp4").unwrap();}
+        commit_upload_for(&account,&plan,&probe_biz).unwrap();
+        let resource=generation_resource_uri(plan);
+        let signed:Value=common_request(&account,"/api/ide/v1/get_resource_url").send_json(serde_json::json!({"uri_list":[resource],"biz_type":probe_biz})).unwrap().into_json().unwrap();
+        let signed=signed.get("data").unwrap_or(&signed);
+        let has_url=signed["url_map"].get(&resource).and_then(Value::as_str).is_some_and(|s|s.starts_with("https://"));
+        println!("generation identity can resolve a signed resource URL: {has_url}");
+        let default_signed:Value=common_request(&account,"/api/ide/v1/get_resource_url").send_json(serde_json::json!({"uri_list":[resource]})).unwrap().into_json().unwrap();
+        let default_signed=default_signed.get("data").unwrap_or(&default_signed);
+        let default_url=default_signed["url_map"].get(&resource).and_then(Value::as_str).filter(|s|s.starts_with("https://"));
+        println!("default namespace HTTPS URL available: {}", default_url.is_some());
+        println!("resource namespace: {}", resource.split('/').take(1).collect::<Vec<_>>().join("/"));
+        if let Some(url)=default_url {
+            match streaming_agent().get(url).set("Range","bytes=0-15").call() {
+                Ok(response)=>{let mut first=[0u8;16]; use std::io::Read; response.into_reader().read_exact(&mut first).unwrap(); println!("default retrieval: ftyp={}, magic={}",&first[4..8]==b"ftyp",first.starts_with(MAGIC_V2_HEADER));},
+                Err(ureq::Error::Status(status,_))=>println!("default retrieval HTTP {status}"),
+                Err(_)=>println!("default retrieval transport failure"),
+            }
+        }
+        for (path,original) in paths.iter().zip(before) {assert_eq!(std::fs::read(path).unwrap(),original,"credentials/config must not change");}
+        assert!(has_url);
+    }
 
     #[test]
     fn generation_uses_native_override_id_not_storage_location() {
