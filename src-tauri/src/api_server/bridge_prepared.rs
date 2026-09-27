@@ -192,8 +192,9 @@ impl BridgeBillingStore {
         let ids={let mut stmt=self.connection.prepare("SELECT p.budget_id FROM bridge_prepared_budgets p
             LEFT JOIN bridge_budget_receipts r ON r.budget_id=p.budget_id
             WHERE p.state IN ('prepared','canceled','no_send') AND r.budget_id IS NULL AND p.created_at_ms<=?1
+              AND (p.state!='prepared' OR p.event_generation=?2)
             ORDER BY p.created_at_ms,p.budget_id LIMIT 128").map_err(db_error)?;
-            let rows=stmt.query_map([now.saturating_sub(60_000)],|r|r.get::<_,String>(0)).map_err(db_error)?;
+            let rows=stmt.query_map(params![now.saturating_sub(60_000),lease.generation()],|r|r.get::<_,String>(0)).map_err(db_error)?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?};
         let mut done=0;
         for id in ids {

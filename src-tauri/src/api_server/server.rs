@@ -135,6 +135,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/internal/bridge/v2/requests/:request_id/billing", get(super::bridge_v2_api::billing))
         .route("/internal/bridge/v2/requests/:request_id/refresh", post(super::bridge_v2_api::refresh))
         .route("/internal/bridge/v2/receipt-events", get(super::bridge_v2_api::events))
+        .route("/internal/bridge/v2/recovery", get(super::bridge_v2_api::recovery_status).post(super::bridge_v2_api::recover))
         .route("/internal/bridge/v2/budgets/prepare", post(super::bridge_v2_api::prepare))
         .route("/internal/bridge/v2/budgets/cancel", post(super::bridge_v2_api::cancel))
         .route("/internal/bridge/v2/budgets/dispatch", post(super::bridge_v2_api::dispatch))
@@ -458,6 +459,37 @@ mod tests {
             .header("content-type","application/json").body(Body::from(claim.to_string())).unwrap()).await.unwrap();
         assert_eq!(denied.status(),StatusCode::FORBIDDEN);
         drop(app);drop(runtime);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn v2_recovery_requires_bridge_auth_identity_and_explicit_confirmation() {
+        use super::super::{bridge_runtime::BridgeBudgetRuntime,bridge_billing::BridgeBillingStore,bridge_budget_lease::BridgeBudgetLease};
+        let mut fixture=BridgeFixture::new();
+        let store=BridgeBillingStore::open(&fixture.dir).unwrap();
+        let lease=BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();drop(lease);drop(store);
+        let runtime=BridgeBudgetRuntime::start(&fixture.dir).unwrap();
+        let app=fixture.take_app().layer(axum::Extension(runtime.clone()));
+        let path="/internal/bridge/v2/recovery";
+        let denied=app.clone().oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(denied.status(),StatusCode::FORBIDDEN);
+        let status=app.clone().oneshot(Request::builder().uri(path).header("authorization",format!("Bearer {}",fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(status.status(),StatusCode::OK);
+        let value:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(status.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(value["recovery_required"],true);
+        let mut body=serde_json::json!({"instance_id":value["instance_id"],"generation":value["generation"],"acknowledge_retained_unknowns":false});
+        let request=|value:&serde_json::Value,key:&str| Request::builder().method("POST").uri(path).header("authorization",format!("Bearer {key}"))
+            .header("content-type","application/json").body(Body::from(value.to_string())).unwrap();
+        let denied=app.clone().oneshot(request(&body,&fixture.key)).await.unwrap();assert_eq!(denied.status(),StatusCode::CONFLICT);
+        body["acknowledge_retained_unknowns"]=serde_json::json!(true);
+        let user_store=aiwork_core::CoreStore::open(&fixture.dir).unwrap();
+        user_store.create_user(aiwork_core::NewUser {id:"regular-recovery-user".into(),name:"Regular".into(),role:aiwork_core::UserRole::User},"bootstrap").unwrap();
+        let regular=user_store.issue_api_key("regular-recovery-user","regular",std::collections::BTreeSet::from(["models:read".into()]),"bootstrap").unwrap();
+        let denied=app.clone().oneshot(request(&body,&regular.plaintext)).await.unwrap();assert_eq!(denied.status(),StatusCode::FORBIDDEN);
+        let activated=app.clone().oneshot(request(&body,&fixture.key)).await.unwrap();assert_eq!(activated.status(),StatusCode::OK);
+        assert!(runtime.recovery_status().unwrap().charge_ready);
+        let stale=app.clone().oneshot(request(&body,&fixture.key)).await.unwrap();assert_eq!(stale.status(),StatusCode::CONFLICT);
+        drop(user_store);drop(app);drop(runtime);
     }
 
     #[tokio::test]

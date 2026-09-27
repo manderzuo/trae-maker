@@ -12,6 +12,28 @@ fn error(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({"error":{"code":code,"type":"bridge_error"}}))).into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RecoveryRequest {
+    instance_id:String,generation:String,acknowledge_retained_unknowns:bool,
+}
+pub(super) async fn recovery_status(axum::Extension(runtime):axum::Extension<Arc<super::bridge_runtime::BridgeBudgetRuntime>>)->Response {
+    match tokio::task::spawn_blocking(move ||runtime.recovery_status()).await {
+        Ok(Ok(value))=>Json(value).into_response(),_=>error(StatusCode::SERVICE_UNAVAILABLE,"bridge_recovery_status_unavailable"),
+    }
+}
+pub(super) async fn recover(axum::Extension(runtime):axum::Extension<Arc<super::bridge_runtime::BridgeBudgetRuntime>>,Json(request):Json<RecoveryRequest>)->Response {
+    if request.instance_id.len()>128 || request.generation.len()>128 {return error(StatusCode::BAD_REQUEST,"bridge_recovery_identity_invalid");}
+    match tokio::task::spawn_blocking(move ||runtime.recover_local_instance(&request.instance_id,&request.generation,request.acknowledge_retained_unknowns)).await {
+        Ok(Ok(value))=>Json(value).into_response(),
+        Ok(Err(reason))=>match reason.as_str() {
+            "bridge_recovery_confirmation_required"|"bridge_recovery_identity_or_state_changed"|"bridge_recovery_busy"=>error(StatusCode::CONFLICT,&reason),
+            _=>error(StatusCode::SERVICE_UNAVAILABLE,"bridge_recovery_failed"),
+        },
+        _=>error(StatusCode::SERVICE_UNAVAILABLE,"bridge_recovery_failed"),
+    }
+}
+
 pub(super) async fn prepare(State(state):State<Arc<ApiSharedState>>,
     axum::Extension(runtime):axum::Extension<Arc<super::bridge_runtime::BridgeBudgetRuntime>>,
     axum::Extension(bridge_key):axum::Extension<super::usage::KeyId>,

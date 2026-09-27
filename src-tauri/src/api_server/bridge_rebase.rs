@@ -89,6 +89,22 @@ fn require_pending_owner(tx:&Transaction<'_>,fence:&RebaseFence)->Result<(),Stri
     let current:(i64,i64,String,Option<String>)=tx.query_row("SELECT snapshot_epoch,fence_epoch,rebase_state,owner_nonce FROM bridge_capacity_accounts WHERE account_ref=?1",[&fence.account_ref],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(db_error)?;
     if current!=(fence.snapshot_epoch,fence.fence_epoch,"fenced".into(),Some(fence.owner_nonce.clone())) {return Err("capacity_rebase_owner_changed".into());}Ok(())
 }
+/// Called only inside the exclusive instance recovery transaction. Abort a
+/// stalled *rebase*, never a financial reservation or a receipt conflict.
+pub(super) fn abort_rebases_for_recovery(tx:&Transaction<'_>)->Result<(),String> {
+    let broken:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_rebases b LEFT JOIN bridge_capacity_accounts a ON a.account_ref=b.account_ref
+        WHERE b.state='pending' AND (a.account_ref IS NULL OR a.rebase_state!='fenced' OR a.owner_nonce IS NULL OR a.owner_nonce!=b.owner_nonce))",[],|r|r.get(0)).map_err(db_error)?;
+    if broken {return Err("capacity_rebase_recovery_binding_invalid".into());}
+    let rows={let mut stmt=tx.prepare("SELECT account_ref,owner_nonce FROM bridge_capacity_rebases WHERE state='pending'").map_err(db_error)?;
+        let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(db_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?};
+    for (account,owner) in rows {
+        if has_conflict(tx,&account)? {
+            tx.execute("UPDATE bridge_capacity_accounts SET owner_nonce=?1 WHERE account_ref=?2",params![format!("receipt-conflict:{owner}"),account]).map_err(db_error)?;
+        } else {tx.execute("UPDATE bridge_capacity_accounts SET rebase_state='open',owner_nonce=NULL WHERE account_ref=?1",[&account]).map_err(db_error)?;}
+        tx.execute("UPDATE bridge_capacity_rebases SET state='aborted' WHERE owner_nonce=?1",[owner]).map_err(db_error)?;
+    }Ok(())
+}
 impl BridgeBillingStore {
     pub(super) fn begin_capacity_rebase(&mut self,lease:&BridgeBudgetLease,account:&str,now:i64)->Result<RebaseFence,String> {
         if !valid_ref(account) || now<0 {return Err("invalid capacity rebase request".into());}
@@ -240,6 +256,25 @@ mod tests {
         assert!(store.begin_capacity_rebase(&lease,"account",now+30).is_err());
         let debit:i64=store.connection.query_row("SELECT actual_microcredits FROM bridge_capacity_covered WHERE budget_id=?1",[&id],|r|r.get(0)).unwrap();
         assert_eq!(debit,50_000_000);
+        cleanup(dir,store,lease);
+    }
+    #[test]
+    fn recovery_failure_rolls_back_rebase_abort_and_generation_together() {
+        use super::super::bridge_budget_lease::BridgeBudgetLease;
+        let (dir,mut store,lease)=fixture();
+        let fence=store.begin_capacity_rebase(&lease,"account",30).unwrap();
+        drop(lease);let mut lease=BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
+        let generation=lease.generation().to_owned();
+        store.connection.execute_batch("CREATE TRIGGER fail_recovery BEFORE UPDATE ON bridge_schema_meta BEGIN SELECT RAISE(ABORT,'fixture-recovery'); END").unwrap();
+        assert!(store.rotate_event_generation_for_recovery(&mut lease,||Ok(())).is_err());
+        assert!(!lease.charge_ready());assert_eq!(lease.generation(),generation);
+        let state:String=store.connection.query_row("SELECT state FROM bridge_capacity_rebases WHERE owner_nonce=?1",[&fence.owner_nonce],|r|r.get(0)).unwrap();
+        assert_eq!(state,"pending","a failed generation CAS must not commit an earlier unfence");
+        let owner:String=store.connection.query_row("SELECT owner_nonce FROM bridge_capacity_accounts WHERE account_ref='account'",[],|r|r.get(0)).unwrap();assert_eq!(owner,fence.owner_nonce);
+        store.connection.execute_batch("DROP TRIGGER fail_recovery").unwrap();
+        store.rotate_event_generation_for_recovery(&mut lease,||Ok(())).unwrap();
+        assert!(lease.charge_ready());
+        assert!(store.commit_capacity_rebase(&lease,&fence,&observation(&fence)).is_err());
         cleanup(dir,store,lease);
     }
 }

@@ -519,6 +519,7 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 ## 26. V2 准备、执行与查询接线（生产尚未启用）
 
 - API server 持有 `BridgeBudgetRuntime`，用量与收费 worker 共享 Arc；停止时先关闭新收费许可，最后一个 worker/观察者释放引用后才可写 clean-close 标记，不能只克隆身份字符串。
+- GET/POST `/internal/bridge/v2/recovery` 沿用桥接管理员鉴权；GET只显示实例/世代/恢复态/保留占用聚合。POST须匹配当前instance/generation并明确acknowledge_retained_unknowns，只在独占本机OS锁且未进入关服的恢复态激活。事务将遗留running标unknown、中止未提交rebase、旋转世代；绝不取消旧prepared/consumed/send_intent或清除P/R/D、receipt-conflict。旧未知项不占新世代TTL扫描页，不支持跨机多活恢复。生产尚未执行此操作。
 - 用量刷新后自动确认该账号已终态且有完整原始来源的预算，逐笔故障不阻断其余预算；未知账单继续保留，普通请求不能直接调用确认财务接口。
 - 每轮确认最多192条待结算与64条已结算历史，使用独立游标；历史复核不得占满待结算通道。已确认no-send无需反复检查，真实Final仍复核迟到冲突。游标仅安排读取，财务事实始终由数据库事务和outbox持久化。
 - `/internal/bridge/v2/requests/:request_id/{execution,result,billing,refresh}` 必须同时指定原预算 `budget_id` 并通过桥接管理员鉴权；只读接口不发起付费请求，不泄露 dispatch token。GET result 不依赖账单是否已到；密文损坏不得返回空成功。

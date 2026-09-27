@@ -455,6 +455,8 @@ impl BridgeBillingStore {
         if !lease.is_active()
             || lease.charge_ready()
             || !lease.recovery_required()
+            || lease.is_closing()
+            || lease.is_closed()
             || !is_recovery_required_generation(&generation)
             || lease.instance_id() != instance_id
             || lease.generation() != generation
@@ -474,6 +476,11 @@ impl BridgeBillingStore {
         {
             return Err("bridge generation changed before recovery could commit".into());
         }
+        // A stopped process is not proof that its upstream request was free.
+        // Keep every P/R/D and token unchanged; only classify orphaned execution.
+        transaction.execute("UPDATE bridge_budget_executions SET execution_state='unknown' WHERE execution_state='running'",[])
+            .map_err(|error|format!("bridge execution recovery failed: {error}"))?;
+        super::bridge_rebase::abort_rebases_for_recovery(&transaction)?;
         let next_generation = new_active_owner_generation();
         let updated = transaction.execute(
             "UPDATE bridge_schema_meta SET event_generation = ?1

@@ -176,6 +176,9 @@ impl BridgeBudgetLease {
     pub(super) fn is_closed(&self) -> bool {
         self.closed
     }
+    pub(super) fn is_closing(&self) -> bool {
+        self.closing
+    }
 
     pub(super) fn recovery_required(&self) -> bool {
         self.recovery_required
