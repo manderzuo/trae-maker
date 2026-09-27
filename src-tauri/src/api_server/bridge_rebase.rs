@@ -74,7 +74,10 @@ pub(super) fn quiet_watermark(conn:&Connection,account:&str)->Result<(i64,i64,i6
     if unsafe_state || has_conflict(conn,account)? {return Err("capacity_rebase_not_quiescent".into());}
     let event=conn.query_row("SELECT COALESCE(MAX(e.sequence),0) FROM bridge_budget_receipt_events e JOIN bridge_prepared_budgets p ON p.budget_id=e.budget_id WHERE p.account_ref=?1",[account],|r|r.get(0)).map_err(db_error)?;
     let legacy=conn.query_row("SELECT COUNT(*) FROM bridge_core_upstream_sessions WHERE account_ref=?1",[account],|r|r.get(0)).map_err(db_error)?;
-    let latest=conn.query_row("SELECT COALESCE(MAX(r.source_read_started_at_ms),0) FROM bridge_budget_receipts r JOIN bridge_prepared_budgets p ON p.budget_id=r.budget_id WHERE p.account_ref=?1",[account],|r|r.get(0)).map_err(db_error)?;
+    let latest=conn.query_row("SELECT COALESCE(MAX(observed),0) FROM (
+        SELECT r.source_read_started_at_ms AS observed FROM bridge_budget_receipts r JOIN bridge_prepared_budgets p ON p.budget_id=r.budget_id WHERE p.account_ref=?1
+        UNION ALL SELECT MAX(r.observed_at_ms,r.updated_at_ms) AS observed FROM bridge_billing_receipts r JOIN bridge_core_upstream_sessions s ON s.request_id=r.request_id WHERE s.account_ref=?1
+    )",[account],|r|r.get(0)).map_err(db_error)?;
     Ok((event,legacy,latest))
 }
 fn check_fence(tx:&Transaction<'_>,lease:&BridgeBudgetLease,fence:&RebaseFence)->Result<(String,Option<String>),String> {

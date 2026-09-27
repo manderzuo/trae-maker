@@ -160,8 +160,9 @@ pub(super) fn initialize_anchor_in_tx(tx:&Transaction<'_>,account:&str,observati
         if unsafe_state || observation.observed_at_ms<latest || snapshot.observed_at_ms!=observation.observed_at_ms || (general,work)!=(snapshot.general,snapshot.work) {
             return Err("capacity_anchor_initial_snapshot_unproven".into());
         }
-        // Legacy receipt finality is not covered by the v2 session policy.
-        if legacy!=0 {return Err("capacity_anchor_legacy_activity_unproven".into());}
+        // Settled legacy history is not a new D to forgive. Its verified final
+        // receipts and timestamps are checked by quiet_watermark; keep the
+        // count in the anchor so later legacy activity invalidates coverage.
         if let Some(existing)=anchor(&tx,account)? {
             return if existing==(snapshot.epoch,event,legacy,encoded) {Ok(())} else {Err("capacity_anchor_already_exists".into())};
         }
@@ -393,6 +394,27 @@ mod tests {
         assert!(store.commit_dedicated_capacity(&lease,&fence,&before).is_err());
         store.abort_capacity_rebase(&lease,&fence).unwrap();
         assert_eq!(store.capacity_totals("account").unwrap().confirmed,50_000_000);
+        cleanup(dir,store,lease);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn completed_legacy_history_can_seed_capacity_but_unknown_or_newer_receipts_cannot() {
+        use super::super::{bridge_billing::{BillingReceipt,BillingReceiptStatus,EvidenceTrust},bridge_budget::CapacitySnapshot,bridge_prepared::tests::{fixture,cleanup}};
+        let (dir,mut store,lease)=fixture();
+        let now=chrono::Utc::now().timestamp_millis()+10_000;
+        let packs=vec![json!({"id":"legacy-g","entitlement_base_info":{"product_id":208,"quota":{"credits_limit":"100"}},"usage":{"credits_amount":"0"}})];
+        let observed=PackObservation::parse(&packs,now).unwrap();
+        store.initialize_capacity(&lease,&CapacitySnapshot {account_ref:"legacy-account".into(),snapshot_ref:"legacy-baseline".into(),epoch:1,general:100_000_000,work:0,observed_at_ms:now}).unwrap();
+        store.record_core_request("legacy-request","key-a").unwrap();
+        store.record_core_session_attempt("legacy-request","legacy-account","legacy-session").unwrap();
+        assert!(store.initialize_capacity_anchor(&lease,"legacy-account",&observed).is_err());
+        store.record_receipt(&BillingReceipt {request_id:"legacy-request".into(),status:BillingReceiptStatus::Final,actual_credits:Some(aiwork_core::CreditAmount::parse("5","credits").unwrap()),unit:Some("credits".into()),source_ref:Some("fixture-final-source".into()),task_ref:Some("legacy-task".into()),observed_at_ms:now-1000},EvidenceTrust::VerifiedSourceContract).unwrap();
+        store.connection.execute("UPDATE bridge_billing_receipts SET updated_at_ms=?1 WHERE request_id='legacy-request'",[now+1]).unwrap();
+        assert!(store.initialize_capacity_anchor(&lease,"legacy-account",&observed).is_err(),"source observed before a receipt change must be rejected");
+        store.connection.execute("UPDATE bridge_billing_receipts SET updated_at_ms=?1 WHERE request_id='legacy-request'",[now-1]).unwrap();
+        store.initialize_capacity_anchor(&lease,"legacy-account",&observed).unwrap();
+        assert_eq!(store.get_receipt("legacy-request").unwrap().unwrap().actual_credits.unwrap().as_microcredits(),5_000_000);
+        let covered:i64=store.connection.query_row("SELECT COUNT(*) FROM bridge_capacity_covered",[],|r|r.get(0)).unwrap();assert_eq!(covered,0,"initial baseline must not manufacture historical debit coverage");
         cleanup(dir,store,lease);
     }
     #[cfg(windows)]

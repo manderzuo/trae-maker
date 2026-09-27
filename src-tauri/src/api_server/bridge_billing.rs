@@ -2258,6 +2258,43 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "explicit immutable production backup migration rehearsal, never the live data directory"]
+    fn migrate_explicit_readonly_snapshot_without_changing_financial_rows() {
+        assert_eq!(std::env::var("BRIDGE_MIGRATION_SNAPSHOT_ACK").as_deref(),Ok("1"));
+        let source=std::path::PathBuf::from(std::env::var("BRIDGE_MIGRATION_SNAPSHOT").expect("explicit snapshot required"));
+        assert!(source.is_absolute() && source.is_file());
+        let bytes=std::fs::read(&source).unwrap();assert!(bytes.len()<=64*1024*1024);
+        let dir=test_dir("real-snapshot-rehearsal");
+        std::fs::write(dir.join(BILLING_DB_FILE),&bytes).unwrap();
+        let copy=Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        let before=snapshot_legacy_rows(&copy);let metadata=bridge_metadata(&copy).unwrap();
+        println!("input schema: {}; legacy row counts: {:?}",metadata.as_ref().map(|m|m.0).unwrap_or(0),before.iter().map(|(name,rows)|(name,rows.len())).collect::<Vec<_>>());
+        drop(copy);
+        let mut store=BridgeBillingStore::open(&dir).unwrap();
+        assert!(snapshot_legacy_rows(&store.connection)==before,"migration changed existing financial facts");
+        let migrated=bridge_metadata(&store.connection).unwrap().unwrap();assert_eq!(migrated.0,BRIDGE_SCHEMA_VERSION);
+        if let Some(prior)=metadata {assert!(prior.1==migrated.1 && prior.2==migrated.2,"migration changed an existing instance/generation");}
+        let check:String=store.connection.query_row("PRAGMA integrity_check",[],|r|r.get(0)).unwrap();assert_eq!(check,"ok");
+        println!("migration reached schema {BRIDGE_SCHEMA_VERSION}; all legacy rows unchanged; integrity ok");
+        // Rehearse fresh-account capacity setup against real historical rows,
+        // using explicitly synthetic balances, never an authorization to spend.
+        let accounts={let mut stmt=store.connection.prepare("SELECT DISTINCT account_ref FROM bridge_core_upstream_sessions ORDER BY account_ref").unwrap();
+            let rows=stmt.query_map([],|r|r.get::<_,String>(0)).unwrap();rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()};
+        let mut lease=super::super::bridge_budget_lease::BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
+        for account in &accounts {
+            let now=chrono::Utc::now().timestamp_millis();
+            let observation=super::super::bridge_capacity_source::PackObservation::parse(&[serde_json::json!({"id":"synthetic-rehearsal-pack","entitlement_base_info":{"product_id":208,"quota":{"credits_limit":"1"}},"usage":{"credits_amount":"0"}})],now).unwrap();
+            store.initialize_capacity_source(&lease,&super::super::bridge_budget::CapacitySnapshot {account_ref:account.clone(),snapshot_ref:"synthetic-migration-only".into(),epoch:1,general:1_000_000,work:0,observed_at_ms:now},Some(&observation)).unwrap();
+        }
+        println!("historical accounts admitted to synthetic initial baseline: {}; no live capacity was written",accounts.len());
+        assert!(snapshot_legacy_rows(&store.connection)==before,"initial baseline changed legacy financial facts");
+        store.finish_activity_lease_cleanly(&mut lease,||Ok(())).unwrap();drop(lease);
+        drop(store);
+        assert!(std::fs::read(source).unwrap()==bytes,"source backup must not change");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn budget_v2_migration_preserves_v1_rows_and_identity() {
         let dir = test_dir("budget-v2-migration");
         let mut old = create_legacy_v0_database(&dir);
