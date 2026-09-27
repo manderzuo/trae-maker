@@ -487,8 +487,15 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 
 ## 22. 桥接预算账号容量基础
 
-- `bridge-billing.sqlite3` 显式升级到 schema v2，旧 Key 映射、模式和回执保留；v1→v2 事务失败完整回滚。已 v2 开库只读校验完整新表定义，不自动补齐损坏布局。
+- `bridge-billing.sqlite3` 显式升级到 schema v3，旧 Key 映射、模式和回执保留；v1→v2→v3 事务失败完整回滚。已最新版本开库只读校验完整新表定义，不自动补齐损坏布局。
 - `bridge_capacity_accounts` 为每个实际上游账号保存一份通用/Work 快照；`bridge_capacity_slots` 按 budget 唯一记录 P（仍可能收费）、R（执行已终止待账）、D（已核验未证明包含在快照）或 released。不同 Core Key 不复制账号余额。
 - 所有容量写入需要当前有效实例 lease；整数 microcredits 溢出拒绝。通用积分可用于视频；仍承诺给普通文字的通用容量按最坏扣包来源保护。真实金额超过预估时照实保存，不能截断。
 - 普通更晚余额不能清除 D；容量取消与计费互斥。容量原语尚需与准备/派发状态在同一事务接入，不能仅因容量单测通过就启用收费路由。
 - 当前用户要求测试产物放 E: 既有隔离目录、复用现有 target，覆盖历史 D: 测试约定；不下载新工具链。
+
+## 23. 单次预算准备与发送许可
+
+- `bridge_prepared_budgets` 保存不可变准备版本及 DPAPI 保护的正文/token；密文绑定 budget/request/Key/account/instance/generation/revision，普通客户端不得提供内部 `TrustedPreparation` 中的金额、账号或证据。
+- 准备与 P 占用、取消与释放 P 均在同一事务。重复准备返回原 token，不重复占用。替换必须出示上一版本持久取消证据，不能复用 budget ID。
+- consume 只取得执行上下文；只有第一次 `mark_budget_send_intent` 成功才许可收费发送，重复仅返回状态。确认未发送与发送许可互斥；已消费不因 TTL 自动退款，HTTP 错误不等于未收费。
+- v3 使用明确非空 CHECK/触发器，避免 SQLite 将 NULL 条件视为通过；v2 的原始定义保留，迁移不能掩盖损坏数据。真实路由、执行恢复和回执事件仍需后续接入，不能据此开放收费。

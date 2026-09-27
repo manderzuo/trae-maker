@@ -6,6 +6,7 @@ pub mod bridge_api;
 pub mod bridge_billing;
 pub(crate) mod bridge_budget;
 pub mod bridge_budget_lease;
+pub(crate) mod bridge_prepared;
 pub mod custom_models;
 pub mod custom_route;
 pub mod conversation;

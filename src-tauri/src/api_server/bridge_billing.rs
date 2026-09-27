@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const BILLING_DB_FILE: &str = "bridge-billing.sqlite3";
 const BRIDGE_SCHEMA_META_TABLE: &str = "bridge_schema_meta";
-const BRIDGE_SCHEMA_VERSION: i64 = 2;
+const BRIDGE_SCHEMA_VERSION: i64 = 3;
 const BRIDGE_ACTIVE_OWNER_PREFIX: &str = "bridge-active-v1-";
 const BRIDGE_RECOVERY_REQUIRED_PREFIX: &str = "bridge-recovery-required-v1-";
 
@@ -1332,7 +1332,7 @@ where
         transaction
             .commit()
             .map_err(|error| format!("bridge billing schema validation commit failed: {error}"))?;
-        if version == 1 {
+        if version < BRIDGE_SCHEMA_VERSION {
             upgrade_bridge_capacity_schema(connection, &migration_hook)?;
         }
         return Ok(());
@@ -1387,6 +1387,15 @@ where F: Fn(&Transaction<'_>) -> Result<(), String>,
         if changed != 1 { return Err("bridge capacity migration lost version CAS".into()); }
         validate_versioned_bridge_schema(&transaction)?;
     }
+    if read_bridge_schema_metadata(&transaction)?.0 == 2 {
+        super::bridge_prepared::create_schema(&transaction)?;
+        super::bridge_prepared::validate_schema(&transaction)?;
+        hook(&transaction)?;
+        let changed=transaction.execute("UPDATE bridge_schema_meta SET schema_version=3 WHERE singleton=1 AND schema_version=2",[])
+            .map_err(|error|format!("bridge preparation migration failed: {error}"))?;
+        if changed!=1 { return Err("bridge preparation migration lost version CAS".into()); }
+        validate_versioned_bridge_schema(&transaction)?;
+    }
     transaction.commit().map_err(|error| format!("bridge capacity migration commit failed: {error}"))
 }
 
@@ -1402,11 +1411,12 @@ fn validate_versioned_bridge_schema(transaction: &Transaction<'_>) -> Result<(),
     if version > BRIDGE_SCHEMA_VERSION {
         return Err(format!("bridge billing schema version {version} is newer than supported"));
     }
-    if !matches!(version, 1 | 2) {
+    if !matches!(version, 1..=3) {
         return Err(format!("bridge billing schema version {version} is unsupported"));
     }
     validate_bridge_schema(transaction, true, false)?;
-    if version == 2 { super::bridge_budget::validate_schema(transaction)?; }
+    if version >= 2 { super::bridge_budget::validate_schema(transaction)?; }
+    if version >= 3 { super::bridge_prepared::validate_schema(transaction)?; }
     validate_bridge_identity(&instance_id, &generation)?;
     validate_foreign_key_integrity(transaction)?;
     Ok(())
@@ -1455,8 +1465,11 @@ fn validate_bridge_schema(
         ("table", "bridge_core_upstream_sessions"),
     ];
     let mut objects = bridge_schema_objects(transaction)?;
-    if versioned && read_bridge_schema_metadata(transaction)?.0 == 2 {
+    if versioned && read_bridge_schema_metadata(transaction)?.0 >= 2 {
         objects.retain(|(_, name)| !super::bridge_budget::SCHEMA_OBJECTS.iter().any(|(_, expected, _)| name == expected));
+    }
+    if versioned && read_bridge_schema_metadata(transaction)?.0 >= 3 {
+        objects.retain(|(_,name)| !super::bridge_prepared::SCHEMA_OBJECTS.iter().any(|(_,expected,_)|name==expected));
     }
     let required_count = LEGACY_OBJECTS.len() + usize::from(versioned);
     let complete = objects.len() == required_count
@@ -2188,7 +2201,7 @@ mod tests {
         assert_eq!((&after.1, &after.2), (&identity.1, &identity.2));
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(after.0, 2, "capacity ledger requires an explicit v1-to-v2 migration");
+        assert_eq!(after.0, BRIDGE_SCHEMA_VERSION, "legacy bridge must traverse every budget schema migration");
     }
 
     #[test]
@@ -2209,7 +2222,7 @@ mod tests {
         drop(db);
         let upgraded=BridgeBillingStore::open(&dir).unwrap();
         assert_eq!(snapshot_legacy_rows(&upgraded.connection),before.1);
-        assert_eq!(bridge_metadata(&upgraded.connection).unwrap().unwrap().0,2);
+        assert_eq!(bridge_metadata(&upgraded.connection).unwrap().unwrap().0,BRIDGE_SCHEMA_VERSION);
         drop(upgraded);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2238,6 +2251,32 @@ mod tests {
             assert_eq!(schema_objects(&db),before,"invalid layouts must not be silently repaired");
             drop(db); std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn prepared_v3_upgrade_preserves_v2_capacity_and_rolls_back_failure() {
+        let dir=test_dir("prepared-v3-upgrade");
+        let mut db=create_legacy_v0_database(&dir);
+        let tx=db.transaction().unwrap();
+        create_bridge_schema_metadata(&tx,&|_|Ok(())).unwrap();
+        super::super::bridge_budget::create_schema(&tx).unwrap();
+        tx.execute("UPDATE bridge_schema_meta SET schema_version=2",[]).unwrap();
+        tx.execute_batch("INSERT INTO bridge_capacity_accounts(account_ref,snapshot_ref,snapshot_epoch,general_microcredits,work_microcredits,observed_at_ms)
+            VALUES ('account','snapshot',1,100,100,1);
+            INSERT INTO bridge_capacity_slots(budget_id,core_key_id,account_ref,snapshot_epoch,bridge_instance_id,event_generation,eligibility,stage,hold_microcredits,amount_microcredits,actual_microcredits)
+            SELECT 'old-budget','legacy-key-a','account',1,bridge_instance_id,event_generation,'general_or_work','D',50,60,60 FROM bridge_schema_meta;").unwrap();
+        tx.commit().unwrap();
+        let before=(schema_objects(&db),snapshot_legacy_rows(&db),bridge_metadata(&db).unwrap());
+        assert!(upgrade_bridge_capacity_schema(&mut db,&|_|Err("injected-v3-failure".into())).is_err());
+        assert_eq!((schema_objects(&db),snapshot_legacy_rows(&db),bridge_metadata(&db).unwrap()),before);
+        drop(db);
+        let store=BridgeBillingStore::open(&dir).unwrap();
+        assert_eq!(store.capacity_totals("account").unwrap().confirmed,60);
+        let identity=bridge_metadata(&store.connection).unwrap().unwrap();
+        let old=before.2.unwrap();
+        assert_eq!((identity.1,identity.2),(old.1,old.2));
+        assert_eq!(identity.0,3);
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -2,7 +2,8 @@
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use super::{bridge_billing::BridgeBillingStore, bridge_budget_lease::BridgeBudgetLease};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all="snake_case")]
 pub(super) enum CapacityEligibility { GeneralOnly, GeneralOrWork }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,14 +138,14 @@ pub(super) fn reserve_in_transaction(tx: &Transaction<'_>, lease: &BridgeBudgetL
     Ok(CapacityMutation::Created)
 }
 
-fn check_capacity(connection: &Connection, input: &CapacityReservation) -> Result<(),String> {
+pub(super) fn check_capacity(connection: &Connection, input: &CapacityReservation) -> Result<(),String> {
     let (general,work,epoch,state):(i64,i64,i64,String)=connection.query_row(
         "SELECT general_microcredits,work_microcredits,snapshot_epoch,rebase_state FROM bridge_capacity_accounts WHERE account_ref=?1",
         [&input.account_ref],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(db_error)?;
     if epoch!=input.snapshot_epoch || state!="open" { return Err("capacity snapshot stale or account fenced".into()); }
     let (mut q,mut f,mut d)=(0_i64,0_i64,0_i64);
-    let mut stmt=connection.prepare("SELECT eligibility,stage,amount_microcredits FROM bridge_capacity_slots WHERE account_ref=?1 AND stage!='released'").map_err(db_error)?;
-    let rows=stmt.query_map([&input.account_ref],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).map_err(db_error)?;
+    let mut stmt=connection.prepare("SELECT eligibility,stage,amount_microcredits FROM bridge_capacity_slots WHERE account_ref=?1 AND budget_id!=?2 AND stage!='released'").map_err(db_error)?;
+    let rows=stmt.query_map(params![input.account_ref,input.budget_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).map_err(db_error)?;
     for row in rows {
         let (eligibility,stage,amount)=row.map_err(db_error)?;
         if stage=="D" { d=checked_add(d,amount)?; }
