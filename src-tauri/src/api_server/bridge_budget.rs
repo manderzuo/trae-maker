@@ -6,7 +6,7 @@ use super::{bridge_billing::BridgeBillingStore, bridge_budget_lease::BridgeBudge
 #[serde(rename_all="snake_case")]
 pub(super) enum CapacityEligibility { GeneralOnly, GeneralOrWork }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct CapacitySnapshot {
     pub account_ref: String,
     pub snapshot_ref: String,
@@ -77,7 +77,8 @@ impl BridgeBillingStore {
     pub(super) fn capacity_totals(&self, account_ref: &str) -> Result<CapacityTotals, String> {
         let mut result = CapacityTotals::default();
         let mut statement = self.connection.prepare(
-            "SELECT stage,amount_microcredits FROM bridge_capacity_slots WHERE account_ref=?1 AND stage!='released'"
+            "SELECT stage,amount_microcredits FROM bridge_capacity_slots s WHERE account_ref=?1 AND stage!='released'
+             AND NOT (stage='D' AND EXISTS(SELECT 1 FROM bridge_capacity_covered c JOIN bridge_capacity_rebases b ON b.owner_nonce=c.owner_nonce WHERE c.budget_id=s.budget_id AND b.state='committed'))"
         ).map_err(db_error)?;
         let rows = statement.query_map([account_ref], |r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).map_err(db_error)?;
         for row in rows {
@@ -150,7 +151,8 @@ pub(super) fn check_capacity(connection: &Connection, input: &CapacityReservatio
         [&input.account_ref],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(db_error)?;
     if epoch!=input.snapshot_epoch || state!="open" { return Err("capacity snapshot stale or account fenced".into()); }
     let (mut q,mut f,mut d)=(0_i64,0_i64,0_i64);
-    let mut stmt=connection.prepare("SELECT eligibility,stage,amount_microcredits FROM bridge_capacity_slots WHERE account_ref=?1 AND budget_id!=?2 AND stage!='released'").map_err(db_error)?;
+    let mut stmt=connection.prepare("SELECT eligibility,stage,amount_microcredits FROM bridge_capacity_slots s WHERE account_ref=?1 AND budget_id!=?2 AND stage!='released'
+        AND NOT (stage='D' AND EXISTS(SELECT 1 FROM bridge_capacity_covered c JOIN bridge_capacity_rebases b ON b.owner_nonce=c.owner_nonce WHERE c.budget_id=s.budget_id AND b.state='committed'))").map_err(db_error)?;
     let rows=stmt.query_map(params![input.account_ref,input.budget_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).map_err(db_error)?;
     for row in rows {
         let (eligibility,stage,amount)=row.map_err(db_error)?;

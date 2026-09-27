@@ -487,10 +487,11 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 
 ## 22. 桥接预算账号容量基础
 
-- `bridge-billing.sqlite3` 显式升级到 schema v5，旧 Key 映射、模式和回执保留；各版本增量迁移事务失败完整回滚。已最新版本开库只读校验完整新表定义，不自动补齐损坏布局。
+- `bridge-billing.sqlite3` 显式升级到 schema v6，旧 Key 映射、模式和回执保留；各版本增量迁移事务失败完整回滚。已最新版本开库只读校验完整新表定义，不自动补齐损坏布局。
 - `bridge_capacity_accounts` 为每个实际上游账号保存一份通用/Work 快照；`bridge_capacity_slots` 按 budget 唯一记录 P（仍可能收费）、R（执行已终止待账）、D（已核验未证明包含在快照）或 released。不同 Core Key 不复制账号余额。
 - 所有容量写入需要当前有效实例 lease；整数 microcredits 溢出拒绝。通用积分可用于视频；仍承诺给普通文字的通用容量按最坏扣包来源保护。真实金额超过预估时照实保存，不能截断。
 - 普通更晚余额不能清除 D；容量取消与计费互斥。容量原语尚需与准备/派发状态在同一事务接入，不能仅因容量单测通过就启用收费路由。
+- v6 静止对账保存持久fence与逐budget covered事实，begin/commit/abort均短事务；P/R、未终态执行、缺账或冲突拒绝。网络在锁外；commit重新核对owner/世代/事件水位/旧链路会话数，原实扣和回执不删除。abort不能移除费用冲突隔离；普通余额、时间更晚或两次相同数字都不是覆盖证明。目前内部CoveredCapacity尚无合格生产来源驱动，不能向公网开放由客户端声明覆盖金额/静止布尔值的接口，也不能宣称自动重基线已交付。
 - 当前用户要求测试产物放 E: 既有隔离目录、复用现有 target，覆盖历史 D: 测试约定；不下载新工具链。
 
 ## 23. 单次预算准备与发送许可
