@@ -335,6 +335,11 @@ mod tests {
         assert_eq!(discovery.status(),StatusCode::OK,"Core must discover the current event generation before recovering its durable cursor");
         let value:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(discovery.into_body(),65536).await.unwrap()).unwrap();
         assert_eq!(value["events"][0]["receipt"]["actual_credits"],"12.345678");
+        let before_missing=store.budget_execution(budget_id).unwrap();
+        let unavailable=app.clone().oneshot(Request::builder().uri(format!("/internal/bridge/v2/requests/request-video/content?budget_id={budget_id}"))
+            .header("authorization",format!("Bearer {}",fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(unavailable.status(),StatusCode::SERVICE_UNAVAILABLE,"no saved source/file cannot imply a second generation");
+        assert_eq!(store.budget_execution(budget_id).unwrap(),before_missing,"artifact failure cannot undo completed execution");
         let artifact=super::super::video_store::artifact_path(&fixture.dir,"video-test").unwrap();
         std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();std::fs::write(&artifact,b"fixture-mp4").unwrap();
         let download=app.clone().oneshot(Request::builder().uri(format!("/internal/bridge/v2/requests/request-video/content?budget_id={budget_id}"))

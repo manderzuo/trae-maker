@@ -586,6 +586,16 @@ impl ApiPool {
             domain:entry.domain.clone(),enterprise_id:entry.enterprise_id.clone(),global_region:entry.global_region})
     }
 
+    /// Read an existing generated resource only. Never use this credential
+    /// lookup for admission/dispatch: it intentionally ignores credit expiry
+    /// and credit cooldown after the already-paid task completed.
+    pub(crate) fn completed_resource_credentials(&self,uid:&str)->Option<PickedAccount> {
+        let entries=safe_lock(&self.entries);
+        let entry=entries.get(uid).filter(|entry|!entry.disabled && !entry.jwt.trim().is_empty())?;
+        Some(PickedAccount {uid:entry.uid.clone(),jwt:entry.jwt.clone(),device_id:entry.device_id.clone(),machine_id:entry.machine_id.clone(),
+            domain:entry.domain.clone(),enterprise_id:entry.enterprise_id.clone(),global_region:entry.global_region})
+    }
+
     pub fn pick_by_uid(&self, uid: &str) -> Option<PickedAccount> {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
@@ -1085,6 +1095,20 @@ mod tests {
             &HashMap::new(),
         );
         pool
+    }
+
+    #[test]
+    fn completed_resource_lookup_is_bound_and_does_not_require_more_credits() {
+        let pool=build_pool(&[("spent-account",0.0,1)]);
+        {
+            let mut entries=safe_lock(&pool.entries);let entry=entries.get_mut("spent-account").unwrap();
+            entry.jwt="fixture-only".into();entry.hard_until=now_ts()+3600;
+        }
+        assert!(pool.pick_bound_for("spent-account",ResourceKind::Work).is_none(),"new paid work remains blocked");
+        assert_eq!(pool.completed_resource_credentials("spent-account").unwrap().uid,"spent-account");
+        assert!(pool.completed_resource_credentials("other-account").is_none());
+        safe_lock(&pool.entries).get_mut("spent-account").unwrap().disabled=true;
+        assert!(pool.completed_resource_credentials("spent-account").is_none(),"explicit disabled account must not be reused");
     }
 
     #[test]

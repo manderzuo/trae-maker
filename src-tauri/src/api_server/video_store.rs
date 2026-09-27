@@ -80,13 +80,12 @@ pub fn download_from_url(
     if !(200..300).contains(&status) {
         return Err(format!("下载视频失败：上游 HTTP {status}"));
     }
-    if let Some(length) = response
-        .header("content-length")
-        .and_then(|v| v.parse::<u64>().ok())
-    {
+    let expected_length=response.header("content-length").and_then(|v|v.parse::<u64>().ok());
+    if let Some(length) = expected_length {
         if length > MAX_VIDEO_BYTES {
             return Err(format!("视频文件超过 {} GiB 限制", MAX_VIDEO_BYTES / (1024 * 1024 * 1024)));
         }
+        if length==0 {return Err("视频文件为空".into());}
     }
 
     let result = (|| -> Result<u64, String> {
@@ -109,6 +108,7 @@ pub fn download_from_url(
                 .write_all(&buf[..n])
                 .map_err(|e| format!("写入视频文件失败: {e}"))?;
         }
+        if total==0 || expected_length.is_some_and(|expected|expected!=total) {return Err("视频流长度不完整".into());}
         writer
             .sync_all()
             .map_err(|e| format!("刷新视频文件失败: {e}"))?;
@@ -117,11 +117,11 @@ pub fn download_from_url(
 
     match result {
         Ok(size) => {
-            // Windows 上目标文件可能是旧产物，先删除再改名，失败时不会影响旧文件。
-            if path.exists() {
-                fs::remove_file(&path).map_err(|e| format!("替换旧视频文件失败: {e}"))?;
+            // Never delete an existing valid artifact before publication.
+            if let Err(error)=fs::rename(&partial,&path) {
+                let _=fs::remove_file(&partial);
+                return Err(format!("提交视频文件失败: {error}"));
             }
-            fs::rename(&partial, &path).map_err(|e| format!("提交视频文件失败: {e}"))?;
             Ok((path, size))
         }
         Err(error) => {
@@ -173,6 +173,29 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn empty_or_truncated_fetch_never_replaces_an_existing_video() {
+        for wire in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort".as_slice(),
+        ] {
+            let root=std::env::temp_dir().join(format!("aiwork-artifact-integrity-{:032x}",rand::random::<u128>()));
+            let path=artifact_path(&root,"video-test").unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(&path,b"original-video").unwrap();
+            let listener=TcpListener::bind("127.0.0.1:0").unwrap();let addr=listener.local_addr().unwrap();
+            let server=thread::spawn(move || {
+                let (mut stream,_)=listener.accept().unwrap();let mut buffer=[0u8;1024];let _=stream.read(&mut buffer);
+                stream.write_all(wire).unwrap();
+            });
+            let outcome=download_from_url(&root,"video-test",&format!("http://{addr}/video.mp4"));server.join().unwrap();
+            let original=fs::read(&path).unwrap();let partial=path.with_extension("mp4.part").exists();
+            let _=fs::remove_dir_all(&root);
+            assert!(outcome.is_err(),"empty or incomplete upstream bodies must not be published");
+            assert_eq!(original,b"original-video");assert!(!partial);
+        }
+    }
+
+    #[test]
     fn rejects_path_traversal_and_builds_default_path() {
         let root = std::env::temp_dir().join("aiwork_video_store_test");
         assert!(artifact_path(&root, "video-1").unwrap().ends_with("video-1.mp4"));
@@ -207,6 +230,8 @@ mod tests {
                 .unwrap();
         });
         let root = std::env::temp_dir().join(format!("aiwork_video_download_{}", std::process::id()));
+        let old=artifact_path(&root,"video-test").unwrap();
+        fs::create_dir_all(old.parent().unwrap()).unwrap();fs::write(&old,b"old-complete-video").unwrap();
         let (path, size) = download_from_url(
             &root,
             "video-test",

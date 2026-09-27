@@ -149,13 +149,19 @@ pub(super) async fn content(State(state):State<Arc<ApiSharedState>>,Path(request
         let task=execution.task_ref.ok_or("task missing")?;
         if result["id"].as_str()!=Some(task.as_str()) {return Err("result task mismatch".into());}
         let permit=state.limiter.acquire_request(&auth.core_key_id,&super::api_keys::KeyLimits::default()).map_err(|_|"download concurrency exceeded")?;
-        let path=super::video_store::artifact_path(&state.data_dir,&task)?;
-        let file=std::fs::File::open(path).map_err(|_|"artifact unavailable")?;
-        let length=file.metadata().map_err(|_|"artifact unavailable")?.len();
-        if length==0 || length>super::video_store::MAX_VIDEO_BYTES {return Err("artifact length invalid".into());}
+        // Complete identity/result checks before network I/O. File recovery
+        // cannot rewrite execution/financial facts or generate another video.
+        drop(store);
+        let (file,length)=super::bridge_artifacts::open_completed(&state,&auth.account_ref,&task,&result)?;
         Ok((file,length,permit))
     }).await;
-    let (mut file,length,permit)=match opened {Ok(Ok(data))=>data,_=>return error(StatusCode::SERVICE_UNAVAILABLE,"budget_content_unavailable")};
+    let (mut file,length,permit)=match opened {
+        Ok(Ok(data))=>data,
+        Ok(Err(reason)) if matches!(reason.as_str(),"artifact_recovery_busy"|"download concurrency exceeded")=>{
+            let mut response=error(StatusCode::TOO_MANY_REQUESTS,"budget_content_busy");response.headers_mut().insert("retry-after","2".parse().unwrap());return response;
+        },
+        _=>return error(StatusCode::SERVICE_UNAVAILABLE,"budget_content_unavailable"),
+    };
     let (send,receive)=tokio::sync::mpsc::channel::<Result<axum::body::Bytes,std::io::Error>>(2);
     tokio::task::spawn_blocking(move || {
         use std::io::Read;let _permit=permit;let mut buffer=[0u8;64*1024];let mut remaining=length;

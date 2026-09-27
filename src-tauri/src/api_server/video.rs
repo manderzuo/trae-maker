@@ -1194,7 +1194,7 @@ fn parse_sse_event(event: &str, data: &str, task_id: &str) -> Result<bool, Strin
     Ok(false)
 }
 
-fn resolve_resource_url(account: &PickedAccount, uri: &str) -> Result<String, String> {
+pub(super) fn resolve_resource_url(account: &PickedAccount, uri: &str) -> Result<String, String> {
     let url = format!("{}{}", AGENT_HOST, "/api/ide/v1/get_resource_url");
     let body = serde_json::json!({ "uri_list": [uri] });
     let trace = now_id("trace");
@@ -1250,6 +1250,22 @@ pub(super) fn run_budget_task(state:std::sync::Arc<ApiSharedState>,runtime:&supe
     runtime.with_store(|s,l|s.bind_budget_task(l,&auth.budget_id,&task.id))?;
     run_native_task(state,task.id.clone(),Value::Null,auth.core_key_id.clone(),None,account,permit,Some(body));
     get(&task.id).ok_or("native task record unavailable".into())
+}
+
+fn finish_artifact_phase(task:&mut VideoTask,budget_v2:bool,
+    resolve:impl FnOnce(&str)->Result<String,String>,download:impl FnOnce(&str)->Result<(),String>) {
+    // Paid execution ends at native done. V2 persists the resource result now;
+    // the authenticated content route performs cache I/O on demand.
+    if task.status!="completed" || budget_v2 {return;}
+    if let Some(uri)=task.resource_uri.as_deref() {
+        if let Ok(url)=resolve(uri) {task.video_url=Some(url);}
+    }
+    if let Some(url)=task.video_url.as_deref() {
+        match download(url) {
+            Ok(())=>{task.content_url=super::video_store::content_url(&task.id).ok();task.artifact_error=None;},
+            Err(error)=>task.artifact_error=Some(error.chars().take(240).collect()),
+        }
+    }
 }
 
 fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Value,owner_key_id:String,
@@ -1450,23 +1466,13 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
         }
         let task_status = get(&task_id).map(|task| task.status).unwrap_or_default();
         if task_status == "completed" {
-            if let Some(uri) = get(&task_id).and_then(|task| task.resource_uri) {
-                if let Ok(url) = resolve_resource_url(&account, &uri) {
-                    update_task(&task_id, |task| task.video_url = Some(url));
-                }
-            }
-            // 生成完成后将上游地址缓存为本地受鉴权资源。失败时保留上游 URL，
-            // 让客户端仍可立即取回视频，同时在任务中给出缓存失败原因。
-            if let Some(url) = get(&task_id).and_then(|task| task.video_url) {
-                match super::video_store::download_from_url(&state.data_dir, &task_id, &url) {
-                    Ok((_path, _size)) => update_task(&task_id, |task| {
-                        task.content_url = super::video_store::content_url(&task.id).ok();
-                        task.artifact_error = None;
-                    }),
-                    Err(error) => update_task(&task_id, |task| {
-                        task.artifact_error = Some(error.chars().take(240).collect());
-                    }),
-                }
+            if let Some(mut completed)=get(&task_id) {
+                finish_artifact_phase(&mut completed,fixed_body.is_some(),
+                    |uri|resolve_resource_url(&account,uri),
+                    |url|super::video_store::download_from_url(&state.data_dir,&task_id,url).map(|_|()));
+                update_task(&task_id,|task| {
+                    task.video_url=completed.video_url;task.content_url=completed.content_url;task.artifact_error=completed.artifact_error;
+                });
             }
             state.pool.note_success(&account.uid);
         } else if task_status == "processing" {
@@ -1490,6 +1496,21 @@ pub fn get(task_id: &str) -> Option<VideoTask> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_completion_defers_artifact_io_but_legacy_still_caches() {
+        let initial=VideoTask {id:"video-fixture".into(),object:"video".into(),model:"seedance".into(),status:"completed".into(),prompt:"fixture".into(),
+            created_at:1,updated_at:2,error:None,transport:"native".into(),video_url:None,resource_uri:Some("tos://completed-resource".into()),video_duration:Some(5.0),
+            content_url:None,artifact_error:None,billing:VideoBillingReceipt::default(),request_key:None,owner_key_id:"key".into()};
+        let mut deferred=initial.clone();
+        finish_artifact_phase(&mut deferred,true,|_|panic!("v2 execution must finish before resource URL lookup"),|_|panic!("v2 execution must not wait for cache download"));
+        assert_eq!(deferred.status,"completed");assert_eq!(deferred.resource_uri,initial.resource_uri);assert!(deferred.video_url.is_none());
+        let mut legacy=initial.clone();
+        finish_artifact_phase(&mut legacy,false,|uri|{assert_eq!(uri,"tos://completed-resource");Ok("https://fixture.invalid/result.mp4".into())},|url|{assert_eq!(url,"https://fixture.invalid/result.mp4");Ok(())});
+        assert!(legacy.content_url.is_some());assert!(legacy.artifact_error.is_none());
+        finish_artifact_phase(&mut legacy,false,|_|Err("expired lookup".into()),|_|Err("cache unavailable".into()));
+        assert_eq!(legacy.status,"completed");assert_eq!(legacy.artifact_error.as_deref(),Some("cache unavailable"));
+    }
 
     #[test]
     fn controlled_video_never_switches_account_after_preparation_or_submission_error() {

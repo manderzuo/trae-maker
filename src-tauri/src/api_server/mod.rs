@@ -14,6 +14,7 @@ pub(crate) mod bridge_v2_api;
 pub(crate) mod bridge_runtime;
 pub(crate) mod bridge_planner;
 pub(crate) mod bridge_dispatch;
+pub(crate) mod bridge_artifacts;
 pub mod custom_models;
 pub mod custom_route;
 pub mod conversation;
