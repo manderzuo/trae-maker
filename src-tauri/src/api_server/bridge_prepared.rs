@@ -81,7 +81,8 @@ pub(super) struct TrustedPreparation {
     pub hold_microcredits:i64, pub expires_at_ms:i64, pub body:Value,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct PreparedBudget {
     pub wire_version:u8, pub authorization:PreparedAuthorization,
     pub dispatch_token:String, pub evidence_level:String, pub prepared_at_ms:i64,
@@ -101,6 +102,28 @@ pub(super) struct ConsumedBudget {
 pub(super) enum ConsumeOutcome { Granted(ConsumedBudget), Existing(String), Rejected(NoSendProof) }
 
 impl BridgeBillingStore {
+    /// Return the encrypted original response before any account selection or
+    /// material upload. The business claim is independent of normalized body.
+    pub(super) fn replay_business_preparation(&self,lease:&BridgeBudgetLease,request:&str,claim:&Value)->Result<Option<PreparedBudget>,String> {
+        let Some(row)=last_row(&self.connection,request)? else {return Ok(None)};
+        let envelope=row.decrypt()?;
+        if envelope.input.body.get("business_claim")!=Some(claim) {return Err("prepared request identity conflict".into());}
+        if row.generation!=lease.generation() {return Err("prepared budget generation requires recovery".into());}
+        // Canceled/expired authorizations also replay. They must never silently
+        // turn into another paid attempt with a new token.
+        Ok(Some(envelope.response()))
+    }
+    pub(super) fn confirmed_profile_high_water(&self,account:&str,profile:&str,since:i64)->Result<i64,String> {
+        let mut stmt=self.connection.prepare("SELECT p.budget_id,r.actual_microcredits FROM bridge_prepared_budgets p
+            JOIN bridge_budget_receipts r ON r.budget_id=p.budget_id
+            WHERE p.account_ref=?1 AND p.created_at_ms>=?2 AND r.receipt_state='final'").map_err(db_error)?;
+        let rows=stmt.query_map(params![account,since],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).map_err(db_error)?;
+        let mut high=0;
+        for row in rows {let (id,actual)=row.map_err(db_error)?;
+            let env=required_row(&self.connection,&id)?.decrypt()?;
+            if env.input.pricing_profile_key==profile {high=high.max(actual);}
+        } Ok(high)
+    }
     pub(super) fn prepare_budget(&mut self,lease:&BridgeBudgetLease,input:&TrustedPreparation,replacement:Option<&str>,now:i64)->Result<PreparedBudget,String> {
         validate_input(input,now)?;
         let previous=last_row(&self.connection,&input.request_id)?;
@@ -160,6 +183,29 @@ impl BridgeBillingStore {
         if row.state!="prepared" {return Err("consumed budget cannot be canceled".into());}
         let proof=decide_no_send(&tx,lease,&row,"canceled",now)?;
         tx.commit().map_err(db_error)?; Ok(proof)
+    }
+    pub(super) fn expire_unconsumed_budgets(&mut self,lease:&BridgeBudgetLease,now:i64)->Result<usize,String> {
+        if now<0 {return Err("invalid sweep time".into());}
+        // Preparation TTL is at most 60s. Read a bounded batch without a write
+        // transaction, then verify ciphertext and the same cancellation CAS as
+        // an explicit cancel. Consumed/send-intent are NEVER timeout refunds.
+        let ids={let mut stmt=self.connection.prepare("SELECT p.budget_id FROM bridge_prepared_budgets p
+            LEFT JOIN bridge_budget_receipts r ON r.budget_id=p.budget_id
+            WHERE p.state IN ('prepared','canceled','no_send') AND r.budget_id IS NULL AND p.created_at_ms<=?1
+            ORDER BY p.created_at_ms,p.budget_id LIMIT 128").map_err(db_error)?;
+            let rows=stmt.query_map([now.saturating_sub(60_000)],|r|r.get::<_,String>(0)).map_err(db_error)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?};
+        let mut done=0;
+        for id in ids {
+            let row=required_row(&self.connection,&id)?;let envelope=row.decrypt()?;
+            if row.state=="prepared" && envelope.authorization.expires_at_ms>now {continue;}
+            // A simultaneous consume wins by leaving no cancel proof. No
+            // disposition is inferred from cancellation or transport failure.
+            if self.cancel_budget(lease,&envelope.response(),now).is_ok() {
+                self.confirm_budget_no_send(lease,&id)?;done+=1;
+            }
+        }
+        Ok(done)
     }
     pub(super) fn consume_budget(&mut self,lease:&BridgeBudgetLease,budget:&PreparedBudget,now:i64)->Result<ConsumeOutcome,String> {
         let verified=verified_budget(&self.connection,budget)?;

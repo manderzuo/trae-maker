@@ -900,7 +900,7 @@ pub(crate) fn read_trae_observation(
 }
 
 /// 调用 TRAE API 拉取积分包列表
-fn query_ent_packs(jwt: &str, dev: &DeviceEntry) -> Result<Vec<serde_json::Value>, String> {
+pub(crate) fn query_ent_packs(jwt: &str, dev: &DeviceEntry) -> Result<Vec<serde_json::Value>, String> {
     let body = ide_query_post(
         &short_agent(),
         "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage",

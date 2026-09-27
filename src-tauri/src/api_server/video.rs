@@ -938,7 +938,7 @@ fn now_id(prefix: &str) -> String {
     format!("{}-{}", prefix, crate::commands::oauth::random_hex(24))
 }
 
-fn build_request_body(input: &Value) -> Value {
+pub(super) fn build_request_body(input: &Value) -> Value {
     let mut body = input.clone();
     let obj = body.as_object_mut().expect("video request is object");
     obj.entry("image_urls").or_insert_with(|| Value::Array(Vec::new()));
@@ -1240,6 +1240,20 @@ pub fn start_native_task(
     account: PickedAccount,
     permit: Permit,
 ) {
+    thread::spawn(move ||run_native_task(state,task_id,input,owner_key_id,core_attribution,account,permit,None));
+}
+
+pub(super) fn run_budget_task(state:std::sync::Arc<ApiSharedState>,runtime:&super::bridge_runtime::BridgeBudgetRuntime,
+    ctx:&super::bridge_prepared::ConsumedBudget,account:PickedAccount,body:Value,permit:Permit)->Result<VideoTask,String> {
+    let auth=&ctx.budget.authorization;
+    let task=create_pending_for("seedance".into(),body["prompt"].as_str().unwrap_or_default().into(),&auth.core_key_id);
+    runtime.with_store(|s,l|s.bind_budget_task(l,&auth.budget_id,&task.id))?;
+    run_native_task(state,task.id.clone(),Value::Null,auth.core_key_id.clone(),None,account,permit,Some(body));
+    get(&task.id).ok_or("native task record unavailable".into())
+}
+
+fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Value,owner_key_id:String,
+    core_attribution:Option<super::bridge_billing::CoreRequestAttribution>,account:PickedAccount,permit:Permit,fixed_body:Option<Value>) {
     if !retain_job_permit(&task_id, permit) {
         update_task(&task_id, |task| {
             task.status = "failed".into();
@@ -1247,14 +1261,14 @@ pub fn start_native_task(
         });
         return;
     }
-    thread::spawn(move || {
+    {
         let _worker_guard = NativeWorkerGuard::new(task_id.clone());
         // HTTP 层尚未收到 SSE 前允许切到下一个 Work 账号；一旦进入 SSE，
         // 账号切换时必须用新账号重新上传参考素材，不能复用上一个账号的 TOS URI。
         let mut account = account;
         let mut tried = HashSet::from([account.uid.clone()]);
         let response = loop {
-            let body = match prepare_native_request(
+            let body = if let Some(body)=fixed_body.as_ref() {body.clone()} else {match prepare_native_request(
                 &state.data_dir,
                 &owner_key_id,
                 &input,
@@ -1276,7 +1290,7 @@ pub fn start_native_task(
                     });
                     return;
                 }
-            };
+            }};
             let mut body = body;
             if let Some(attribution) = core_attribution.as_ref() {
                 let session_id = super::bridge_billing::core_usage_session_id(
@@ -1291,7 +1305,7 @@ pub fn start_native_task(
                     return;
                 }
             }
-            if super::bridge_billing::BridgeBillingStore::record_core_upstream_attempt_from_payload(
+            if fixed_body.is_none() && super::bridge_billing::BridgeBillingStore::record_core_upstream_attempt_from_payload(
                 &state.data_dir,
                 core_attribution.as_ref(),
                 &account.uid,
@@ -1345,7 +1359,7 @@ pub fn start_native_task(
                     let text = response.into_string().unwrap_or_default();
                     let kind = classify_video_error(status, &text);
                     state.pool.note_error(&account.uid, kind);
-                    if can_retry_account(core_attribution.as_ref(), retryable_account_error(kind)) {
+                    if fixed_body.is_none() && can_retry_account(core_attribution.as_ref(), retryable_account_error(kind)) {
                         if let Some(next) = state.pool.pick_excluding_for(&tried, ResourceKind::Work) {
                             tried.insert(next.uid.clone());
                             account = next;
@@ -1365,7 +1379,7 @@ pub fn start_native_task(
                     let text = response.into_string().unwrap_or_default();
                     let kind = classify_video_error(status, &text);
                     state.pool.note_error(&account.uid, kind);
-                    if can_retry_account(core_attribution.as_ref(), retryable_account_error(kind)) {
+                    if fixed_body.is_none() && can_retry_account(core_attribution.as_ref(), retryable_account_error(kind)) {
                         if let Some(next) = state.pool.pick_excluding_for(&tried, ResourceKind::Work) {
                             tried.insert(next.uid.clone());
                             account = next;
@@ -1462,7 +1476,7 @@ pub fn start_native_task(
             );
             state.pool.note_error(&account.uid, super::ErrKind::Server);
         }
-    });
+    }
 }
 
 pub fn get(task_id: &str) -> Option<VideoTask> {

@@ -244,9 +244,20 @@ impl RefreshQueue {
 /// Queue one refresh only after checking the persisted, unique request mapping.
 /// This function never performs an upstream request or accepts a caller-chosen account.
 pub(crate) fn request_refresh(state: Arc<ApiSharedState>, request_id: &str) -> Result<(), String> {
-    let lookup = {
+    let (lookup, wake_identity) = {
         let store = super::bridge_billing::BridgeBillingStore::open(&state.data_dir)?;
-        store.usage_session_for_request(request_id)?
+        let lookup = store.usage_session_for_request(request_id)?;
+        let execution = store.budget_execution_for_request(request_id)?;
+        if let Some(execution) = &execution {
+            if store.latest_budget_receipt_event(&execution.budget_id)?.is_some() {
+                return Ok(());
+            }
+        }
+        let wake_identity = match execution.filter(|e| e.finished_at_ms.is_some()) {
+            Some(execution) => format!("terminal:{}:{}", execution.budget_id, request_id),
+            None => format!("request:{request_id}"),
+        };
+        (lookup, wake_identity)
     };
     let (account_ref, attempt_at_ms) = match lookup {
         super::bridge_billing::CoreBillingSessionLookup::Unique {
@@ -262,13 +273,13 @@ pub(crate) fn request_refresh(state: Arc<ApiSharedState>, request_id: &str) -> R
         .get(&key)
         .and_then(|registration| registration.queue.upgrade())
         .ok_or_else(|| "Core usage refresh scheduler is not running".to_string())?;
-    queue.enqueue(account_ref, attempt_at_ms, Some(request_id));
+    queue.enqueue(account_ref, attempt_at_ms, Some(&wake_identity));
     Ok(())
 }
 
 /// Start one idempotent scheduler per normalized data directory. It discovers
 /// persisted pending accounts immediately and keeps a fixed pool of four workers.
-pub(crate) fn start(state: Arc<ApiSharedState>, stop: Arc<AtomicBool>) {
+pub(super) fn start_with_runtime(state: Arc<ApiSharedState>, stop: Arc<AtomicBool>, runtime: Option<Arc<super::bridge_runtime::BridgeBudgetRuntime>>) {
     let pending_state = state.clone();
     let pending_loader: Arc<PendingLoader> = Arc::new(move || {
         super::bridge_billing::pending_core_session_accounts_for_poll(&pending_state.data_dir)
@@ -276,7 +287,7 @@ pub(crate) fn start(state: Arc<ApiSharedState>, stop: Arc<AtomicBool>) {
     let refresh_state = state.clone();
     let refresh_stop = stop.clone();
     let refresh: Arc<RefreshHandler> = Arc::new(move |item| {
-        refresh_pending_account(&refresh_state, item, &refresh_stop)
+        refresh_pending_account(&refresh_state, item, &refresh_stop, runtime.as_deref())
     });
     if let Err(error) = start_inner(state.clone(), stop, pending_loader, refresh) {
         crate::fs_utils::app_log(&state.data_dir, &format!("Core 用量后台刷新器启动失败：{error}"));
@@ -538,6 +549,7 @@ fn refresh_pending_account(
     state: &ApiSharedState,
     item: &WorkItem,
     stop: &AtomicBool,
+    runtime: Option<&super::bridge_runtime::BridgeBudgetRuntime>,
 ) -> bool {
     if stop.load(Ordering::Acquire) {
         return false;
@@ -574,6 +586,11 @@ fn refresh_pending_account(
     }
     if stop.load(Ordering::Acquire) {
         return false;
+    }
+    if let Some(runtime) = runtime {
+        if runtime.confirm_account(&item.account_ref).is_err() {
+            crate::fs_utils::app_log(&state.data_dir, "Core v2 用量已刷新，但部分回执确认失败；保留预算等待重查");
+        }
     }
     match super::bridge_billing::pending_core_session_accounts_for_poll(&state.data_dir) {
         Ok(pending) => pending.iter().any(|(uid, _)| uid == &item.account_ref),

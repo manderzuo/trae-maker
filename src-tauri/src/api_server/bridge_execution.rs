@@ -120,6 +120,10 @@ fn load_result(connection:&Connection,id:&str)->Result<Option<Value>,String> {
     Ok(Some(protected.result))
 }
 impl BridgeBillingStore {
+    pub(super) fn budget_execution_for_request(&self,request_id:&str)->Result<Option<BudgetExecution>,String> {
+        let id:Option<String>=self.connection.query_row("SELECT budget_id FROM bridge_budget_executions WHERE request_id=?1",[request_id],|r|r.get(0)).optional().map_err(db_error)?;
+        id.map(|id|required_execution(&self.connection,&id)).transpose()
+    }
     pub(super) fn budget_session_attribution(&self,account:&str,session:&str)->Result<Option<super::bridge_billing::CoreSessionLookup>,String> {
         let id:Option<String>=self.connection.query_row("SELECT budget_id FROM bridge_budget_executions WHERE account_ref=?1 AND session_ref=?2",params![account,session],|r|r.get(0)).optional().map_err(db_error)?;
         let Some(id)=id else {return Ok(None)};

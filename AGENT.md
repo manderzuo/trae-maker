@@ -514,3 +514,13 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 - 用量缓存保留每次完整查询的原始会话观察和查询起止；执行中候选变化不会永久污染终态后唯一观察，旧审计缓存冲突仍保留。缺 total/明细、分页截断、总数变化或触及上限而未完整覆盖时不具备结算资格。同次查询冲突拒绝，等值小数按 microcredits 比较。
 - `failed_no_charge` 只来自持久取消/no-send 决定，不能由 HTTP 错误、任务失败或空账单产生。未知金额不造 0。冲突事件保留原账并隔离该账号的新派发容量，不影响已保存结果读取；Core 消费者必须按事件 kind 分流到冲突接口，不能把 conflict 携带的候选 receipt 当新 Final。
 - v2 Final/FailedNoCharge/Conflict 不再占普通待结账号轮询；不同 Key 始终按 budget/request 唯一关联。禁止把 v2 记录写成旧 mode 或用假旧 Final 使轮询退队。真实运行器、自动确认驱动、HTTP 路由及 Core 事件消费尚待接入，本节原语测试不等于公网交付。
+
+## 26. V2 准备、执行与查询接线（生产尚未启用）
+
+- API server 持有 `BridgeBudgetRuntime`，用量与收费 worker 共享 Arc；停止时先关闭新收费许可，最后一个 worker/观察者释放引用后才可写 clean-close 标记，不能只克隆身份字符串。
+- 用量刷新后自动确认该账号已终态且有完整原始来源的预算，逐笔故障不阻断其余预算；未知账单继续保留，普通请求不能直接调用确认财务接口。
+- `/internal/bridge/v2/requests/:request_id/{execution,result,billing,refresh}` 必须同时指定原预算 `budget_id` 并通过桥接管理员鉴权；只读接口不发起付费请求，不泄露 dispatch token。GET result 不依赖账单是否已到；密文损坏不得返回空成功。
+- 已持久执行终态可重置一次刷新退避；重复 POST refresh 不得反复唤醒。GET receipt-events 非空世代错误返回409，空世代用于只读发现；分页按全库 sequence 含历史世代事件，避免正常重启隐去尚未消费的回执。Core 新世代从0幂等重放，旧游标/事实保留。
+- POST `/internal/bridge/v2/budgets/{prepare,cancel,dispatch}`：prepare只接业务字段，服务端固定账号、精确权益包和策略预算；cancel/dispatch校验全PreparedBudget与加密原件。收费worker固定账号/参数、不转账号或重发；结果先持久化。5秒维护批次只清理过期且从未consume的预算，consumed/send_intent不因TTL退款。
+- 原生已验证档案仅无参考720p16:9的10/15s；其余规格需本机`bridge-budget-policy.json`显式有限风险政策。预算不是上游保证最高费用，实扣仍来自唯一会话。参考视频可信时长适配尚未完成，不能冒用文生预算。
+- 现在已接入真实准备/执行器、结果下载、自动确认与Core持久事件游标；Core收费新入口仍由默认关闭的budget_billing_v2隔离。普通Chat早SSE新账本、账号静止对账/异常lease恢复、后台完整工作流恢复及真实端到端验收仍未完成。旧quote503分支未伪造报价，禁止据本地测试声称已生产修复。

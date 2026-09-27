@@ -153,8 +153,23 @@ impl BridgeBillingStore {
     pub(super) fn budget_receipt_events(&self,generation:&str,after:i64,limit:usize)->Result<Vec<BudgetReceiptEvent>,String> {
         if generation!=self.bridge_identity()?.1 {return Err("receipt event generation changed; recover pending requests before resetting cursor".into());}
         if after<0 || !(1..=256).contains(&limit) {return Err("invalid receipt event page".into());}
-        let mut stmt=self.connection.prepare("SELECT sequence,generation,event_id,budget_id,event_kind,evidence_hash,payload_json FROM bridge_budget_receipt_events WHERE generation=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3").map_err(db_error)?;
-        let rows=stmt.query_map(params![generation,after,limit as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Vec<u8>>(5)?,r.get::<_,String>(6)?))).map_err(db_error)?;
+        // The requested generation fences the reader against a changed server,
+        // but sequence is database-wide. Replay historical generations too:
+        // clean shutdown changes the active generation and must not hide an
+        // unconsumed receipt/conflict committed immediately before shutdown.
+        self.read_receipt_events(None, after, limit, None)
+    }
+    /// Recovery reads a specific immutable budget, even after a generation change.
+    pub(super) fn latest_budget_receipt_event(&self,budget_id:&str)->Result<Option<BudgetReceiptEvent>,String> {
+        let row:Option<(String,i64)>=self.connection.query_row(
+            "SELECT generation,sequence FROM bridge_budget_receipt_events WHERE budget_id=?1 ORDER BY sequence DESC LIMIT 1",
+            [budget_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(db_error)?;
+        let Some((generation,sequence))=row else {return Ok(None)};
+        Ok(self.read_receipt_events(Some(&generation),sequence-1,1,Some(budget_id))?.pop())
+    }
+    fn read_receipt_events(&self,generation:Option<&str>,after:i64,limit:usize,budget:Option<&str>)->Result<Vec<BudgetReceiptEvent>,String> {
+        let mut stmt=self.connection.prepare("SELECT sequence,generation,event_id,budget_id,event_kind,evidence_hash,payload_json FROM bridge_budget_receipt_events WHERE (?1 IS NULL OR generation=?1) AND sequence>?2 AND (?4 IS NULL OR budget_id=?4) ORDER BY sequence LIMIT ?3").map_err(db_error)?;
+        let rows=stmt.query_map(params![generation,after,limit as i64,budget],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Vec<u8>>(5)?,r.get::<_,String>(6)?))).map_err(db_error)?;
         let mut events=Vec::new();
         for row in rows {
             let (sequence,stored_generation,event_id,budget_id,kind,hash,json)=row.map_err(db_error)?;
@@ -173,11 +188,11 @@ impl BridgeBillingStore {
     }
 }
 #[cfg(all(test,windows))]
-mod tests {
+pub(in crate::api_server) mod tests {
     use super::*;
     use super::super::{bridge_prepared::{tests::{fixture,input,cleanup},ConsumeOutcome},bridge_execution::ExecutionState};
     use serde_json::json;
-    fn send(store:&mut BridgeBillingStore,lease:&BridgeBudgetLease,request:&str)->String {
+    pub(in crate::api_server) fn send(store:&mut BridgeBillingStore,lease:&BridgeBudgetLease,request:&str)->String {
         let mut value=input();value.request_id=request.into();
         let prepared=store.prepare_budget(lease,&value,None,10).unwrap();
         let ConsumeOutcome::Granted(ctx)=store.consume_budget(lease,&prepared,20).unwrap() else {panic!("consume")};
@@ -186,7 +201,7 @@ mod tests {
         store.finish_budget_result(lease,&prepared.authorization.budget_id,ExecutionState::Succeeded,&json!({"ok":true}),chrono::Utc::now().timestamp_millis()+1000).unwrap();
         prepared.authorization.budget_id
     }
-    fn cache(dir:&std::path::Path,store:&BridgeBillingStore,ids:&[(&str,&str)],time_offset:i64) {
+    pub(in crate::api_server) fn cache(dir:&std::path::Path,store:&BridgeBillingStore,ids:&[(&str,&str)],time_offset:i64) {
         let mut rows=serde_json::Map::new();let mut observations=serde_json::Map::new();
         for (id,amount) in ids {
             let e=store.budget_execution(id).unwrap().unwrap();let observed=e.finished_at_ms.unwrap()+time_offset;
@@ -245,6 +260,19 @@ mod tests {
         let count:i64=store.connection.query_row("SELECT COUNT(*) FROM bridge_budget_receipts",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
         store.connection.execute_batch("DROP TRIGGER inject_outbox_failure").unwrap();
         assert_eq!(store.confirm_budget_usage(&lease,&id).unwrap(),ReceiptChange::Created);
+        cleanup(dir,store,lease);
+    }
+    #[test]
+    fn clean_restart_replays_prior_generation_events_for_core_recovery() {
+        let (dir,mut store,mut lease)=fixture();let id=send(&mut store,&lease,"request-before-restart");
+        cache(&dir,&store,&[(&id,"12")],2000);store.confirm_budget_usage(&lease,&id).unwrap();
+        let previous=lease.generation().to_owned();
+        store.finish_activity_lease_cleanly(&mut lease,||Ok(())).unwrap();drop(lease);
+        let lease=BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
+        assert_ne!(lease.generation(),previous);
+        let events=store.budget_receipt_events(lease.generation(),0,100).unwrap();
+        assert_eq!(events.len(),1,"a generation change must not hide an event that Core has not consumed");
+        assert_eq!(events[0].generation,previous);assert_eq!(events[0].budget_id,id);
         cleanup(dir,store,lease);
     }
     #[test]

@@ -576,6 +576,16 @@ impl ApiPool {
     }
 
     /// 指定 uid 取号（T2.4 会话粘性）：账号 healthy 时返回其凭证，否则 None
+    pub(crate) fn pick_bound_for(&self,uid:&str,kind:ResourceKind)->Option<PickedAccount> {
+        let entries=safe_lock(&self.entries);
+        let balances=safe_lock(&self.balances);
+        let entry=entries.get(uid)?;
+        let credit=if kind==ResourceKind::Work {Some(balances.get(uid).map(video_available_credit).unwrap_or(0.0))} else {None};
+        if !selectable_with_credit(entry,&HashSet::new(),now_ts(),credit) {return None;}
+        Some(PickedAccount {uid:entry.uid.clone(),jwt:entry.jwt.clone(),device_id:entry.device_id.clone(),machine_id:entry.machine_id.clone(),
+            domain:entry.domain.clone(),enterprise_id:entry.enterprise_id.clone(),global_region:entry.global_region})
+    }
+
     pub fn pick_by_uid(&self, uid: &str) -> Option<PickedAccount> {
         let entries = safe_lock(&self.entries);
         let now = now_ts();

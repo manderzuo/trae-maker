@@ -20,6 +20,7 @@ pub struct ApiServerHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
     background_stop: Arc<std::sync::atomic::AtomicBool>,
+    budget_runtime: Option<Arc<super::bridge_runtime::BridgeBudgetRuntime>>,
 }
 
 impl ApiServerHandle {
@@ -27,6 +28,7 @@ impl ApiServerHandle {
     /// 超时才 abort（P2 修复9：原实现 send 后立即 abort，优雅停机被自身取消，
     /// 在途请求被硬断）
     pub fn stop(&mut self) {
+        if let Some(runtime) = &self.budget_runtime { runtime.begin_close(); }
         self.background_stop.store(true, std::sync::atomic::Ordering::Release);
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -36,6 +38,7 @@ impl ApiServerHandle {
                 h.abort();
             }
         }
+        self.budget_runtime.take();
     }
 }
 
@@ -72,10 +75,14 @@ pub async fn start_api_server(
         .await
         .map_err(|e| format!("端口 {} 绑定失败: {}", port, e))?;
 
-    let app = build_router(state.clone());
+    let runtime_dir = state.data_dir.clone();
+    let budget_runtime = tokio::task::spawn_blocking(move || super::bridge_runtime::BridgeBudgetRuntime::start(&runtime_dir))
+        .await.map_err(|_| "bridge runtime initialization failed".to_string())??;
+    let app = build_router(state.clone()).layer(axum::Extension(budget_runtime.clone()));
     spawn_wb_health_probe(state.clone());
     let background_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    super::usage_refresh::start(state.clone(), background_stop.clone());
+    super::bridge_runtime::BridgeBudgetRuntime::start_maintenance(&budget_runtime,background_stop.clone());
+    super::usage_refresh::start_with_runtime(state.clone(), background_stop.clone(), Some(budget_runtime.clone()));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -92,6 +99,7 @@ pub async fn start_api_server(
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join_handle),
         background_stop,
+        budget_runtime: Some(budget_runtime),
     })
 }
 
@@ -121,6 +129,15 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/internal/bridge/models", get(super::bridge_api::models))
         .route("/internal/bridge/summary", get(super::bridge_api::summary))
         .route("/internal/bridge/quotes", post(super::bridge_api::quote))
+        .route("/internal/bridge/v2/requests/:request_id/execution", get(super::bridge_v2_api::execution))
+        .route("/internal/bridge/v2/requests/:request_id/result", get(super::bridge_v2_api::result))
+        .route("/internal/bridge/v2/requests/:request_id/content", get(super::bridge_v2_api::content))
+        .route("/internal/bridge/v2/requests/:request_id/billing", get(super::bridge_v2_api::billing))
+        .route("/internal/bridge/v2/requests/:request_id/refresh", post(super::bridge_v2_api::refresh))
+        .route("/internal/bridge/v2/receipt-events", get(super::bridge_v2_api::events))
+        .route("/internal/bridge/v2/budgets/prepare", post(super::bridge_v2_api::prepare))
+        .route("/internal/bridge/v2/budgets/cancel", post(super::bridge_v2_api::cancel))
+        .route("/internal/bridge/v2/budgets/dispatch", post(super::bridge_v2_api::dispatch))
         .route("/internal/bridge/key-registry", put(super::bridge_api::replace_core_key_registry).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/internal/bridge/key-usage", get(super::bridge_api::core_key_usage))
         .route(
@@ -235,6 +252,103 @@ mod tests {
 
     // ==================== P2 修复9：优雅停机轮询 ====================
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn v2_read_routes_deliver_result_before_receipt_without_exposing_dispatch_token() {
+        use super::super::{bridge_billing::BridgeBillingStore, bridge_budget::CapacitySnapshot,
+            bridge_budget_lease::BridgeBudgetLease, bridge_prepared::{tests::input, ConsumeOutcome},
+            bridge_execution::ExecutionState};
+        let mut fixture = BridgeFixture::new();
+        let mut store = BridgeBillingStore::open(&fixture.dir).unwrap();
+        store.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").unwrap();
+        let lease = BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
+        store.initialize_capacity(&lease, &CapacitySnapshot { account_ref: "account".into(),
+            snapshot_ref: "test-only".into(), epoch: 1, general: 100_000_000,
+            work: 100_000_000, observed_at_ms: 1 }).unwrap();
+        let prepared = store.prepare_budget(&lease, &input(), None, 10).unwrap();
+        let ConsumeOutcome::Granted(ctx) = store.consume_budget(&lease, &prepared, 20).unwrap() else { panic!("consume") };
+        let budget_id = &prepared.authorization.budget_id;
+        store.mark_budget_send_intent(&lease, budget_id, &ctx.consume_epoch).unwrap();
+        store.bind_budget_task(&lease, budget_id, "video-test").unwrap();
+        let app = fixture.take_app();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sent, received) = std::sync::mpsc::channel();
+        let scheduler = super::super::usage_refresh::start_with(fixture.state.clone(), stop.clone(),
+            || Ok(Vec::new()), move |_| { sent.send(()).unwrap(); true });
+        super::super::usage_refresh::request_refresh(fixture.state.clone(), "request-video").unwrap();
+        received.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        store.finish_budget_result(&lease, budget_id, ExecutionState::Succeeded,
+            &serde_json::json!({"id":"video-test","status":"completed"}), chrono::Utc::now().timestamp_millis()).unwrap();
+        let refresh_path = format!("/internal/bridge/v2/requests/request-video/refresh?budget_id={budget_id}");
+        let response = app.clone().oneshot(Request::builder().method("POST").uri(&refresh_path)
+            .header("authorization", format!("Bearer {}", fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        let refresh_status = response.status();
+        let terminal_woke = received.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+        let repeated = app.clone().oneshot(Request::builder().method("POST").uri(&refresh_path)
+            .header("authorization", format!("Bearer {}", fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        let duplicate_woke = received.recv_timeout(std::time::Duration::from_millis(100)).is_ok();
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        scheduler.join().unwrap();
+        assert_eq!(refresh_status, StatusCode::ACCEPTED);
+        assert_eq!(repeated.status(), StatusCode::ACCEPTED);
+        assert!(terminal_woke, "durable execution completion must reset the pre-completion backoff immediately");
+        assert!(!duplicate_woke, "repeated observers must not restart the backoff");
+        for (route, expected) in [("execution", "succeeded"), ("billing", "pending"), ("result", "ready")] {
+            let path = format!("/internal/bridge/v2/requests/request-video/{route}?budget_id={budget_id}");
+            let response = app.clone().oneshot(Request::builder().uri(&path)
+                .header("authorization", format!("Bearer {}", fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["status"], expected);
+            assert_eq!(value["core_key_id"], "key-a");
+            assert_eq!(value["budget_id"], budget_id.as_str());
+            assert!(!String::from_utf8_lossy(&bytes).contains(&prepared.dispatch_token));
+            if route == "billing" { assert!(value["receipt"].is_null()); }
+            let rejected = app.clone().oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        }
+        let wrong = format!("/internal/bridge/v2/requests/request-other/billing?budget_id={budget_id}");
+        let response = app.clone().oneshot(Request::builder().uri(wrong)
+            .header("authorization", format!("Bearer {}", fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        super::super::bridge_receipts::tests::cache(&fixture.dir, &store, &[(budget_id, "12.345678")], 2000);
+        store.confirm_budget_usage(&lease, budget_id).unwrap();
+        let response = app.clone().oneshot(Request::builder()
+            .uri(format!("/internal/bridge/v2/requests/request-video/billing?budget_id={budget_id}"))
+            .header("authorization", format!("Bearer {}", fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["status"], "final");
+        assert_eq!(value["receipt"]["actual_credits"], "12.345678");
+        assert_eq!(value["event"]["receipt"], value["receipt"]);
+        let response = app.clone().oneshot(Request::builder()
+            .uri("/internal/bridge/v2/receipt-events?generation=old&after=0&limit=10")
+            .header("authorization", format!("Bearer {}", fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        // A broken result must not be converted into an empty success or resubmitted.
+        let discovery=app.clone().oneshot(Request::builder()
+            .uri("/internal/bridge/v2/receipt-events?generation=&after=0&limit=10")
+            .header("authorization",format!("Bearer {}",fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(discovery.status(),StatusCode::OK,"Core must discover the current event generation before recovering its durable cursor");
+        let value:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(discovery.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(value["events"][0]["receipt"]["actual_credits"],"12.345678");
+        let artifact=super::super::video_store::artifact_path(&fixture.dir,"video-test").unwrap();
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();std::fs::write(&artifact,b"fixture-mp4").unwrap();
+        let download=app.clone().oneshot(Request::builder().uri(format!("/internal/bridge/v2/requests/request-video/content?budget_id={budget_id}"))
+            .header("authorization",format!("Bearer {}",fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(download.status(),StatusCode::OK);
+        assert_eq!(&axum::body::to_bytes(download.into_body(),65536).await.unwrap()[..],b"fixture-mp4");
+        store.connection.execute("UPDATE bridge_budget_executions SET result_ciphertext=x'00' WHERE budget_id=?1", [budget_id]).unwrap();
+        let response = app.oneshot(Request::builder()
+            .uri(format!("/internal/bridge/v2/requests/request-video/result?budget_id={budget_id}"))
+            .header("authorization", format!("Bearer {}", fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(lease);
+        drop(store);
+    }
+
     #[test]
     fn wait_task_finished_detects_completion_and_timeout() {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -305,6 +419,45 @@ mod tests {
         assert_eq!(body["request_id"], "request-unknown");
         assert_eq!(body["status"], "unknown");
         assert!(body["actual_credits"].is_null());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn v2_prepare_replays_before_io_and_cancel_proves_no_send() {
+        use super::super::{bridge_runtime::BridgeBudgetRuntime,bridge_budget::CapacitySnapshot,bridge_prepared::tests::input};
+        let mut fixture=BridgeFixture::new();
+        let runtime=BridgeBudgetRuntime::start(&fixture.dir).unwrap();
+        let claim=serde_json::json!({"wire_version":2,"parent_request_id":"request-video","request_id":"request-video","core_key_id":"key-a",
+            "request_fingerprint":"core-fingerprint","endpoint":"videos","model":"seedance","step_kind":"video","body":{"prompt":"cat"}});
+        let prepared=runtime.with_store(|s,l| {
+            s.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").unwrap();
+            s.initialize_capacity(l,&CapacitySnapshot {account_ref:"account".into(),snapshot_ref:"fixture".into(),epoch:1,general:100_000_000,work:100_000_000,observed_at_ms:1})?;
+            let mut i=input();i.parent_request_id="request-video".into();i.body=serde_json::json!({"business_claim":claim,"upstream":{"prompt":"cat"}});
+            s.prepare_budget(l,&i,None,10)
+        }).unwrap();
+        let app=fixture.take_app().layer(axum::Extension(runtime.clone()));
+        let response=app.clone().oneshot(Request::builder().method("POST").uri("/internal/bridge/v2/budgets/prepare")
+            .header("authorization",format!("Bearer {}",fixture.key)).header("content-type","application/json")
+            .body(Body::from(claim.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK,"persisted replay must work even with an empty live account pool");
+        let value:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(value["dispatch_token"],prepared.dispatch_token);
+        let mut forged=claim.clone();forged["hold_microcredits"]=serde_json::json!(1);
+        let rejected=app.clone().oneshot(Request::builder().method("POST").uri("/internal/bridge/v2/budgets/prepare")
+            .header("authorization",format!("Bearer {}",fixture.key)).header("content-type","application/json").body(Body::from(forged.to_string())).unwrap()).await.unwrap();
+        assert_eq!(rejected.status(),StatusCode::UNPROCESSABLE_ENTITY);
+        let response=app.clone().oneshot(Request::builder().method("POST").uri("/internal/bridge/v2/budgets/cancel")
+            .header("authorization",format!("Bearer {}",fixture.key)).header("content-type","application/json")
+            .body(Body::from(value.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK);
+        runtime.with_store(|s,_| {
+            assert_eq!(s.capacity_totals("account")?.pending,0);
+            assert_eq!(s.latest_budget_receipt_event(&prepared.authorization.budget_id)?.unwrap().kind,"failed_no_charge");Ok(())
+        }).unwrap();
+        let denied=app.clone().oneshot(Request::builder().method("POST").uri("/internal/bridge/v2/budgets/prepare")
+            .header("content-type","application/json").body(Body::from(claim.to_string())).unwrap()).await.unwrap();
+        assert_eq!(denied.status(),StatusCode::FORBIDDEN);
+        drop(app);drop(runtime);
     }
 
     #[tokio::test]
