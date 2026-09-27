@@ -1401,12 +1401,12 @@ fn bridge_schema_objects(transaction: &Transaction<'_>) -> Result<Vec<(String, S
 fn bridge_table_columns(
     transaction: &Transaction<'_>,
     table: &str,
-) -> Result<Vec<(String, String, i64, i64)>, String> {
+) -> Result<Vec<(String, String, i64, Option<String>, i64)>, String> {
     let mut statement = transaction
         .prepare(&format!("PRAGMA table_info(\"{table}\")"))
         .map_err(|error| format!("bridge {table} columns unavailable: {error}"))?;
     let columns = statement
-        .query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(5)?)))
+        .query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
         .map_err(|error| format!("bridge {table} columns unavailable: {error}"))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|error| format!("bridge {table} columns unavailable: {error}"));
@@ -1476,12 +1476,19 @@ fn validate_bridge_schema(
     for (table, columns) in required_columns {
         let actual = bridge_table_columns(transaction, table)?;
         if actual.len() != columns.len() || columns.iter().any(|(name, kind, not_null)| {
-            !actual.iter().any(|(found_name, found_kind, found_not_null, _)| {
+            !actual.iter().any(|(found_name, found_kind, found_not_null, _, _)| {
                 found_name == name && found_kind.eq_ignore_ascii_case(kind)
                     && (*found_not_null != 0) == *not_null
             })
         }) {
             return Err(format!("bridge billing {table} columns or NOT NULL constraints do not match the legacy layout"));
+        }
+        if matches!(*table, "bridge_core_requests" | "bridge_core_upstream_sessions")
+            && !actual.iter().any(|(name, _, _, default, _)| {
+                name == "conflict" && default.as_deref() == Some("0")
+            })
+        {
+            return Err(format!("bridge billing {table} conflict column default is not canonical 0"));
         }
     }
     let required_primary_keys: &[(&str, &[(&str, i64)])] = &[
@@ -1497,9 +1504,9 @@ fn validate_bridge_schema(
     ];
     for (table, keys) in required_primary_keys {
         let actual = bridge_table_columns(transaction, table)?;
-        if actual.iter().filter(|(_, _, _, primary)| *primary != 0).count() != keys.len()
+        if actual.iter().filter(|(_, _, _, _, primary)| *primary != 0).count() != keys.len()
             || keys.iter().any(|(name, rank)| {
-                !actual.iter().any(|(found_name, _, _, found_rank)| {
+                !actual.iter().any(|(found_name, _, _, _, found_rank)| {
                     found_name == name && found_rank == rank
                 })
             })
@@ -1526,6 +1533,7 @@ fn validate_bridge_schema(
         return Err("bridge request-mode foreign key does not match the legacy layout".into());
     }
     validate_bridge_lookup_index(transaction)?;
+    validate_receipt_status_binary_collation(transaction)?;
     if check_constraints_by_write_probe {
         validate_legacy_check_constraints(transaction)?;
     } else {
@@ -1535,6 +1543,49 @@ fn validate_bridge_schema(
         validate_bridge_metadata_table(transaction)?;
     }
     Ok(())
+}
+
+fn validate_receipt_status_binary_collation(transaction: &Transaction<'_>) -> Result<(), String> {
+    let sql: String = transaction.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bridge_billing_receipts'",
+        [],
+        |row| row.get(0),
+    ).map_err(|error| format!("bridge receipt status definition unavailable: {error}"))?;
+    let tokens = tokenize_sqlite_schema_sql(&sql)?;
+    let opening = tokens.iter().position(|token| token == "P:(")
+        .ok_or_else(|| "bridge receipt table definition has no column list".to_string())?;
+    let mut column_start = opening + 1;
+    let mut nested = 0usize;
+    for cursor in opening + 1..tokens.len() {
+        let end_of_column = match tokens[cursor].as_str() {
+            "P:(" => { nested += 1; false }
+            "P:)" if nested == 0 => true,
+            "P:)" => { nested -= 1; false }
+            "P:," if nested == 0 => true,
+            _ => false,
+        };
+        if !end_of_column { continue; }
+        if tokens.get(column_start).is_some_and(|token| token == "I:status") {
+            let mut constraint_depth = 0usize;
+            let column = &tokens[column_start + 1..cursor];
+            for (index, token) in column.iter().enumerate() {
+                if token == "I:collate" && constraint_depth == 0
+                    && column.get(index + 1).map(String::as_str) != Some("I:binary")
+                {
+                    return Err("bridge receipt status column must use BINARY collation".into());
+                }
+                match token.as_str() {
+                    "P:(" => constraint_depth += 1,
+                    "P:)" if constraint_depth > 0 => constraint_depth -= 1,
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
+        if tokens[cursor] == "P:)" { break; }
+        column_start = cursor + 1;
+    }
+    Err("bridge receipt status column definition is missing".into())
 }
 
 fn validate_bridge_check_constraint_structure(
@@ -1924,7 +1975,7 @@ fn validate_bridge_metadata_table(transaction: &Transaction<'_>) -> Result<(), S
         ("event_generation", "TEXT", true, 0),
     ];
     if columns.len() != expected.len() || expected.iter().any(|(name, kind, not_null, primary)| {
-        !columns.iter().any(|(found_name, found_kind, found_not_null, found_primary)| {
+        !columns.iter().any(|(found_name, found_kind, found_not_null, _, found_primary)| {
             found_name == name && found_kind.eq_ignore_ascii_case(kind)
                 && (*found_not_null != 0) == *not_null && found_primary == primary
         })
@@ -2090,6 +2141,217 @@ fn test_dir(label: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_conflict_default_one_is_refused_for_both_tables() {
+        assert_default_one_variants_are_refused(false);
+    }
+
+    #[test]
+    fn versioned_conflict_default_one_is_refused_for_both_tables() {
+        assert_default_one_variants_are_refused(true);
+    }
+
+    fn assert_default_one_variants_are_refused(versioned: bool) {
+        let mut accepted = Vec::new();
+        let mut changed = Vec::new();
+        for table in ["bridge_core_requests", "bridge_core_upstream_sessions"] {
+            let dir = test_dir(&format!("default-one-{}-{table}", if versioned { "v1" } else { "v0" }));
+            let fixture = create_schema_variant_fixture(&dir, versioned);
+            rebuild_conflict_with_default_one(&fixture, table);
+            let omitted_value = omitted_conflict_value(&fixture, table);
+            let before_schema = schema_objects(&fixture);
+            let before_rows = snapshot_legacy_rows(&fixture);
+            let before_metadata = bridge_metadata(&fixture).unwrap();
+            drop(fixture);
+
+            let opened = BridgeBillingStore::open(&dir);
+            let was_accepted = opened.is_ok();
+            drop(opened);
+            let after = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+            let after_schema = schema_objects(&after);
+            let after_rows = snapshot_legacy_rows(&after);
+            let after_metadata = bridge_metadata(&after).unwrap();
+            drop(after);
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            assert_eq!(omitted_value, 1, "the {table} fixture must persist omitted conflict as 1");
+            assert_eq!(before_metadata.is_some(), versioned, "fixture version is wrong for {table}");
+            if was_accepted { accepted.push(table); }
+            if after_schema != before_schema || after_rows != before_rows || after_metadata != before_metadata {
+                changed.push(table);
+            }
+        }
+        assert!(accepted.is_empty(), "DEFAULT 1 schema variants passed open: {accepted:?}");
+        assert!(changed.is_empty(), "rejected DEFAULT 1 variants changed schema, rows or metadata: {changed:?}");
+    }
+
+    fn create_schema_variant_fixture(dir: &Path, versioned: bool) -> Connection {
+        if versioned {
+            drop(BridgeBillingStore::open(dir).unwrap());
+            Connection::open(dir.join(BILLING_DB_FILE)).unwrap()
+        } else {
+            create_legacy_v0_database(dir)
+        }
+    }
+
+    fn rebuild_conflict_with_default_one(connection: &Connection, table: &str) {
+        let sql = match table {
+            "bridge_core_requests" =>
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE bridge_core_requests_rebuilt (
+                   request_id TEXT PRIMARY KEY NOT NULL,
+                   core_key_id TEXT NOT NULL,
+                   associated_at_ms INTEGER NOT NULL,
+                   conflict INTEGER NOT NULL DEFAULT 1 CHECK(conflict IN (0, 1))
+                 );
+                 INSERT INTO bridge_core_requests_rebuilt SELECT * FROM bridge_core_requests;
+                 DROP TABLE bridge_core_requests;
+                 ALTER TABLE bridge_core_requests_rebuilt RENAME TO bridge_core_requests;
+                 PRAGMA foreign_keys = ON;",
+            "bridge_core_upstream_sessions" =>
+                "CREATE TABLE bridge_core_upstream_sessions_rebuilt (
+                   request_id TEXT NOT NULL,
+                   account_ref TEXT NOT NULL,
+                   session_id TEXT NOT NULL,
+                   conflict INTEGER NOT NULL DEFAULT 1 CHECK(conflict IN (0, 1)),
+                   associated_at_ms INTEGER NOT NULL,
+                   PRIMARY KEY(request_id, account_ref, session_id)
+                 );
+                 INSERT INTO bridge_core_upstream_sessions_rebuilt SELECT * FROM bridge_core_upstream_sessions;
+                 DROP TABLE bridge_core_upstream_sessions;
+                 ALTER TABLE bridge_core_upstream_sessions_rebuilt RENAME TO bridge_core_upstream_sessions;
+                 CREATE INDEX bridge_core_upstream_sessions_lookup_idx
+                   ON bridge_core_upstream_sessions(account_ref, session_id);",
+            _ => unreachable!("only the two conflict columns are fixture variants"),
+        };
+        connection.execute_batch(sql).unwrap();
+    }
+
+    fn omitted_conflict_value(connection: &Connection, table: &str) -> i64 {
+        let (insert, lookup) = match table {
+            "bridge_core_requests" => (
+                "INSERT INTO bridge_core_requests(request_id, core_key_id, associated_at_ms)
+                 VALUES ('default-probe-request', 'legacy-key-a', 0)",
+                "SELECT conflict FROM bridge_core_requests WHERE request_id = 'default-probe-request'",
+            ),
+            "bridge_core_upstream_sessions" => (
+                "INSERT INTO bridge_core_upstream_sessions(request_id, account_ref, session_id, associated_at_ms)
+                 VALUES ('legacy-quoted', 'default-probe-account', 'default-probe-session', 0)",
+                "SELECT conflict FROM bridge_core_upstream_sessions
+                 WHERE account_ref = 'default-probe-account' AND session_id = 'default-probe-session'",
+            ),
+            _ => unreachable!("only the two conflict columns are fixture variants"),
+        };
+        connection.execute_batch("SAVEPOINT omitted_conflict_probe").unwrap();
+        connection.execute(insert, []).unwrap();
+        let value = connection.query_row(lookup, [], |row| row.get(0)).unwrap();
+        connection.execute_batch("ROLLBACK TO omitted_conflict_probe; RELEASE omitted_conflict_probe").unwrap();
+        value
+    }
+
+    #[test]
+    fn legacy_receipt_nocase_is_refused_without_migration() {
+        assert_receipt_nocase_variant_is_refused(false);
+    }
+
+    #[test]
+    fn versioned_receipt_nocase_is_refused() {
+        assert_receipt_nocase_variant_is_refused(true);
+    }
+
+    fn assert_receipt_nocase_variant_is_refused(versioned: bool) {
+        let dir = test_dir(if versioned { "receipt-nocase-v1" } else { "receipt-nocase-v0" });
+        let fixture = create_schema_variant_fixture(&dir, versioned);
+        rebuild_receipts_with_status_column(
+            &fixture,
+            "TEXT COLLATE NOCASE NOT NULL CHECK(status IN ('pending','final','unknown','unverified','conflict'))",
+            "",
+        );
+        fixture.execute_batch("SAVEPOINT nocase_probe").unwrap();
+        fixture.execute(
+            "INSERT INTO bridge_billing_receipts(request_id, status, observed_at_ms, updated_at_ms)
+             VALUES ('nocase-probe', 'FINAL', 0, 0)",
+            [],
+        ).unwrap();
+        let sql_matches_lowercase: i64 = fixture.query_row(
+            "SELECT COUNT(*) FROM bridge_billing_receipts
+             WHERE request_id = 'nocase-probe' AND status = 'final'",
+            [], |row| row.get(0),
+        ).unwrap();
+        fixture.execute_batch("ROLLBACK TO nocase_probe; RELEASE nocase_probe").unwrap();
+        let before_schema = schema_objects(&fixture);
+        let before_rows = snapshot_legacy_rows(&fixture);
+        let before_metadata = bridge_metadata(&fixture).unwrap();
+        drop(fixture);
+
+        let opened = BridgeBillingStore::open(&dir);
+        let was_accepted = opened.is_ok();
+        drop(opened);
+        let after = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        let after_schema = schema_objects(&after);
+        let after_rows = snapshot_legacy_rows(&after);
+        let after_metadata = bridge_metadata(&after).unwrap();
+        drop(after);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(sql_matches_lowercase, 1, "the NOCASE fixture must match FINAL as final in SQL");
+        assert!(BillingReceiptStatus::parse("FINAL").is_err(), "Rust must reject the same uppercase status");
+        assert!(!was_accepted, "NOCASE receipt status must be refused for v{}", if versioned { 1 } else { 0 });
+        assert_eq!(after_schema, before_schema, "rejection must not change the schema");
+        assert_eq!(after_rows, before_rows, "rejection must preserve old rows");
+        assert_eq!(after_metadata, before_metadata, "rejection must not add or change metadata");
+    }
+
+    fn rebuild_receipts_with_status_column(connection: &Connection, status_column: &str, extra_check: &str) {
+        connection.execute_batch(&format!(
+            "CREATE TABLE bridge_billing_receipts_rebuilt (
+               request_id TEXT PRIMARY KEY NOT NULL,
+               status {status_column},
+               actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+               unit TEXT, source_ref TEXT, task_ref TEXT,
+               observed_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+               {extra_check}
+             );
+             INSERT INTO bridge_billing_receipts_rebuilt SELECT * FROM bridge_billing_receipts;
+             DROP TABLE bridge_billing_receipts;
+             ALTER TABLE bridge_billing_receipts_rebuilt RENAME TO bridge_billing_receipts;"
+        )).unwrap();
+    }
+
+    #[test]
+    fn collate_words_in_comments_and_string_checks_do_not_change_binary_status() {
+        let dir = test_dir("collate-token-decoys");
+        let fixture = create_legacy_v0_database(&dir);
+        rebuild_receipts_with_status_column(
+            &fixture,
+            "TEXT /* COLLATE NOCASE */ NOT NULL CHECK(status IN ('pending','final','unknown','unverified','conflict'))",
+            ", CHECK('COLLATE NOCASE' = 'COLLATE NOCASE')",
+        );
+        let before_rows = snapshot_legacy_rows(&fixture);
+        drop(fixture);
+
+        let migrated = BridgeBillingStore::open(&dir).is_ok();
+        let reopened = BridgeBillingStore::open(&dir).is_ok();
+        let after = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        let after_rows = snapshot_legacy_rows(&after);
+        let metadata = bridge_metadata(&after).unwrap();
+        let uppercase_insert = after.execute(
+            "INSERT INTO bridge_billing_receipts(request_id, status, observed_at_ms, updated_at_ms)
+             VALUES ('binary-probe', 'FINAL', 0, 0)",
+            [],
+        );
+        drop(after);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(migrated && reopened, "comments and string literals must not count as column COLLATE");
+        assert!(metadata.is_some(), "canonical v0 with harmless COLLATE text must migrate");
+        assert_eq!(after_rows, before_rows, "migration must preserve legacy rows");
+        assert!(matches!(uppercase_insert,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
+            "BINARY status CHECK must reject uppercase FINAL");
+    }
 
     #[test]
     fn versioned_open_does_not_wait_for_or_take_a_writer_reservation() {
