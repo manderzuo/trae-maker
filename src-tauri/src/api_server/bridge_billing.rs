@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const BILLING_DB_FILE: &str = "bridge-billing.sqlite3";
 const BRIDGE_SCHEMA_META_TABLE: &str = "bridge_schema_meta";
-const BRIDGE_SCHEMA_VERSION: i64 = 3;
+const BRIDGE_SCHEMA_VERSION: i64 = 4;
 const BRIDGE_ACTIVE_OWNER_PREFIX: &str = "bridge-active-v1-";
 const BRIDGE_RECOVERY_REQUIRED_PREFIX: &str = "bridge-recovery-required-v1-";
 
@@ -855,6 +855,11 @@ impl BridgeBillingStore {
         for row in rows {
             matches.push(row.map_err(|error| format!("upstream session attribution row invalid: {error}"))?);
         }
+        match self.budget_session_attribution(account_ref,session_id)? {
+            Some(CoreSessionLookup::Unique {request_id,core_key_id})=>matches.push((request_id,core_key_id,false,false)),
+            Some(CoreSessionLookup::Ambiguous)=>return Ok(Some(CoreSessionLookup::Ambiguous)),
+            None=>{},
+        }
         if matches.is_empty() {
             return Ok(None);
         }
@@ -870,14 +875,21 @@ impl BridgeBillingStore {
     /// use this allowlist to avoid polling unrelated accounts.
     pub(super) fn pending_core_session_accounts(&self) -> Result<Vec<(String, i64)>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT s.account_ref, MIN(s.associated_at_ms)
+            "SELECT account_ref, MIN(associated_at_ms) FROM (
+             SELECT s.account_ref, s.associated_at_ms
              FROM bridge_core_upstream_sessions s
              JOIN bridge_core_requests r ON r.request_id = s.request_id
              LEFT JOIN bridge_billing_receipts b ON b.request_id = r.request_id
              WHERE s.conflict = 0 AND r.conflict = 0
                AND (b.request_id IS NULL OR b.status IN ('pending','unknown','unverified'))
-             GROUP BY s.account_ref
-             ORDER BY s.account_ref",
+             UNION ALL
+             SELECT e.account_ref, e.started_at_ms AS associated_at_ms
+             FROM bridge_budget_executions e
+             JOIN bridge_capacity_slots c ON c.budget_id=e.budget_id
+             WHERE c.stage IN ('P','R')
+               AND NOT EXISTS(SELECT 1 FROM bridge_core_requests r WHERE r.request_id=e.request_id)
+               AND NOT EXISTS(SELECT 1 FROM bridge_core_upstream_sessions s WHERE s.account_ref=e.account_ref AND s.session_id=e.session_ref)
+             ) GROUP BY account_ref ORDER BY account_ref",
         ).map_err(|error| format!("pending Core session account query unavailable: {error}"))?;
         let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
             .map_err(|error| format!("pending Core session account query failed: {error}"))?;
@@ -1396,6 +1408,15 @@ where F: Fn(&Transaction<'_>) -> Result<(), String>,
         if changed!=1 { return Err("bridge preparation migration lost version CAS".into()); }
         validate_versioned_bridge_schema(&transaction)?;
     }
+    if read_bridge_schema_metadata(&transaction)?.0 == 3 {
+        super::bridge_execution::create_schema(&transaction)?;
+        super::bridge_execution::validate_schema(&transaction)?;
+        hook(&transaction)?;
+        let changed=transaction.execute("UPDATE bridge_schema_meta SET schema_version=4 WHERE singleton=1 AND schema_version=3",[])
+            .map_err(|error|format!("bridge execution migration failed: {error}"))?;
+        if changed!=1 {return Err("bridge execution migration lost version CAS".into());}
+        validate_versioned_bridge_schema(&transaction)?;
+    }
     transaction.commit().map_err(|error| format!("bridge capacity migration commit failed: {error}"))
 }
 
@@ -1411,12 +1432,13 @@ fn validate_versioned_bridge_schema(transaction: &Transaction<'_>) -> Result<(),
     if version > BRIDGE_SCHEMA_VERSION {
         return Err(format!("bridge billing schema version {version} is newer than supported"));
     }
-    if !matches!(version, 1..=3) {
+    if !matches!(version, 1..=4) {
         return Err(format!("bridge billing schema version {version} is unsupported"));
     }
     validate_bridge_schema(transaction, true, false)?;
     if version >= 2 { super::bridge_budget::validate_schema(transaction)?; }
     if version >= 3 { super::bridge_prepared::validate_schema(transaction)?; }
+    if version >= 4 { super::bridge_execution::validate_schema(transaction)?; }
     validate_bridge_identity(&instance_id, &generation)?;
     validate_foreign_key_integrity(transaction)?;
     Ok(())
@@ -1470,6 +1492,9 @@ fn validate_bridge_schema(
     }
     if versioned && read_bridge_schema_metadata(transaction)?.0 >= 3 {
         objects.retain(|(_,name)| !super::bridge_prepared::SCHEMA_OBJECTS.iter().any(|(_,expected,_)|name==expected));
+    }
+    if versioned && read_bridge_schema_metadata(transaction)?.0 >= 4 {
+        objects.retain(|(_,name)| !super::bridge_execution::SCHEMA_OBJECTS.iter().any(|(_,expected,_)|name==expected));
     }
     let required_count = LEGACY_OBJECTS.len() + usize::from(versioned);
     let complete = objects.len() == required_count
@@ -2275,8 +2300,30 @@ mod tests {
         let identity=bridge_metadata(&store.connection).unwrap().unwrap();
         let old=before.2.unwrap();
         assert_eq!((identity.1,identity.2),(old.1,old.2));
-        assert_eq!(identity.0,3);
+        assert_eq!(identity.0,BRIDGE_SCHEMA_VERSION);
         drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn execution_v4_migration_failure_preserves_existing_sent_budget() {
+        use super::super::bridge_prepared::{tests::{fixture,input,cleanup},ConsumeOutcome};
+        let (dir,mut store,lease)=fixture();
+        let prepared=store.prepare_budget(&lease,&input(),None,10).unwrap();
+        let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&prepared,20).unwrap() else {panic!("first consume")};
+        store.mark_budget_send_intent(&lease,&prepared.authorization.budget_id,&ctx.consume_epoch).unwrap();
+        store.connection.execute_batch("DROP TABLE bridge_budget_executions; UPDATE bridge_schema_meta SET schema_version=3").unwrap();
+        let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
+        let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
+            let count:i64=tx.query_row("SELECT COUNT(*) FROM bridge_budget_executions WHERE execution_state='unknown'",[],|r|r.get(0)).unwrap();
+            assert_eq!(count,1);Err("injected-v4-migration-failure".into())
+        });
+        assert!(result.unwrap_err().contains("injected-v4"));
+        assert_eq!((schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap()),before);
+        assert_eq!(store.capacity_totals("account").unwrap().pending,40_000_000);
+        drop(store);let store=BridgeBillingStore::open(&dir).unwrap();
+        assert!(store.budget_execution(&prepared.authorization.budget_id).unwrap().is_some());
+        cleanup(dir,store,lease);
     }
 
     #[test]

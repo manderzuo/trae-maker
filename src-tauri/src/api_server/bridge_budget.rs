@@ -104,6 +104,12 @@ impl CapacityEligibility {
 
 pub(super) fn require_active_lease(tx: &Transaction<'_>, lease: &BridgeBudgetLease) -> Result<(), String> {
     if !lease.charge_ready() { return Err("active charging lease required".into()); }
+    require_fact_lease(tx,lease)
+}
+
+// Closing admission must not prevent already-sent workers from persisting facts.
+pub(super) fn require_fact_lease(tx:&Transaction<'_>,lease:&BridgeBudgetLease)->Result<(),String> {
+    if !lease.is_active() || lease.is_closed() {return Err("active bridge fact owner required".into());}
     let current: (String,String) = tx.query_row("SELECT bridge_instance_id,event_generation FROM bridge_schema_meta WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(db_error)?;
     if current.0 != lease.instance_id() || current.1 != lease.generation() {
         return Err("bridge capacity lease generation changed".into());
@@ -165,11 +171,11 @@ pub(super) fn check_capacity(connection: &Connection, input: &CapacityReservatio
 }
 
 pub(super) fn transition_in_transaction(tx: &Transaction<'_>,lease: &BridgeBudgetLease,budget_id:&str,transition:CapacityTransition)->Result<CapacityMutation,String> {
-    require_active_lease(tx,lease)?;
+    if transition==CapacityTransition::CancelUnsent {require_active_lease(tx,lease)?;} else {require_fact_lease(tx,lease)?;}
     let (stage,actual,instance,generation):(String,Option<i64>,String,String)=tx.query_row(
         "SELECT stage,actual_microcredits,bridge_instance_id,event_generation FROM bridge_capacity_slots WHERE budget_id=?1",
         [budget_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(db_error)?;
-    if instance!=lease.instance_id() || generation!=lease.generation() { return Err("capacity budget belongs to another lease generation".into()); }
+    if instance!=lease.instance_id() || (transition==CapacityTransition::CancelUnsent && generation!=lease.generation()) { return Err("capacity budget belongs to another lease generation".into()); }
     let (next,amount,actual)=match transition {
         CapacityTransition::ExecutionTerminal => match stage.as_str() {
             "P" => ("R",None,None), "R"|"D"=>return Ok(CapacityMutation::Duplicate),

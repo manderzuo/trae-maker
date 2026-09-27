@@ -246,7 +246,7 @@ impl RefreshQueue {
 pub(crate) fn request_refresh(state: Arc<ApiSharedState>, request_id: &str) -> Result<(), String> {
     let lookup = {
         let store = super::bridge_billing::BridgeBillingStore::open(&state.data_dir)?;
-        store.core_session_for_request(request_id)?
+        store.usage_session_for_request(request_id)?
     };
     let (account_ref, attempt_at_ms) = match lookup {
         super::bridge_billing::CoreBillingSessionLookup::Unique {

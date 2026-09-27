@@ -197,6 +197,9 @@ impl BridgeBillingStore {
         if !key_active(&tx,&row.core_key_id)? {return Err("Core Key disabled before send".into());}
         bridge_budget::check_capacity(&tx,&envelope.capacity_reservation())?;
         let updated=tx.execute("UPDATE bridge_prepared_budgets SET state='send_intent' WHERE budget_id=?1 AND state='consumed' AND consume_epoch=?2",params![budget_id,consume_epoch]).map_err(db_error)?;
+        if updated==1 {
+            super::bridge_execution::register_send(&tx,&envelope.execution_identity(),chrono::Utc::now().timestamp_millis(),super::bridge_execution::ExecutionState::Running)?;
+        }
         tx.commit().map_err(db_error)?; Ok(updated==1)
     }
     pub(super) fn fail_budget_before_send(&mut self,lease:&BridgeBudgetLease,budget_id:&str,consume_epoch:&str,now:i64)->Result<NoSendProof,String> {
@@ -217,10 +220,18 @@ struct ProtectedPreparation {
     generation:String,revision:i64,dispatch_token:String,session_ref:String,prepared_at_ms:i64,
 }
 impl ProtectedPreparation {
+    fn execution_identity(&self)->super::bridge_execution::ExecutionIdentity {
+        super::bridge_execution::ExecutionIdentity {authorization:self.authorization.clone(),session_ref:self.session_ref.clone(),step_kind:self.input.step_kind.clone()}
+    }
     fn response(&self)->PreparedBudget {PreparedBudget {wire_version:2,authorization:self.authorization.clone(),dispatch_token:self.dispatch_token.clone(),
         evidence_level:self.input.evidence_level.clone(),prepared_at_ms:self.prepared_at_ms,revision:self.revision}}
     fn capacity_reservation(&self)->CapacityReservation {CapacityReservation {budget_id:self.authorization.budget_id.clone(),core_key_id:self.input.core_key_id.clone(),
         account_ref:self.input.account_ref.clone(),snapshot_epoch:self.input.snapshot_epoch,eligibility:self.input.eligibility,hold:self.input.hold_microcredits}}
+}
+pub(super) fn sent_execution_identity(connection:&Connection,budget_id:&str)->Result<super::bridge_execution::ExecutionIdentity,String> {
+    let row=required_row(connection,budget_id)?;
+    if row.state!="send_intent" {return Err("budget has no durable send intent".into());}
+    Ok(row.decrypt()?.execution_identity())
 }
 struct PreparedRow {
     budget_id:String,request_id:String,core_key_id:String,account_ref:String,revision:i64,generation:String,
@@ -300,11 +311,11 @@ fn validate_input(input:&TrustedPreparation,now:i64)->Result<(),String> {
 }
 
 #[cfg(all(test,windows))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use super::super::bridge_budget::CapacitySnapshot;
     use std::{path::PathBuf,sync::{Arc,Barrier},thread};
-    fn fixture()->(PathBuf,BridgeBillingStore,BridgeBudgetLease) {
+    pub(crate) fn fixture()->(PathBuf,BridgeBillingStore,BridgeBudgetLease) {
         let dir=std::env::temp_dir().join(format!("aiwork-prepared-{:032x}",rand::random::<u128>()));
         let mut store=BridgeBillingStore::open(&dir).unwrap();
         store.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").unwrap();
@@ -312,10 +323,10 @@ mod tests {
         store.initialize_capacity(&lease,&CapacitySnapshot {account_ref:"account".into(),snapshot_ref:"snapshot".into(),epoch:1,general:100_000_000,work:100_000_000,observed_at_ms:1}).unwrap();
         (dir,store,lease)
     }
-    fn input()->TrustedPreparation {
+    pub(crate) fn input()->TrustedPreparation {
         TrustedPreparation {parent_request_id:"request-parent".into(),request_id:"request-video".into(),core_key_id:"key-a".into(),request_fingerprint:"core-fingerprint".into(),endpoint:"videos".into(),model:"seedance".into(),step_kind:"video".into(),account_ref:"account".into(),snapshot_epoch:1,eligibility:CapacityEligibility::GeneralOrWork,policy_version:"policy-1".into(),pricing_profile_key:"720p-5s-test-policy".into(),evidence_level:"policy_only".into(),hold_microcredits:40_000_000,expires_at_ms:1000,body:serde_json::json!({"prompt":"test fixture only","duration":5})}
     }
-    fn cleanup(dir:PathBuf,store:BridgeBillingStore,lease:BridgeBudgetLease) {
+    pub(crate) fn cleanup(dir:PathBuf,store:BridgeBillingStore,lease:BridgeBudgetLease) {
         drop(lease); drop(store); std::fs::remove_dir_all(dir).unwrap();
     }
 
