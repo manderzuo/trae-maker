@@ -784,6 +784,18 @@ impl ApiPool {
         }).collect()
     }
 
+    pub(crate) fn observe_verified_capacity(&self, uid:&str, general:i64, work:i64, observed_at_ms:i64) -> Result<(),String> {
+        if general<0 || work<0 || general.checked_add(work).is_none() || observed_at_ms<=0 {return Err("invalid balance observation".into());}
+        let mut entries=safe_lock(&self.entries);
+        let Some(entry)=entries.get_mut(uid).filter(|e|!e.disabled) else {return Ok(())};
+        let mut balances=safe_lock(&self.balances);
+        if balances.get(uid).and_then(|v|v.observed_at_ms).is_some_and(|old|old>=observed_at_ms) {return Ok(())}
+        let general=general as f64/1_000_000.0;let work=work as f64/1_000_000.0;
+        entry.credits=Some(general);
+        balances.insert(uid.into(),CreditBalance {general:Some(general),work:Some(work),total:Some(general+work),general_verified:true,observed_at_ms:Some(observed_at_ms)});
+        Ok(())
+    }
+
     pub fn count(&self) -> usize {
         safe_lock(&self.entries).len()
     }
@@ -1634,6 +1646,21 @@ mod tests {
             &HashSet::from(["uid_a".to_string()]),
         );
         assert!(pool.has_selectable_for(ResourceKind::Work));
+    }
+
+    #[test]
+    fn native_balance_observation_refreshes_summary_without_desktop_clicks() {
+        let pool=ApiPool::new();
+        pool.sync_from_accounts_with_balances(&[acct("A","uid_a")],&["uid_a".into()],&[],&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new());
+        let now=chrono::Utc::now().timestamp_millis();
+        pool.observe_verified_capacity("uid_a",1_234_567,2_000_001,now).unwrap();
+        assert_eq!(pool.bridge_credit_snapshots(),vec![(true,Some(1.234567),Some(2.000001),Some(now))]);
+        pool.observe_verified_capacity("uid_a",9_000_000,9_000_000,now-1).unwrap();
+        assert_eq!(pool.bridge_credit_snapshots()[0].1,Some(1.234567));
+        assert!(pool.observe_verified_capacity("uid_a",-1,5,now+1).is_err());
+        assert_eq!(pool.bridge_credit_snapshots()[0].3,Some(now));
+        pool.observe_verified_capacity("uid_a",0,0,now+1).unwrap();
+        assert_eq!(pool.bridge_credit_snapshots(),vec![(true,Some(0.0),Some(0.0),Some(now+1))]);
     }
 
     #[test]

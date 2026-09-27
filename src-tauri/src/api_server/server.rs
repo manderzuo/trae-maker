@@ -83,6 +83,7 @@ pub async fn start_api_server(
     let background_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     super::bridge_runtime::BridgeBudgetRuntime::start_maintenance(&budget_runtime,background_stop.clone());
     super::usage_refresh::start_with_runtime(state.clone(), background_stop.clone(), Some(budget_runtime.clone()));
+    super::balance_refresh::start(state.pool.clone(),background_stop.clone());
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
