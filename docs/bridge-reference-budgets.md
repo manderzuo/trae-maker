@@ -37,3 +37,9 @@ Reference input errors return HTTP 400 with one of
 `reference_video_format_unsupported`, `reference_asset_type_mismatch` or
 `reference_asset_unavailable`. Missing/expired administrator policies remain
 configuration errors, separate from invalid client data and capacity errors.
+
+The native uploader uses `override_resource_id` when provided, falling back to
+`store_uri` and removing the query suffix, matching the installed native
+remote-attachment uploader. The PUT storage location is not necessarily the
+generation service's resource identifier. Images retain their raw-image upload
+contract; remote video attachments retain the native Magic V2 envelope.

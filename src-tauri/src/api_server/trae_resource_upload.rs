@@ -135,6 +135,14 @@ fn native_target_path() -> String {
     format!("{}.trae", crate::commands::oauth::random_hex(32))
 }
 
+fn generation_resource_uri(plan:UploadPlan)->String {
+    // Native remote-attachment uploader returns overrideResourceId || oid,
+    // stripping the query before passing it to tools. The storage PUT target
+    // is not necessarily an ID the video-generation service can resolve.
+    let resource=plan.resource_id.unwrap_or(plan.store_uri);
+    resource.split('?').next().unwrap_or(&resource).to_owned()
+}
+
 fn image_target_path(width: u32, height: u32) -> String {
     format!(
         "{}_{}x{}.trae",
@@ -437,14 +445,14 @@ pub fn upload_asset(
         )?;
         upload_image_bytes(&plan, bytes, &record.mime_type)?;
         commit_upload_for(account, &plan, IMAGE_BIZ_TYPE)?;
-        return Ok(plan.resource_id.unwrap_or(plan.store_uri));
+        return Ok(generation_resource_uri(plan));
     }
     let target = native_target_path();
     let plan = request_upload_plan(account, &target)?;
     let encoded = encode_remote_attachment(bytes);
     upload_bytes(&plan, &encoded)?;
     commit_upload(account, &plan)?;
-    Ok(plan.store_uri)
+    Ok(generation_resource_uri(plan))
 }
 
 fn detect_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -517,6 +525,18 @@ fn detect_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_uses_native_override_id_not_storage_location() {
+        let plan=parse_upload_url_response(&serde_json::json!({"upload_hosts":["upload.invalid"],"store_infos":[{
+            "auth":"fixture", "store_uri":"storage/private-object.trae", "override_resource_id":"resource/public-id?temporary=fixture"
+        }]})).unwrap();
+        assert_eq!(generation_resource_uri(plan),"resource/public-id");
+        let plan=parse_upload_url_response(&serde_json::json!({"upload_hosts":["upload.invalid"],"store_infos":[{
+            "auth":"fixture", "store_uri":"storage/fallback.trae"
+        }]})).unwrap();
+        assert_eq!(generation_resource_uri(plan),"storage/fallback.trae");
+    }
 
     #[test]
     fn crc32_matches_official_hex_format() {
