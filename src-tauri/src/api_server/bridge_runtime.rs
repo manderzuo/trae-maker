@@ -2,7 +2,7 @@
 use std::{path::{Path,PathBuf},sync::{Arc,Mutex}};
 use super::{bridge_billing::BridgeBillingStore,bridge_budget_lease::BridgeBudgetLease};
 
-pub(super) struct BridgeBudgetRuntime { data_dir:PathBuf, lease:Mutex<BridgeBudgetLease>, planning:Mutex<std::collections::HashSet<String>>, receipt_cursors:Mutex<std::collections::HashMap<String,String>> }
+pub(super) struct BridgeBudgetRuntime { data_dir:PathBuf, lease:Mutex<BridgeBudgetLease>, planning:Mutex<std::collections::HashSet<String>>, receipt_cursors:Mutex<std::collections::HashMap<String,(String,String)>> }
 pub(super) struct PlanningGuard<'a> {runtime:&'a BridgeBudgetRuntime,request:String}
 impl Drop for PlanningGuard<'_> {
     fn drop(&mut self) {if let Ok(mut busy)=self.runtime.planning.lock() {busy.remove(&self.request);}}
@@ -46,20 +46,31 @@ impl BridgeBudgetRuntime {
     }
     pub(super) fn confirm_account(&self,account:&str)->Result<(),String> {
         let after=self.receipt_cursors.lock().map_err(|_|"receipt cursor unavailable")?.get(account).cloned().unwrap_or_default();
-        let candidates = self.with_store(|store,_| {
-            let mut stmt=store.connection.prepare("SELECT p.budget_id,p.state FROM bridge_prepared_budgets p
-                LEFT JOIN bridge_budget_executions e ON e.budget_id=p.budget_id
-                WHERE p.account_ref=?1 AND p.budget_id>?2
-                  AND (e.finished_at_ms IS NOT NULL OR p.state IN ('canceled','no_send'))
-                ORDER BY p.budget_id LIMIT 256").map_err(|e|e.to_string())?;
-            let rows=stmt.query_map([account,after.as_str()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?;
-            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())
+        let (candidates,next) = self.with_store(|store,_| {
+            let mut candidates=Vec::new();
+            let mut next=(String::new(),String::new());
+            // Give pending receipts their own lane. A large settled history must
+            // never consume the whole page ahead of newly available money facts.
+            // Keep a smaller independent history lane to detect later conflicts.
+            for (history,cursor,limit) in [(0,after.0.as_str(),192),(1,after.1.as_str(),64)] {
+                let mut stmt=store.connection.prepare("SELECT p.budget_id,p.state FROM bridge_prepared_budgets p
+                    LEFT JOIN bridge_budget_executions e ON e.budget_id=p.budget_id
+                    LEFT JOIN bridge_budget_receipts r ON r.budget_id=p.budget_id
+                    WHERE p.account_ref=?1 AND p.budget_id>?2
+                      AND (e.finished_at_ms IS NOT NULL OR p.state IN ('canceled','no_send'))
+                      AND ((?3=0 AND r.budget_id IS NULL) OR (?3=1 AND r.receipt_state='final'))
+                    ORDER BY p.budget_id LIMIT ?4").map_err(|e|e.to_string())?;
+                let rows=stmt.query_map(rusqlite::params![account,cursor,history,limit],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?;
+                let page=rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+                if page.len()==limit as usize {
+                    let value=page.last().unwrap().0.clone();
+                    if history==0 {next.0=value;} else {next.1=value;}
+                }
+                candidates.extend(page);
+            }
+            Ok((candidates,next))
         })?;
-        // Revisit settled facts on later source observations as well. Bound work
-        // and rotate by immutable ID so neither old pending nor settled rows can
-        // permanently starve later requests. This cursor schedules reads only;
-        // financial facts and the event outbox are persisted transactionally.
-        let next=if candidates.len()==256 {candidates.last().unwrap().0.clone()} else {String::new()};
+        // Cursors schedule reads only; money facts/outbox remain transactional.
         let mut failed=false;
         for (id,state) in candidates {
             let result=self.with_store(|store,lease| if matches!(state.as_str(),"canceled"|"no_send") {
@@ -87,6 +98,27 @@ impl Drop for BridgeBudgetRuntime {
 mod tests {
     use super::*;
     use super::super::{bridge_prepared::tests::fixture,bridge_receipts::tests::{send,cache}};
+    #[test]
+    fn new_receipt_is_not_queued_behind_a_full_page_of_settled_history() {
+        use super::super::bridge_prepared::tests::input;
+        let (dir,mut store,lease)=fixture();
+        let mut ids=Vec::new();
+        for i in 0..257 {
+            let mut value=input();value.request_id=format!("request-priority-{i}");
+            let budget=store.prepare_budget(&lease,&value,None,10).unwrap();
+            store.cancel_budget(&lease,&budget,20).unwrap();
+            ids.push(budget.authorization.budget_id);
+        }
+        ids.sort();
+        for id in &ids[..256] {store.confirm_budget_no_send(&lease,id).unwrap();}
+        let latest=&ids[256];
+        assert!(store.latest_budget_receipt_event(latest).unwrap().is_none());
+        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default())});
+        runtime.confirm_account("account").unwrap();
+        assert!(store.latest_budget_receipt_event(latest).unwrap().is_some(),
+            "newly available receipts must not wait for a full historical sweep");
+        drop(runtime);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn expired_unused_preparation_releases_capacity_but_never_consumed_or_sent_budgets() {
         use super::super::bridge_prepared::{tests::input,ConsumeOutcome};

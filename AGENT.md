@@ -519,6 +519,7 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 
 - API server 持有 `BridgeBudgetRuntime`，用量与收费 worker 共享 Arc；停止时先关闭新收费许可，最后一个 worker/观察者释放引用后才可写 clean-close 标记，不能只克隆身份字符串。
 - 用量刷新后自动确认该账号已终态且有完整原始来源的预算，逐笔故障不阻断其余预算；未知账单继续保留，普通请求不能直接调用确认财务接口。
+- 每轮确认最多192条待结算与64条已结算历史，使用独立游标；历史复核不得占满待结算通道。已确认no-send无需反复检查，真实Final仍复核迟到冲突。游标仅安排读取，财务事实始终由数据库事务和outbox持久化。
 - `/internal/bridge/v2/requests/:request_id/{execution,result,billing,refresh}` 必须同时指定原预算 `budget_id` 并通过桥接管理员鉴权；只读接口不发起付费请求，不泄露 dispatch token。GET result 不依赖账单是否已到；密文损坏不得返回空成功。
 - 已持久执行终态可重置一次刷新退避；重复 POST refresh 不得反复唤醒。GET receipt-events 非空世代错误返回409，空世代用于只读发现；分页按全库 sequence 含历史世代事件，避免正常重启隐去尚未消费的回执。Core 新世代从0幂等重放，旧游标/事实保留。
 - POST `/internal/bridge/v2/budgets/{prepare,cancel,dispatch}`：prepare只接业务字段，服务端固定账号、精确权益包和策略预算；cancel/dispatch校验全PreparedBudget与加密原件。收费worker固定账号/参数、不转账号或重发；结果先持久化。5秒维护批次只清理过期且从未consume的预算，consumed/send_intent不因TTL退款。
