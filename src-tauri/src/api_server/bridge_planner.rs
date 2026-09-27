@@ -1,5 +1,6 @@
 //! Business input adapter. Clients cannot supply account, hold or price evidence.
 use serde_json::{json,Value};
+use std::collections::HashSet;
 use super::{bridge_runtime::BridgeBudgetRuntime,bridge_prepared::PreparedBudget,pool::PickedAccount};
 
 #[derive(Clone,serde::Deserialize,serde::Serialize,PartialEq)]
@@ -9,7 +10,7 @@ pub(super) struct PrepareRequest {
     pub request_fingerprint:String,pub endpoint:String,pub model:String,pub step_kind:String,pub body:Value,
 }
 pub(super) trait PreparationSource {
-    fn select(&self,video:bool)->Result<PickedAccount,String>;
+    fn select(&self,video:bool,excluded:&HashSet<String>)->Result<PickedAccount,String>;
     fn capacity(&self,account:&PickedAccount)->Result<Vec<Value>,String>;
     fn estimate(&self,account:&PickedAccount,workload:i64)->Result<i64,String>;
     fn policy(&self,profile:&str,now:i64)->Result<(i64,String,i64),String>;
@@ -17,8 +18,8 @@ pub(super) trait PreparationSource {
 }
 pub(super) struct NativePreparationSource<'a>(pub &'a super::ApiSharedState,pub &'a str);
 impl PreparationSource for NativePreparationSource<'_> {
-    fn select(&self,video:bool)->Result<PickedAccount,String> {
-        self.0.pool.pick_excluding_for(&Default::default(),if video {super::pool::ResourceKind::Work} else {super::pool::ResourceKind::General})
+    fn select(&self,video:bool,excluded:&HashSet<String>)->Result<PickedAccount,String> {
+        self.0.pool.pick_excluding_for(excluded,if video {super::pool::ResourceKind::Work} else {super::pool::ResourceKind::General})
             .ok_or("upstream_account_unavailable".into())
     }
     fn capacity(&self,account:&PickedAccount)->Result<Vec<Value>,String> {
@@ -98,7 +99,7 @@ fn parse_risk_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64)
     Ok((hold,version.into(),expires))
 }
 pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource,now:i64)->Result<PreparedBudget,String> {
-    use super::{bridge_budget::{CapacityEligibility,CapacitySnapshot},bridge_prepared::TrustedPreparation};
+    use super::{bridge_budget::{CapacityEligibility,CapacitySnapshot,CapacityReservation,check_capacity},bridge_prepared::TrustedPreparation};
     use rusqlite::OptionalExtension;
     if request.wire_version!=2 || now<0 || !request.body.is_object() || serde_json::to_vec(&request.body).map_err(|_|"invalid input")?.len()>256*1024
         || [&request.parent_request_id,&request.request_id,&request.core_key_id,&request.request_fingerprint,&request.model].iter()
@@ -127,7 +128,22 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         if request.step_kind=="assist" {body.as_object_mut().unwrap().remove("tools");body.as_object_mut().unwrap().remove("tool_choice");}
         (body,format!("{}:{}",request.step_kind,request.model),None)
     };
-    let account=source.select(video)?;
+    let mut excluded=HashSet::new();
+    let mut last_error="upstream_account_unavailable".to_string();
+    // Only preparation may try another account. Bound read-side work and never
+    // turn a persistence/identity/normalization failure into another attempt.
+    for _ in 0..8 {
+    let account=match source.select(video,&excluded) {
+        Ok(account)=>account,
+        Err(error) if error=="upstream_account_unavailable"=>return Err(last_error),
+        Err(error)=>return Err(error),
+    };
+    if !excluded.insert(account.uid.clone()) {return Err("preparation_candidate_repeated".into());}
+    let attempt=(|| {
+    runtime.with_store(|store,_| {
+        let fenced:bool=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_accounts WHERE account_ref=?1 AND rebase_state!='open')",[&account.uid],|r|r.get(0)).map_err(|e|e.to_string())?;
+        if fenced {Err("capacity snapshot stale or account fenced".into())} else {Ok(())}
+    })?;
     let live=parse_capacity(&source.capacity(&account)?,now)?;
     let (hold,policy,expiry,evidence)=if let Some(workload)=workload {
         let estimate=source.estimate(&account,workload)?;
@@ -141,10 +157,10 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
     };
     let expiry=expiry.min(live.valid_until_ms).min(now.checked_add(60_000).ok_or("budget time overflow")?);
     if expiry<=now || hold<=0 {return Err("budget_policy_expired".into());}
-    let normalized=source.normalize(&account,&body,video,&request.core_key_id)?;
-    // Account/amount decisions have no network calls inside the following lease
-    // and SQLite transaction sequence. The local capacity CAS is authoritative.
-    runtime.with_store(|store,lease| {
+    // Reject known insufficient capacity before account-bound asset uploads.
+    // Repeat this preflight after uploads; the atomic prepare CAS remains the
+    // authority when another request competes between either check and commit.
+    let preflight=|store:&mut super::bridge_billing::BridgeBillingStore,lease:&super::bridge_budget_lease::BridgeBudgetLease| {
         let epoch:Option<i64>=store.connection.query_row("SELECT snapshot_epoch FROM bridge_capacity_accounts WHERE account_ref=?1",[&account.uid],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         let totals=store.capacity_totals(&account.uid)?;
         let promised=totals.pending.checked_add(totals.awaiting_receipt).and_then(|v|v.checked_add(hold)).ok_or("capacity overflow")?;
@@ -154,12 +170,28 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         if video && general_promised && promised>live.general {return Err("upstream_capacity_insufficient".into());}
         if epoch.is_none() {store.initialize_capacity(lease,&CapacitySnapshot {account_ref:account.uid.clone(),snapshot_ref:format!("native-entitlements:{now}"),epoch:1,
             general:live.general,work:live.work,observed_at_ms:now})?;}
+        check_capacity(&store.connection,&CapacityReservation {budget_id:request.request_id.clone(),core_key_id:request.core_key_id.clone(),
+            account_ref:account.uid.clone(),snapshot_epoch:epoch.unwrap_or(1),eligibility:if video {CapacityEligibility::GeneralOrWork} else {CapacityEligibility::GeneralOnly},hold})?;
+        Ok(epoch.unwrap_or(1))
+    };
+    runtime.with_store(|store,lease|preflight(store,lease))?;
+    let normalized=source.normalize(&account,&body,video,&request.core_key_id)?;
+    runtime.with_store(|store,lease| {
+        let epoch=preflight(store,lease)?;
         store.prepare_budget(lease,&TrustedPreparation {parent_request_id:request.parent_request_id.clone(),request_id:request.request_id.clone(),core_key_id:request.core_key_id.clone(),
             request_fingerprint:request.request_fingerprint.clone(),endpoint:request.endpoint.clone(),model:request.model.clone(),step_kind:request.step_kind.clone(),
-            account_ref:account.uid.clone(),snapshot_epoch:epoch.unwrap_or(1),eligibility:if video {CapacityEligibility::GeneralOrWork} else {CapacityEligibility::GeneralOnly},
-            policy_version:policy,pricing_profile_key:profile,evidence_level:evidence.into(),hold_microcredits:hold,expires_at_ms:expiry,
+            account_ref:account.uid.clone(),snapshot_epoch:epoch,eligibility:if video {CapacityEligibility::GeneralOrWork} else {CapacityEligibility::GeneralOnly},
+            policy_version:policy,pricing_profile_key:profile.clone(),evidence_level:evidence.into(),hold_microcredits:hold,expires_at_ms:expiry,
             body:json!({"business_claim":claim,"upstream":normalized})},None,now)
     })
+    })();
+    match attempt {
+        Ok(prepared)=>return Ok(prepared),
+        Err(error) if matches!(error.as_str(),"upstream_capacity_insufficient"|"upstream_capacity_unavailable"|"capacity snapshot stale or account fenced")=>last_error=error,
+        Err(error)=>return Err(error),
+    }
+    }
+    Err(last_error)
 }
 
 #[derive(Debug,PartialEq)]
@@ -271,11 +303,65 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
+    fn prepare_skips_unusable_accounts_before_creating_a_budget() {
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        struct Source { calls:AtomicUsize, normalized:AtomicUsize, mode:u8 }
+        impl PreparationSource for Source {
+            fn select(&self,_:bool,excluded:&HashSet<String>)->Result<PickedAccount,String> {
+                let index=self.calls.fetch_add(1,Ordering::SeqCst);
+                if index>1 {return Err("upstream_account_unavailable".into());}
+                assert_eq!(excluded.contains("unusable"),index>0);
+                Ok(PickedAccount {uid:if index==0 {"unusable"} else {"ready"}.into(),jwt:"fixture".into(),
+                    device_id:"device".into(),machine_id:"device".into(),domain:String::new(),enterprise_id:String::new(),global_region:false})
+            }
+            fn capacity(&self,a:&PickedAccount)->Result<Vec<Value>,String> {
+                Ok(vec![pack(208,if a.uid=="unusable" && self.mode==0 {"1"} else {"100"},"0",0,300)])
+            }
+            fn estimate(&self,a:&PickedAccount,_:i64)->Result<i64,String> {
+                if a.uid=="unusable" && self.mode==3 {Err("upstream_capacity_insufficient".into())} else {Ok(40_000_000)}
+            }
+            fn policy(&self,_:&str,_:i64)->Result<(i64,String,i64),String> {Err("budget_policy_unconfigured".into())}
+            fn normalize(&self,a:&PickedAccount,b:&Value,_:bool,_:&str)->Result<Value,String> {
+                assert_eq!(a.uid,"ready","preflight must precede account-bound uploads");
+                self.normalized.fetch_add(1,Ordering::SeqCst);Ok(b.clone())
+            }
+        }
+        for mode in 0..4 {
+            let dir=std::env::temp_dir().join(format!("aiwork-fallback-{:032x}",rand::random::<u128>()));
+            let runtime=BridgeBudgetRuntime::start(&dir).unwrap();
+            runtime.with_store(|s,l| {
+                s.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").map_err(|e|e.to_string())?;
+                if mode==1 || mode==2 {
+                    s.initialize_capacity(l,&super::super::bridge_budget::CapacitySnapshot {
+                        account_ref:"unusable".into(),snapshot_ref:"fixture".into(),epoch:1,
+                        general:if mode==2 {1} else {100_000_000},work:0,observed_at_ms:1})?;
+                    if mode==1 {s.connection.execute_batch("UPDATE bridge_capacity_accounts SET rebase_state='fenced',owner_nonce='fixture'").map_err(|e|e.to_string())?;}
+                }
+                Ok(())
+            }).unwrap();
+            let source=Source {calls:AtomicUsize::new(0),normalized:AtomicUsize::new(0),mode};
+            let req=PrepareRequest {wire_version:2,parent_request_id:"request-a".into(),request_id:"request-a".into(),core_key_id:"key-a".into(),
+                request_fingerprint:"fingerprint".into(),endpoint:"videos".into(),model:"seedance".into(),step_kind:"video".into(),
+                body:json!({"prompt":"cat","duration":10,"resolution":"720p"})};
+            let budget=prepare(&runtime,&req,&source,100_000).expect("another eligible account must be tried");
+            assert_eq!(source.calls.load(Ordering::SeqCst),2);
+            assert_eq!(source.normalized.load(Ordering::SeqCst),1);
+            assert_eq!(prepare(&runtime,&req,&source,100_001).unwrap().dispatch_token,budget.dispatch_token);
+            assert_eq!(source.calls.load(Ordering::SeqCst),2,"replay never selects another account");
+            runtime.with_store(|s,_| {
+                assert_eq!(s.capacity_totals("unusable")?.pending,0);
+                assert_eq!(s.capacity_totals("ready")?.pending,44_000_000);Ok(())
+            }).unwrap();
+            drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[cfg(windows)]
+    #[test]
     fn prepare_replay_reuses_account_body_token_and_only_reserves_small_hold() {
         use std::sync::atomic::{AtomicUsize,Ordering};
         struct Source {calls:AtomicUsize,low_general:std::sync::atomic::AtomicBool}
         impl PreparationSource for Source {
-            fn select(&self,_:bool)->Result<PickedAccount,String> {self.calls.fetch_add(1,Ordering::SeqCst);Ok(PickedAccount {
+            fn select(&self,_:bool,excluded:&HashSet<String>)->Result<PickedAccount,String> {if excluded.contains("account") {return Err("upstream_account_unavailable".into());} self.calls.fetch_add(1,Ordering::SeqCst);Ok(PickedAccount {
                 uid:"account".into(),jwt:"fixture".into(),device_id:"device".into(),machine_id:"device".into(),
                 domain:String::new(),enterprise_id:String::new(),global_region:false})}
             fn capacity(&self,_:&PickedAccount)->Result<Vec<Value>,String> {Ok(vec![pack(208,if self.low_general.load(Ordering::SeqCst) {"1"} else {"100"},"0",0,300),pack(209,"100","0",0,300)])}

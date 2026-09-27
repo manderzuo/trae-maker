@@ -524,4 +524,5 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 - 已持久执行终态可重置一次刷新退避；重复 POST refresh 不得反复唤醒。GET receipt-events 非空世代错误返回409，空世代用于只读发现；分页按全库 sequence 含历史世代事件，避免正常重启隐去尚未消费的回执。Core 新世代从0幂等重放，旧游标/事实保留。
 - POST `/internal/bridge/v2/budgets/{prepare,cancel,dispatch}`：prepare只接业务字段，服务端固定账号、精确权益包和策略预算；cancel/dispatch校验全PreparedBudget与加密原件。收费worker固定账号/参数、不转账号或重发；结果先持久化。5秒维护批次只清理过期且从未consume的预算，consumed/send_intent不因TTL退款。
 - 原生已验证档案仅无参考720p16:9的10/15s；其余规格需本机`bridge-budget-policy.json`显式有限风险政策。预算不是上游保证最高费用，实扣仍来自唯一会话。参考视频可信时长适配尚未完成，不能冒用文生预算。
+- 新预算准备最多检查8个不同账号，容量不足或账号被对账/冲突栅栏隔离时可继续选择；在素材上传前检查实时与本地容量，准备落库再次CAS。身份/存储/策略/素材错误不换号重试；已准备请求先重放，已发送任务不能进入账号切换。
 - 现在已接入真实准备/执行器、结果下载、自动确认与Core持久事件游标；Core收费新入口仍由默认关闭的budget_billing_v2隔离。普通Chat早SSE新账本、账号静止对账/异常lease恢复、后台完整工作流恢复及真实端到端验收仍未完成。旧quote503分支未伪造报价，禁止据本地测试声称已生产修复。
