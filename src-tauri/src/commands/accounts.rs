@@ -901,8 +901,16 @@ pub(crate) fn read_trae_observation(
 
 /// 调用 TRAE API 拉取积分包列表
 pub(crate) fn query_ent_packs(jwt: &str, dev: &DeviceEntry) -> Result<Vec<serde_json::Value>, String> {
+    query_ent_packs_with_agent(&short_agent(),jwt,dev)
+}
+/// Budget admission/background reconciliation must not occupy a worker for the
+/// desktop refresher's full 120 second timeout.
+pub(crate) fn query_ent_packs_for_bridge(jwt:&str,dev:&DeviceEntry)->Result<Vec<serde_json::Value>,String> {
+    query_ent_packs_with_agent(&ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build(),jwt,dev)
+}
+fn query_ent_packs_with_agent(agent:&ureq::Agent,jwt:&str,dev:&DeviceEntry)->Result<Vec<serde_json::Value>,String> {
     let body = ide_query_post(
-        &short_agent(),
+        agent,
         "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage",
         jwt,
         dev,

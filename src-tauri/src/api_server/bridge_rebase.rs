@@ -46,7 +46,7 @@ pub(super) fn validate_schema(tx:&Transaction<'_>)->Result<(),String> {
     }Ok(())
 }
 fn valid_ref(s:&str)->bool {!s.is_empty() && s.len()<=256 && s.trim()==s && !s.chars().any(char::is_control)}
-fn snapshot(conn:&Connection,account:&str)->Result<CapacitySnapshot,String> {
+pub(super) fn snapshot(conn:&Connection,account:&str)->Result<CapacitySnapshot,String> {
     conn.query_row("SELECT snapshot_ref,snapshot_epoch,general_microcredits,work_microcredits,observed_at_ms FROM bridge_capacity_accounts WHERE account_ref=?1",[account],
         |r|Ok(CapacitySnapshot {account_ref:account.into(),snapshot_ref:r.get(0)?,epoch:r.get(1)?,general:r.get(2)?,work:r.get(3)?,observed_at_ms:r.get(4)?})).map_err(db_error)
 }
@@ -55,7 +55,7 @@ fn has_conflict(conn:&Connection,account:&str)->Result<bool,String> {
         OR EXISTS(SELECT 1 FROM bridge_core_upstream_sessions s LEFT JOIN bridge_billing_receipts r ON r.request_id=s.request_id
         JOIN bridge_core_requests q ON q.request_id=s.request_id WHERE s.account_ref=?1 AND (s.conflict=1 OR q.conflict=1 OR r.status='conflict'))",[account],|r|r.get(0)).map_err(db_error)
 }
-fn quiet_watermark(conn:&Connection,account:&str)->Result<(i64,i64,i64),String> {
+pub(super) fn quiet_watermark(conn:&Connection,account:&str)->Result<(i64,i64,i64),String> {
     // Check executions independently from slots: even a premature D cannot be
     // interpreted as proof that an upstream operation has stopped consuming.
     let unsafe_state:bool=conn.query_row("SELECT
@@ -127,6 +127,9 @@ impl BridgeBillingStore {
         tx.commit().map_err(db_error)?;Ok(fence)
     }
     pub(super) fn commit_capacity_rebase(&mut self,lease:&BridgeBudgetLease,fence:&RebaseFence,coverage:&CoveredCapacity)->Result<(),String> {
+        self.commit_capacity_rebase_source(lease,fence,coverage,None)
+    }
+    pub(super) fn commit_capacity_rebase_source(&mut self,lease:&BridgeBudgetLease,fence:&RebaseFence,coverage:&CoveredCapacity,source:Option<&super::bridge_capacity_source::PackObservation>)->Result<(),String> {
         let s=&coverage.snapshot;
         if !coverage.external_activity_excluded || !valid_ref(&coverage.coverage_ref) || !valid_ref(&s.snapshot_ref)
             || coverage.quiescent_since_ms<0 || coverage.quiescent_since_ms>fence.started_at_ms
@@ -145,12 +148,20 @@ impl BridgeBillingStore {
         require_pending_owner(&tx,fence)?;
         let (event,legacy,latest)=quiet_watermark(&tx,&fence.account_ref)?;
         if event!=fence.event_sequence || legacy!=fence.legacy_sessions || latest>fence.started_at_ms {return Err("capacity_rebase_watermark_changed".into());}
+        if let Some(observation)=source {
+            if observation.observed_at_ms!=s.observed_at_ms || observation.balances()? != (s.general,s.work) {return Err("capacity_source_snapshot_mismatch".into());}
+            super::bridge_capacity_source::verify_anchor(&tx,fence,observation)?;
+        } else {
+            let anchored:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_anchors WHERE account_ref=?1)",[&fence.account_ref],|r|r.get(0)).map_err(db_error)?;
+            if anchored {return Err("capacity_source_required".into());}
+        }
         tx.execute("INSERT INTO bridge_capacity_covered(budget_id,owner_nonce,actual_microcredits,receipt_hash)
             SELECT s.budget_id,?1,s.actual_microcredits,r.semantic_hash FROM bridge_capacity_slots s JOIN bridge_budget_receipts r ON r.budget_id=s.budget_id
             WHERE s.account_ref=?2 AND s.stage='D' AND NOT EXISTS(SELECT 1 FROM bridge_capacity_covered c WHERE c.budget_id=s.budget_id)",params![fence.owner_nonce,fence.account_ref]).map_err(db_error)?;
         tx.execute("UPDATE bridge_capacity_rebases SET state='committed',coverage_json=?1 WHERE owner_nonce=?2",params![encoded,fence.owner_nonce]).map_err(db_error)?;
         tx.execute("UPDATE bridge_capacity_accounts SET snapshot_ref=?1,snapshot_epoch=?2,general_microcredits=?3,work_microcredits=?4,observed_at_ms=?5,rebase_state='open',owner_nonce=NULL WHERE account_ref=?6",
             params![s.snapshot_ref,s.epoch,s.general,s.work,s.observed_at_ms,s.account_ref]).map_err(db_error)?;
+        if let Some(observation)=source {super::bridge_capacity_source::advance_anchor(&tx,fence,observation)?;}
         tx.commit().map_err(db_error)
     }
     pub(super) fn abort_capacity_rebase(&mut self,lease:&BridgeBudgetLease,fence:&RebaseFence)->Result<(),String> {

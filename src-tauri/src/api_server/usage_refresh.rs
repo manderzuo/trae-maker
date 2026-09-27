@@ -279,10 +279,18 @@ pub(crate) fn request_refresh(state: Arc<ApiSharedState>, request_id: &str) -> R
 
 /// Start one idempotent scheduler per normalized data directory. It discovers
 /// persisted pending accounts immediately and keeps a fixed pool of four workers.
+pub(super) fn pending_refresh_accounts(data_dir:&Path)->Result<Vec<(String,i64)>,String> {
+    let mut pending=super::bridge_billing::pending_core_session_accounts_for_poll(data_dir)?.into_iter().collect::<BTreeMap<_,_>>();
+    match super::bridge_capacity_source::pending_accounts(data_dir) {
+        Ok(capacity)=>for (account,time) in capacity {pending.entry(account).and_modify(|v|*v=(*v).min(time)).or_insert(time);},
+        Err(_)=>crate::fs_utils::app_log(data_dir,"Core 专用账号对账索引不可用；正常账单确认继续，容量保持原值"),
+    }
+    Ok(pending.into_iter().collect())
+}
 pub(super) fn start_with_runtime(state: Arc<ApiSharedState>, stop: Arc<AtomicBool>, runtime: Option<Arc<super::bridge_runtime::BridgeBudgetRuntime>>) {
     let pending_state = state.clone();
     let pending_loader: Arc<PendingLoader> = Arc::new(move || {
-        super::bridge_billing::pending_core_session_accounts_for_poll(&pending_state.data_dir)
+        pending_refresh_accounts(&pending_state.data_dir)
     });
     let refresh_state = state.clone();
     let refresh_stop = stop.clone();
@@ -564,9 +572,7 @@ fn refresh_pending_account(
     if stop.load(Ordering::Acquire) {
         return false;
     }
-    let Some((_, attempt_at_ms)) = pending.iter().find(|(uid, _)| uid == &item.account_ref) else {
-        return false;
-    };
+    if let Some((_, attempt_at_ms)) = pending.iter().find(|(uid, _)| uid == &item.account_ref) {
     let account_refs = HashSet::from([item.account_ref.clone()]);
     let credentials = state.pool.usage_credentials_for(&account_refs);
     if credentials.is_empty() {
@@ -592,7 +598,21 @@ fn refresh_pending_account(
             crate::fs_utils::app_log(&state.data_dir, "Core v2 用量已刷新，但部分回执确认失败；保留预算等待重查");
         }
     }
-    match super::bridge_billing::pending_core_session_accounts_for_poll(&state.data_dir) {
+    }
+    // Same bounded worker/queue, but independent from publishing per-Key receipts:
+    // account rebasing must not delay Core reading the already committed outbox.
+    if !stop.load(Ordering::Acquire) {
+        if let Some(runtime)=runtime {
+            let result=super::bridge_capacity_source::reconcile_with(runtime,&item.account_ref,|| {
+                if stop.load(Ordering::Acquire) {return Err("capacity_refresh_stopped".into());}
+                let account=state.pool.completed_resource_credentials(&item.account_ref).ok_or("capacity_credentials_unavailable")?;
+                crate::commands::accounts::query_ent_packs_for_bridge(&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id,..Default::default()})
+                    .map_err(|_|"upstream_capacity_unavailable".into())
+            });
+            if result.is_err() {crate::fs_utils::app_log(&state.data_dir,"Core 专用账号容量核对暂未通过；保留费用事实，等待下次核对");}
+        }
+    }
+    match pending_refresh_accounts(&state.data_dir) {
         Ok(pending) => pending.iter().any(|(uid, _)| uid == &item.account_ref),
         Err(_) => true,
     }

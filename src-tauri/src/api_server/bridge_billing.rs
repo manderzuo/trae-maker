@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const BILLING_DB_FILE: &str = "bridge-billing.sqlite3";
 const BRIDGE_SCHEMA_META_TABLE: &str = "bridge_schema_meta";
-const BRIDGE_SCHEMA_VERSION: i64 = 6;
+const BRIDGE_SCHEMA_VERSION: i64 = 7;
 const BRIDGE_ACTIVE_OWNER_PREFIX: &str = "bridge-active-v1-";
 const BRIDGE_RECOVERY_REQUIRED_PREFIX: &str = "bridge-recovery-required-v1-";
 
@@ -1444,6 +1444,15 @@ where F: Fn(&Transaction<'_>) -> Result<(), String>,
         if changed!=1 {return Err("bridge rebase migration lost version CAS".into());}
         validate_versioned_bridge_schema(&transaction)?;
     }
+    if read_bridge_schema_metadata(&transaction)?.0 == 6 {
+        super::bridge_capacity_source::create_schema(&transaction)?;
+        super::bridge_capacity_source::validate_schema(&transaction)?;
+        hook(&transaction)?;
+        let changed=transaction.execute("UPDATE bridge_schema_meta SET schema_version=7 WHERE singleton=1 AND schema_version=6",[])
+            .map_err(|error|format!("bridge capacity source migration failed: {error}"))?;
+        if changed!=1 {return Err("bridge capacity source migration lost version CAS".into());}
+        validate_versioned_bridge_schema(&transaction)?;
+    }
     transaction.commit().map_err(|error| format!("bridge capacity migration commit failed: {error}"))
 }
 
@@ -1468,6 +1477,7 @@ fn validate_versioned_bridge_schema(transaction: &Transaction<'_>) -> Result<(),
     if version >= 4 { super::bridge_execution::validate_schema(transaction)?; }
     if version >= 5 { super::bridge_receipts::validate_schema(transaction)?; }
     if version >= 6 { super::bridge_rebase::validate_schema(transaction)?; }
+    if version >= 7 { super::bridge_capacity_source::validate_schema(transaction)?; }
     validate_bridge_identity(&instance_id, &generation)?;
     validate_foreign_key_integrity(transaction)?;
     Ok(())
@@ -1530,6 +1540,9 @@ fn validate_bridge_schema(
     }
     if versioned && read_bridge_schema_metadata(transaction)?.0 >= 6 {
         objects.retain(|(_,name)| !super::bridge_rebase::SCHEMA_OBJECTS.iter().any(|(_,expected,_)|name==expected));
+    }
+    if versioned && read_bridge_schema_metadata(transaction)?.0 >= 7 {
+        objects.retain(|(_,name)| !super::bridge_capacity_source::SCHEMA_OBJECTS.iter().any(|(_,expected,_)|name==expected));
     }
     let required_count = LEGACY_OBJECTS.len() + usize::from(versioned);
     let complete = objects.len() == required_count
@@ -2347,7 +2360,7 @@ mod tests {
         let prepared=store.prepare_budget(&lease,&input(),None,10).unwrap();
         let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&prepared,20).unwrap() else {panic!("first consume")};
         store.mark_budget_send_intent(&lease,&prepared.authorization.budget_id,&ctx.consume_epoch).unwrap();
-        store.connection.execute_batch("DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; DROP TABLE bridge_budget_executions; UPDATE bridge_schema_meta SET schema_version=3").unwrap();
+        store.connection.execute_batch("DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; DROP TABLE bridge_budget_executions; UPDATE bridge_schema_meta SET schema_version=3").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
             let count:i64=tx.query_row("SELECT COUNT(*) FROM bridge_budget_executions WHERE execution_state='unknown'",[],|r|r.get(0)).unwrap();
@@ -2368,7 +2381,7 @@ mod tests {
         use super::super::bridge_prepared::tests::{fixture,input,cleanup};
         let (dir,mut store,lease)=fixture();
         let prepared=store.prepare_budget(&lease,&input(),None,10).unwrap();
-        store.connection.execute_batch("DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; UPDATE bridge_schema_meta SET schema_version=4").unwrap();
+        store.connection.execute_batch("DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; UPDATE bridge_schema_meta SET schema_version=4").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
             let count:i64=tx.query_row("SELECT COUNT(*) FROM bridge_budget_receipts",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
@@ -2388,7 +2401,7 @@ mod tests {
         use super::super::{bridge_prepared::tests::{fixture,cleanup},bridge_receipts::tests::{send,cache}};
         let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"request-schema6");
         cache(&dir,&store,&[(&id,"50")],2000);store.confirm_budget_usage(&lease,&id).unwrap();
-        store.connection.execute_batch("DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; UPDATE bridge_schema_meta SET schema_version=5").unwrap();
+        store.connection.execute_batch("DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; UPDATE bridge_schema_meta SET schema_version=5").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='bridge_capacity_covered')",[],|r|r.get(0)).unwrap();
@@ -2401,6 +2414,29 @@ mod tests {
         assert_eq!(store.latest_budget_receipt_event(&id).unwrap().unwrap().receipt.unwrap().actual_credits.unwrap().as_microcredits(),50_000_000);
         store.connection.execute_batch("DROP INDEX bridge_capacity_rebases_pending").unwrap();
         assert!(BridgeBillingStore::open(&dir).is_err(),"opening latest schema must not silently repair a missing guard");
+        cleanup(dir,store,lease);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_v7_migration_preserves_receipts_and_rolls_back_failed_anchor_schema() {
+        use super::super::{bridge_prepared::tests::{fixture,cleanup},bridge_receipts::tests::{send,cache}};
+        let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"request-schema7");
+        cache(&dir,&store,&[(&id,"50")],2000);store.confirm_budget_usage(&lease,&id).unwrap();
+        store.connection.execute_batch("DROP TABLE IF EXISTS bridge_capacity_anchors; UPDATE bridge_schema_meta SET schema_version=6").unwrap();
+        let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
+        let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
+            let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='bridge_capacity_anchors')",[],|r|r.get(0)).unwrap();
+            assert!(exists);Err("injected-v7-migration-failure".into())
+        });
+        assert!(result.unwrap_err().contains("injected-v7"));
+        assert_eq!((schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap()),before);
+        drop(store);let store=BridgeBillingStore::open(&dir).unwrap();
+        assert_eq!(store.capacity_totals("account").unwrap().confirmed,50_000_000);
+        assert_eq!(store.latest_budget_receipt_event(&id).unwrap().unwrap().receipt.unwrap().actual_credits.unwrap().as_microcredits(),50_000_000);
+        let count:i64=store.connection.query_row("SELECT COUNT(*) FROM bridge_capacity_anchors",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
+        store.connection.execute_batch("DROP TABLE bridge_capacity_anchors").unwrap();
+        assert!(BridgeBillingStore::open(&dir).is_err());
         cleanup(dir,store,lease);
     }
 

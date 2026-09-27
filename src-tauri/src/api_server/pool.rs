@@ -586,7 +586,7 @@ impl ApiPool {
             domain:entry.domain.clone(),enterprise_id:entry.enterprise_id.clone(),global_region:entry.global_region})
     }
 
-    /// Read an existing generated resource only. Never use this credential
+    /// Read an existing generated resource or reconcile completed usage only. Never use this credential
     /// lookup for admission/dispatch: it intentionally ignores credit expiry
     /// and credit cooldown after the already-paid task completed.
     pub(crate) fn completed_resource_credentials(&self,uid:&str)->Option<PickedAccount> {

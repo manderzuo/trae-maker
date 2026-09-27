@@ -19,6 +19,7 @@ impl Drop for PlanningGuard<'_> {
     fn drop(&mut self) {if let Ok(mut busy)=self.runtime.planning.lock() {busy.remove(&self.request);}}
 }
 impl BridgeBudgetRuntime {
+    pub(super) fn data_dir(&self)->&Path {&self.data_dir}
     pub(super) fn start(data_dir:&Path)->Result<Arc<Self>,String> {
         let store=BridgeBillingStore::open(data_dir)?;
         let lease=BridgeBudgetLease::try_acquire(&store)?.ok_or("bridge activity already owned by another server")?;

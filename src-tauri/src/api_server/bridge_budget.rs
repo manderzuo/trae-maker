@@ -39,6 +39,9 @@ impl BridgeBillingStore {
     /// Initial observation only. A newer number is not proof that it covers D;
     /// replacing an existing observation requires the later fenced rebase flow.
     pub(super) fn initialize_capacity(&mut self, lease: &BridgeBudgetLease, snapshot: &CapacitySnapshot) -> Result<CapacityMutation, String> {
+        self.initialize_capacity_source(lease,snapshot,None)
+    }
+    pub(super) fn initialize_capacity_source(&mut self,lease:&BridgeBudgetLease,snapshot:&CapacitySnapshot,source:Option<&super::bridge_capacity_source::PackObservation>)->Result<CapacityMutation,String> {
         if !valid_ref(&snapshot.account_ref) || !valid_ref(&snapshot.snapshot_ref)
             || snapshot.epoch <= 0 || snapshot.general < 0 || snapshot.work < 0 || snapshot.observed_at_ms < 0 {
             return Err("invalid capacity snapshot".into());
@@ -52,13 +55,15 @@ impl BridgeBillingStore {
             |row| Ok(CapacitySnapshot { account_ref:snapshot.account_ref.clone(), snapshot_ref:row.get(0)?,epoch:row.get(1)?,general:row.get(2)?,work:row.get(3)?,observed_at_ms:row.get(4)? }),
         ).optional().map_err(db_error)?;
         if let Some(existing) = existing {
-            return if existing == *snapshot { Ok(CapacityMutation::Duplicate) }
-                else { Err("capacity snapshot replacement requires verified coverage and a rebase fence".into()) };
+            if existing!=*snapshot {return Err("capacity snapshot replacement requires verified coverage and a rebase fence".into());}
+            if let Some(source)=source {super::bridge_capacity_source::initialize_anchor_in_tx(&tx,&snapshot.account_ref,source)?;}
+            tx.commit().map_err(db_error)?;return Ok(CapacityMutation::Duplicate);
         }
         tx.execute("INSERT INTO bridge_capacity_accounts
             (account_ref,snapshot_ref,snapshot_epoch,general_microcredits,work_microcredits,observed_at_ms)
             VALUES (?1,?2,?3,?4,?5,?6)",
             params![snapshot.account_ref,snapshot.snapshot_ref,snapshot.epoch,snapshot.general,snapshot.work,snapshot.observed_at_ms]).map_err(db_error)?;
+        if let Some(source)=source {super::bridge_capacity_source::initialize_anchor_in_tx(&tx,&snapshot.account_ref,source)?;}
         tx.commit().map_err(db_error)?;
         Ok(CapacityMutation::Created)
     }

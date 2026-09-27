@@ -23,7 +23,7 @@ impl PreparationSource for NativePreparationSource<'_> {
             .ok_or("upstream_account_unavailable".into())
     }
     fn capacity(&self,account:&PickedAccount)->Result<Vec<Value>,String> {
-        crate::commands::accounts::query_ent_packs(&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id.clone(),..Default::default()})
+        crate::commands::accounts::query_ent_packs_for_bridge(&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id.clone(),..Default::default()})
             .map_err(|_|"upstream_capacity_unavailable".into())
     }
     fn estimate(&self,account:&PickedAccount,workload:i64)->Result<i64,String> {
@@ -165,7 +165,18 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         let fenced:bool=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_accounts WHERE account_ref=?1 AND rebase_state!='open')",[&account.uid],|r|r.get(0)).map_err(|e|e.to_string())?;
         if fenced {Err("capacity snapshot stale or account fenced".into())} else {Ok(())}
     })?;
-    let live=parse_capacity(&source.capacity(&account)?,now)?;
+    let packs=source.capacity(&account)?;
+    let live=parse_capacity(&packs,now)?;
+    let observation=if super::bridge_capacity_source::dedicated_enabled(runtime.data_dir(),&account.uid)? {
+        Some(super::bridge_capacity_source::PackObservation::parse(&packs,now)?)
+    } else {None};
+    if observation.is_some() {
+        // A top-up with no outstanding debit has no receipt-triggered worker.
+        // Re-read under a quiescent fence before accepting the larger capacity.
+        // Failure preserves the conservative snapshot; regular preflight below
+        // can still admit a request within its already verified capacity.
+        let _=super::bridge_capacity_source::reconcile_increased_capacity(runtime,&account.uid,live.general,live.work,||source.capacity(&account));
+    }
     let (hold,policy,expiry,evidence)=if let Some(workload)=workload {
         let estimate=source.estimate(&account,workload)?;
         let observed=runtime.with_store(|s,_|s.confirmed_profile_high_water(&account.uid,&profile,now.saturating_sub(7*86400*1000)))?;
@@ -189,8 +200,8 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         if promised>available {return Err("upstream_capacity_insufficient".into());}
         let general_promised:bool=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_slots WHERE account_ref=?1 AND stage IN ('P','R') AND eligibility='general')",[&account.uid],|r|r.get(0)).map_err(|e|e.to_string())?;
         if video && general_promised && promised>live.general {return Err("upstream_capacity_insufficient".into());}
-        if epoch.is_none() {store.initialize_capacity(lease,&CapacitySnapshot {account_ref:account.uid.clone(),snapshot_ref:format!("native-entitlements:{now}"),epoch:1,
-            general:live.general,work:live.work,observed_at_ms:now})?;}
+        if epoch.is_none() {store.initialize_capacity_source(lease,&CapacitySnapshot {account_ref:account.uid.clone(),snapshot_ref:format!("native-entitlements:{now}"),epoch:1,
+            general:live.general,work:live.work,observed_at_ms:now},observation.as_ref())?;}
         check_capacity(&store.connection,&CapacityReservation {budget_id:request.request_id.clone(),core_key_id:request.core_key_id.clone(),
             account_ref:account.uid.clone(),snapshot_epoch:epoch.unwrap_or(1),eligibility:if video {CapacityEligibility::GeneralOrWork} else {CapacityEligibility::GeneralOnly},hold})?;
         Ok(epoch.unwrap_or(1))
@@ -230,13 +241,14 @@ pub(super) fn parse_capacity(packs:&[Value],now:i64)->Result<LiveCapacity,String
     for pack in packs {
         let base=&pack["entitlement_base_info"];
         let product=base["product_id"].as_i64();
-        if !matches!(product,Some(208|209)) || base["quota"]["credits_limit"].is_null() {continue;}
+        if !matches!(product,Some(208|209|221)) || base["quota"]["credits_limit"].is_null() {continue;}
         let time=|v:&Value|->Result<Option<i64>,String> {
             if v.is_null() {Ok(None)} else {v.as_i64().filter(|n|*n>=0).map(Some).ok_or("invalid entitlement time".into())}
         };
         let start=time(&base["start_time"])?;
         let end=[time(&base["end_time"])?,time(&pack["expire_time"])?].into_iter().flatten().filter(|v|*v>0).min();
         if start.is_some_and(|v|v>now/1000) || end.is_some_and(|v|v<=now/1000) {continue;}
+        if pack["usage"].as_object().is_some_and(|m|m.is_empty()) {continue;}
         let remaining=micro(&base["quota"]["credits_limit"])? .saturating_sub(micro(&pack["usage"]["credits_amount"])?).max(0);
         let slot=if product==Some(209) {&mut live.work} else {&mut live.general};
         *slot=slot.checked_add(remaining).ok_or("capacity overflow")?;
@@ -309,7 +321,9 @@ mod tests {
         let packs=vec![pack(208,"10.123456","0.000001",0,200),pack(209,"20.000001","0.5",0,300),
             pack(208,"999","0",0,99),pack(208,"999","0",150,300),pack(999,"999","0",0,300)];
         assert_eq!(parse_capacity(&packs,100_000).unwrap(),LiveCapacity {general:10_123_455,work:19_500_001,valid_until_ms:200_000});
-        let mut bad=pack(208,"10","0",0,200);bad["usage"]=json!({});
+        let mut sparse=pack(208,"150","0",0,200);sparse["usage"]=json!({});
+        assert_eq!(parse_capacity(&[pack(221,"500","100",0,200),sparse],100_000).unwrap().general,400_000_000,"monthly credits count but sparse usage must not imply unspent credits");
+        let mut bad=pack(208,"10","0",0,200);bad["usage"]=Value::Null;
         assert!(parse_capacity(&[bad],100_000).is_err(),"missing use cannot imply zero spent");
     }
     #[test]
@@ -391,24 +405,30 @@ mod tests {
     #[test]
     fn prepare_replay_reuses_account_body_token_and_only_reserves_small_hold() {
         use std::sync::atomic::{AtomicUsize,Ordering};
-        struct Source {calls:AtomicUsize,low_general:std::sync::atomic::AtomicBool}
+        struct Source {calls:AtomicUsize,low_general:std::sync::atomic::AtomicBool,bonus:std::sync::atomic::AtomicBool}
         impl PreparationSource for Source {
             fn select(&self,_:bool,excluded:&HashSet<String>)->Result<PickedAccount,String> {if excluded.contains("account") {return Err("upstream_account_unavailable".into());} self.calls.fetch_add(1,Ordering::SeqCst);Ok(PickedAccount {
                 uid:"account".into(),jwt:"fixture".into(),device_id:"device".into(),machine_id:"device".into(),
                 domain:String::new(),enterprise_id:String::new(),global_region:false})}
-            fn capacity(&self,_:&PickedAccount)->Result<Vec<Value>,String> {Ok(vec![pack(208,if self.low_general.load(Ordering::SeqCst) {"1"} else {"100"},"0",0,300),pack(209,"100","0",0,300)])}
+            fn capacity(&self,_:&PickedAccount)->Result<Vec<Value>,String> {
+                let mut packs=vec![pack(208,if self.low_general.load(Ordering::SeqCst) {"1"} else {"100"},"0",0,4102444800),pack(209,"100","0",0,4102444800)];
+                if self.bonus.load(Ordering::SeqCst) {let mut extra=pack(208,"50","0",0,4102444800);extra["id"]=json!("bonus");packs.push(extra);}
+                std::thread::sleep(std::time::Duration::from_millis(2));Ok(packs)
+            }
             fn estimate(&self,_:&PickedAccount,_:i64)->Result<i64,String> {Ok(40_000_000)}
             fn policy(&self,_:&str,_:i64)->Result<(i64,String,i64),String> {Ok((62_000_000,"fixture-policy".into(),300_000))}
             fn normalize(&self,_:&PickedAccount,body:&Value,_:bool,_:&str)->Result<Value,String> {Ok(body.clone())}
         }
         let dir=std::env::temp_dir().join(format!("aiwork-planner-{:032x}",rand::random::<u128>()));
         let runtime=BridgeBudgetRuntime::start(&dir).unwrap();
+        std::fs::write(dir.join("bridge-dedicated-accounts.json"),serde_json::to_vec(&json!({"version":1,"accounts":["account"]})).unwrap()).unwrap();
         runtime.with_store(|s,_| {s.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").map_err(|e|e.to_string())}).unwrap();
-        let source=Source {calls:AtomicUsize::new(0),low_general:std::sync::atomic::AtomicBool::new(false)};
+        let source=Source {calls:AtomicUsize::new(0),low_general:std::sync::atomic::AtomicBool::new(false),bonus:std::sync::atomic::AtomicBool::new(false)};
         let mut req=PrepareRequest {wire_version:2,parent_request_id:"request-a".into(),request_id:"request-a".into(),core_key_id:"key-a".into(),
             request_fingerprint:"fingerprint".into(),endpoint:"videos".into(),model:"seedance".into(),step_kind:"video".into(),
             body:json!({"model":"seedance","prompt":"cat","duration":5})};
         let first=prepare(&runtime,&req,&source,100_000).unwrap();
+        runtime.with_store(|s,_| {let n:i64=s.connection.query_row("SELECT COUNT(*) FROM bridge_capacity_anchors WHERE account_ref='account'",[],|r|r.get(0)).unwrap();assert_eq!(n,1,"anchor must precede first paid budget");Ok(())}).unwrap();
         assert_eq!(first.authorization.hold_credits.as_microcredits(),62_000_000);
         assert_eq!(first.evidence_level,"policy_only");
         assert_eq!(prepare(&runtime,&req,&source,101_000).unwrap().dispatch_token,first.dispatch_token);
@@ -425,8 +445,11 @@ mod tests {
         runtime.with_store(|s,l| {s.cancel_budget(l,&first,104_000)?;s.cancel_budget(l,&second,104_000)?;Ok(())}).unwrap();
         let mut chat=req.clone();chat.request_id="request-assist".into();chat.parent_request_id="request-parent".into();
         chat.endpoint="chat".into();chat.model="deepseek-v4-flash".into();chat.step_kind="assist".into();chat.body=json!({"messages":[{"role":"user","content":"hi"}]});
+        source.bonus.store(true,Ordering::SeqCst);
         prepare(&runtime,&chat,&source,105_000).unwrap();
+        runtime.with_store(|s,_| {let general:i64=s.connection.query_row("SELECT general_microcredits FROM bridge_capacity_accounts WHERE account_ref='account'",[],|r|r.get(0)).unwrap();assert_eq!(general,150_000_000,"new packs must become usable without an unrelated future debit");Ok(())}).unwrap();
         source.low_general.store(true,Ordering::SeqCst);
+        source.bonus.store(false,Ordering::SeqCst);
         req.request_id="request-c".into();req.parent_request_id="request-c".into();
         assert!(prepare(&runtime,&req,&source,106_000).is_err(),"expired general capacity cannot be backed by video-only credits when chat is still promised");
         drop(runtime);std::fs::remove_dir_all(dir).unwrap();
