@@ -484,3 +484,11 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
   成功响应中的 session 证据独立合并；新旧内容冲突保持歧义，晚到 session 不因日聚合保护而丢弃。
   缺文件可初始化，其他读取或 JSON 解析错误必须中止写入并保留原文件；成功时间不得倒退。
 - 用量刷新测试仅用隔离 mock/fixture，不访问真实账号或运行中服务；停止后台 worker 后不再发起新查询。
+
+## 22. 桥接预算账号容量基础
+
+- `bridge-billing.sqlite3` 显式升级到 schema v2，旧 Key 映射、模式和回执保留；v1→v2 事务失败完整回滚。已 v2 开库只读校验完整新表定义，不自动补齐损坏布局。
+- `bridge_capacity_accounts` 为每个实际上游账号保存一份通用/Work 快照；`bridge_capacity_slots` 按 budget 唯一记录 P（仍可能收费）、R（执行已终止待账）、D（已核验未证明包含在快照）或 released。不同 Core Key 不复制账号余额。
+- 所有容量写入需要当前有效实例 lease；整数 microcredits 溢出拒绝。通用积分可用于视频；仍承诺给普通文字的通用容量按最坏扣包来源保护。真实金额超过预估时照实保存，不能截断。
+- 普通更晚余额不能清除 D；容量取消与计费互斥。容量原语尚需与准备/派发状态在同一事务接入，不能仅因容量单测通过就启用收费路由。
+- 当前用户要求测试产物放 E: 既有隔离目录、复用现有 target，覆盖历史 D: 测试约定；不下载新工具链。

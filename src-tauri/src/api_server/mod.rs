@@ -4,6 +4,7 @@ pub mod assets;
 pub mod auth;
 pub mod bridge_api;
 pub mod bridge_billing;
+pub(crate) mod bridge_budget;
 pub mod bridge_budget_lease;
 pub mod custom_models;
 pub mod custom_route;

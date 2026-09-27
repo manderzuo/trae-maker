@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const BILLING_DB_FILE: &str = "bridge-billing.sqlite3";
 const BRIDGE_SCHEMA_META_TABLE: &str = "bridge_schema_meta";
-const BRIDGE_SCHEMA_VERSION: i64 = 1;
+const BRIDGE_SCHEMA_VERSION: i64 = 2;
 const BRIDGE_ACTIVE_OWNER_PREFIX: &str = "bridge-active-v1-";
 const BRIDGE_RECOVERY_REQUIRED_PREFIX: &str = "bridge-recovery-required-v1-";
 
@@ -230,7 +230,7 @@ pub(super) enum PersistReceiptResult {
 }
 
 pub(super) struct BridgeBillingStore {
-    connection: Connection,
+    pub(super) connection: Connection,
 }
 
 impl BridgeBillingStore {
@@ -1328,9 +1328,13 @@ where
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|error| format!("bridge billing read-only validation transaction unavailable: {error}"))?;
         validate_versioned_bridge_schema(&transaction)?;
+        let version = read_bridge_schema_metadata(&transaction)?.0;
         transaction
             .commit()
             .map_err(|error| format!("bridge billing schema validation commit failed: {error}"))?;
+        if version == 1 {
+            upgrade_bridge_capacity_schema(connection, &migration_hook)?;
+        }
         return Ok(());
     }
 
@@ -1362,7 +1366,28 @@ where
     transaction
         .commit()
         .map_err(|error| format!("bridge billing schema commit failed: {error}"))?;
+    upgrade_bridge_capacity_schema(connection, &|_| Ok(()))?;
     Ok(())
+}
+
+fn upgrade_bridge_capacity_schema<F>(connection: &mut Connection, hook: &F) -> Result<(), String>
+where F: Fn(&Transaction<'_>) -> Result<(), String>,
+{
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("bridge capacity migration unavailable: {error}"))?;
+    validate_versioned_bridge_schema(&transaction)?;
+    let (version, _, _) = read_bridge_schema_metadata(&transaction)?;
+    if version == 1 {
+        super::bridge_budget::create_schema(&transaction)?;
+        super::bridge_budget::validate_schema(&transaction)?;
+        hook(&transaction)?;
+        let changed = transaction.execute(
+            "UPDATE bridge_schema_meta SET schema_version = 2 WHERE singleton = 1 AND schema_version = 1", [],
+        ).map_err(|error| format!("bridge capacity migration version update failed: {error}"))?;
+        if changed != 1 { return Err("bridge capacity migration lost version CAS".into()); }
+        validate_versioned_bridge_schema(&transaction)?;
+    }
+    transaction.commit().map_err(|error| format!("bridge capacity migration commit failed: {error}"))
 }
 
 fn validate_versioned_bridge_schema(transaction: &Transaction<'_>) -> Result<(), String> {
@@ -1377,10 +1402,11 @@ fn validate_versioned_bridge_schema(transaction: &Transaction<'_>) -> Result<(),
     if version > BRIDGE_SCHEMA_VERSION {
         return Err(format!("bridge billing schema version {version} is newer than supported"));
     }
-    if version != BRIDGE_SCHEMA_VERSION {
+    if !matches!(version, 1 | 2) {
         return Err(format!("bridge billing schema version {version} is unsupported"));
     }
     validate_bridge_schema(transaction, true, false)?;
+    if version == 2 { super::bridge_budget::validate_schema(transaction)?; }
     validate_bridge_identity(&instance_id, &generation)?;
     validate_foreign_key_integrity(transaction)?;
     Ok(())
@@ -1428,7 +1454,10 @@ fn validate_bridge_schema(
         ("table", "bridge_core_request_modes"),
         ("table", "bridge_core_upstream_sessions"),
     ];
-    let objects = bridge_schema_objects(transaction)?;
+    let mut objects = bridge_schema_objects(transaction)?;
+    if versioned && read_bridge_schema_metadata(transaction)?.0 == 2 {
+        objects.retain(|(_, name)| !super::bridge_budget::SCHEMA_OBJECTS.iter().any(|(_, expected, _)| name == expected));
+    }
     let required_count = LEGACY_OBJECTS.len() + usize::from(versioned);
     let complete = objects.len() == required_count
         && LEGACY_OBJECTS.iter().all(|(kind, name)| {
@@ -1666,7 +1695,7 @@ fn extract_sqlite_check_expressions(sql: &str) -> Result<Vec<Vec<String>>, Strin
     Ok(checks)
 }
 
-fn tokenize_sqlite_schema_sql(sql: &str) -> Result<Vec<String>, String> {
+pub(super) fn tokenize_sqlite_schema_sql(sql: &str) -> Result<Vec<String>, String> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -2123,7 +2152,7 @@ where
     transaction.execute(
         "INSERT INTO bridge_schema_meta(singleton, schema_version, bridge_instance_id, event_generation)
          VALUES (1, ?1, ?2, ?3)",
-        params![BRIDGE_SCHEMA_VERSION, instance_id, generation],
+        params![1, instance_id, generation],
     ).map_err(|error| format!("bridge billing schema metadata insertion failed: {error}"))?;
     Ok(())
 }
@@ -2141,6 +2170,75 @@ fn test_dir(label: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_v2_migration_preserves_v1_rows_and_identity() {
+        let dir = test_dir("budget-v2-migration");
+        let mut old = create_legacy_v0_database(&dir);
+        let tx = old.transaction().unwrap();
+        create_bridge_schema_metadata(&tx, &|_| Ok(())).unwrap();
+        tx.commit().unwrap();
+        let before = snapshot_legacy_rows(&old);
+        let identity = bridge_metadata(&old).unwrap().unwrap();
+        assert_eq!(identity.0, 1);
+        drop(old);
+        let store = BridgeBillingStore::open(&dir).unwrap();
+        let after = bridge_metadata(&store.connection).unwrap().unwrap();
+        assert_eq!(snapshot_legacy_rows(&store.connection), before);
+        assert_eq!((&after.1, &after.2), (&identity.1, &identity.2));
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(after.0, 2, "capacity ledger requires an explicit v1-to-v2 migration");
+    }
+
+    #[test]
+    fn budget_v2_migration_failure_rolls_back_and_can_retry() {
+        let dir=test_dir("budget-v2-rollback");
+        let mut db=create_legacy_v0_database(&dir);
+        let tx=db.transaction().unwrap();
+        create_bridge_schema_metadata(&tx,&|_|Ok(())).unwrap();
+        tx.commit().unwrap();
+        let before=(schema_objects(&db),snapshot_legacy_rows(&db),bridge_metadata(&db).unwrap());
+        let result=upgrade_bridge_capacity_schema(&mut db,&|tx| {
+            let tables:i64=tx.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='bridge_capacity_slots'",[],|r|r.get(0)).unwrap();
+            assert_eq!(tables,1,"failure injection must follow v2 DDL");
+            Err("injected failure before version CAS".into())
+        });
+        assert!(result.unwrap_err().contains("injected failure"));
+        assert_eq!((schema_objects(&db),snapshot_legacy_rows(&db),bridge_metadata(&db).unwrap()),before);
+        drop(db);
+        let upgraded=BridgeBillingStore::open(&dir).unwrap();
+        assert_eq!(snapshot_legacy_rows(&upgraded.connection),before.1);
+        assert_eq!(bridge_metadata(&upgraded.connection).unwrap().unwrap().0,2);
+        drop(upgraded);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn budget_v2_rejects_missing_constraints_foreign_keys_and_indexes() {
+        use super::super::bridge_budget::SCHEMA_OBJECTS;
+        for variant in 0..3 {
+            let dir=test_dir("budget-v2-invalid-schema");
+            drop(BridgeBillingStore::open(&dir).unwrap());
+            let db=Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+            if variant==0 { db.execute_batch("DROP INDEX bridge_capacity_slots_by_account_stage").unwrap(); }
+            else {
+                db.execute_batch("DROP TABLE bridge_capacity_slots").unwrap();
+                let sql=SCHEMA_OBJECTS[1].2;
+                let malformed=if variant==1 { sql.replace("CHECK(typeof(hold_microcredits) = 'integer' AND hold_microcredits > 0)","") }
+                    else { sql.replace("REFERENCES bridge_capacity_accounts(account_ref)","") };
+                assert_ne!(malformed,sql);
+                db.execute_batch(&malformed).unwrap();
+                db.execute_batch(SCHEMA_OBJECTS[2].2).unwrap();
+            }
+            let before=schema_objects(&db);
+            drop(db);
+            assert!(BridgeBillingStore::open(&dir).is_err(),"variant {variant} accepted");
+            let db=Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+            assert_eq!(schema_objects(&db),before,"invalid layouts must not be silently repaired");
+            drop(db); std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[test]
     fn legacy_conflict_default_one_is_refused_for_both_tables() {
@@ -2605,7 +2703,7 @@ mod tests {
         assert!(opened, "a valid legacy v0 database should open");
         assert_eq!(
             metadata.map(|(version, instance_id, generation)| {
-                version == 1 && !instance_id.trim().is_empty() && !generation.trim().is_empty()
+                version == BRIDGE_SCHEMA_VERSION && !instance_id.trim().is_empty() && !generation.trim().is_empty()
             }),
             Some(true),
             "migration should persist v1 and non-empty instance/generation identities"
@@ -2692,7 +2790,7 @@ mod tests {
 
         assert!(first_open && second_open, "fresh v1 DB should open and reopen");
         assert!(first_metadata.as_ref().is_some_and(|(version, instance, generation)| {
-            *version == 1 && !instance.trim().is_empty() && !generation.trim().is_empty()
+            *version == BRIDGE_SCHEMA_VERSION && !instance.trim().is_empty() && !generation.trim().is_empty()
         }), "fresh DB should persist v1 instance and generation metadata");
         assert_eq!(second_metadata, first_metadata, "ordinary reopen must not rotate identity or generation");
     }
