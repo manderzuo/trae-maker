@@ -58,6 +58,7 @@ pub(super) fn dispatch(state:Arc<super::ApiSharedState>,runtime:Arc<BridgeBudget
     // Arc are held inside the worker until saving its outcome has completed.
     tokio::task::spawn_blocking(move || {
         let worker_state=state.clone();
+        let stream=if video {None} else {runtime.chunks.begin(&ctx.budget.authorization.budget_id).ok()};
         let result=run_consumed(&runtime,&ctx,|body| {
             if video {
                 match super::video::run_budget_task(worker_state,&runtime,&ctx,account,body.clone(),permit) {
@@ -69,14 +70,16 @@ pub(super) fn dispatch(state:Arc<super::ApiSharedState>,runtime:Arc<BridgeBudget
                 let _permit=permit;
                 let bytes=match serde_json::to_vec(body) {Ok(b)=>b,Err(_)=>return WorkerResult::Unknown};
                 match super::routes::make_upstream_request(&account.jwt,&account.uid,&account.device_id,&account.machine_id,&bytes) {
-                    Ok(reader)=>match super::sse::aggregate(reader,&format!("chatcmpl-{}",ctx.budget.authorization.request_id)) {
-                        (Some(result),None)=>WorkerResult::Terminal(ExecutionState::Succeeded,result),
+                    Ok(reader)=>match super::sse::aggregate_live(reader,&format!("chatcmpl-{}",ctx.budget.authorization.request_id),&ctx.budget.authorization.model,
+                        |delta| {if let Some(writer)=&stream {writer.push(delta);}}) {
+                        Ok(result)=>WorkerResult::Terminal(ExecutionState::Succeeded,result),
                         _=>WorkerResult::Unknown,
                     },
                     Err(_)=>WorkerResult::Unknown,
                 }
             }
         });
+        drop(stream);
         if result.is_err() {eprintln!("[bridge-v2] execution outcome persistence requires recovery");}
         let _=super::usage_refresh::request_refresh(state,&ctx.budget.authorization.request_id);
     });

@@ -74,6 +74,32 @@ impl PreparationSource for NativePreparationSource<'_> {
         }
     }
 }
+fn chat_profile(input:&Value,model:&str,kind:&str)->Result<(Value,String),String> {
+    let mut body=super::payload::sanitize_scheduler_chat_body(input);
+    if !body["messages"].as_array().is_some_and(|m|!m.is_empty()) {return Err("invalid_budget_business_request".into());}
+    let mut text_only=body.clone();let mut images=0usize;let mut image_bytes=0usize;
+    for message in text_only["messages"].as_array_mut().unwrap() {
+        if let Some(parts)=message["content"].as_array_mut() {for part in parts {
+            if part["type"]!="image_url" {continue;}
+            let url=part.pointer("/image_url/url").and_then(Value::as_str).ok_or("invalid_chat_image")?;
+            let valid=if url.starts_with("data:image/") {url.contains(";base64,")} else {
+                url.len()<=2048 && url::Url::parse(url).is_ok_and(|u|u.scheme()=="https" && u.host_str().is_some() && u.username().is_empty() && u.password().is_none())
+            };
+            if !valid {return Err("invalid_chat_image".into());}
+            images+=1;image_bytes=image_bytes.checked_add(url.len()).ok_or("budget_chat_input_too_large")?;
+            if images>10 || image_bytes>6*1024*1024 {return Err("budget_chat_input_too_large".into());}
+            part["image_url"]["url"]=json!("[image]");
+        }}
+    }
+    if kind=="assist" && images!=0 {return Err("invalid_chat_image".into());}
+    if serde_json::to_vec(&text_only).map_err(|_|"invalid chat input")?.len()>64*1024 {
+        return Err("budget_chat_input_too_large".into());
+    }
+    body["model"]=json!(model);body["max_tokens"]=json!(if kind=="assist" {1024} else {4096});
+    if kind=="assist" {body.as_object_mut().unwrap().remove("tools");body.as_object_mut().unwrap().remove("tool_choice");}
+    let profile=if images==0 {format!("{kind}:{model}")} else {format!("{kind}:{model}:images{images}")};
+    Ok((body,profile))
+}
 fn parse_native_estimate(value:&Value,item:&str)->Result<i64,String> {
     if value["code"].as_i64()!=Some(0) {return Err("native_estimate_rejected".into());}
     let rows=value["results"].as_array().ok_or("native_estimate_invalid")?;
@@ -101,7 +127,7 @@ fn parse_risk_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64)
 pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource,now:i64)->Result<PreparedBudget,String> {
     use super::{bridge_budget::{CapacityEligibility,CapacitySnapshot,CapacityReservation,check_capacity},bridge_prepared::TrustedPreparation};
     use rusqlite::OptionalExtension;
-    if request.wire_version!=2 || now<0 || !request.body.is_object() || serde_json::to_vec(&request.body).map_err(|_|"invalid input")?.len()>256*1024
+    if request.wire_version!=2 || now<0 || !request.body.is_object() || serde_json::to_vec(&request.body).map_err(|_|"invalid input")?.len()>7*1024*1024
         || [&request.parent_request_id,&request.request_id,&request.core_key_id,&request.request_fingerprint,&request.model].iter()
             .any(|s|s.is_empty() || s.len()>256 || s.trim()!=s.as_str() || s.chars().any(char::is_control)) {
         return Err("invalid_budget_business_request".into());
@@ -120,13 +146,8 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         if active {Ok(())} else {Err("core_key_not_active".into())}
     })?;
     let (body,profile,workload)=if video {video_profile(&request.body)?} else {
-        let mut body=super::payload::sanitize_scheduler_chat_body(&request.body);
-        if !body["messages"].as_array().is_some_and(|m|!m.is_empty()) || serde_json::to_vec(&body).map_err(|_|"invalid chat input")?.len()>64*1024 {
-            return Err("budget_chat_input_too_large".into());
-        }
-        body["model"]=json!(request.model);body["max_tokens"]=json!(if request.step_kind=="assist" {1024} else {4096});
-        if request.step_kind=="assist" {body.as_object_mut().unwrap().remove("tools");body.as_object_mut().unwrap().remove("tool_choice");}
-        (body,format!("{}:{}",request.step_kind,request.model),None)
+        let (body,profile)=chat_profile(&request.body,&request.model,&request.step_kind)?;
+        (body,profile,None)
     };
     let mut excluded=HashSet::new();
     let mut last_error="upstream_account_unavailable".to_string();
@@ -271,6 +292,17 @@ mod tests {
     fn pack(product:i64,limit:&str,used:&str,start:i64,end:i64)->Value {
         json!({"entitlement_base_info":{"product_id":product,"quota":{"credits_limit":limit},"start_time":start},
             "usage":{"credits_amount":used},"expire_time":end})
+    }
+    #[test]
+    fn chat_vision_budget_counts_images_without_treating_base64_as_text() {
+        let image=format!("data:image/png;base64,{}","A".repeat(100_000));
+        let body=json!({"messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":image}}]}],"tools":[{"type":"function","function":{"name":"download"}}]});
+        let (normalized,profile)=chat_profile(&body,"vision-model","chat").unwrap();
+        assert_eq!(profile,"chat:vision-model:images1");assert_eq!(normalized["messages"],body["messages"]);assert_eq!(normalized["tools"],body["tools"]);
+        assert_eq!(chat_profile(&json!({"messages":[{"role":"user","content":"hello"}]}),"text-model","chat").unwrap().1,"chat:text-model");
+        assert!(chat_profile(&body,"vision-model","assist").is_err(),"bounded text assist budget must not authorize images");
+        let huge=json!({"messages":[{"role":"user","content":"x".repeat(65_536)}]});assert!(chat_profile(&huge,"model","chat").is_err());
+        let invalid=json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///private.png"}}]}]});assert!(chat_profile(&invalid,"model","chat").is_err());
     }
     #[test]
     fn capacity_excludes_expired_future_unknown_and_preserves_microcredits() {

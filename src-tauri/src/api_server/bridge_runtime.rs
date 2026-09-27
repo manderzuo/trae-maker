@@ -2,7 +2,7 @@
 use std::{path::{Path,PathBuf},sync::{Arc,Mutex}};
 use super::{bridge_billing::BridgeBillingStore,bridge_budget_lease::BridgeBudgetLease};
 
-pub(super) struct BridgeBudgetRuntime { data_dir:PathBuf, lease:Mutex<BridgeBudgetLease>, planning:Mutex<std::collections::HashSet<String>>, receipt_cursors:Mutex<std::collections::HashMap<String,(String,String)>> }
+pub(super) struct BridgeBudgetRuntime { data_dir:PathBuf, lease:Mutex<BridgeBudgetLease>, planning:Mutex<std::collections::HashSet<String>>, receipt_cursors:Mutex<std::collections::HashMap<String,(String,String)>>,pub(super) chunks:super::bridge_chunks::Hub }
 pub(super) struct PlanningGuard<'a> {runtime:&'a BridgeBudgetRuntime,request:String}
 #[derive(serde::Serialize)]
 pub(super) struct RecoveryStatus {
@@ -22,7 +22,7 @@ impl BridgeBudgetRuntime {
     pub(super) fn start(data_dir:&Path)->Result<Arc<Self>,String> {
         let store=BridgeBillingStore::open(data_dir)?;
         let lease=BridgeBudgetLease::try_acquire(&store)?.ok_or("bridge activity already owned by another server")?;
-        Ok(Arc::new(Self {data_dir:data_dir.into(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default())}))
+        Ok(Arc::new(Self {data_dir:data_dir.into(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),chunks:Default::default()}))
     }
     pub(super) fn begin_planning(&self,request:&str)->Result<PlanningGuard<'_>,String> {
         let mut busy=self.planning.lock().map_err(|_|"budget planner unavailable")?;
@@ -183,7 +183,7 @@ mod tests {
         store.finish_activity_lease_cleanly(&mut lease,||Ok(())).unwrap();drop(lease);
         let lease=BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
         value.request_id="request-current-expired".into();let current=store.prepare_budget(&lease,&value,None,20).unwrap();
-        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default())});
+        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),chunks:Default::default()});
         assert_eq!(runtime.sweep_expired_budgets(100_000).unwrap(),1,"old-generation unknowns must not occupy the entire expiry page");
         assert_eq!(store.capacity_totals("account").unwrap().pending,128,"do not reinterpret old preparation as a refund proof");
         assert_eq!(store.latest_budget_receipt_event(&current.authorization.budget_id).unwrap().unwrap().kind,"failed_no_charge");
@@ -204,7 +204,7 @@ mod tests {
         for id in &ids[..256] {store.confirm_budget_no_send(&lease,id).unwrap();}
         let latest=&ids[256];
         assert!(store.latest_budget_receipt_event(latest).unwrap().is_none());
-        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default())});
+        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),chunks:Default::default()});
         runtime.confirm_account("account").unwrap();
         assert!(store.latest_budget_receipt_event(latest).unwrap().is_some(),
             "newly available receipts must not wait for a full historical sweep");
@@ -222,7 +222,7 @@ mod tests {
         let sent=store.prepare_budget(&lease,&other,None,10).unwrap();
         let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&sent,20).unwrap() else {panic!("consume")};
         store.mark_budget_send_intent(&lease,&sent.authorization.budget_id,&ctx.consume_epoch).unwrap();
-        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default())});
+        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),chunks:Default::default()});
         assert_eq!(runtime.sweep_expired_budgets(100_000).unwrap(),1);
         assert_eq!(store.capacity_totals("account").unwrap().pending,80_000_000);
         assert_eq!(store.latest_budget_receipt_event(&first.authorization.budget_id).unwrap().unwrap().kind,"failed_no_charge");
@@ -236,7 +236,7 @@ mod tests {
         let (dir,mut store,lease)=fixture();
         let id=send(&mut store,&lease,"request-runtime");
         cache(&dir,&store,&[(&id,"11.234567")],2000);
-        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default())});
+        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),chunks:Default::default()});
         runtime.confirm_account("account").unwrap();
         assert_eq!(store.latest_budget_receipt_event(&id).unwrap().unwrap().receipt.unwrap().actual_credits.unwrap().to_string(),"11.234567");
         cache(&dir,&store,&[(&id,"12.234567")],3000);

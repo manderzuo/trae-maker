@@ -131,12 +131,13 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/internal/bridge/quotes", post(super::bridge_api::quote))
         .route("/internal/bridge/v2/requests/:request_id/execution", get(super::bridge_v2_api::execution))
         .route("/internal/bridge/v2/requests/:request_id/result", get(super::bridge_v2_api::result))
+        .route("/internal/bridge/v2/requests/:request_id/chunks", get(super::bridge_v2_api::chunks))
         .route("/internal/bridge/v2/requests/:request_id/content", get(super::bridge_v2_api::content))
         .route("/internal/bridge/v2/requests/:request_id/billing", get(super::bridge_v2_api::billing))
         .route("/internal/bridge/v2/requests/:request_id/refresh", post(super::bridge_v2_api::refresh))
         .route("/internal/bridge/v2/receipt-events", get(super::bridge_v2_api::events))
         .route("/internal/bridge/v2/recovery", get(super::bridge_v2_api::recovery_status).post(super::bridge_v2_api::recover))
-        .route("/internal/bridge/v2/budgets/prepare", post(super::bridge_v2_api::prepare))
+        .route("/internal/bridge/v2/budgets/prepare", post(super::bridge_v2_api::prepare).layer(DefaultBodyLimit::max(8*1024*1024)))
         .route("/internal/bridge/v2/budgets/cancel", post(super::bridge_v2_api::cancel))
         .route("/internal/bridge/v2/budgets/dispatch", post(super::bridge_v2_api::dispatch))
         .route("/internal/bridge/key-registry", put(super::bridge_api::replace_core_key_registry).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
@@ -252,6 +253,30 @@ mod tests {
     }
 
     // ==================== P2 修复9：优雅停机轮询 ====================
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn v2_chat_chunks_require_binding_and_survive_without_a_receipt() {
+        use super::super::{bridge_runtime::BridgeBudgetRuntime,bridge_budget::CapacitySnapshot,bridge_prepared::tests::input};
+        let mut fixture=BridgeFixture::new();let runtime=BridgeBudgetRuntime::start(&fixture.dir).unwrap();
+        let prepared=runtime.with_store(|s,l| {
+            s.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").unwrap();
+            s.initialize_capacity(l,&CapacitySnapshot {account_ref:"account".into(),snapshot_ref:"fixture".into(),epoch:1,general:100_000_000,work:0,observed_at_ms:1})?;
+            let mut p=input();p.step_kind="chat".into();p.endpoint="chat".into();p.model="text-model".into();s.prepare_budget(l,&p,None,10)
+        }).unwrap();
+        let budget=&prepared.authorization.budget_id;let id=&prepared.authorization.request_id;
+        let writer=runtime.chunks.begin(budget).unwrap();writer.push(serde_json::json!({"content":"incremental"}));
+        let app=fixture.take_app().layer(axum::Extension(runtime.clone()));
+        let path=format!("/internal/bridge/v2/requests/{id}/chunks?budget_id={budget}&after=0");
+        let r=app.clone().oneshot(Request::builder().uri(&path).header("authorization",format!("Bearer {}",fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(r.status(),StatusCode::OK);
+        let value:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(r.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(value["chunks"][0]["content"],"incremental");assert_eq!(value["next"],1);assert_eq!(value["core_key_id"],"key-a");
+        assert_eq!(value["finished"],false);assert!(!value.to_string().contains(&prepared.dispatch_token));
+        let r=app.clone().oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap()).await.unwrap();assert_eq!(r.status(),StatusCode::FORBIDDEN);
+        let r=app.clone().oneshot(Request::builder().uri(path.replace(id,"wrong-request")).header("authorization",format!("Bearer {}",fixture.key)).body(Body::empty()).unwrap()).await.unwrap();assert_eq!(r.status(),StatusCode::CONFLICT);
+        drop(writer);drop(app);drop(runtime);
+    }
 
     #[cfg(windows)]
     #[tokio::test]

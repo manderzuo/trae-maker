@@ -3,6 +3,10 @@ use std::io::{BufRead, BufReader, Read};
 use serde_json::{json, Map, Value};
 use super::usage::extract_tokens;
 
+#[path = "bridge_chat.rs"]
+mod budget_chat;
+pub(super) use budget_chat::aggregate_live;
+
 /// 聚合器只能在收到明确完成事件后构造成功响应。
 pub const INCOMPLETE_STREAM_ERROR_CODE: i64 = -1;
 

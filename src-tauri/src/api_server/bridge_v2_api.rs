@@ -8,6 +8,34 @@ use super::{ApiSharedState, bridge_billing::BridgeBillingStore, bridge_prepared:
 #[derive(Deserialize)]
 pub(crate) struct BudgetQuery { budget_id: String }
 
+#[derive(Deserialize)]
+pub(super) struct ChunkQuery {budget_id:String,#[serde(default)] after:u64}
+pub(super) async fn chunks(State(state):State<Arc<ApiSharedState>>,
+    axum::Extension(runtime):axum::Extension<Arc<super::bridge_runtime::BridgeBudgetRuntime>>,
+    Path(request):Path<String>,Query(query):Query<ChunkQuery>)->Response {
+    if !super::bridge_billing::valid_request_id(&request) || !super::bridge_billing::valid_request_id(&query.budget_id) {
+        return error(StatusCode::BAD_REQUEST,"invalid_request_id");
+    }
+    let reply=tokio::task::spawn_blocking(move ||->Result<(StatusCode,Value),String> {
+        let store=BridgeBillingStore::open(&state.data_dir)?;
+        let auth=stored_budget_authorization(&store.connection,&query.budget_id)?;
+        if auth.request_id!=request || auth.endpoint!="chat" {return Ok((StatusCode::CONFLICT,json!({"error":{"code":"identity_conflict"}})));}
+        let mut value=json!({"wire_version":2,"request_id":request,"budget_id":auth.budget_id,
+            "core_key_id":auth.core_key_id,"account_ref":auth.account_ref,"bridge_instance_id":auth.bridge_instance_id});
+        drop(store);
+        match runtime.chunks.page(&query.budget_id,query.after) {
+            Ok(Some(page))=>{
+                value["status"]=json!("available");value["chunks"]=json!(page.chunks);value["next"]=json!(page.next);value["finished"]=json!(page.finished);
+            },
+            Ok(None)=>{value["status"]=json!("unavailable");},
+            Err(_)=>return Ok((StatusCode::CONFLICT,json!({"error":{"code":"chat_stream_cursor_unavailable"}}))),
+        }
+        Ok((StatusCode::OK,value))
+    }).await;
+    let mut response=match reply {Ok(Ok((status,value)))=>(status,Json(value)).into_response(),_=>error(StatusCode::SERVICE_UNAVAILABLE,"bridge_state_unavailable")};
+    response.headers_mut().insert("cache-control","no-store".parse().unwrap());response
+}
+
 fn error(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({"error":{"code":code,"type":"bridge_error"}}))).into_response()
 }
@@ -49,6 +77,8 @@ pub(super) async fn prepare(State(state):State<Arc<ApiSharedState>>,
                 "budget_preparation_busy"=>return error(StatusCode::CONFLICT,"budget_preparation_busy"),
                 "prepared request identity conflict"=>return error(StatusCode::CONFLICT,"budget_identity_conflict"),
                 "invalid_budget_business_request"=>return error(StatusCode::BAD_REQUEST,"invalid_budget_business_request"),
+                "invalid_chat_image"=>return error(StatusCode::BAD_REQUEST,"invalid_chat_image"),
+                "budget_chat_input_too_large"=>return error(StatusCode::PAYLOAD_TOO_LARGE,"budget_chat_input_too_large"),
                 _=>"budget_preparation_failed",
             };error(StatusCode::SERVICE_UNAVAILABLE,code)
         },

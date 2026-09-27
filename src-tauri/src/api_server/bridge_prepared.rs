@@ -146,7 +146,9 @@ impl BridgeBillingStore {
         let envelope=ProtectedPreparation {version:1,purpose:"bridge-budget-preparation".into(),authorization,input:input.clone(),generation:lease.generation().into(),revision,
             dispatch_token:token,session_ref,prepared_at_ms:now};
         let plaintext=serde_json::to_vec(&envelope).map_err(|_|"budget protection encoding failed")?;
-        if plaintext.len()>8*1024*1024 {return Err("prepared body exceeds protected storage limit".into());}
+        // The supported 6MiB image envelope appears in both immutable business
+        // claim and normalized upstream payload. Keep a finite combined bound.
+        if plaintext.len()>16*1024*1024 {return Err("prepared body exceeds protected storage limit".into());}
         let protected=crate::vault::protect_blob(&plaintext)?;
         let token_hash=Sha256::digest(envelope.dispatch_token.as_bytes());
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
@@ -419,6 +421,20 @@ pub(super) mod tests {
         });
         assert_ne!(canceled,consumed);
         assert_eq!(store.capacity_totals("account").unwrap().pending,if canceled {0}else{40_000_000});
+        cleanup(dir,store,lease);
+    }
+
+    #[test]
+    fn vision_business_and_normalized_copies_fit_protected_budget_without_lifting_all_limits() {
+        let (dir,mut store,lease)=fixture();
+        let mut p=input();let image="a".repeat(6*1024*1024);
+        p.body=serde_json::json!({"business_claim":{"image":image},"upstream":{"image":image}});
+        let prepared=store.prepare_budget(&lease,&p,None,10).expect("two bounded copies of the supported 6MiB image envelope must fit");
+        let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&prepared,20).unwrap() else {panic!("consume")};
+        assert_eq!(ctx.body["upstream"]["image"].as_str().unwrap().len(),6*1024*1024);
+        let mut excessive=input();excessive.request_id="too-large".into();excessive.body=serde_json::json!({"padding":"a".repeat(17*1024*1024)});
+        assert!(store.prepare_budget(&lease,&excessive,None,30).err().unwrap().contains("protected storage limit"));
+        assert_eq!(store.capacity_totals("account").unwrap().pending,40_000_000);
         cleanup(dir,store,lease);
     }
 
