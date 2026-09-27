@@ -6,6 +6,8 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 const BILLING_DB_FILE: &str = "bridge-billing.sqlite3";
+const BRIDGE_SCHEMA_META_TABLE: &str = "bridge_schema_meta";
+const BRIDGE_SCHEMA_VERSION: i64 = 1;
 
 /// The caller may identify a request, but can never supply the quote amount.
 #[derive(Clone, Debug, Deserialize)]
@@ -291,7 +293,7 @@ impl BridgeBillingStore {
         fs::create_dir_all(data_dir)
             .map_err(|error| format!("bridge billing data directory unavailable: {error}"))?;
         let path = data_dir.join(BILLING_DB_FILE);
-        let connection = Connection::open(path)
+        let mut connection = Connection::open(path)
             .map_err(|error| format!("bridge billing database unavailable: {error}"))?;
         connection
             .busy_timeout(Duration::from_secs(5))
@@ -300,57 +302,75 @@ impl BridgeBillingStore {
             .execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = FULL;
-                 CREATE TABLE IF NOT EXISTS bridge_billing_receipts (
-                   request_id TEXT PRIMARY KEY NOT NULL,
-                   status TEXT NOT NULL CHECK(status IN ('pending','final','unknown','unverified','conflict')),
-                   actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
-                   unit TEXT,
-                   source_ref TEXT,
-                   task_ref TEXT,
-                   observed_at_ms INTEGER NOT NULL,
-                   updated_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS bridge_core_key_registry_state (
-                   singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                   version INTEGER NOT NULL CHECK(version >= 0),
-                   updated_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS bridge_core_api_keys (
-                   key_id TEXT PRIMARY KEY NOT NULL,
-                   display_name TEXT NOT NULL,
-                   active INTEGER NOT NULL CHECK(active IN (0, 1)),
-                   snapshot_version INTEGER NOT NULL CHECK(snapshot_version >= 0)
-                 );
-                 CREATE TABLE IF NOT EXISTS bridge_core_requests (
-                   request_id TEXT PRIMARY KEY NOT NULL,
-                   core_key_id TEXT NOT NULL,
-                   associated_at_ms INTEGER NOT NULL,
-                   conflict INTEGER NOT NULL DEFAULT 0 CHECK(conflict IN (0, 1))
-                 );
-                 CREATE TABLE IF NOT EXISTS bridge_core_one_shot_test_requests (
-                   request_id TEXT PRIMARY KEY NOT NULL,
-                   authorized_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS bridge_core_request_modes (
-                   request_id TEXT PRIMARY KEY NOT NULL REFERENCES bridge_core_requests(request_id),
-                   billing_mode TEXT NOT NULL CHECK(billing_mode IN ('quoted', 'legacy_one_shot', 'controlled_unquoted')),
-                   operation_id TEXT,
-                   CHECK((billing_mode = 'controlled_unquoted' AND operation_id IS NOT NULL)
-                      OR (billing_mode != 'controlled_unquoted' AND operation_id IS NULL))
-                 );
-                 CREATE TABLE IF NOT EXISTS bridge_core_upstream_sessions (
-                   request_id TEXT NOT NULL,
-                   account_ref TEXT NOT NULL,
-                   session_id TEXT NOT NULL,
-                   conflict INTEGER NOT NULL DEFAULT 0 CHECK(conflict IN (0, 1)),
-                   associated_at_ms INTEGER NOT NULL,
-                   PRIMARY KEY(request_id, account_ref, session_id)
-                 );
-                 CREATE INDEX IF NOT EXISTS bridge_core_upstream_sessions_lookup_idx
-                   ON bridge_core_upstream_sessions(account_ref, session_id);",
+                 PRAGMA foreign_keys = ON;",
             )
-            .map_err(|error| format!("bridge billing schema unavailable: {error}"))?;
+            .map_err(|error| format!("bridge billing database pragmas unavailable: {error}"))?;
+        initialize_bridge_schema(&mut connection, |_| Ok(()))?;
         Ok(Self { connection })
+    }
+
+    pub(super) fn bridge_identity(&self) -> Result<(String, String), String> {
+        let (version, instance_id, generation): (i64, String, String) = self.connection
+            .query_row(
+                "SELECT schema_version, bridge_instance_id, event_generation FROM bridge_schema_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| format!("bridge billing identity unavailable: {error}"))?;
+        if version != BRIDGE_SCHEMA_VERSION {
+            return Err("bridge billing identity has an unsupported schema version".into());
+        }
+        validate_bridge_identity(&instance_id, &generation)?;
+        Ok((instance_id, generation))
+    }
+
+    pub(super) fn rotate_event_generation_for_recovery<F>(
+        &mut self,
+        lease: &mut super::bridge_budget_lease::BridgeBudgetLease,
+        confirm_workers_stopped: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        let (instance_id, generation) = self.bridge_identity()?;
+        if !lease.is_active()
+            || lease.instance_id() != instance_id
+            || lease.generation() != generation
+        {
+            return Err("recovery requires an active lease for this instance and generation".into());
+        }
+        // The caller must have stopped and joined the old charging workers.
+        // This internal confirmation is explicit; 3b must supply the real join.
+        confirm_workers_stopped()?;
+        let transaction = self.connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("bridge generation recovery transaction unavailable: {error}"))?;
+        let (version, current_instance, current_generation) = read_bridge_schema_metadata(&transaction)?;
+        if version != BRIDGE_SCHEMA_VERSION
+            || current_instance != instance_id
+            || current_generation != generation
+        {
+            return Err("bridge generation changed before recovery could commit".into());
+        }
+        let next_generation = loop {
+            let candidate = format!("bridge-generation-v1-{:032x}", rand::random::<u128>());
+            if candidate != generation {
+                break candidate;
+            }
+        };
+        let updated = transaction.execute(
+            "UPDATE bridge_schema_meta SET event_generation = ?1
+             WHERE singleton = 1 AND schema_version = ?2
+               AND bridge_instance_id = ?3 AND event_generation = ?4",
+            params![next_generation, BRIDGE_SCHEMA_VERSION, instance_id, generation],
+        ).map_err(|error| format!("bridge generation recovery update failed: {error}"))?;
+        if updated != 1 {
+            return Err("bridge generation recovery lost its identity CAS".into());
+        }
+        transaction.commit()
+            .map_err(|error| format!("bridge generation recovery commit failed: {error}"))?;
+        lease.record_generation(next_generation.clone());
+        Ok(next_generation)
     }
 
     pub(super) fn replace_core_key_registry(
@@ -1178,6 +1198,327 @@ fn credit_amount_from_microcredits(value: i64) -> Result<CreditAmount, String> {
     CreditAmount::parse(&decimal, "credits")
 }
 
+fn initialize_bridge_schema<F>(connection: &mut Connection, migration_hook: F) -> Result<(), String>
+where
+    F: Fn(&Transaction<'_>) -> Result<(), String>,
+{
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("bridge billing schema transaction unavailable: {error}"))?;
+    let objects = bridge_schema_objects(&transaction)?;
+    match objects.iter().find(|(_, name)| name == BRIDGE_SCHEMA_META_TABLE) {
+        Some((kind, _)) => {
+            if kind != "table" {
+                return Err("bridge billing schema metadata object is not a table".into());
+            }
+            validate_bridge_metadata_table(&transaction)?;
+            let (version, instance_id, generation) = read_bridge_schema_metadata(&transaction)?;
+            if version > BRIDGE_SCHEMA_VERSION {
+                return Err(format!("bridge billing schema version {version} is newer than supported"));
+            }
+            if version != BRIDGE_SCHEMA_VERSION {
+                return Err(format!("bridge billing schema version {version} is unsupported"));
+            }
+            validate_bridge_schema(&transaction, true)?;
+            validate_bridge_identity(&instance_id, &generation)?;
+            validate_foreign_key_integrity(&transaction)?;
+        }
+        None if objects.is_empty() => {
+            create_legacy_bridge_schema(&transaction)?;
+            validate_bridge_schema(&transaction, false)?;
+            validate_foreign_key_integrity(&transaction)?;
+            create_bridge_schema_metadata(&transaction, &migration_hook)?;
+        }
+        None => {
+            validate_bridge_schema(&transaction, false)?;
+            validate_foreign_key_integrity(&transaction)?;
+            create_bridge_schema_metadata(&transaction, &migration_hook)?;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("bridge billing schema commit failed: {error}"))?;
+    Ok(())
+}
+
+fn bridge_schema_objects(transaction: &Transaction<'_>) -> Result<Vec<(String, String)>, String> {
+    let mut statement = transaction
+        .prepare("SELECT type, name FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name")
+        .map_err(|error| format!("bridge schema inventory unavailable: {error}"))?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|error| format!("bridge schema inventory failed: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("bridge schema inventory failed: {error}"));
+    rows
+}
+
+fn bridge_table_columns(
+    transaction: &Transaction<'_>,
+    table: &str,
+) -> Result<Vec<(String, String, i64, i64)>, String> {
+    let mut statement = transaction
+        .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+        .map_err(|error| format!("bridge {table} columns unavailable: {error}"))?;
+    let columns = statement
+        .query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(5)?)))
+        .map_err(|error| format!("bridge {table} columns unavailable: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("bridge {table} columns unavailable: {error}"));
+    columns
+}
+
+fn validate_bridge_schema(transaction: &Transaction<'_>, versioned: bool) -> Result<(), String> {
+    const LEGACY_OBJECTS: &[(&str, &str)] = &[
+        ("index", "bridge_core_upstream_sessions_lookup_idx"),
+        ("table", "bridge_billing_receipts"),
+        ("table", "bridge_core_key_registry_state"),
+        ("table", "bridge_core_api_keys"),
+        ("table", "bridge_core_requests"),
+        ("table", "bridge_core_one_shot_test_requests"),
+        ("table", "bridge_core_request_modes"),
+        ("table", "bridge_core_upstream_sessions"),
+    ];
+    let objects = bridge_schema_objects(transaction)?;
+    let required_count = LEGACY_OBJECTS.len() + usize::from(versioned);
+    let complete = objects.len() == required_count
+        && LEGACY_OBJECTS.iter().all(|(kind, name)| {
+            objects.iter().any(|(found_kind, found_name)| found_kind == kind && found_name == name)
+        })
+        && (!versioned || objects.iter().any(|(kind, name)| {
+            kind == "table" && name == BRIDGE_SCHEMA_META_TABLE
+        }));
+    if !complete {
+        return Err("bridge billing schema layout is incomplete or contains unknown objects".into());
+    }
+
+    let required_columns: &[(&str, &[(&str, &str)])] = &[
+        ("bridge_billing_receipts", &[
+            ("request_id", "TEXT"), ("status", "TEXT"), ("actual_microcredits", "INTEGER"),
+            ("unit", "TEXT"), ("source_ref", "TEXT"), ("task_ref", "TEXT"),
+            ("observed_at_ms", "INTEGER"), ("updated_at_ms", "INTEGER"),
+        ]),
+        ("bridge_core_key_registry_state", &[
+            ("singleton", "INTEGER"), ("version", "INTEGER"), ("updated_at_ms", "INTEGER"),
+        ]),
+        ("bridge_core_api_keys", &[
+            ("key_id", "TEXT"), ("display_name", "TEXT"), ("active", "INTEGER"),
+            ("snapshot_version", "INTEGER"),
+        ]),
+        ("bridge_core_requests", &[
+            ("request_id", "TEXT"), ("core_key_id", "TEXT"),
+            ("associated_at_ms", "INTEGER"), ("conflict", "INTEGER"),
+        ]),
+        ("bridge_core_one_shot_test_requests", &[
+            ("request_id", "TEXT"), ("authorized_at_ms", "INTEGER"),
+        ]),
+        ("bridge_core_request_modes", &[
+            ("request_id", "TEXT"), ("billing_mode", "TEXT"), ("operation_id", "TEXT"),
+        ]),
+        ("bridge_core_upstream_sessions", &[
+            ("request_id", "TEXT"), ("account_ref", "TEXT"), ("session_id", "TEXT"),
+            ("conflict", "INTEGER"), ("associated_at_ms", "INTEGER"),
+        ]),
+    ];
+    for (table, columns) in required_columns {
+        let actual = bridge_table_columns(transaction, table)?;
+        if actual.len() != columns.len() || columns.iter().any(|(name, kind)| {
+            !actual.iter().any(|(found_name, found_kind, _, _)| {
+                found_name == name && found_kind.eq_ignore_ascii_case(kind)
+            })
+        }) {
+            return Err(format!("bridge billing {table} columns do not match the legacy layout"));
+        }
+    }
+    let required_primary_keys: &[(&str, &[(&str, i64)])] = &[
+        ("bridge_billing_receipts", &[("request_id", 1)]),
+        ("bridge_core_key_registry_state", &[("singleton", 1)]),
+        ("bridge_core_api_keys", &[("key_id", 1)]),
+        ("bridge_core_requests", &[("request_id", 1)]),
+        ("bridge_core_one_shot_test_requests", &[("request_id", 1)]),
+        ("bridge_core_request_modes", &[("request_id", 1)]),
+        ("bridge_core_upstream_sessions", &[
+            ("request_id", 1), ("account_ref", 2), ("session_id", 3),
+        ]),
+    ];
+    for (table, keys) in required_primary_keys {
+        let actual = bridge_table_columns(transaction, table)?;
+        if actual.iter().filter(|(_, _, _, primary)| *primary != 0).count() != keys.len()
+            || keys.iter().any(|(name, rank)| {
+                !actual.iter().any(|(found_name, _, _, found_rank)| {
+                    found_name == name && found_rank == rank
+                })
+            })
+        {
+            return Err(format!("bridge billing {table} primary key does not match the legacy layout"));
+        }
+    }
+    let mut foreign_key_statement = transaction
+        .prepare("PRAGMA foreign_key_list(bridge_core_request_modes)")
+        .map_err(|error| format!("bridge request-mode foreign key unavailable: {error}"))?;
+    let foreign_keys = foreign_key_statement
+        .query_map([], |row| Ok((
+            row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, String>(4)?,
+        )))
+        .map_err(|error| format!("bridge request-mode foreign key unreadable: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("bridge request-mode foreign key unreadable: {error}"))?;
+    if foreign_keys.len() != 1 || !matches!(
+        &foreign_keys[0],
+        (0, 0, table, from, to)
+            if table == "bridge_core_requests" && from == "request_id" && to == "request_id"
+    ) {
+        return Err("bridge request-mode foreign key does not match the legacy layout".into());
+    }
+    if versioned {
+        validate_bridge_metadata_table(transaction)?;
+    }
+    Ok(())
+}
+
+fn validate_bridge_metadata_table(transaction: &Transaction<'_>) -> Result<(), String> {
+    let columns = bridge_table_columns(transaction, BRIDGE_SCHEMA_META_TABLE)?;
+    let expected = [
+        ("singleton", "INTEGER", false, 1),
+        ("schema_version", "INTEGER", true, 0),
+        ("bridge_instance_id", "TEXT", true, 0),
+        ("event_generation", "TEXT", true, 0),
+    ];
+    if columns.len() != expected.len() || expected.iter().any(|(name, kind, not_null, primary)| {
+        !columns.iter().any(|(found_name, found_kind, found_not_null, found_primary)| {
+            found_name == name && found_kind.eq_ignore_ascii_case(kind)
+                && (*found_not_null != 0) == *not_null && found_primary == primary
+        })
+    }) {
+        return Err("bridge billing schema metadata columns are invalid".into());
+    }
+    Ok(())
+}
+
+fn read_bridge_schema_metadata(transaction: &Transaction<'_>) -> Result<(i64, String, String), String> {
+    let row_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM bridge_schema_meta", [], |row| row.get(0))
+        .map_err(|error| format!("bridge billing schema metadata unreadable: {error}"))?;
+    if row_count != 1 {
+        return Err("bridge billing schema metadata must contain exactly one row".into());
+    }
+    let (singleton, version, instance_id, generation): (i64, i64, String, String) = transaction
+        .query_row(
+            "SELECT singleton, schema_version, bridge_instance_id, event_generation FROM bridge_schema_meta",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| format!("bridge billing schema metadata unreadable: {error}"))?;
+    if singleton != 1 {
+        return Err("bridge billing schema metadata singleton is invalid".into());
+    }
+    Ok((version, instance_id, generation))
+}
+
+fn validate_bridge_identity(instance_id: &str, generation: &str) -> Result<(), String> {
+    let valid = |value: &str| {
+        !value.is_empty() && value.len() <= 128
+            && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    };
+    if !valid(instance_id) || !valid(generation) || instance_id == generation {
+        return Err("bridge billing instance or generation metadata is invalid".into());
+    }
+    Ok(())
+}
+
+fn validate_foreign_key_integrity(transaction: &Transaction<'_>) -> Result<(), String> {
+    let mut statement = transaction
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|error| format!("bridge billing foreign key check unavailable: {error}"))?;
+    if statement
+        .query([])
+        .map_err(|error| format!("bridge billing foreign key check failed: {error}"))?
+        .next()
+        .map_err(|error| format!("bridge billing foreign key check failed: {error}"))?
+        .is_some()
+    {
+        return Err("bridge billing legacy foreign key references are invalid".into());
+    }
+    Ok(())
+}
+
+fn create_legacy_bridge_schema(transaction: &Transaction<'_>) -> Result<(), String> {
+    transaction.execute_batch(
+        "CREATE TABLE bridge_billing_receipts (
+           request_id TEXT PRIMARY KEY NOT NULL,
+           status TEXT NOT NULL CHECK(status IN ('pending','final','unknown','unverified','conflict')),
+           actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+           unit TEXT,
+           source_ref TEXT,
+           task_ref TEXT,
+           observed_at_ms INTEGER NOT NULL,
+           updated_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE bridge_core_key_registry_state (
+           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+           version INTEGER NOT NULL CHECK(version >= 0),
+           updated_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE bridge_core_api_keys (
+           key_id TEXT PRIMARY KEY NOT NULL,
+           display_name TEXT NOT NULL,
+           active INTEGER NOT NULL CHECK(active IN (0, 1)),
+           snapshot_version INTEGER NOT NULL CHECK(snapshot_version >= 0)
+         );
+         CREATE TABLE bridge_core_requests (
+           request_id TEXT PRIMARY KEY NOT NULL,
+           core_key_id TEXT NOT NULL,
+           associated_at_ms INTEGER NOT NULL,
+           conflict INTEGER NOT NULL DEFAULT 0 CHECK(conflict IN (0, 1))
+         );
+         CREATE TABLE bridge_core_one_shot_test_requests (
+           request_id TEXT PRIMARY KEY NOT NULL,
+           authorized_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE bridge_core_request_modes (
+           request_id TEXT PRIMARY KEY NOT NULL REFERENCES bridge_core_requests(request_id),
+           billing_mode TEXT NOT NULL CHECK(billing_mode IN ('quoted', 'legacy_one_shot', 'controlled_unquoted')),
+           operation_id TEXT,
+           CHECK((billing_mode = 'controlled_unquoted' AND operation_id IS NOT NULL)
+              OR (billing_mode != 'controlled_unquoted' AND operation_id IS NULL))
+         );
+         CREATE TABLE bridge_core_upstream_sessions (
+           request_id TEXT NOT NULL,
+           account_ref TEXT NOT NULL,
+           session_id TEXT NOT NULL,
+           conflict INTEGER NOT NULL DEFAULT 0 CHECK(conflict IN (0, 1)),
+           associated_at_ms INTEGER NOT NULL,
+           PRIMARY KEY(request_id, account_ref, session_id)
+         );
+         CREATE INDEX bridge_core_upstream_sessions_lookup_idx
+           ON bridge_core_upstream_sessions(account_ref, session_id);",
+    ).map_err(|error| format!("bridge billing legacy schema creation failed: {error}"))
+}
+
+fn create_bridge_schema_metadata<F>(transaction: &Transaction<'_>, migration_hook: &F) -> Result<(), String>
+where
+    F: Fn(&Transaction<'_>) -> Result<(), String>,
+{
+    transaction.execute_batch(
+        "CREATE TABLE bridge_schema_meta (
+           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+           schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+           bridge_instance_id TEXT NOT NULL CHECK(length(bridge_instance_id) BETWEEN 1 AND 128),
+           event_generation TEXT NOT NULL CHECK(length(event_generation) BETWEEN 1 AND 128)
+         );",
+    ).map_err(|error| format!("bridge billing schema metadata creation failed: {error}"))?;
+    migration_hook(transaction)?;
+    let instance_id = format!("bridge-instance-v1-{:032x}", rand::random::<u128>());
+    let generation = format!("bridge-generation-v1-{:032x}", rand::random::<u128>());
+    transaction.execute(
+        "INSERT INTO bridge_schema_meta(singleton, schema_version, bridge_instance_id, event_generation)
+         VALUES (1, ?1, ?2, ?3)",
+        params![BRIDGE_SCHEMA_VERSION, instance_id, generation],
+    ).map_err(|error| format!("bridge billing schema metadata insertion failed: {error}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 fn test_dir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -1191,6 +1532,433 @@ fn test_dir(label: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn create_legacy_v0_database(dir: &Path) -> Connection {
+        let connection = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE bridge_billing_receipts (
+               request_id TEXT PRIMARY KEY NOT NULL,
+               status TEXT NOT NULL CHECK(status IN ('pending','final','unknown','unverified','conflict')),
+               actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+               unit TEXT,
+               source_ref TEXT,
+               task_ref TEXT,
+               observed_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE bridge_core_key_registry_state (
+               singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+               version INTEGER NOT NULL CHECK(version >= 0),
+               updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE bridge_core_api_keys (
+               key_id TEXT PRIMARY KEY NOT NULL,
+               display_name TEXT NOT NULL,
+               active INTEGER NOT NULL CHECK(active IN (0, 1)),
+               snapshot_version INTEGER NOT NULL CHECK(snapshot_version >= 0)
+             );
+             CREATE TABLE bridge_core_requests (
+               request_id TEXT PRIMARY KEY NOT NULL,
+               core_key_id TEXT NOT NULL,
+               associated_at_ms INTEGER NOT NULL,
+               conflict INTEGER NOT NULL DEFAULT 0 CHECK(conflict IN (0, 1))
+             );
+             CREATE TABLE bridge_core_one_shot_test_requests (
+               request_id TEXT PRIMARY KEY NOT NULL,
+               authorized_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE bridge_core_request_modes (
+               request_id TEXT PRIMARY KEY NOT NULL REFERENCES bridge_core_requests(request_id),
+               billing_mode TEXT NOT NULL CHECK(billing_mode IN ('quoted', 'legacy_one_shot', 'controlled_unquoted')),
+               operation_id TEXT,
+               CHECK((billing_mode = 'controlled_unquoted' AND operation_id IS NOT NULL)
+                  OR (billing_mode != 'controlled_unquoted' AND operation_id IS NULL))
+             );
+             CREATE TABLE bridge_core_upstream_sessions (
+               request_id TEXT NOT NULL,
+               account_ref TEXT NOT NULL,
+               session_id TEXT NOT NULL,
+               conflict INTEGER NOT NULL DEFAULT 0 CHECK(conflict IN (0, 1)),
+               associated_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(request_id, account_ref, session_id)
+             );
+             CREATE INDEX bridge_core_upstream_sessions_lookup_idx
+               ON bridge_core_upstream_sessions(account_ref, session_id);
+             INSERT INTO bridge_core_key_registry_state VALUES (1, 7, 1700000000000);
+             INSERT INTO bridge_core_api_keys VALUES ('legacy-key-a', 'Legacy A', 1, 7);
+             INSERT INTO bridge_core_api_keys VALUES ('legacy-key-b', 'Legacy B', 0, 7);
+             INSERT INTO bridge_core_requests VALUES ('legacy-quoted', 'legacy-key-a', 1700000000001, 0);
+             INSERT INTO bridge_core_requests VALUES ('legacy-one-shot', 'legacy-key-b', 1700000000002, 0);
+             INSERT INTO bridge_core_requests VALUES ('legacy-controlled', 'legacy-key-a', 1700000000003, 1);
+             INSERT INTO bridge_core_one_shot_test_requests VALUES ('legacy-one-shot', 1700000000004);
+             INSERT INTO bridge_core_request_modes VALUES ('legacy-quoted', 'quoted', NULL);
+             INSERT INTO bridge_core_request_modes VALUES ('legacy-one-shot', 'legacy_one_shot', NULL);
+             INSERT INTO bridge_core_request_modes VALUES ('legacy-controlled', 'controlled_unquoted', 'legacy-op');
+             INSERT INTO bridge_core_upstream_sessions VALUES ('legacy-quoted', 'legacy-account-a', 'legacy-session-a', 0, 1700000000005);
+             INSERT INTO bridge_core_upstream_sessions VALUES ('legacy-controlled', 'legacy-account-b', 'legacy-session-b', 1, 1700000000006);
+             INSERT INTO bridge_billing_receipts VALUES ('legacy-quoted', 'final', 1250000, 'credits', 'legacy-source-final', 'legacy-task-final', 1700000000007, 1700000000008);
+             INSERT INTO bridge_billing_receipts VALUES ('legacy-one-shot', 'conflict', NULL, 'credits', 'legacy-source-conflict', NULL, 1700000000009, 1700000000010);
+             INSERT INTO bridge_billing_receipts VALUES ('legacy-controlled', 'unknown', NULL, 'credits', NULL, NULL, 1700000000011, 1700000000012);"
+        ).unwrap();
+        connection
+    }
+
+    fn snapshot_legacy_rows(connection: &Connection) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        [
+            "bridge_billing_receipts",
+            "bridge_core_key_registry_state",
+            "bridge_core_api_keys",
+            "bridge_core_requests",
+            "bridge_core_one_shot_test_requests",
+            "bridge_core_request_modes",
+            "bridge_core_upstream_sessions",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let column_count = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..column_count)
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (table.to_string(), rows)
+        })
+        .collect()
+    }
+
+    fn bridge_metadata(connection: &Connection) -> rusqlite::Result<Option<(i64, String, String)>> {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bridge_schema_meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        connection
+            .query_row(
+                "SELECT schema_version, bridge_instance_id, event_generation FROM bridge_schema_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map(Some)
+    }
+
+    fn create_bridge_metadata(connection: &Connection, version: i64) {
+        connection.execute_batch(
+            "CREATE TABLE bridge_schema_meta (
+               singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+               schema_version INTEGER NOT NULL,
+               bridge_instance_id TEXT NOT NULL,
+               event_generation TEXT NOT NULL
+             );",
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO bridge_schema_meta VALUES (1, ?1, 'fixture-instance', 'fixture-generation')",
+            [version],
+        ).unwrap();
+    }
+
+    fn schema_objects(connection: &Connection) -> Vec<(String, String)> {
+        connection
+            .prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn legacy_v0_migration_preserves_all_existing_rows_and_creates_v1_metadata() {
+        let dir = test_dir("legacy-v0-migration");
+        let legacy = create_legacy_v0_database(&dir);
+        let before = snapshot_legacy_rows(&legacy);
+        drop(legacy);
+
+        let (opened, metadata, after) = match BridgeBillingStore::open(&dir) {
+            Ok(store) => {
+                let metadata = bridge_metadata(&store.connection).unwrap();
+                let after = snapshot_legacy_rows(&store.connection);
+                drop(store);
+                (true, metadata, Some(after))
+            }
+            Err(_) => (false, None, None),
+        };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(opened, "a valid legacy v0 database should open");
+        assert_eq!(
+            metadata.map(|(version, instance_id, generation)| {
+                version == 1 && !instance_id.trim().is_empty() && !generation.trim().is_empty()
+            }),
+            Some(true),
+            "migration should persist v1 and non-empty instance/generation identities"
+        );
+        assert_eq!(after, Some(before), "migration must retain every legacy row and field");
+    }
+
+    #[test]
+    fn fresh_database_persists_instance_and_generation_across_reopen() {
+        let dir = test_dir("fresh-v1-stability");
+        let (first_open, first_metadata, second_open, second_metadata) =
+            match BridgeBillingStore::open(&dir) {
+                Ok(first) => {
+                    let first_metadata = bridge_metadata(&first.connection).unwrap();
+                    drop(first);
+                    match BridgeBillingStore::open(&dir) {
+                        Ok(second) => {
+                            let second_metadata = bridge_metadata(&second.connection).unwrap();
+                            drop(second);
+                            (true, first_metadata, true, second_metadata)
+                        }
+                        Err(_) => (true, first_metadata, false, None),
+                    }
+                }
+                Err(_) => (false, None, false, None),
+            };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(first_open && second_open, "fresh v1 DB should open and reopen");
+        assert!(first_metadata.as_ref().is_some_and(|(version, instance, generation)| {
+            *version == 1 && !instance.trim().is_empty() && !generation.trim().is_empty()
+        }), "fresh DB should persist v1 instance and generation metadata");
+        assert_eq!(second_metadata, first_metadata, "ordinary reopen must not rotate identity or generation");
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected_without_schema_mutation() {
+        let dir = test_dir("future-schema-version");
+        let fixture = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        create_bridge_metadata(&fixture, 99);
+        let before = schema_objects(&fixture);
+        drop(fixture);
+
+        let opened = BridgeBillingStore::open(&dir).is_ok();
+        let after = Connection::open(dir.join(BILLING_DB_FILE))
+            .map(|connection| schema_objects(&connection));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(!opened, "a schema version newer than v1 must be refused");
+        assert_eq!(after.unwrap(), before, "refusing a future DB must not create or rewrite objects");
+    }
+
+    #[test]
+    fn partial_v1_schema_is_rejected_without_filling_missing_tables() {
+        let dir = test_dir("partial-v1-schema");
+        let fixture = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        create_bridge_metadata(&fixture, 1);
+        let before = schema_objects(&fixture);
+        drop(fixture);
+
+        let opened = BridgeBillingStore::open(&dir).is_ok();
+        let after = Connection::open(dir.join(BILLING_DB_FILE))
+            .map(|connection| schema_objects(&connection));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(!opened, "a v1 marker without its required legacy tables must be refused");
+        assert_eq!(after.unwrap(), before, "refusing a partial DB must not synthesize missing tables");
+    }
+
+    #[test]
+    fn conflicting_instance_and_generation_metadata_is_refused() {
+        let dir = test_dir("conflicting-v1-identities");
+        let store = BridgeBillingStore::open(&dir).unwrap();
+        let instance_id = store.bridge_identity().unwrap().0;
+        drop(store);
+        let connection = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        connection.execute(
+            "UPDATE bridge_schema_meta SET event_generation = ?1 WHERE singleton = 1",
+            [&instance_id],
+        ).unwrap();
+        drop(connection);
+
+        let reopened = BridgeBillingStore::open(&dir);
+        let rejected = reopened.is_err();
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(rejected, "conflicting instance/generation metadata must fail closed");
+    }
+
+    #[test]
+    fn malformed_legacy_layout_is_rejected_without_creating_other_tables() {
+        let dir = test_dir("malformed-legacy-layout");
+        let fixture = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        fixture.execute_batch(
+            "CREATE TABLE bridge_core_api_keys (key_id TEXT PRIMARY KEY NOT NULL, active INTEGER NOT NULL);
+             INSERT INTO bridge_core_api_keys VALUES ('partial-key', 1);",
+        ).unwrap();
+        let before = schema_objects(&fixture);
+        drop(fixture);
+
+        let opened = BridgeBillingStore::open(&dir).is_ok();
+        let after = Connection::open(dir.join(BILLING_DB_FILE))
+            .map(|connection| schema_objects(&connection));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(!opened, "an incomplete unversioned legacy layout must be refused");
+        assert_eq!(after.unwrap(), before, "refusing malformed v0 must not fill the rest of the layout");
+    }
+
+    #[test]
+    fn legacy_layout_without_receipt_primary_key_is_refused() {
+        let dir = test_dir("legacy-missing-receipt-primary-key");
+        let legacy = create_legacy_v0_database(&dir);
+        legacy.execute_batch(
+            "ALTER TABLE bridge_billing_receipts RENAME TO old_bridge_billing_receipts;
+             CREATE TABLE bridge_billing_receipts (
+               request_id TEXT NOT NULL,
+               status TEXT NOT NULL CHECK(status IN ('pending','final','unknown','unverified','conflict')),
+               actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+               unit TEXT, source_ref TEXT, task_ref TEXT,
+               observed_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO bridge_billing_receipts SELECT * FROM old_bridge_billing_receipts;
+             DROP TABLE old_bridge_billing_receipts;",
+        ).unwrap();
+        let before = snapshot_legacy_rows(&legacy);
+        drop(legacy);
+
+        let opened = BridgeBillingStore::open(&dir).is_ok();
+        let reopened = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        let after = snapshot_legacy_rows(&reopened);
+        let metadata = bridge_metadata(&reopened).unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(!opened, "v0 without the immutable receipt request key must be refused");
+        assert_eq!(metadata, None, "rejected v0 must not gain a version marker");
+        assert_eq!(after, before, "rejection must not alter legacy receipt or other rows");
+    }
+
+    #[test]
+    fn legacy_layout_without_request_mode_foreign_key_is_refused() {
+        let dir = test_dir("legacy-missing-mode-foreign-key");
+        let legacy = create_legacy_v0_database(&dir);
+        legacy.execute_batch(
+            "ALTER TABLE bridge_core_request_modes RENAME TO old_bridge_core_request_modes;
+             CREATE TABLE bridge_core_request_modes (
+               request_id TEXT PRIMARY KEY NOT NULL,
+               billing_mode TEXT NOT NULL CHECK(billing_mode IN ('quoted', 'legacy_one_shot', 'controlled_unquoted')),
+               operation_id TEXT,
+               CHECK((billing_mode = 'controlled_unquoted' AND operation_id IS NOT NULL)
+                  OR (billing_mode != 'controlled_unquoted' AND operation_id IS NULL))
+             );
+             INSERT INTO bridge_core_request_modes SELECT * FROM old_bridge_core_request_modes;
+             DROP TABLE old_bridge_core_request_modes;",
+        ).unwrap();
+        let before = snapshot_legacy_rows(&legacy);
+        drop(legacy);
+
+        let opened = BridgeBillingStore::open(&dir).is_ok();
+        let reopened = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        let after = snapshot_legacy_rows(&reopened);
+        let metadata = bridge_metadata(&reopened).unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(!opened, "v0 without the declared request-mode foreign key must be refused");
+        assert_eq!(metadata, None, "rejected v0 must not gain a version marker");
+        assert_eq!(after, before, "rejection must not alter legacy rows");
+    }
+
+    #[test]
+    fn failed_legacy_migration_rolls_back_schema_and_keeps_legacy_rows() {
+        let dir = test_dir("migration-write-failure");
+        let legacy = create_legacy_v0_database(&dir);
+        let before = snapshot_legacy_rows(&legacy);
+        drop(legacy);
+
+        let mut connection = Connection::open(dir.join(BILLING_DB_FILE)).unwrap();
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;",
+        ).unwrap();
+        let saw_uncommitted_metadata_table = std::cell::Cell::new(false);
+        let migration_error = initialize_bridge_schema(&mut connection, |transaction| {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bridge_schema_meta')",
+                [], |row| row.get(0),
+            ).unwrap();
+            saw_uncommitted_metadata_table.set(exists);
+            Err("injected failure after metadata DDL".into())
+        }).err();
+        let after_rows = snapshot_legacy_rows(&connection);
+        let metadata = bridge_metadata(&connection).unwrap();
+        drop(connection);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(saw_uncommitted_metadata_table.get(), "fault must occur after metadata DDL in the migration transaction");
+        assert_eq!(migration_error.as_deref(), Some("injected failure after metadata DDL"));
+        assert_eq!(metadata, None, "failed migration must not leave a v1 marker");
+        assert_eq!(after_rows, before, "failed migration must preserve all legacy rows and fields");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_recovery_rejects_a_foreign_lease_before_worker_confirmation() {
+        use super::super::bridge_budget_lease::BridgeBudgetLease;
+
+        let first_dir = test_dir("recovery-foreign-lease-a");
+        let second_dir = test_dir("recovery-foreign-lease-b");
+        let first = BridgeBillingStore::open(&first_dir).unwrap();
+        let mut second = BridgeBillingStore::open(&second_dir).unwrap();
+        let mut foreign_lease = BridgeBudgetLease::try_acquire(&first).unwrap().unwrap();
+        let before = second.bridge_identity().unwrap().1;
+        let confirmed = std::cell::Cell::new(false);
+        let result = second.rotate_event_generation_for_recovery(&mut foreign_lease, || {
+            confirmed.set(true);
+            Ok(())
+        });
+        let after = second.bridge_identity().unwrap().1;
+        drop(foreign_lease);
+        drop(second);
+        drop(first);
+        std::fs::remove_dir_all(first_dir).unwrap();
+        std::fs::remove_dir_all(second_dir).unwrap();
+
+        assert!(result.is_err(), "recovery must reject another bridge instance's lease");
+        assert!(!confirmed.get(), "foreign lease must be rejected before worker confirmation");
+        assert_eq!(after, before, "foreign lease must not rotate the stored generation");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_recovery_rotates_only_after_worker_stop_confirmation() {
+        use super::super::bridge_budget_lease::BridgeBudgetLease;
+
+        let dir = test_dir("explicit-generation-recovery");
+        let mut store = BridgeBillingStore::open(&dir).unwrap();
+        let before = store.bridge_identity().unwrap().1;
+        let mut lease = BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
+        let after_acquire = store.bridge_identity().unwrap().1;
+        let denied = store.rotate_event_generation_for_recovery(&mut lease, || {
+            Err("old charging workers are still active".into())
+        });
+        let after_denied = store.bridge_identity().unwrap().1;
+        let rotated = store.rotate_event_generation_for_recovery(&mut lease, || Ok(()));
+        let after_rotation = store.bridge_identity().unwrap().1;
+        drop(lease);
+        drop(store);
+        let reopened = BridgeBillingStore::open(&dir).unwrap();
+        let after_reopen = reopened.bridge_identity().unwrap().1;
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert_eq!(after_acquire, before, "acquiring a lease must not rotate generation");
+        assert!(denied.is_err(), "workers still active must block recovery");
+        assert_eq!(after_denied, before, "failed recovery must retain the old generation");
+        assert!(rotated.is_ok(), "confirmed worker shutdown should permit explicit recovery");
+        assert_eq!(rotated.unwrap(), after_rotation);
+        assert_ne!(after_rotation, before, "explicit recovery must mint a new generation");
+        assert_eq!(after_reopen, after_rotation, "reopening must retain the recovered generation");
+    }
 
     #[test]
     fn core_controlled_attribution_rejects_operation_or_mode_rebinding() {
