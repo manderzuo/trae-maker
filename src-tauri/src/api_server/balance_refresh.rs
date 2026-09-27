@@ -6,7 +6,17 @@ fn refresh_one<F>(pool:&ApiPool,uid:&str,read:F)->Result<(),String>
 where F:FnOnce(&super::pool::PickedAccount)->Result<Vec<serde_json::Value>,String> {
     let Some(account)=pool.completed_resource_credentials(uid) else {return Ok(())};
     let observed=chrono::Utc::now().timestamp_millis();
-    let packs=read(&account)?;
+    let mut packs=read(&account)?;
+    // The native dashboard counts an explicit empty usage object as an unused
+    // reward pack. Apply that display contract to this local copy only. The
+    // admission/rebase parser keeps its stricter independent evidence rules;
+    // no request receipt or financial row is synthesized here.
+    for pack in &mut packs {
+        if pack.pointer("/entitlement_base_info/quota/credits_limit").is_some()
+            && pack.get("usage").and_then(serde_json::Value::as_object).is_some_and(|m|m.is_empty()) {
+            pack["usage"]=serde_json::json!({"credits_amount":"0"});
+        }
+    }
     let (general,work)=super::bridge_capacity_source::PackObservation::parse(&packs,observed)?.balances()?;
     pool.observe_verified_capacity(uid,general,work,observed)
 }
@@ -34,6 +44,14 @@ mod tests {
         assert_eq!(pool.bridge_credit_snapshots(),before);
         assert!(refresh_one(&pool,"a",|_|Ok(vec![json!({"entitlement_base_info":{"product_id":208,"quota":{"credits_limit":"10"}},"usage":null})])).is_err());
         assert_eq!(pool.bridge_credit_snapshots(),before);
+    }
+    #[test]
+    fn sparse_unused_reward_is_visible_without_becoming_settlement_evidence() {
+        let pool=pool();
+        let packs=vec![json!({"entitlement_base_info":{"entitlement_id":"unused-reward","product_id":208,"quota":{"credits_limit":"150"}},"usage":{}})];
+        refresh_one(&pool,"a",|_|Ok(packs.clone())).unwrap();
+        assert_eq!(pool.bridge_credit_snapshots()[0].1,Some(150.0),"dashboard must match native available-credit display");
+        assert_eq!(super::super::bridge_capacity_source::PackObservation::parse(&packs,1).unwrap().balances().unwrap(),(0,0),"display interpretation must not change debit evidence");
     }
     #[test]
     fn disabled_account_does_not_trigger_upstream_request() {

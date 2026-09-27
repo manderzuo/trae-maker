@@ -119,7 +119,9 @@ fn parse_native_estimate(value:&Value,item:&str)->Result<i64,String> {
 fn parse_risk_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64),String> {
     if value["version"].as_u64()!=Some(1) {return Err("budget_policy_invalid".into());}
     let entries=value["profiles"].as_array().ok_or("budget_policy_invalid")?;
-    let matches:Vec<_>=entries.iter().filter(|p|p["profile"].as_str()==Some(profile)).collect();
+    // Catalog/dispatch model IDs are ASCII-case insensitive. Apply the same
+    // contract to policy lookup, retaining the exact-one-match ambiguity guard.
+    let matches:Vec<_>=entries.iter().filter(|p|p["profile"].as_str().is_some_and(|p|p.eq_ignore_ascii_case(profile))).collect();
     if matches.len()!=1 {return Err("budget_policy_unconfigured".into());}
     let p=matches[0];
     let version=p["policy_version"].as_str().filter(|s|!s.trim().is_empty() && s.len()<=256).ok_or("budget_policy_invalid")?;
@@ -313,6 +315,15 @@ pub(super) fn video_hold(estimate:i64,observed:i64)->Result<i64,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn risk_policy_matches_catalog_model_case_but_rejects_ambiguous_duplicates() {
+        let mut policies=json!({"version":1,"profiles":[{"profile":"chat:deepseek-v4-flash","hold_credits":"10","policy_version":"fixture","source":"bounded test","expires_at_ms":100}]});
+        assert_eq!(parse_risk_policy(&policies,"chat:DeepSeek-V4-Flash",1).unwrap().0,10_000_000);
+        assert!(parse_risk_policy(&policies,"chat:deepseek-v4-pro",1).is_err());
+        let mut duplicate=policies["profiles"][0].clone();duplicate["profile"]=json!("chat:DeepSeek-V4-Flash");
+        policies["profiles"].as_array_mut().unwrap().push(duplicate);
+        assert!(parse_risk_policy(&policies,"chat:deepseek-v4-flash",1).is_err(),"case aliases must never select an arbitrary budget");
+    }
     fn pack(product:i64,limit:&str,used:&str,start:i64,end:i64)->Value {
         json!({"entitlement_base_info":{"product_id":product,"quota":{"credits_limit":limit},"start_time":start},
             "usage":{"credits_amount":used},"expire_time":end})
