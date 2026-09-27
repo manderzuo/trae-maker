@@ -1,5 +1,7 @@
 # AGENT.md — AI Work 助手 (ai-work-assistant) v3.3.5
 
+> 2026-09-28 v2 素材预算：见 `docs/bridge-reference-budgets.md`。上传素材重复校验摘要和类型；参考视频风险档案含服务端校验的参考总时长，count-only 不放行，未知格式明确400。部署风险政策与真实验收独立，不能把代码支持当作所有档位价格已校准。
+
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
 

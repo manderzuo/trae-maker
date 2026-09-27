@@ -73,7 +73,9 @@ pub(super) async fn prepare(State(state):State<Arc<ApiSharedState>>,
         Ok(Err(reason))=>{
             let code=match reason.as_str() {
                 "budget_policy_unconfigured"|"budget_policy_expired"|"upstream_account_unavailable"|"upstream_capacity_insufficient"|
-                "upstream_capacity_unavailable"|"native_estimate_unavailable"|"bridge_recovery_required"|"reference_video_budget_metadata_required"=>reason.as_str(),
+                "upstream_capacity_unavailable"|"native_estimate_unavailable"|"bridge_recovery_required"=>reason.as_str(),
+                "reference_video_budget_metadata_required"|"reference_video_metadata_invalid"|
+                "reference_video_format_unsupported"|"reference_asset_type_mismatch"|"reference_asset_unavailable"=>return error(StatusCode::BAD_REQUEST,&reason),
                 "budget_preparation_busy"=>return error(StatusCode::CONFLICT,"budget_preparation_busy"),
                 "prepared request identity conflict"=>return error(StatusCode::CONFLICT,"budget_identity_conflict"),
                 "invalid_budget_business_request"=>return error(StatusCode::BAD_REQUEST,"invalid_budget_business_request"),

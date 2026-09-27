@@ -552,6 +552,10 @@ pub fn read_public(
         .ok_or_else(|| "素材不存在、已过期或链接无效".to_string())?;
     let path = file_path(data_dir, &record)?;
     let bytes = fs::read(path).map_err(|e| format!("读取素材失败: {e}"))?;
+    if bytes.len() > MAX_ASSET_BYTES || bytes.len() as u64 != record.size
+        || format!("{:x}", Sha256::digest(&bytes)) != record.sha256 {
+        return Err("素材内容与上传时的摘要不一致".into());
+    }
     Ok((record, bytes))
 }
 
@@ -573,6 +577,10 @@ pub fn read_owned(
         .ok_or_else(|| "素材不存在、已过期或无权访问".to_string())?;
     let path = file_path(data_dir, &record)?;
     let bytes = fs::read(path).map_err(|e| format!("读取素材失败: {e}"))?;
+    if bytes.len() > MAX_ASSET_BYTES || bytes.len() as u64 != record.size
+        || format!("{:x}", Sha256::digest(&bytes)) != record.sha256 {
+        return Err("素材内容与上传时的摘要不一致".into());
+    }
     Ok((record, bytes))
 }
 
@@ -652,12 +660,15 @@ mod tests {
         let (_, bytes) = read_owned(&root, "key-a", &record.id).unwrap();
         assert_eq!(bytes, png);
         assert!(read_owned(&root, "key-b", &record.id).is_err());
+        let path = file_path(&root, &record).unwrap();
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nother").unwrap();
+        assert!(read_owned(&root, "key-a", &record.id).is_err(), "same-size file replacement must fail the saved digest");
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn core_asset_storage_does_not_touch_legacy_index_and_verifies_digest() {
-        let root = std::path::PathBuf::from(r"D:\gpt").join(format!(
+        let root = std::env::temp_dir().join(format!(
             "aiwork-assets-core-{}",
             rand::random::<u64>()
         ));

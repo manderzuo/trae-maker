@@ -17,6 +17,7 @@ pub(crate) mod bridge_dispatch;
 pub(crate) mod bridge_artifacts;
 pub(crate) mod bridge_chunks;
 pub(crate) mod bridge_capacity_source;
+pub(crate) mod bridge_reference;
 pub mod custom_models;
 pub mod custom_route;
 pub mod conversation;

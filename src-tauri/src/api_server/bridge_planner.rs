@@ -15,9 +15,17 @@ pub(super) trait PreparationSource {
     fn estimate(&self,account:&PickedAccount,workload:i64)->Result<i64,String>;
     fn policy(&self,profile:&str,now:i64)->Result<(i64,String,i64),String>;
     fn normalize(&self,account:&PickedAccount,body:&Value,video:bool,key:&str)->Result<Value,String>;
+    fn reference_seconds(&self,body:&Value)->Result<Option<u64>,String> {
+        if ["video_urls","video_asset_ids"].iter().any(|k|body[k].as_array().is_some_and(|v|!v.is_empty())) {
+            Err("reference_video_budget_metadata_required".into())
+        } else {Ok(None)}
+    }
 }
 pub(super) struct NativePreparationSource<'a>(pub &'a super::ApiSharedState,pub &'a str);
 impl PreparationSource for NativePreparationSource<'_> {
+    fn reference_seconds(&self,body:&Value)->Result<Option<u64>,String> {
+        super::bridge_reference::owned_reference_seconds(&self.0.data_dir,self.1,body)
+    }
     fn select(&self,video:bool,excluded:&HashSet<String>)->Result<PickedAccount,String> {
         self.0.pool.pick_excluding_for(excluded,if video {super::pool::ResourceKind::Work} else {super::pool::ResourceKind::General})
             .ok_or("upstream_account_unavailable".into())
@@ -119,9 +127,12 @@ fn parse_risk_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64)
     let expires=p["expires_at_ms"].as_i64().filter(|n|*n>now).ok_or("budget_policy_expired")?;
     let hold=micro(&p["hold_credits"])?;
     if hold<=0 {return Err("budget_policy_invalid".into());}
-    // Reference-video price depends on verified reference duration. Until that
-    // metadata adapter exists, a count-only profile cannot authorize its spend.
-    if profile.contains(":video") && !profile.ends_with(":video0") {return Err("reference_video_budget_metadata_required".into());}
+    // This profile suffix is produced by the server's immutable local media
+    // inspection, never accepted from client JSON or the language model.
+    if profile.contains(":video") && !profile.ends_with(":video0")
+        && !profile.rsplit_once(":ref_seconds").is_some_and(|(_,s)|s.parse::<u64>().is_ok_and(|v|(1..=60).contains(&v))) {
+        return Err("reference_video_budget_metadata_required".into());
+    }
     Ok((hold,version.into(),expires))
 }
 pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource,now:i64)->Result<PreparedBudget,String> {
@@ -145,10 +156,11 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         let active:bool=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM bridge_core_api_keys WHERE key_id=?1 AND active=1 AND snapshot_version>0)",[&request.core_key_id],|r|r.get(0)).map_err(|e|e.to_string())?;
         if active {Ok(())} else {Err("core_key_not_active".into())}
     })?;
-    let (body,profile,workload)=if video {video_profile(&request.body)?} else {
+    let (body,mut profile,workload)=if video {video_profile(&request.body)?} else {
         let (body,profile)=chat_profile(&request.body,&request.model,&request.step_kind)?;
         (body,profile,None)
     };
+    if video {if let Some(seconds)=source.reference_seconds(&body)? {profile.push_str(&format!(":ref_seconds{seconds}"));}}
     let mut excluded=HashSet::new();
     let mut last_error="upstream_account_unavailable".to_string();
     // Only preparation may try another account. Bound read-side work and never
@@ -346,6 +358,15 @@ mod tests {
         assert_eq!(video_hold(374_625_200,0).unwrap(),413_000_000);
         assert_eq!(video_hold(40_000_000,56_208_000).unwrap(),62_000_000);
         assert!(video_hold(0,0).is_err());assert!(video_hold(i64::MAX,0).is_err());
+    }
+    #[test]
+    fn reference_policy_requires_server_measured_duration_and_never_uses_count_only_price() {
+        let profile="seedance2-fast:480p:16:9:5s:images0:video1:ref_seconds6";
+        let policy=json!({"version":1,"profiles":[{"profile":profile,"policy_version":"reference-risk-v1","source":"bounded reference calibration","expires_at_ms":300000,"hold_credits":"160"}]});
+        assert_eq!(parse_risk_policy(&policy,profile,100000).unwrap().0,160_000_000);
+        for bad in ["seedance2-fast:480p:16:9:5s:images0:video1","seedance2-fast:480p:16:9:5s:images0:video1:ref_seconds0","seedance2-fast:480p:16:9:5s:images0:video1:ref_seconds61"] {
+            let mut p=policy.clone();p["profiles"][0]["profile"]=json!(bad);assert!(parse_risk_policy(&p,bad,100000).is_err());
+        }
     }
     #[cfg(windows)]
     #[test]
