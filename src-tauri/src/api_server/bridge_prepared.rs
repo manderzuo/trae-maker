@@ -102,6 +102,26 @@ pub(super) struct ConsumedBudget {
 pub(super) enum ConsumeOutcome { Granted(ConsumedBudget), Existing(String), Rejected(NoSendProof) }
 
 impl BridgeBillingStore {
+    /// Final positive receipts are the durable calibration record. Read only
+    /// successful videos on this account; conflicts/unknown/zero bills cannot
+    /// become pricing evidence. No second mutable money ledger is introduced.
+    pub(super) fn confirmed_video_prices(&self,account:&str,since:i64,now:i64)->Result<Vec<(String,i64)>,String> {
+        let mut stmt=self.connection.prepare("SELECT p.budget_id,r.actual_microcredits FROM bridge_prepared_budgets p
+            JOIN bridge_budget_receipts r ON r.budget_id=p.budget_id
+            JOIN bridge_budget_executions e ON e.budget_id=p.budget_id
+            WHERE p.account_ref=?1 AND p.created_at_ms>=?2 AND p.created_at_ms<=?3
+              AND r.receipt_state='final' AND r.actual_microcredits>0
+              AND e.step_kind='video' AND e.execution_state='succeeded'
+            ORDER BY p.created_at_ms DESC,p.budget_id DESC LIMIT 512").map_err(db_error)?;
+        let rows=stmt.query_map(params![account,since,now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).map_err(db_error)?;
+        let mut prices=std::collections::BTreeMap::<String,i64>::new();
+        for row in rows {
+            let (id,actual)=row.map_err(db_error)?;let env=required_row(&self.connection,&id)?.decrypt()?;
+            if env.input.account_ref!=account || env.input.step_kind!="video" {return Err("calibration identity mismatch".into());}
+            let high=prices.entry(env.input.pricing_profile_key).or_default();*high=(*high).max(actual);
+        }
+        Ok(prices.into_iter().collect())
+    }
     /// Return the encrypted original response before any account selection or
     /// material upload. The business claim is independent of normalized body.
     pub(super) fn replay_business_preparation(&self,lease:&BridgeBudgetLease,request:&str,claim:&Value)->Result<Option<PreparedBudget>,String> {

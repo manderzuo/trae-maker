@@ -146,12 +146,18 @@ fn parse_risk_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64)
     // Catalog/dispatch model IDs are ASCII-case insensitive. Apply the same
     // contract to policy lookup, retaining the exact-one-match ambiguity guard.
     let matches:Vec<_>=entries.iter().filter(|p|p["profile"].as_str().is_some_and(|p|p.eq_ignore_ascii_case(profile))).collect();
-    if matches.is_empty() {return default_chat_policy(profile);}
+    if matches.is_empty() {
+        if video_spec(profile).is_some() {return neighboring_policy(value,profile,now);}
+        return default_chat_policy(profile);
+    }
     if matches.len()!=1 {return Err("budget_policy_unconfigured".into());}
     let p=matches[0];
     let version=p["policy_version"].as_str().filter(|s|!s.trim().is_empty() && s.len()<=256).ok_or("budget_policy_invalid")?;
     if !p["source"].as_str().is_some_and(|s|!s.trim().is_empty()) {return Err("budget_policy_invalid".into());}
-    let expires=p["expires_at_ms"].as_i64().filter(|n|*n>now).ok_or("budget_policy_expired")?;
+    let expires=p["expires_at_ms"].as_i64().ok_or("budget_policy_invalid")?;
+    if expires<=now {
+        return if video_spec(profile).is_some() {neighboring_policy(value,profile,now).map_err(|e|if e=="budget_policy_unconfigured" {"budget_policy_expired".into()} else {e})} else {Err("budget_policy_expired".into())};
+    }
     let hold=micro(&p["hold_credits"])?;
     if hold<=0 {return Err("budget_policy_invalid".into());}
     // This profile suffix is produced by the server's immutable local media
@@ -161,6 +167,61 @@ fn parse_risk_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64)
         return Err("reference_video_budget_metadata_required".into());
     }
     Ok((hold,version.into(),expires))
+}
+
+fn video_spec(profile:&str)->Option<(String,String,i64)> {
+    let fields:Vec<_>=profile.splitn(6,':').collect();
+    if fields.len()!=6 || fields[0]!="seedance2-fast" || !matches!(fields[1],"480p"|"720p") || fields[2]!="16" || fields[3]!="9" {return None;}
+    let duration=fields[4].strip_suffix('s')?.parse::<i64>().ok().filter(|d|(4..=15).contains(d))?;
+    let reference:Vec<_>=fields[5].split(':').collect();
+    if !(2..=3).contains(&reference.len()) {return None;}
+    let images=reference[0].strip_prefix("images")?.parse::<u32>().ok()?;
+    let videos=reference[1].strip_prefix("video")?.parse::<u32>().ok()?;
+    if images>10 || videos>10 || (videos==0 && reference.len()!=2) {return None;}
+    if videos>0 && (reference.len()!=3 || !reference[2].strip_prefix("ref_seconds").and_then(|s|s.parse::<u32>().ok()).is_some_and(|s|(1..=60).contains(&s))) {return None;}
+    Some((fields[..4].join(":"),fields[5].into(),duration))
+}
+fn neighbor<'a,T>(target:i64,candidates:&'a [(i64,T)])->Option<&'a (i64,T)> {
+    candidates.iter().filter(|(d,_)|*d>=target).min_by_key(|(d,_)|*d)
+        .or_else(||candidates.iter().max_by_key(|(d,_)|*d))
+}
+fn scale_hold(amount:i64,source:i64,target:i64)->Result<i64,String> {
+    if amount<=0 || source<=0 || target<=0 {return Err("invalid video estimate".into());}
+    if target<=source {return Ok(amount);}
+    let value=(i128::from(amount)*i128::from(target)+i128::from(source)-1)/i128::from(source);
+    i64::try_from(((value+999_999)/1_000_000)*1_000_000).map_err(|_|"video budget overflow".into())
+}
+fn neighboring_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64),String> {
+    let (family,reference,target)=video_spec(profile).ok_or("budget_policy_unconfigured")?;
+    let entries=value["profiles"].as_array().ok_or("budget_policy_invalid")?;
+    let candidates:Vec<_>=entries.iter().filter_map(|p| {
+        let name=p["profile"].as_str()?;let (f,r,d)=video_spec(name)?;
+        (name!=profile && f==family && r==reference && p["expires_at_ms"].as_i64().is_some_and(|t|t>now)).then_some((d,name))
+    }).collect();
+    let (duration,name)=neighbor(target,&candidates).ok_or("budget_policy_unconfigured")?;
+    let (amount,version,expiry)=parse_risk_policy(value,name,now)?;
+    let version:String=version.chars().take(96).collect();
+    Ok((scale_hold(amount,*duration,target)?,format!("neighbor-risk-v1:{duration}s:{version}"),expiry))
+}
+fn observed_video_budget(prices:&[(String,i64)],profile:&str)->Result<Option<(i64,String,&'static str)>,String> {
+    if let Some((_,amount))=prices.iter().find(|(p,_)|p==profile) {
+        return Ok(Some((video_hold(*amount,0)?,"observed-price-buffer-v1".into(),"observed_actual")));
+    }
+    let Some((family,reference,target))=video_spec(profile) else {return Ok(None)};
+    let candidates:Vec<_>=prices.iter().filter_map(|(p,amount)| {
+        let (f,r,d)=video_spec(p)?;(f==family && r==reference).then_some((d,*amount))
+    }).collect();
+    let Some((duration,amount))=neighbor(target,&candidates) else {return Ok(None)};
+    Ok(Some((video_hold(scale_hold(*amount,*duration,target)?,0)?,format!("observed-neighbor-risk-v1:{duration}s"),"policy_only")))
+}
+fn fallback_video_budget(source:&dyn PreparationSource,profile:&str,now:i64,observed:Option<(i64,String,&'static str)>)->Result<(i64,String,i64,&'static str),String> {
+    match source.policy(profile,now) {
+        Ok((hold,version,expiry))=>Ok((hold,version,expiry,"policy_only")),
+        Err(error) if matches!(error.as_str(),"budget_policy_unconfigured"|"budget_policy_expired")=> {
+            observed.map(|(hold,version,evidence)|(hold,version,i64::MAX,evidence)).ok_or(error)
+        },
+        Err(error)=>Err(error),
+    }
 }
 pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource,now:i64)->Result<PreparedBudget,String> {
     use super::{bridge_budget::{CapacityEligibility,CapacitySnapshot,CapacityReservation,check_capacity},bridge_prepared::TrustedPreparation};
@@ -216,10 +277,18 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         // can still admit a request within its already verified capacity.
         let _=super::bridge_capacity_source::reconcile_increased_capacity(runtime,&account.uid,live.general,live.work,||source.capacity(&account));
     }
-    let (hold,policy,expiry,evidence)=if let Some(workload)=workload {
-        let estimate=source.estimate(&account,workload)?;
-        let observed=runtime.with_store(|s,_|s.confirmed_profile_high_water(&account.uid,&profile,now.saturating_sub(7*86400*1000)))?;
-        (video_hold(estimate,observed)?,"native-estimate-buffer-v1".to_string(),i64::MAX,"native_estimate")
+    let (hold,policy,expiry,evidence)=if video {
+        let prices=runtime.with_store(|s,_|s.confirmed_video_prices(&account.uid,now.saturating_sub(7*86400*1000),now))?;
+        let observed=observed_video_budget(&prices,&profile)?;
+        if let Some((hold,version,"observed_actual"))=observed.as_ref() {
+            (*hold,version.clone(),i64::MAX,"observed_actual")
+        } else if let Some(workload)=workload {
+            match source.estimate(&account,workload) {
+                Ok(estimate)=>(video_hold(estimate,0)?,"native-estimate-buffer-v1".to_string(),i64::MAX,"native_estimate"),
+                Err(error) if error=="native_estimate_unavailable"=>fallback_video_budget(source,&profile,now,observed)?,
+                Err(error)=>return Err(error),
+            }
+        } else {fallback_video_budget(source,&profile,now,observed)?}
     } else if request.step_kind=="assist" {
         (2_000_000,"bounded-assist-2-credit-risk-v1".into(),i64::MAX,"policy_only")
     } else {
@@ -323,10 +392,14 @@ pub(super) fn video_profile(body:&Value)->Result<(Value,String,Option<i64>),Stri
     if images>10 || videos>10 {return Err("too many references".into());}
     // Native workload has only been captured for these exact unreferenced
     // profiles. Other specifications require explicit local risk policy.
-    let workload=if resolution=="720p" && ratio=="16:9" && images==0 && videos==0 {
+    let workload=if resolution=="720p" && images==0 && videos==0 {
         match duration {10=>Some(225000),15=>Some(337500),_=>None}
     } else {None};
-    let profile=format!("seedance2-fast:{resolution}:{ratio}:{duration}s:images{images}:video{videos}");
+    // Aspect ratio is an execution parameter, not a pricing dimension for
+    // Seedance Fast 480p/720p. Keep the legacy 16:9 policy namespace so existing
+    // calibrated duration/resolution budgets and receipts remain usable. The
+    // actual body retains the requested ratio. Reference classes stay separate.
+    let profile=format!("seedance2-fast:{resolution}:16:9:{duration}s:images{images}:video{videos}");
     Ok((body,profile,workload))
 }
 pub(super) fn video_hold(estimate:i64,observed:i64)->Result<i64,String> {
@@ -340,6 +413,77 @@ pub(super) fn video_hold(estimate:i64,observed:i64)->Result<i64,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_video_spec_uses_longer_neighbor_without_crossing_reference_class() {
+        let policies=json!({"version":1,"profiles":[
+            {"profile":"seedance2-fast:720p:16:9:5s:images0:video0","hold_credits":"133","policy_version":"five","source":"calibrated","expires_at_ms":200},
+            {"profile":"seedance2-fast:720p:16:9:10s:images0:video0","hold_credits":"280","policy_version":"ten","source":"calibrated","expires_at_ms":200}
+        ]});
+        let quote=parse_risk_policy(&policies,"seedance2-fast:720p:16:9:7s:images0:video0",100).unwrap();
+        assert_eq!(quote.0,280_000_000);
+        assert!(quote.1.contains("neighbor"));
+        assert_eq!(parse_risk_policy(&policies,"seedance2-fast:720p:16:9:12s:images0:video0",100).unwrap().0,336_000_000);
+        for other in ["seedance2-fast:480p:16:9:7s:images0:video0","seedance2-fast:720p:16:9:7s:images1:video0",
+            "seedance2-fast:720p:16:9:7s:images0:video1:ref_seconds6"] {
+            assert!(parse_risk_policy(&policies,other,100).is_err());
+        }
+        assert!(parse_risk_policy(&policies,"seedance2-fast:720p:16:9:7s:images0:video0",201).is_err());
+    }
+    #[test]
+    fn observed_neighbor_prices_preserve_reference_class_and_buffer_only_the_hold() {
+        let prices=vec![("seedance2-fast:720p:16:9:5s:images1:video0".into(),120_000_000),
+            ("seedance2-fast:720p:16:9:10s:images1:video0".into(),250_000_000)];
+        let exact=observed_video_budget(&prices,"seedance2-fast:720p:16:9:5s:images1:video0").unwrap().unwrap();
+        assert_eq!((exact.0,exact.2),(132_000_000,"observed_actual"));
+        let neighbor=observed_video_budget(&prices,"seedance2-fast:720p:16:9:7s:images1:video0").unwrap().unwrap();
+        assert_eq!((neighbor.0,neighbor.2),(275_000_000,"policy_only"));
+        assert_eq!(observed_video_budget(&prices,"seedance2-fast:720p:16:9:12s:images1:video0").unwrap().unwrap().0,330_000_000);
+        for other in ["seedance2-fast:480p:16:9:7s:images1:video0","seedance2-fast:720p:16:9:7s:images0:video0",
+            "seedance2-fast:720p:16:9:7s:images1:video1:ref_seconds6"] {
+            assert!(observed_video_budget(&prices,other).unwrap().is_none());
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn finalized_video_price_survives_restart_and_prepares_next_task_without_exact_policy() {
+        use std::sync::atomic::{AtomicBool,Ordering};
+        struct Source {known:AtomicBool}
+        impl PreparationSource for Source {
+            fn select(&self,_:bool,_:&HashSet<String>)->Result<PickedAccount,String> {Ok(PickedAccount {uid:"account".into(),jwt:"fixture".into(),device_id:"d".into(),machine_id:"d".into(),domain:String::new(),enterprise_id:String::new(),global_region:false})}
+            fn capacity(&self,_:&PickedAccount)->Result<Vec<Value>,String> {Ok(vec![pack(208,"1000","0",0,4102444800)])}
+            fn estimate(&self,_:&PickedAccount,_:i64)->Result<i64,String> {Err("native_estimate_unavailable".into())}
+            fn policy(&self,_:&str,_:i64)->Result<(i64,String,i64),String> {if self.known.load(Ordering::SeqCst) {Ok((40_000_000,"first-risk".into(),i64::MAX))} else {Err("budget_policy_unconfigured".into())}}
+            fn normalize(&self,_:&PickedAccount,b:&Value,_:bool,_:&str)->Result<Value,String> {Ok(b.clone())}
+        }
+        let dir=std::env::temp_dir().join(format!("aiwork-calibrated-price-{:032x}",rand::random::<u128>()));
+        let runtime=BridgeBudgetRuntime::start(&dir).unwrap();
+        runtime.with_store(|s,_| {s.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").map_err(|e|e.to_string())}).unwrap();
+        let now=chrono::Utc::now().timestamp_millis();
+        let mut req=PrepareRequest {wire_version:2,parent_request_id:"first".into(),request_id:"first".into(),core_key_id:"key-a".into(),request_fingerprint:"first-fingerprint".into(),endpoint:"videos".into(),model:"seedance".into(),step_kind:"video".into(),body:json!({"prompt":"cat","duration":5,"resolution":"480p"})};
+        let source=Source {known:AtomicBool::new(true)};
+        let first=prepare(&runtime,&req,&source,now-7000).unwrap();
+        runtime.with_store(|s,l| {
+            use super::super::{bridge_prepared::ConsumeOutcome,bridge_execution::ExecutionState};
+            let ConsumeOutcome::Granted(ctx)=s.consume_budget(l,&first,now-6000)? else {return Err("consume".into())};
+            s.mark_budget_send_intent(l,&first.authorization.budget_id,&ctx.consume_epoch)?;
+            s.bind_budget_task(l,&first.authorization.budget_id,"video-fixture")?;
+            s.finish_budget_result(l,&first.authorization.budget_id,ExecutionState::Succeeded,&json!({"status":"completed"}),now+1000)?;
+            super::super::bridge_receipts::tests::cache(&dir,s,&[(&first.authorization.budget_id,"56.208")],2000);
+            s.confirm_budget_usage(l,&first.authorization.budget_id)?;Ok(())
+        }).unwrap();
+        runtime.begin_close();drop(runtime);
+        let runtime=BridgeBudgetRuntime::start(&dir).unwrap();source.known.store(false,Ordering::SeqCst);
+        req.request_id="next".into();req.parent_request_id="next".into();req.request_fingerprint="next-fingerprint".into();
+        let next=prepare(&runtime,&req,&source,now+4000).expect("a verified final sample must replace missing precise policy after restart");
+        assert_eq!(next.authorization.hold_credits.as_microcredits(),62_000_000);
+        assert_eq!(next.evidence_level,"observed_actual");
+        runtime.with_store(|s,_| {
+            s.connection.execute("UPDATE bridge_budget_receipts SET receipt_state='conflict' WHERE budget_id=?1",[&first.authorization.budget_id]).map_err(|e|e.to_string())?;
+            assert!(s.confirmed_video_prices("account",now-10000,now+4000)?.is_empty(),"conflicted receipts must immediately stop calibrating future holds");
+            Ok(())
+        }).unwrap();
+        runtime.begin_close();drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn advertised_chat_models_have_bounded_model_specific_budget_without_calibration_entries() {
         let empty=json!({"version":1,"profiles":[]});
@@ -408,6 +552,20 @@ mod tests {
             json!({"prompt":"cat","duration":5.5}),json!({"prompt":"cat","session_id":"override"}),json!({"prompt":"cat","account_ref":"user-chosen"})] {
             assert!(video_profile(&body).is_err());
         }
+    }
+    #[test]
+    fn aspect_ratio_preserves_execution_but_shares_calibrated_price() {
+        for resolution in ["480p","720p"] {
+            for duration in 4..=15 {
+                for ratio in ["16:9","9:16","1:1","4:3","3:4","21:9"] {
+                    let (body,profile,_)=video_profile(&json!({"prompt":"cat","duration":duration,"resolution":resolution,"ratio":ratio})).unwrap();
+                    assert_eq!(body["ratio"],ratio);
+                    assert_eq!(profile,format!("seedance2-fast:{resolution}:16:9:{duration}s:images0:video0"));
+                }
+            }
+        }
+        let (_,profile,_)=video_profile(&json!({"prompt":"cat","duration":5,"resolution":"720p","ratio":"9:16","image_asset_ids":["asset-1"]})).unwrap();
+        assert_eq!(profile,"seedance2-fast:720p:16:9:5s:images1:video0");
     }
     #[test]
     fn video_budget_rounds_up_buffered_max_not_key_balance() {

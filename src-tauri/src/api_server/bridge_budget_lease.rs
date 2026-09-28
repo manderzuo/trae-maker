@@ -2,7 +2,12 @@ use super::bridge_billing::{
     is_dirty_bridge_generation, is_recovery_required_generation, BridgeBillingStore,
 };
 
+#[cfg(not(test))]
 const HOST_ACTIVITY_MUTEX: &str = "Global\\AIWorkBridgeBilling-host-v1";
+// Tests retain the same exclusive host lease contract in a separate namespace.
+// They must not stop a live production gateway merely to acquire a fixture lease.
+#[cfg(test)]
+const HOST_ACTIVITY_MUTEX: &str = "Global\\AIWorkBridgeBilling-test-host-v1";
 
 /// Keep this guard alive until every charging worker using the instance has exited.
 /// The Windows mutexes are owned by dedicated threads so this guard can be dropped
