@@ -144,6 +144,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/internal/bridge/models", get(super::bridge_api::models))
         .route("/internal/bridge/summary", get(super::bridge_api::summary))
         .route("/internal/bridge/quotes", post(super::bridge_api::quote))
+        .route("/internal/bridge/v2/video-capabilities", get(super::video_capabilities::get))
         .route("/internal/bridge/v2/requests/:request_id/execution", get(super::bridge_v2_api::execution))
         .route("/internal/bridge/v2/requests/:request_id/result", get(super::bridge_v2_api::result))
         .route("/internal/bridge/v2/requests/:request_id/chunks", get(super::bridge_v2_api::chunks))
@@ -1189,6 +1190,21 @@ mod tests {
             .unwrap();
         let response = fixture.take_app().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn video_capabilities_require_bridge_auth_and_do_not_disable_normal_video() {
+        let mut fixture=BridgeFixture::new();let app=fixture.take_app();
+        let response=app.clone().oneshot(Request::builder().uri("/internal/bridge/v2/video-capabilities").header("authorization",format!("Bearer {}",fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK);
+        let value:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(value["native_first_frame"],false);assert_eq!(value["native_video_extend"],false);
+        let response=app.clone().oneshot(Request::builder().uri("/internal/bridge/v2/video-capabilities").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::FORBIDDEN);
+        let response=app.oneshot(Request::builder().method("POST").uri("/v1/videos/generations").header("authorization",format!("Bearer {}",fixture.key)).header("content-type","application/json").body(Body::from("{}" )).unwrap()).await.unwrap();
+        assert_ne!(response.status(),StatusCode::NOT_FOUND);
+        let bytes=axum::body::to_bytes(response.into_body(),65536).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("continuation_mode_unsupported"));
     }
 
     #[tokio::test]
