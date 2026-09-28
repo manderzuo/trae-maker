@@ -741,7 +741,7 @@ export interface PoolStatus {
 
 export interface ApiPoolFile {
   enabled_uids: string[];
-  /** 调度策略：expire_first（默认）/ credit_first / random / weighted / p2c / sequential_drain */
+  /** 调度策略：expire_first（默认）/ credit_first / credit_low_first / random / weighted / p2c / sequential_drain */
   strategy?: string;
   /** Buddy 池调度策略（取值同 strategy）；空 = 跟随 Trae 池（两池同策略） */
   wb_strategy?: string;

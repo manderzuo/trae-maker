@@ -16,6 +16,8 @@ pub enum PoolStrategy {
     ExpireFirst,
     /// 剩余通用积分多优先
     CreditFirst,
+    /// 剩余可用积分少优先（视频按通用 + Work 积分）
+    CreditLowFirst,
     /// 随机取号
     Random,
     /// 三因子加权随机（T2.2/F-29 v1.2）：积分占比×10 + 闲置补偿（每小时+0.5
@@ -33,6 +35,7 @@ impl PoolStrategy {
     pub fn parse(s: &str) -> Self {
         match s {
             "credit_first" => Self::CreditFirst,
+            "credit_low_first" => Self::CreditLowFirst,
             "random" => Self::Random,
             "weighted" => Self::Weighted,
             "p2c" => Self::P2C,
@@ -55,6 +58,7 @@ impl PoolStrategy {
         match self {
             Self::ExpireFirst => "expire_first",
             Self::CreditFirst => "credit_first",
+            Self::CreditLowFirst => "credit_low_first",
             Self::Random => "random",
             Self::Weighted => "weighted",
             Self::P2C => "p2c",
@@ -550,6 +554,11 @@ impl ApiPool {
             .unwrap_or(0);
         let picked = match strategy {
             PoolStrategy::Random => candidates[(seed as usize) % candidates.len()],
+            PoolStrategy::CreditLowFirst => candidates.iter().copied().min_by(|a, b| {
+                let aw = balances.get(&a.uid).map(video_available_credit).unwrap_or(0.0);
+                let bw = balances.get(&b.uid).map(video_available_credit).unwrap_or(0.0);
+                aw.total_cmp(&bw).then_with(|| a.uid.cmp(&b.uid))
+            }).unwrap_or(candidates[0]),
             PoolStrategy::ExpireFirst => candidates.iter().copied().min_by_key(|e| {
                 e.credits_expire_at.filter(|value| *value > 0).unwrap_or(i64::MAX)
             }).unwrap_or(candidates[0]),
@@ -963,6 +972,12 @@ fn pick_by_strategy<'a>(
         PoolStrategy::Weighted => pick_weighted(cands, rand_seed, now),
         PoolStrategy::P2C => pick_p2c(cands, rand_seed, now),
         PoolStrategy::SequentialDrain => cands.iter().copied().min_by(|a, b| a.uid.cmp(&b.uid)),
+        PoolStrategy::CreditLowFirst => cands.iter().copied()
+            .filter(|e| e.credits.is_some_and(|v| v.is_finite() && v > 0.0))
+            .min_by(|a, b| {
+                a.credits.unwrap_or(0.0).total_cmp(&b.credits.unwrap_or(0.0))
+                    .then_with(|| a.uid.cmp(&b.uid))
+            }),
         PoolStrategy::CreditFirst => cands.iter().copied().max_by(|a, b| {
             a.credits
                 .unwrap_or(0.0)
@@ -1194,6 +1209,57 @@ mod tests {
         pool.set_strategy(PoolStrategy::CreditFirst);
         let picked = pool.pick_excluding(&HashSet::new()).unwrap();
         assert_eq!(picked.uid, "uid_b");
+    }
+
+    #[test]
+    fn credit_low_first_prefers_low_positive_balance_and_skips_excluded() {
+        let pool = build_pool(&[
+            ("high", 300.0, 3_900_000_000),
+            ("low", 50.0, 4_000_000_000),
+            ("zero", 0.0, 3_800_000_000),
+        ]);
+        pool.set_strategy(PoolStrategy::parse("credit_low_first"));
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "low");
+        assert_eq!(pool.pick_excluding(&HashSet::from(["low".into()])).unwrap().uid, "high");
+        assert!(pool.pick_excluding(&HashSet::from(["low".into(), "high".into()])).is_none());
+        assert_eq!(PoolStrategy::parse("credit_low_first").as_str(), "credit_low_first");
+    }
+
+    #[test]
+    fn credit_low_first_preserves_concurrent_spread() {
+        let pool = build_pool(&[("low", 50.0, 4_000_000_000), ("high", 300.0, 4_000_000_000)]);
+        pool.set_strategy(PoolStrategy::parse("credit_low_first"));
+        // A future timestamp keeps this assertion independent of test-runner scheduling.
+        *safe_lock(&pool.recent_pick) = ("low".into(), i64::MAX);
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "high");
+        *safe_lock(&pool.recent_pick) = (String::new(), 0);
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "low");
+    }
+
+    #[test]
+    fn credit_low_first_skips_unknown_invalid_balances_and_breaks_ties_by_uid() {
+        let pool = build_pool(&[("b", 50.0, 4_000_000_000), ("a", 50.0, 4_000_000_000),
+            ("unknown", 1.0, 4_000_000_000), ("invalid", f64::NAN, 4_000_000_000)]);
+        safe_lock(&pool.entries).get_mut("unknown").unwrap().credits = None;
+        pool.set_strategy(PoolStrategy::parse("credit_low_first"));
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "a");
+        assert!(pool.pick_excluding(&HashSet::from(["a".into(), "b".into()])).is_none());
+        assert_eq!(PoolStrategy::resolve_wb("credit_low_first", ""), PoolStrategy::CreditLowFirst);
+        assert_eq!(PoolStrategy::resolve_wb("credit_low_first", "weighted"), PoolStrategy::Weighted);
+    }
+
+    #[test]
+    fn credit_low_first_video_uses_general_plus_work_and_fails_over_after_drain() {
+        let pool = build_pool(&[("a", 10.0, 3_900_000_000), ("b", 50.0, 4_000_000_000)]);
+        let now = chrono::Utc::now().timestamp_millis();
+        pool.observe_verified_capacity("a", 10_000_000, 200_000_000, now).unwrap();
+        pool.observe_verified_capacity("b", 50_000_000, 0, now).unwrap();
+        pool.set_strategy(PoolStrategy::parse("credit_low_first"));
+        assert_eq!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::General).unwrap().uid, "a");
+        assert_eq!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).unwrap().uid, "b");
+        assert_eq!(pool.pick_excluding_for(&HashSet::from(["b".into()]), ResourceKind::Work).unwrap().uid, "a");
+        pool.observe_verified_capacity("b", 0, 0, now + 1).unwrap();
+        assert_eq!(pool.pick_excluding_for(&HashSet::new(), ResourceKind::Work).unwrap().uid, "a");
     }
 
     #[test]

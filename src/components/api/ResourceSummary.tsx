@@ -29,12 +29,13 @@ function Row({ label, value }: { label: string; value: ReactNode }) {
 }
 
 /** 池内调度策略取值（Trae / Buddy 同一套，pool.rs PoolStrategy） */
-const STRATEGIES = ['expire_first', 'credit_first', 'random', 'weighted', 'p2c', 'sequential_drain'] as const;
+const STRATEGIES = ['expire_first', 'credit_first', 'credit_low_first', 'random', 'weighted', 'p2c', 'sequential_drain'] as const;
 
 /** 池内调度策略文案（与账号池选择下拉一致） */
 const STRATEGY_LABELS: Record<string, string> = {
   expire_first: '积分先过期优先',
   credit_first: '剩余积分多优先',
+  credit_low_first: '剩余积分少优先',
   random: '随机',
   weighted: '三因子加权随机',
   p2c: 'P2C 随机二选一',

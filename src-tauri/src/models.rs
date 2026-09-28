@@ -346,7 +346,7 @@ pub struct AccountCooldownsFile {
 pub struct ApiPoolFile {
     #[serde(default)]
     pub enabled_uids: Vec<String>,
-    /// 调度策略：expire_first（默认）/ credit_first / random / weighted / p2c / sequential_drain
+    /// 调度策略：expire_first（默认）/ credit_first / credit_low_first / random / weighted / p2c / sequential_drain
     #[serde(default)]
     pub strategy: String,
     /// Buddy 池调度策略（取值同上）；空 = 沿用 strategy（兼容旧数据两池同策略）
