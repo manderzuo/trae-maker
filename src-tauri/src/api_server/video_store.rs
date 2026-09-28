@@ -159,7 +159,7 @@ pub fn cleanup(data_dir: &Path, retention_secs: u64) -> usize {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(now);
-        if retention_secs > 0 && now.saturating_sub(old) >= retention_secs && fs::remove_file(path).is_ok() {
+        if retention_secs > 0 && now.saturating_sub(old) >= retention_secs && super::video_frames::remove_if_unleased(data_dir,&path) {
             removed += 1;
         }
     }

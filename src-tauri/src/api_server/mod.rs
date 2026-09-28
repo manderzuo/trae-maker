@@ -48,6 +48,7 @@ pub mod usage;
 pub(crate) mod usage_refresh;
 pub mod video;
 pub(crate) mod video_capabilities;
+pub(crate) mod video_frames;
 pub mod video_payload;
 pub mod video_store;
 pub mod video_worker;

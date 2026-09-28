@@ -92,6 +92,12 @@ pub async fn start_api_server(
     let runtime_dir = state.data_dir.clone();
     let budget_runtime = tokio::task::spawn_blocking(move || super::bridge_runtime::BridgeBudgetRuntime::start(&runtime_dir))
         .await.map_err(|_| "bridge runtime initialization failed".to_string())??;
+    if state.data_dir.join("video-frame-extractor.json").exists() {
+        match super::video_frames::configured_extractor(&state.data_dir) {
+            Ok(_)=>eprintln!("private video frame extractor digest verified"),
+            Err(_)=>eprintln!("private video frame extractor unavailable; ordinary video and billing remain active"),
+        }
+    }
     let app = build_router(state.clone()).layer(axum::Extension(budget_runtime.clone()));
     spawn_wb_health_probe(state.clone());
     let background_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -149,6 +155,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/internal/bridge/v2/requests/:request_id/result", get(super::bridge_v2_api::result))
         .route("/internal/bridge/v2/requests/:request_id/chunks", get(super::bridge_v2_api::chunks))
         .route("/internal/bridge/v2/requests/:request_id/content", get(super::bridge_v2_api::content))
+        .route("/internal/bridge/v2/requests/:request_id/last-frame", post(super::bridge_v2_api::last_frame))
         .route("/internal/bridge/v2/requests/:request_id/billing", get(super::bridge_v2_api::billing))
         .route("/internal/bridge/v2/requests/:request_id/refresh", post(super::bridge_v2_api::refresh))
         .route("/internal/bridge/v2/receipt-events", get(super::bridge_v2_api::events))
@@ -293,6 +300,30 @@ mod tests {
         let lease=BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
         assert!(lease.charge_ready(),"normal idle restart must not require manual financial recovery");
         drop(lease);drop(store);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn last_frame_requires_exact_completed_budget_and_never_changes_billing() {
+        use super::super::{bridge_billing::BridgeBillingStore,bridge_budget::CapacitySnapshot,bridge_budget_lease::BridgeBudgetLease,bridge_prepared::{tests::input,ConsumeOutcome},bridge_execution::ExecutionState,video_frames};
+        let mut f=BridgeFixture::new();let source=video_frames::tests::Fixture::new();
+        std::fs::copy(source.0.join("video-frame-extractor.json"),f.dir.join("video-frame-extractor.json")).unwrap();
+        let artifact=super::super::video_store::artifact_path(&f.dir,"frame-video").unwrap();std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();std::fs::copy(source.clip(),&artifact).unwrap();
+        let mut store=BridgeBillingStore::open(&f.dir).unwrap();store.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").unwrap();
+        let lease=BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();store.initialize_capacity(&lease,&CapacitySnapshot {account_ref:"account".into(),snapshot_ref:"fixture".into(),epoch:1,general:100_000_000,work:100_000_000,observed_at_ms:1}).unwrap();
+        let prepared=store.prepare_budget(&lease,&input(),None,10).unwrap();let budget=&prepared.authorization.budget_id;
+        let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&prepared,20).unwrap()else{panic!("consume")};store.mark_budget_send_intent(&lease,budget,&ctx.consume_epoch).unwrap();store.bind_budget_task(&lease,budget,"frame-video").unwrap();
+        let app=f.take_app();let path=format!("/internal/bridge/v2/requests/request-video/last-frame?budget_id={budget}");
+        let request=|url:String,auth:bool|{let mut b=Request::builder().method("POST").uri(url);if auth{b=b.header("authorization",format!("Bearer {}",f.key));}b.body(Body::empty()).unwrap()};
+        assert_eq!(app.clone().oneshot(request(path.clone(),false)).await.unwrap().status(),StatusCode::FORBIDDEN);
+        assert_eq!(app.clone().oneshot(request(path.clone(),true)).await.unwrap().status(),StatusCode::CONFLICT);
+        store.finish_budget_result(&lease,budget,ExecutionState::Succeeded,&serde_json::json!({"id":"frame-video","status":"completed"}),chrono::Utc::now().timestamp_millis()).unwrap();
+        let before=store.budget_execution(budget).unwrap();let count:i64=store.connection.query_row("SELECT COUNT(*) FROM bridge_prepared_budgets",[],|r|r.get(0)).unwrap();
+        for _ in 0..2 {let r=app.clone().oneshot(request(path.clone(),true)).await.unwrap();assert_eq!(r.status(),StatusCode::OK);assert_eq!(r.headers()["x-aiwork-frame-timestamp-ms"],"875");assert_eq!(r.headers()["content-type"],"image/png");let bytes=axum::body::to_bytes(r.into_body(),8*1024*1024).await.unwrap();assert_eq!(&bytes[..8],b"\x89PNG\r\n\x1a\n");}
+        let wrong=path.replace("request-video","request-other");assert_eq!(app.clone().oneshot(request(wrong,true)).await.unwrap().status(),StatusCode::CONFLICT);
+        assert_eq!(store.budget_execution(budget).unwrap(),before);assert_eq!(store.connection.query_row("SELECT COUNT(*) FROM bridge_prepared_budgets",[],|r|r.get::<_,i64>(0)).unwrap(),count);
+        store.connection.execute("UPDATE bridge_budget_executions SET result_ciphertext=x'00' WHERE budget_id=?1",[budget]).unwrap();
+        assert_eq!(app.oneshot(request(path,true)).await.unwrap().status(),StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[cfg(windows)]

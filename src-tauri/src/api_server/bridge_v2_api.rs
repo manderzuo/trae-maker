@@ -213,6 +213,38 @@ pub(super) async fn content(State(state):State<Arc<ApiSharedState>>,Path(request
 pub(crate) async fn billing(State(state): State<Arc<ApiSharedState>>, Path(request): Path<String>, Query(query): Query<BudgetQuery>) -> Response {
     read_request(state, request, query.budget_id, "billing").await
 }
+pub(super) async fn last_frame(State(state):State<Arc<ApiSharedState>>,Path(request):Path<String>,Query(query):Query<BudgetQuery>)->Response {
+    if !super::bridge_billing::valid_request_id(&request)||!super::bridge_billing::valid_request_id(&query.budget_id){return error(StatusCode::BAD_REQUEST,"invalid_request_id");}
+    let reply=tokio::task::spawn_blocking(move||->Result<_,String>{
+        let store=BridgeBillingStore::open(&state.data_dir)?;
+        let auth=stored_budget_authorization(&store.connection,&query.budget_id)?;
+        if auth.request_id!=request||auth.endpoint!="videos"{return Err("identity_conflict".into());}
+        let execution=store.budget_execution(&query.budget_id)?.ok_or("frame_result_not_ready")?;
+        if execution.budget_id!=auth.budget_id||execution.request_id!=auth.request_id||execution.core_key_id!=auth.core_key_id||execution.account_ref!=auth.account_ref||execution.bridge_instance_id!=auth.bridge_instance_id||execution.step_kind!="video"{return Err("identity_conflict".into());}
+        if execution.state!=super::bridge_execution::ExecutionState::Succeeded||!execution.result_available{return Err("frame_result_not_ready".into());}
+        let result=store.load_budget_result(&query.budget_id)?.ok_or("frame_result_not_ready")?;
+        let task=execution.task_ref.ok_or("frame_result_not_ready")?;
+        if result["id"].as_str()!=Some(task.as_str())||result["status"]!="completed"{return Err("identity_conflict".into());}
+        drop(store);
+        let extractor=super::video_frames::configured_extractor(&state.data_dir)?;
+        let (_file,_length)=super::bridge_artifacts::open_completed(&state,&auth.account_ref,&task,&result)?;
+        let path=super::video_store::artifact_path(&state.data_dir,&task)?;
+        let frame=super::video_frames::extract_last(&state.data_dir,&path,&extractor)?;
+        let bytes=super::video_frames::read_small(&frame.path,8*1024*1024)?;
+        Ok((frame,bytes,auth))
+    }).await;
+    match reply {
+        Ok(Ok((frame,bytes,auth)))=>Response::builder().header("content-type","image/png").header("content-length",bytes.len()).header("cache-control","private, no-store")
+            .header("x-aiwork-frame-width",frame.width).header("x-aiwork-frame-height",frame.height).header("x-aiwork-frame-timestamp-ms",frame.timestamp_ms)
+            .header("x-aiwork-source-sha256",frame.source_sha256).header("x-aiwork-frame-sha256",frame.frame_sha256)
+            .header("x-aiwork-request-id",auth.request_id).header("x-aiwork-budget-id",auth.budget_id).header("x-aiwork-core-key-id",auth.core_key_id)
+            .header("x-aiwork-account-ref",auth.account_ref).header("x-aiwork-bridge-instance-id",auth.bridge_instance_id)
+            .body(axum::body::Body::from(bytes)).unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"frame_output_unavailable")),
+        Ok(Err(code)) if matches!(code.as_str(),"identity_conflict"|"frame_result_not_ready")=>error(StatusCode::CONFLICT,&code),
+        Ok(Err(code)) if matches!(code.as_str(),"frame_extractor_busy"|"artifact_recovery_busy")=>{let mut r=error(StatusCode::TOO_MANY_REQUESTS,"frame_extractor_busy");r.headers_mut().insert("retry-after","2".parse().unwrap());r},
+        _=>error(StatusCode::SERVICE_UNAVAILABLE,"frame_extraction_unavailable"),
+    }
+}
 pub(crate) async fn refresh(State(state): State<Arc<ApiSharedState>>, Path(request): Path<String>, Query(query): Query<BudgetQuery>) -> Response {
     read_request(state, request, query.budget_id, "refresh").await
 }
