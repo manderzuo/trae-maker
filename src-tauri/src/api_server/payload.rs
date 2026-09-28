@@ -28,8 +28,8 @@ pub fn sanitize_scheduler_chat_body(body: &Value) -> Value {
 /// 模型显示名 → (canonical config_name, 内部 model_name) 映射
 /// 大小写不敏感：客户端可传入 "doubao-seed-2.1-turbo" 或 "Doubao-Seed-2.1-Turbo"
 /// 与上游 batch_get_detail_param（solo_work_lite，2026-09 实测）同步
-fn model_config(model: &str) -> (&'static str, &'static str) {
-    match model.to_lowercase().as_str() {
+pub(super) fn model_config(model: &str) -> Option<(&'static str, &'static str)> {
+    Some(match model.to_lowercase().as_str() {
         "doubao-seed-evolving" => ("Doubao-Seed-Evolving", "Doubao-Seed-Evolving__dev"),
         "doubao-seed-2.1-pro" | "seed-code-pro-0430" => ("Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev"),
         "doubao-seed-2.1-turbo" => ("Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.1-Turbo__dev"),
@@ -50,8 +50,8 @@ fn model_config(model: &str) -> (&'static str, &'static str) {
         "minimax-m3" => ("minimax-m3", "minimax-m3__dev"),
         "qwen3.8-max" => ("qwen3.8-max", "qwen3.8-max__dev"),
         "qwen-3.7-plus" => ("qwen-3.7-plus", "qwen-3.7-plus__dev"),
-        _ => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
-    }
+        _ => return None,
+    })
 }
 
 /// 生成类似 UUID 的十六进制字符串
@@ -160,7 +160,11 @@ pub fn prepare_llm_chat_body_with_conversation(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default_model.to_string());
-    let (config_name, model_name) = model_config(&model);
+    // Never silently execute a different paid model. The bridge rejects unknown
+    // mappings; legacy callers retain the requested ID for an upstream error.
+    let (config_name, model_name) = model_config(&model)
+        .map(|(config, backend)| (config.to_owned(), backend.to_owned()))
+        .unwrap_or_else(|| (model.clone(), model.clone()));
 
     // normalize tool_choice and tools (reuse existing logic)
     normalize_tool_choice(obj_mut);
@@ -491,6 +495,20 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn selected_model_is_not_replaced_by_default_or_unknown_fallback() {
+        for (requested,config,backend) in [
+            ("glm-5.3-flash","glm-5.3-flash","glm-5.3-flash__dev"),
+            ("DeepSeek-V4-Pro","DeepSeek-V4-Pro","deepseek_v4_pro__dev"),
+            ("future-model","future-model","future-model"),
+        ] {
+            let body=json!({"model":requested,"messages":[{"role":"user","content":"hello"}]});
+            let value:Value=serde_json::from_slice(&prepare_llm_chat_body(&serde_json::to_vec(&body).unwrap(),"deepseek-v4-flash","uid","device","machine")).unwrap();
+            assert_eq!(value["config_name"],config);
+            assert_eq!(value["model_name"],backend);
+        }
+    }
 
     #[test]
     fn anthropic_basic_text_conversion() {

@@ -57,7 +57,11 @@ impl PreparationSource for NativePreparationSource<'_> {
         // This is administrator-owned local configuration, never a request field.
         // No policy is silently manufactured for an unsupported specification.
         let path=self.0.data_dir.join("bridge-budget-policy.json");
-        let metadata=std::fs::metadata(&path).map_err(|_|"budget_policy_unconfigured")?;
+        let metadata=match std::fs::metadata(&path) {
+            Ok(value)=>value,
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return default_chat_policy(profile),
+            Err(_)=>return Err("budget_policy_unavailable".into()),
+        };
         if metadata.len()>128*1024 {return Err("budget_policy_invalid".into());}
         let value:Value=serde_json::from_slice(&std::fs::read(path).map_err(|_|"budget_policy_unavailable")?).map_err(|_|"budget_policy_invalid")?;
         parse_risk_policy(&value,profile,now)
@@ -70,6 +74,9 @@ impl PreparationSource for NativePreparationSource<'_> {
             let value=super::video::prepare_native_request(&self.0.data_dir,self.1,body,account).map_err(|_|"reference_preparation_failed")?;
             Ok(super::video::build_request_body(&value))
         } else {
+            if !body["model"].as_str().is_some_and(|m|super::payload::model_config(m).is_some()) {
+                return Err("invalid_budget_business_request".into());
+            }
             let sanitized=super::payload::sanitize_scheduler_chat_body(body);
             let bytes=serde_json::to_vec(&sanitized).map_err(|_|"chat_normalization_failed")?;
             let bytes=super::payload::prepare_llm_chat_body_with_conversation(&bytes,&self.0.default_model,&account.uid,&account.device_id,&account.machine_id,None);
@@ -116,12 +123,30 @@ fn parse_native_estimate(value:&Value,item:&str)->Result<i64,String> {
     let amount=micro(&rows[0]["estimated_credits"])?;
     if amount<=0 {return Err("native_estimate_invalid".into());} Ok(amount)
 }
+/// Release-owned per-model risk allowances, not prices or maximum upstream bills.
+/// chat_profile bounds text to 64 KiB, output to 4096 tokens and references to
+/// ten images / 6 MiB. Only named, supported Trae adapters are eligible. Actual
+/// receipts still settle each request; unknowns retain their existing hold.
+fn default_chat_policy(profile:&str)->Result<(i64,String,i64),String> {
+    let model=profile.strip_prefix("chat:").ok_or("budget_policy_unconfigured")?;
+    let model=if let Some((model,count))=model.rsplit_once(":images") {
+        if !count.parse::<usize>().is_ok_and(|n|(1..=10).contains(&n)) {return Err("budget_policy_unconfigured".into());}
+        model
+    } else {model};
+    let (canonical,_)=super::payload::model_config(model).ok_or("budget_policy_unconfigured")?;
+    if !super::models_sync::default_models().iter().any(|m|m.id.eq_ignore_ascii_case(canonical)) {
+        return Err("budget_policy_unconfigured".into());
+    }
+    Ok((10_000_000,format!("bounded-chat-10-credit-v1:{}",canonical.to_ascii_lowercase()),i64::MAX))
+}
+
 fn parse_risk_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64),String> {
     if value["version"].as_u64()!=Some(1) {return Err("budget_policy_invalid".into());}
     let entries=value["profiles"].as_array().ok_or("budget_policy_invalid")?;
     // Catalog/dispatch model IDs are ASCII-case insensitive. Apply the same
     // contract to policy lookup, retaining the exact-one-match ambiguity guard.
     let matches:Vec<_>=entries.iter().filter(|p|p["profile"].as_str().is_some_and(|p|p.eq_ignore_ascii_case(profile))).collect();
+    if matches.is_empty() {return default_chat_policy(profile);}
     if matches.len()!=1 {return Err("budget_policy_unconfigured".into());}
     let p=matches[0];
     let version=p["policy_version"].as_str().filter(|s|!s.trim().is_empty() && s.len()<=256).ok_or("budget_policy_invalid")?;
@@ -316,10 +341,31 @@ pub(super) fn video_hold(estimate:i64,observed:i64)->Result<i64,String> {
 mod tests {
     use super::*;
     #[test]
+    fn advertised_chat_models_have_bounded_model_specific_budget_without_calibration_entries() {
+        let empty=json!({"version":1,"profiles":[]});
+        for model in super::super::models_sync::default_models() {
+            let profile=format!("chat:{}",model.id);
+            let (hold,version,expiry)=parse_risk_policy(&empty,&profile,100).unwrap();
+            assert_eq!(hold,10_000_000);
+            assert!(version.contains(&model.id.to_ascii_lowercase()));
+            assert!(expiry>100);
+        }
+        let image=parse_risk_policy(&empty,"chat:Doubao-Seed-2.1-Pro:images2",100).unwrap();
+        assert_eq!(image.0,10_000_000);
+        for unknown in ["chat:unknown-model","chat:DeepSeek-V4-Flash:images0","chat:DeepSeek-V4-Flash:images11",
+            "seedance2-fast:720p:16:9:6s:images0:video0"] {
+            assert!(parse_risk_policy(&empty,unknown,100).is_err());
+        }
+        let override_policy=json!({"version":1,"profiles":[{"profile":"chat:GLM-5.3-Flash","hold_credits":"3","policy_version":"admin-glm","source":"admin risk cap","expires_at_ms":200}]});
+        assert_eq!(parse_risk_policy(&override_policy,"chat:glm-5.3-flash",100).unwrap().0,3_000_000);
+        assert_eq!(parse_risk_policy(&override_policy,"chat:deepseek-v4-flash",100).unwrap().0,10_000_000);
+        assert!(parse_risk_policy(&override_policy,"chat:glm-5.3-flash",201).is_err(),"expired explicit policy must not silently widen to defaults");
+    }
+    #[test]
     fn risk_policy_matches_catalog_model_case_but_rejects_ambiguous_duplicates() {
         let mut policies=json!({"version":1,"profiles":[{"profile":"chat:deepseek-v4-flash","hold_credits":"10","policy_version":"fixture","source":"bounded test","expires_at_ms":100}]});
         assert_eq!(parse_risk_policy(&policies,"chat:DeepSeek-V4-Flash",1).unwrap().0,10_000_000);
-        assert!(parse_risk_policy(&policies,"chat:deepseek-v4-pro",1).is_err());
+        assert!(parse_risk_policy(&policies,"chat:unknown-model",1).is_err());
         let mut duplicate=policies["profiles"][0].clone();duplicate["profile"]=json!("chat:DeepSeek-V4-Flash");
         policies["profiles"].as_array_mut().unwrap().push(duplicate);
         assert!(parse_risk_policy(&policies,"chat:deepseek-v4-flash",1).is_err(),"case aliases must never select an arbitrary budget");
