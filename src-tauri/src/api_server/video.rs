@@ -80,6 +80,9 @@ pub struct VideoTask {
     pub updated_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Safe provider details retained in the durable task/bridge result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_error: Option<aiwork_core::UpstreamFailure>,
     /// 传输层状态，便于客户端区分异步任务桥与其它资源类型。
     pub transport: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133,6 +136,8 @@ struct PersistedVideoTask {
     created_at: u64,
     updated_at: u64,
     error: Option<String>,
+    #[serde(default)]
+    upstream_error: Option<aiwork_core::UpstreamFailure>,
     transport: String,
     video_url: Option<String>,
     resource_uri: Option<String>,
@@ -306,6 +311,7 @@ fn persisted(task: &VideoTask) -> PersistedVideoTask {
         created_at: task.created_at,
         updated_at: task.updated_at,
         error: task.error.clone(),
+        upstream_error: task.upstream_error.clone(),
         transport: task.transport.clone(),
         video_url: task.video_url.clone(),
         resource_uri: task.resource_uri.clone(),
@@ -328,6 +334,7 @@ fn restored(task: PersistedVideoTask) -> VideoTask {
         created_at: task.created_at,
         updated_at: task.updated_at,
         error: task.error,
+        upstream_error: task.upstream_error,
         transport: task.transport,
         video_url: task.video_url,
         resource_uri: task.resource_uri,
@@ -698,6 +705,7 @@ pub fn create_pending_for(model: String, prompt: String, owner_key_id: &str) -> 
         created_at: now,
         updated_at: now,
         error: None,
+        upstream_error: None,
         transport: "trae_work_native_sse".into(),
         video_url: None,
         resource_uri: None,
@@ -862,17 +870,14 @@ fn can_retry_account(
     })
 }
 
-fn video_error_message(data: &str) -> String {
-    serde_json::from_str::<Value>(data)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("message")
-                .or_else(|| value.get("error").and_then(|v| v.get("message")))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| data.chars().take(240).collect())
+fn record_upstream_failure(task_id: &str, data: &str, http_status: Option<u16>) {
+    let detail=aiwork_core::UpstreamFailure::from_body(data,http_status);
+    update_task(task_id, |task| {
+        task.status="failed".into();
+        // Keep the legacy field usable, but never expose a raw JSON/HTML body.
+        task.error=Some(detail.message.clone().unwrap_or_else(|| detail.description()));
+        task.upstream_error=Some(detail);
+    });
 }
 
 /// 建立幂等键映射并限制内存增长。已存在的键由路由层先返回，不会覆盖原任务。
@@ -1161,6 +1166,10 @@ fn parse_sse_event(event: &str, data: &str, task_id: &str) -> Result<bool, Strin
             .map_err(|e| format!("Seedance {event} JSON 无效: {e}"))?;
         let billing = extract_billing_candidate(data, task_id)?;
         apply_result_payload(task_id, &value, billing);
+        if value["status"]=="failed" || value["error"].is_object() {
+            record_upstream_failure(task_id,data,None);
+            return Ok(true);
+        }
     } else if event == "done" {
         // “done” 没有 result 资源时不能向调用方报告成功，否则会得到一个
         // 永远无法下载的空任务。允许 done 携带最后一条结果数据作为兜底。
@@ -1169,6 +1178,10 @@ fn parse_sse_event(event: &str, data: &str, task_id: &str) -> Result<bool, Strin
                 let billing = extract_billing_candidate(data, task_id)
                     .map_err(|error| error.to_string())?;
                 apply_result_payload(task_id, &value, billing);
+                if value["status"]=="failed" || value["error"].is_object() {
+                    record_upstream_failure(task_id,data,None);
+                    return Ok(true);
+                }
             }
         }
         let has_resource = get(task_id)
@@ -1184,11 +1197,7 @@ fn parse_sse_event(event: &str, data: &str, task_id: &str) -> Result<bool, Strin
         });
         return Ok(true);
     } else if event == "error" {
-        let message = video_error_message(data);
-        update_task(task_id, |task| {
-            task.status = "failed".into();
-            task.error = Some(message);
-        });
+        record_upstream_failure(task_id,data,None);
         return Ok(true);
     }
     Ok(false)
@@ -1382,13 +1391,7 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
                             continue;
                         }
                     }
-                    update_task(&task_id, |task| {
-                        task.status = "failed".into();
-                        task.error = Some(format!(
-                            "Seedance 上游 HTTP {status}: {}",
-                            text.chars().take(240).collect::<String>()
-                        ));
-                    });
+                    record_upstream_failure(&task_id,&text,Some(status));
                     return;
                 }
                 Err(ureq::Error::Status(status, response)) => {
@@ -1402,13 +1405,7 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
                             continue;
                         }
                     }
-                    update_task(&task_id, |task| {
-                        task.status = "failed".into();
-                        task.error = Some(format!(
-                            "Seedance 上游 HTTP {status}: {}",
-                            text.chars().take(240).collect::<String>()
-                        ));
-                    });
+                    record_upstream_failure(&task_id,&text,Some(status));
                     return;
                 }
                 Err(error) => {
@@ -1498,9 +1495,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upstream_failure_sse_preserves_code_and_reason_after_persistence() {
+        let task=create_pending("seedance".into(),"error-detail-fixture".into());
+        assert!(parse_sse_event("error",r#"{"error":{"code":"INVALID_DURATION","message":"Reference duration exceeds maximum; token=private-token"},"account_id":"private-account"}"#,&task.id).unwrap());
+        let task=restored(persisted(&get(&task.id).unwrap()));
+        let value=serde_json::to_value(task).unwrap();
+        assert_eq!(value["upstream_error"]["code"],"INVALID_DURATION");
+        assert!(value["upstream_error"]["message"].as_str().unwrap().contains("Reference duration exceeds maximum"));
+        assert!(!value.to_string().contains("private-token"));
+        assert!(!value.to_string().contains("private-account"));
+        assert_eq!(value["status"],"failed");
+        assert_eq!(value["billing"]["status"],"absent","failure is not a zero-charge receipt");
+    }
+    #[test]
+    fn failed_result_event_is_terminal_and_done_cannot_replace_its_reason() {
+        let task=create_pending("seedance".into(),"failed-result-fixture".into());
+        let data=r#"{"status":"failed","error":{"code":"UNSUPPORTED_REFERENCE","message":"Reference type is unsupported"}}"#;
+        assert!(parse_sse_event("result",data,&task.id).unwrap());
+        assert_eq!(get(&task.id).unwrap().upstream_error.unwrap().code.as_deref(),Some("UNSUPPORTED_REFERENCE"));
+        assert!(parse_sse_event("done",data,&task.id).unwrap());
+        let restored=restored(persisted(&get(&task.id).unwrap()));
+        assert_eq!(restored.error.as_deref(),Some("Reference type is unsupported"));
+        assert_eq!(restored.upstream_error.unwrap().code.as_deref(),Some("UNSUPPORTED_REFERENCE"));
+    }
+
+    #[test]
     fn budget_completion_defers_artifact_io_but_legacy_still_caches() {
         let initial=VideoTask {id:"video-fixture".into(),object:"video".into(),model:"seedance".into(),status:"completed".into(),prompt:"fixture".into(),
-            created_at:1,updated_at:2,error:None,transport:"native".into(),video_url:None,resource_uri:Some("tos://completed-resource".into()),video_duration:Some(5.0),
+            created_at:1,updated_at:2,error:None,upstream_error:None,transport:"native".into(),video_url:None,resource_uri:Some("tos://completed-resource".into()),video_duration:Some(5.0),
             content_url:None,artifact_error:None,billing:VideoBillingReceipt::default(),request_key:None,owner_key_id:"key".into()};
         let mut deferred=initial.clone();
         finish_artifact_phase(&mut deferred,true,|_|panic!("v2 execution must finish before resource URL lookup"),|_|panic!("v2 execution must not wait for cache download"));
@@ -1818,6 +1840,7 @@ mod tests {
             created_at: 1,
             updated_at: 2,
             error: None,
+            upstream_error: None,
             transport: "trae_work_native_sse".into(),
             video_url: Some("https://example.invalid/video.mp4".into()),
             resource_uri: Some("tos://video".into()),

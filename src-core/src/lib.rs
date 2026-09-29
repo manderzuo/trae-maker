@@ -1,4 +1,6 @@
 mod cost;
+mod upstream_failure;
+pub use upstream_failure::UpstreamFailure;
 mod credits;
 mod admin_summary;
 mod admin_credentials;
