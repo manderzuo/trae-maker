@@ -442,6 +442,9 @@ mod tests {
         let download=app.clone().oneshot(Request::builder().uri(format!("/internal/bridge/v2/requests/request-video/content?budget_id={budget_id}"))
             .header("authorization",format!("Bearer {}",fixture.key)).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(download.status(),StatusCode::OK);
+        assert_eq!(download.headers().get("x-aiwork-request-id").and_then(|v|v.to_str().ok()),Some("request-video"));
+        assert_eq!(download.headers().get("x-aiwork-core-key-id").and_then(|v|v.to_str().ok()),Some("key-a"));
+        assert_eq!(download.headers().get("x-aiwork-task-ref").and_then(|v|v.to_str().ok()),Some("video-test"));
         assert_eq!(&axum::body::to_bytes(download.into_body(),65536).await.unwrap()[..],b"fixture-mp4");
         store.connection.execute("UPDATE bridge_budget_executions SET result_ciphertext=x'00' WHERE budget_id=?1", [budget_id]).unwrap();
         let response = app.oneshot(Request::builder()

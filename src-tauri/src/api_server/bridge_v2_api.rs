@@ -174,20 +174,21 @@ pub(super) async fn content(State(state):State<Arc<ApiSharedState>>,Path(request
         let auth=stored_budget_authorization(&store.connection,&query.budget_id)?;
         if auth.request_id!=request || auth.endpoint!="videos" {return Err("content binding mismatch".into());}
         let execution=store.budget_execution(&query.budget_id)?.ok_or("execution missing")?;
+        if execution.budget_id!=auth.budget_id||execution.request_id!=auth.request_id||execution.core_key_id!=auth.core_key_id||execution.account_ref!=auth.account_ref||execution.bridge_instance_id!=auth.bridge_instance_id||execution.step_kind!="video" {return Err("content identity mismatch".into());}
         if execution.state!=super::bridge_execution::ExecutionState::Succeeded || !execution.result_available {return Err("result not ready".into());}
         // Decrypt and verify saved result as well: a damaged result must not
         // authorize downloading an unrelated or unproven file after restart.
         let result=store.load_budget_result(&query.budget_id)?.ok_or("result missing")?;
         let task=execution.task_ref.ok_or("task missing")?;
-        if result["id"].as_str()!=Some(task.as_str()) {return Err("result task mismatch".into());}
+        if result["id"].as_str()!=Some(task.as_str()) || result["status"]!="completed" {return Err("result task mismatch".into());}
         let permit=state.limiter.acquire_request(&auth.core_key_id,&super::api_keys::KeyLimits::default()).map_err(|_|"download concurrency exceeded")?;
         // Complete identity/result checks before network I/O. File recovery
         // cannot rewrite execution/financial facts or generate another video.
         drop(store);
         let (file,length)=super::bridge_artifacts::open_completed(&state,&auth.account_ref,&task,&result)?;
-        Ok((file,length,permit))
+        Ok((file,length,permit,auth,task))
     }).await;
-    let (mut file,length,permit)=match opened {
+    let (mut file,length,permit,auth,task)=match opened {
         Ok(Ok(data))=>data,
         Ok(Err(reason)) if matches!(reason.as_str(),"artifact_recovery_busy"|"download concurrency exceeded")=>{
             let mut response=error(StatusCode::TOO_MANY_REQUESTS,"budget_content_busy");response.headers_mut().insert("retry-after","2".parse().unwrap());return response;
@@ -207,6 +208,9 @@ pub(super) async fn content(State(state):State<Arc<ApiSharedState>>,Path(request
         }
     });
     Response::builder().header("content-type","video/mp4").header("content-length",length).header("cache-control","private, no-store")
+        .header("x-aiwork-request-id",auth.request_id).header("x-aiwork-budget-id",auth.budget_id)
+        .header("x-aiwork-core-key-id",auth.core_key_id).header("x-aiwork-account-ref",auth.account_ref)
+        .header("x-aiwork-bridge-instance-id",auth.bridge_instance_id).header("x-aiwork-task-ref",task)
         .header("content-disposition","attachment; filename=video.mp4").body(axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receive)))
         .unwrap_or_else(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"content_response_failed"))
 }
