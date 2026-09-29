@@ -156,6 +156,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/internal/bridge/v2/requests/:request_id/chunks", get(super::bridge_v2_api::chunks))
         .route("/internal/bridge/v2/requests/:request_id/content", get(super::bridge_v2_api::content))
         .route("/internal/bridge/v2/requests/:request_id/last-frame", post(super::bridge_v2_api::last_frame))
+        .route("/internal/bridge/v2/reference-last-frame", post(super::bridge_v2_api::reference_last_frame))
         .route("/internal/bridge/v2/requests/:request_id/billing", get(super::bridge_v2_api::billing))
         .route("/internal/bridge/v2/requests/:request_id/refresh", post(super::bridge_v2_api::refresh))
         .route("/internal/bridge/v2/receipt-events", get(super::bridge_v2_api::events))
@@ -300,6 +301,39 @@ mod tests {
         let lease=BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
         assert!(lease.charge_ready(),"normal idle restart must not require manual financial recovery");
         drop(lease);drop(store);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reference_last_frame_requires_auth_extracts_bytes_and_never_creates_budget() {
+        use super::super::{video_frames,bridge_billing::BridgeBillingStore};
+        use sha2::{Digest,Sha256};
+        let mut f=BridgeFixture::new();let source=video_frames::tests::Fixture::new();
+        std::fs::copy(source.0.join("video-frame-extractor.json"),f.dir.join("video-frame-extractor.json")).unwrap();
+        let bytes=std::fs::read(source.clip()).unwrap();let sha=format!("{:x}",Sha256::digest(&bytes));
+        let app=f.take_app();
+        let request=|auth:bool,bytes:Vec<u8>| {
+            let mut b=Request::post("/internal/bridge/v2/reference-last-frame").header("x-aiwork-core-key-id","key-fixture").header("content-type","video/mp4");
+            if auth {b=b.header("authorization",format!("Bearer {}",f.key));}
+            b.body(Body::from(bytes)).unwrap()
+        };
+        assert_eq!(app.clone().oneshot(request(false,bytes.clone())).await.unwrap().status(),StatusCode::FORBIDDEN);
+        for _ in 0..2 {
+            let r=app.clone().oneshot(request(true,bytes.clone())).await.unwrap();
+            assert_eq!(r.status(),StatusCode::OK);
+            assert_eq!(r.headers()["x-aiwork-source-sha256"],sha);
+            assert_eq!(r.headers()["x-aiwork-core-key-id"],"key-fixture");
+            assert_eq!(r.headers()["x-aiwork-frame-timestamp-ms"],"875");
+            let png=axum::body::to_bytes(r.into_body(),8*1024*1024).await.unwrap();
+            assert_eq!(&png[..8],b"\x89PNG\r\n\x1a\n");
+        }
+        assert_eq!(app.clone().oneshot(request(true,b"not an mp4".to_vec())).await.unwrap().status(),StatusCode::BAD_REQUEST);
+        let mut broken=b"\x00\x00\x00\x18ftypmp42".to_vec();broken.extend_from_slice(b"broken media");
+        assert_eq!(app.oneshot(request(true,broken)).await.unwrap().status(),StatusCode::SERVICE_UNAVAILABLE);
+        let store=BridgeBillingStore::open(&f.dir).unwrap();
+        assert_eq!(store.connection.query_row("SELECT COUNT(*) FROM bridge_prepared_budgets",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        let files=std::fs::read_dir(super::super::video_store::storage_dir(&f.dir)).unwrap().count();
+        assert_eq!(files,0,"temporary uploaded source must be removed on success and decode failure");
     }
 
     #[cfg(windows)]

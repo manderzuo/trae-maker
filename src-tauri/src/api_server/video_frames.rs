@@ -112,11 +112,11 @@ fn limits() -> std::sync::Arc<Limits> {
         })
         .clone()
 }
-struct Slot {
+pub(super) struct Slot {
     limits: std::sync::Arc<Limits>,
 }
 impl Slot {
-    fn acquire() -> Result<Self, String> {
+    pub(super) fn acquire() -> Result<Self, String> {
         Self::on(limits())
     }
     fn on(l: std::sync::Arc<Limits>) -> Result<Self, String> {
@@ -279,6 +279,25 @@ pub(crate) fn extract_last(
     extractor_path: &Path,
 ) -> Result<FrameArtifact, String> {
     extract_with_timeout(data_dir, owned_video_path, extractor_path, PROCESS_TIMEOUT)
+}
+/// Authenticated uploaded bytes, never a caller-supplied local path or URL.
+/// The caller holds a bounded upload permit until this worker exits.
+pub(crate) fn extract_uploaded(data_dir: &Path, bytes: &[u8]) -> Result<FrameArtifact,String> {
+    if !(12..=32*1024*1024).contains(&bytes.len()) || &bytes[4..8]!=b"ftyp" {
+        return Err("frame_source_invalid".into());
+    }
+    let extractor=configured_extractor(data_dir)?;
+    let root=super::video_store::storage_dir(data_dir);
+    fs::create_dir_all(&root).map_err(|_|"frame_source_unavailable")?;
+    let path=root.join(format!("reference-frame-{:032x}.mp4",rand::random::<u128>()));
+    struct Source(PathBuf);
+    impl Drop for Source {fn drop(&mut self) {let _=fs::remove_file(&self.0);}}
+    let mut file=OpenOptions::new().create_new(true).write(true).open(&path).map_err(|_|"frame_source_unavailable")?;
+    let source=Source(path);
+    let written=file.write_all(bytes).and_then(|_|file.sync_all());
+    drop(file);
+    written.map_err(|_|"frame_source_unavailable")?;
+    extract_last(data_dir,&source.0,&extractor)
 }
 fn extract_with_timeout(
     data_dir: &Path,

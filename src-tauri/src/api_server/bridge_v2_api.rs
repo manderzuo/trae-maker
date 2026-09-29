@@ -8,6 +8,32 @@ use super::{ApiSharedState, bridge_billing::BridgeBillingStore, bridge_prepared:
 #[derive(Deserialize)]
 pub(crate) struct BudgetQuery { budget_id: String }
 
+/// Internal bridge authentication is enforced by the router middleware.
+/// This non-billable route accepts bytes only; Core verifies asset ownership.
+pub(super) async fn reference_last_frame(State(state):State<Arc<ApiSharedState>>,request:axum::extract::Request)->Response {
+    static SLOTS:std::sync::OnceLock<Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
+    let slots=SLOTS.get_or_init(||Arc::new(tokio::sync::Semaphore::new(4))).clone();
+    let permit=match slots.try_acquire_owned() {Ok(p)=>p,Err(_)=>return error(StatusCode::TOO_MANY_REQUESTS,"frame_extractor_busy")};
+    let key=request.headers().get("x-aiwork-core-key-id").and_then(|v|v.to_str().ok()).unwrap_or("").to_owned();
+    if key.is_empty()||key.len()>128||!key.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'-'|b'_')) {return error(StatusCode::BAD_REQUEST,"invalid_core_key_id");}
+    let bytes=match axum::body::to_bytes(request.into_body(),32*1024*1024).await {Ok(b)=>b,Err(_)=>return error(StatusCode::PAYLOAD_TOO_LARGE,"frame_source_invalid")};
+    if bytes.len()<12||&bytes[4..8]!=b"ftyp" {return error(StatusCode::BAD_REQUEST,"frame_source_invalid");}
+    let result=tokio::task::spawn_blocking(move||->Result<_,String>{
+        let _permit=permit;
+        let frame=super::video_frames::extract_uploaded(&state.data_dir,&bytes)?;
+        let png=super::video_frames::read_small(&frame.path,8*1024*1024)?;
+        Ok((frame,png))
+    }).await;
+    match result {
+        Ok(Ok((frame,png)))=>Response::builder().header("content-type","image/png").header("content-length",png.len()).header("cache-control","private, no-store")
+            .header("x-aiwork-core-key-id",key).header("x-aiwork-source-sha256",frame.source_sha256).header("x-aiwork-frame-sha256",frame.frame_sha256)
+            .header("x-aiwork-frame-width",frame.width).header("x-aiwork-frame-height",frame.height).header("x-aiwork-frame-timestamp-ms",frame.timestamp_ms)
+            .body(axum::body::Body::from(png)).unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"frame_output_unavailable")),
+        Ok(Err(code)) if code=="frame_extractor_busy"=>error(StatusCode::TOO_MANY_REQUESTS,"frame_extractor_busy"),
+        _=>error(StatusCode::SERVICE_UNAVAILABLE,"frame_extraction_unavailable"),
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct ChunkQuery {budget_id:String,#[serde(default)] after:u64}
 pub(super) async fn chunks(State(state):State<Arc<ApiSharedState>>,
