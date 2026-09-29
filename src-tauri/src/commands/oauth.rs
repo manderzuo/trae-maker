@@ -799,7 +799,7 @@ pub(crate) fn persist_native_oauth_account(
 ///
 /// 该函数只用于首次 BitBrowser 导入的“升级”步骤；正常续期不再调用 BitBrowser，
 /// 而是走本机 refresh_token ExchangeToken。已登录页面通常会自动回调，若页面需要
-/// 人工确认则在短超时后返回错误，调用方仍可保留已捕获的短期 JWT。
+/// 人工确认则等待指定时限；失败必须返回错误，不得把短期网页 JWT 当作长期接管成功。
 pub(crate) fn native_oauth_exchange_for_bitbrowser(
     state: &AppState,
     profile_id: &str,

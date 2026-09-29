@@ -27,9 +27,16 @@ export function DiscoverModal({
         <p className="text-xs leading-relaxed text-slate-500 dark:text-zinc-400">
           本机 Trae Work / Trae 通过 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">storage.json</code> 与
           {' '}<code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">state.vscdb</code> 识别登录账号；
-          BitBrowser 则扫描备注/网址为 Trae Work 的 profile，通过 CDP 读取页面 localStorage 中的登录态。
-          完整 JWT 只在本地加密 vault 内流转，不会展示、写日志或上传。
+          BitBrowser 扫描网页登录账号后，会打开 TRAE 官方原生授权页；完成授权才能接管可自动续期的长期登录态。
+          完整凭据仅在本机加密保存，不会在列表或日志中展示。
         </p>
+
+        {addingUid && discovered?.some((d) => d.user_id === addingUid && d.source === 'bitbrowser') && (
+          <p role="status" className="rounded border border-amber-300 p-2 text-xs text-amber-700 dark:text-amber-300">
+            等待原生授权：请切到所选 BitBrowser 窗口完成 TRAE 官方授权，最长等待 5 分钟。
+            请勿关闭或切换该窗口的账号；未完成授权不会覆盖已有凭据。JWT 短效不影响通过续期凭据自动刷新。
+          </p>
+        )}
 
         {scanning && (
           <div className="flex items-center gap-2 py-4 text-sm text-slate-500">
@@ -91,12 +98,12 @@ export function DiscoverModal({
                         ) : d.uid_confident && (d.source !== 'bitbrowser' || d.token_present) ? (
                           <button
                             onClick={() => onAdd(d)}
-                            disabled={addingUid === d.user_id}
+                            disabled={addingUid !== null}
                             className="btn-outline !px-2 !py-1 text-xs disabled:cursor-not-allowed disabled:opacity-60"
                           >
                             {addingUid === d.user_id ? (
                               <>
-                                <Loader2 size={12} className="animate-spin" /> 加入中
+                                <Loader2 size={12} className="animate-spin" /> {d.source === 'bitbrowser' ? '等待原生授权' : '加入中'}
                               </>
                             ) : (
                               <>
@@ -117,7 +124,7 @@ export function DiscoverModal({
               <span className="text-xs text-slate-400">
                 {notInPool > 0 ? `${notInPool} 个账号未入池` : '所有登录账号均已入池'}
               </span>
-              <button onClick={onRescan} className="btn-outline text-xs">
+              <button onClick={onRescan} disabled={addingUid !== null} className="btn-outline text-xs disabled:opacity-60">
                 <RefreshCw size={12} /> 重新扫描
               </button>
             </div>

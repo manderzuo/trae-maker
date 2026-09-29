@@ -2,15 +2,15 @@
 //!
 //! BitBrowser 的 Local API 只负责找到 profile 并打开它的 CDP 调试端口；
 //! 账号凭据从 Trae Work 页面 `localStorage["Cloud-IDE-Token"]` 临时读取，
-//! 随即写入 AI Work 助手的 Stronghold vault，并在首次导入时生成原生 icube 快照；
-//! 可选接管的 refresh_token 用于后续本机续期。密码、Cookie 与完整 JWT 均不返回前端，
+//! 导入时通过官方原生 OAuth 换取可续期凭据，再写入 Stronghold vault 并生成 icube 快照；
+//! 原生 refresh_token 用于后续本机续期。密码、Cookie 与完整 JWT 均不返回前端，
 //! 也不写入日志。Local API 地址被限制为本机回环地址，避免把凭据转发到远端。
 
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tauri::State;
-use tungstenite::{connect, Message};
+use tungstenite::Message;
 
 use crate::commands::trae_apps::DiscoveredAccount;
 use crate::state::AppState;
@@ -377,9 +377,41 @@ fn is_trae_page(target: &Value) -> bool {
     is_trae_hint(&url) || title.to_ascii_lowercase().contains("trae")
 }
 
+fn connect_cdp(ws_url: &str) -> Result<tungstenite::WebSocket<std::net::TcpStream>, String> {
+    let url = url::Url::parse(ws_url).map_err(|_| "无效的本机 CDP 地址")?;
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let ip: std::net::IpAddr = if host == "localhost" {
+        std::net::Ipv4Addr::LOCALHOST.into()
+    } else {
+        host.parse().map_err(|_| "CDP 仅允许本机回环地址")?
+    };
+    if url.scheme() != "ws" || !ip.is_loopback() || !url.username().is_empty() || url.password().is_some() {
+        return Err("CDP 仅允许无凭据的本机 WebSocket 地址".into());
+    }
+    let stream = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::new(ip, url.port_or_known_default().unwrap_or(80)),
+        Duration::from_secs(4),
+    ).map_err(|_| "连接本机浏览器超时或失败，请确认窗口仍在运行")?;
+    stream.set_read_timeout(Some(Duration::from_secs(8))).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(Duration::from_secs(4))).map_err(|e| e.to_string())?;
+    tungstenite::client(ws_url, stream)
+        .map(|(socket, _)| socket)
+        .map_err(|_| "本机浏览器 CDP 握手失败或超时".into())
+}
+
+fn read_cdp(
+    socket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+    deadline: std::time::Instant,
+) -> Result<Message, String> {
+    let remaining = deadline.checked_duration_since(std::time::Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or("浏览器页面响应超时，请确认页面正常后重试")?;
+    socket.get_mut().set_read_timeout(Some(remaining)).map_err(|e| e.to_string())?;
+    socket.read().map_err(|_| "浏览器页面响应超时或连接断开，请确认页面正常后重试".into())
+}
+
 fn cdp_evaluate(ws_url: &str) -> Result<Value, String> {
-    let (mut socket, _) = connect(ws_url)
-        .map_err(|e| format!("连接 Trae Work CDP 页面失败：{e}"))?;
+    let mut socket = connect_cdp(ws_url)?;
     let request = json!({
         "id": 1,
         "method": "Runtime.evaluate",
@@ -393,10 +425,9 @@ fn cdp_evaluate(ws_url: &str) -> Result<Value, String> {
         .send(Message::Text(request.to_string().into()))
         .map_err(|e| format!("发送 Trae Work CDP 请求失败：{e}"))?;
 
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let message = socket
-            .read()
-            .map_err(|e| format!("读取 Trae Work CDP 响应失败：{e}"))?;
+        let message = read_cdp(&mut socket, deadline)?;
         if !message.is_text() {
             continue;
         }
@@ -426,8 +457,7 @@ fn cdp_evaluate(ws_url: &str) -> Result<Value, String> {
 /// 随后写回 `localStorage[Cloud-IDE-Token]`。只等待 CDP 的 reload ACK，
 /// 新 token 的可见性由 `capture_profile_refreshed` 轮询确认。
 fn cdp_reload(ws_url: &str) -> Result<(), String> {
-    let (mut socket, _) = connect(ws_url)
-        .map_err(|e| format!("连接 Trae Work CDP 页面刷新失败：{e}"))?;
+    let mut socket = connect_cdp(ws_url)?;
     let request = json!({
         "id": 1,
         "method": "Page.reload",
@@ -437,10 +467,9 @@ fn cdp_reload(ws_url: &str) -> Result<(), String> {
         .send(Message::Text(request.to_string().into()))
         .map_err(|e| format!("发送 Trae Work 页面刷新请求失败：{e}"))?;
 
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let message = socket
-            .read()
-            .map_err(|e| format!("读取 Trae Work 页面刷新响应失败：{e}"))?;
+        let message = read_cdp(&mut socket, deadline)?;
         if !message.is_text() {
             continue;
         }
@@ -465,8 +494,7 @@ fn cdp_reload(ws_url: &str) -> Result<(), String> {
 /// 只供本地 OAuth 桥使用：调用方负责生成并校验 URL，避免把任意远端
 /// 导航能力暴露给前端。CDP 连接仅在本次导航期间存在，不保存浏览器会话。
 fn cdp_navigate(ws_url: &str, url: &str) -> Result<(), String> {
-    let (mut socket, _) = connect(ws_url)
-        .map_err(|e| format!("连接 BitBrowser OAuth 页面失败：{e}"))?;
+    let mut socket = connect_cdp(ws_url)?;
     let request = json!({
         "id": 1,
         "method": "Page.navigate",
@@ -476,10 +504,9 @@ fn cdp_navigate(ws_url: &str, url: &str) -> Result<(), String> {
         .send(Message::Text(request.to_string().into()))
         .map_err(|e| format!("发送 BitBrowser OAuth 导航请求失败：{e}"))?;
 
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let message = socket
-            .read()
-            .map_err(|e| format!("读取 BitBrowser OAuth 导航响应失败：{e}"))?;
+        let message = read_cdp(&mut socket, deadline)?;
         if !message.is_text() {
             continue;
         }
@@ -494,6 +521,9 @@ fn cdp_navigate(ws_url: &str, url: &str) -> Result<(), String> {
         }
         if let Some(error) = value.get("error") {
             return Err(format!("BitBrowser OAuth 页面导航失败：{error}"));
+        }
+        if value.pointer("/result/errorText").and_then(Value::as_str).is_some_and(|v| !v.is_empty()) {
+            return Err("BitBrowser 未能打开官方授权页，请检查该窗口的网络连接".into());
         }
         return Ok(());
     }
@@ -879,6 +909,9 @@ fn persist_captured_token(
     captured: &CapturedToken,
     account_name: Option<String>,
 ) -> Result<BitBrowserImportResult, String> {
+    if captured.refresh_token.as_deref().is_none_or(|token| token.trim().is_empty()) {
+        return Err("未取得原生续期凭据，不能标记长期登录接管成功；请在 BitBrowser 完成官方授权，已有凭据未更改".into());
+    }
     let mut name = account_name.unwrap_or_default().trim().to_string();
     if name.is_empty() {
         name = profile
@@ -1104,46 +1137,23 @@ pub fn bitbrowser_account_import(
         }
     }
 
-    // 首次 BitBrowser 登录完成后，自动做一次短时原生 OAuth 握手，尽量把
-    // refresh_token 一并接管。这样后续续期可完全走本机 Trae ExchangeToken，
-    // BitBrowser 只承担本次首次登录；若授权页需要人工确认，保留已捕获 JWT，
-    // 不阻断账号入池和快照生成。
-    if captured.refresh_token.is_none() {
-        match crate::commands::oauth::native_oauth_exchange_for_bitbrowser(
-            &state,
-            id,
-            // BitBrowser 首次打开授权页可能需要几十秒加载/跳转；25 秒会把
-            // 正常的授权流程误判为失败，随后只留下很快过期的网页 JWT。
-            Duration::from_secs(90),
-        ) {
-            Ok(exchange) if exchange.user_id == captured.user_id => {
-                let info = crate::jwt::parse(&exchange.jwt);
-                captured = CapturedToken {
-                    token: exchange.jwt,
-                    refresh_token: Some(exchange.refresh_token),
-                    user_id: exchange.user_id,
-                    exp_timestamp: info.exp_timestamp,
-                    page_url: captured.page_url,
-                };
-                crate::fs_utils::app_log(
-                    &state.data_dir,
-                    &format!("BitBrowser 首次登录已自动接管原生 refresh_token: uid={} profile={}", captured.user_id, id),
-                );
-            }
-            Ok(exchange) => {
-                crate::fs_utils::app_log(
-                    &state.data_dir,
-                    &format!("BitBrowser 原生 OAuth 返回其他 UID，保留网页 JWT: expected={} actual={}", captured.user_id, exchange.user_id),
-                );
-            }
-            Err(error) => {
-                crate::fs_utils::app_log(
-                    &state.data_dir,
-                    &format!("BitBrowser 首次原生 OAuth 自动接管未完成，保留网页 JWT: uid={} error={error}", captured.user_id),
-                );
-            }
-        }
+    // 扫描只用网页 JWT 识别账号；长期接管必须完成与原生登录相同的
+    // OAuth 换票。不把任意 localStorage refresh 字段误当成原生凭据，
+    // 授权失败/超时/错号时不覆盖账号池中原有的登录态。
+    let exchange = crate::commands::oauth::native_oauth_exchange_for_bitbrowser(
+        &state, id, Duration::from_secs(300),
+    ).map_err(|error| format!("长期登录接管未完成：{error}。请在所选 BitBrowser 窗口完成 TRAE 官方授权后重试；未覆盖已有账号凭据"))?;
+    if exchange.user_id != captured.user_id {
+        return Err("授权账号与扫描账号不一致，已取消接管；未覆盖已有账号凭据".into());
     }
+    let info = crate::jwt::parse(&exchange.jwt);
+    captured = CapturedToken {
+        token: exchange.jwt,
+        refresh_token: Some(exchange.refresh_token),
+        user_id: exchange.user_id,
+        exp_timestamp: info.exp_timestamp,
+        page_url: captured.page_url,
+    };
 
     persist_captured_token(&state, &profile, &captured, account_name)
 }
@@ -1151,6 +1161,65 @@ pub fn bitbrowser_account_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdp_command_ignores_events_and_accepts_matching_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/page", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let request: Value = serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "Runtime.evaluate");
+            for response in [json!({"method": "Runtime.event"}), json!({"id": 2, "result": {}}),
+                json!({"id": 1, "result": {"result": {"value": {"fixture": "ok"}}}})] {
+                socket.send(Message::Text(response.to_string().into())).unwrap();
+            }
+        });
+        assert_eq!(cdp_evaluate(&url).unwrap(), json!({"fixture": "ok"}));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cdp_rejects_remote_or_credentialed_targets() {
+        for url in ["ws://192.0.2.1:9222/page", "ws://user:secret@127.0.0.1:9222/page", "https://127.0.0.1:9222/page"] {
+            assert!(connect_cdp(url).is_err());
+        }
+    }
+
+    #[test]
+    fn cdp_idle_page_times_out_instead_of_leaving_import_loading() {
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url=format!("ws://{}/page",listener.local_addr().unwrap());
+        let server=std::thread::spawn(move|| {
+            let (stream,_)=listener.accept().unwrap();
+            let mut socket=tungstenite::accept(stream).unwrap();
+            let _=socket.read().unwrap();
+            std::thread::sleep(Duration::from_secs(17));
+        });
+        let started=std::time::Instant::now();
+        let result=cdp_evaluate(&url);
+        let elapsed=started.elapsed();
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(elapsed<Duration::from_secs(16),"idle CDP must time out before the peer closes: {elapsed:?}");
+    }
+
+    #[test]
+    fn web_only_import_must_not_be_persisted_as_success() {
+        let root=std::env::temp_dir().join(format!("bit-import-guard-{}",rand::random::<u64>()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+        let _cleanup=Cleanup(root.clone());
+        let state=AppState{data_dir:root.clone(),python_dir:root.clone(),python_exe:"unused".into(),jwt_refresh_lock:std::sync::Mutex::new(())};
+        // Existing destination avoids cloning any installed client's profile in this regression.
+        std::fs::create_dir_all(state.path("profiles").join("123456789")).unwrap();
+        let profile=BrowserProfile{id:"fixture".into(),seq:None,name:Some("fixture".into()),status:Some(true),hint:"trae".into()};
+        let captured=CapturedToken{token:"fixture-web-jwt".into(),refresh_token:None,user_id:"123456789".into(),exp_timestamp:None,page_url:"https://www.trae.cn/work".into()};
+        let result=persist_captured_token(&state,&profile,&captured,None);
+        assert!(result.is_err(),"web JWT without renewable credentials must not report a completed takeover");
+        assert!(!state.path("checkin_accounts.json").exists(),"failed takeover must not replace account records");
+    }
 
     #[test]
     fn trae_hint_accepts_encoded_work_url() {

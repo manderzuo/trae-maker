@@ -163,7 +163,11 @@ export default function Accounts() {
     setAddingUid(d.user_id);
     try {
       if (d.source === 'bitbrowser') {
+        toast('info', '正在打开 BitBrowser 官方授权页，请在该窗口完成授权；最长等待 5 分钟');
         const result = await api.accounts.importBitBrowser(d.window_id!, d.user_id);
+        if (!result.refresh_token_captured) {
+          throw new Error('未取得原生续期凭据，请完成官方授权，不能视为长期登录接管成功');
+        }
         const snapshotNote = result.native_snapshot_error
           ? `；原生切换快照生成失败：${result.native_snapshot_error}`
           : result.native_snapshot_created
@@ -173,22 +177,20 @@ export default function Accounts() {
               : '';
         toast(
           result.native_snapshot_error ? 'warn' : 'success',
-          `BitBrowser 账号 ${result.user_id} 已${result.updated ? '更新' : '加入'}账号池${snapshotNote}`,
+          `BitBrowser 账号 ${result.user_id} 已完成长期登录接管（可自动续期）${snapshotNote}`,
         );
       } else {
         await api.accounts.addDiscovered(d.user_id, '', d.app, d.dc_uid, d.uid_confident);
         toast('success', `账号 ${d.user_id} 已加入账号池`);
       }
-      // 重新合并两类发现结果，保持弹窗中的 BitBrowser 条目不消失。
-      const [localResult, bitResult] = await Promise.allSettled([
-        api.accounts.discover(),
-        api.accounts.discoverBitBrowser(),
-      ]);
-      setDiscovered([
-        ...(localResult.status === 'fulfilled' ? localResult.value : []),
-        ...(bitResult.status === 'fulfilled' ? bitResult.value : []),
-      ]);
+      // 入池已完成，不等待所有浏览器重新扫描，避免成功后仍显示“加入中”。
+      setDiscovered((items) => items?.map((item) =>
+        item.user_id === d.user_id ? { ...item, in_pool: true } : item) ?? null);
       void refreshAccounts();
+      // 单账号积分异步刷新；网络失败不改变已经完成的授权结果。
+      void api.accounts.fetchRemainingCredits(d.user_id)
+        .catch((error) => toast('warn', `账号接管已完成，但积分查询失败：${String(error)}`))
+        .finally(() => { void refreshAccounts(); });
     } catch (err) {
       toast('error', `加入失败：${String(err)}`);
     } finally {

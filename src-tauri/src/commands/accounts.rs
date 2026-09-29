@@ -903,6 +903,12 @@ pub(crate) fn read_trae_observation(
 pub(crate) fn query_ent_packs(jwt: &str, dev: &DeviceEntry) -> Result<Vec<serde_json::Value>, String> {
     query_ent_packs_with_agent(&short_agent(),jwt,dev)
 }
+
+fn account_device_view(map: &DeviceMap, uid: &str) -> Option<String> {
+    if uid.trim().is_empty() { return None; }
+    // 与实际请求的 resolve_device 一致；仅展示，不重置已有设备配置。
+    Some(fs_utils::mask(&map.get(uid).cloned().unwrap_or_else(|| derive_device(uid)).device_id))
+}
 /// Budget admission/background reconciliation must not occupy a worker for the
 /// desktop refresher's full 120 second timeout.
 pub(crate) fn query_ent_packs_for_bridge(jwt:&str,dev:&DeviceEntry)->Result<Vec<serde_json::Value>,String> {
@@ -1862,9 +1868,7 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
             }
             best.map(|(_, c)| c)
         };
-        let device_mask = device_map
-            .get(&uid)
-            .map(|d: &DeviceEntry| fs_utils::mask(&d.device_id));
+        let device_mask = account_device_view(&device_map, &uid);
         let checked = checked_uids.contains(&uid) || checked_legacy_names.contains(&a.name);
         // 冷却状态：until > now 表示仍在冷却中（SessionDead 的 until=9999999999 始终 > now）
         let (cd_type, cd_until, cd_reason) = if let Some(entry) = cd.cooldowns.get(&uid) {
@@ -1949,6 +1953,15 @@ pub fn resolve_user_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_device_view_matches_request_fallback_without_replacing_existing_device() {
+        let mut map=DeviceMap::new();
+        assert_eq!(account_device_view(&map,"2117003799429594").as_deref(),Some("9241…4852"));
+        map.insert("2117003799429594".into(),DeviceEntry{device_id:"existing-device".into(),..Default::default()});
+        assert_eq!(account_device_view(&map,"2117003799429594").as_deref(),Some("exis…vice"));
+        assert_eq!(account_device_view(&map,""),None);
+    }
 
     /// derive_device 必须与 auto_checkin.py `get_device_for`（gen=2）产出完全一致，
     /// 否则 Rust 积分请求与 Python 签到请求的设备指纹漂移，新 JWT 会被服务端 401。

@@ -87,9 +87,10 @@ export function HelpModal({ open, onClose }: { open: boolean; onClose: () => voi
           </h3>
           <p className="text-xs leading-relaxed text-sky-800 dark:text-sky-200">
             JWT 是短期 access token，Trae Work 通常签发约 8 小时；长期有效的是原生 refresh_token。
-            首次从 BitBrowser 导入时会自动接管 refresh_token 并生成 TRAE Work CN 快照；之后点击「刷新/续期」
-            均直接走本机原生 ExchangeToken，不再依赖 BitBrowser 窗口。旧账号若没有 refresh_token，
-            请从 BitBrowser 重新导入一次完成接管。
+            从 BitBrowser「加入/更新接管」时，请在打开的 TRAE 官方授权页完成原生授权（最长等待 5 分钟）。
+            成功后才会保存 refresh_token 并生成 TRAE Work CN 快照；授权失败不会覆盖已有凭据。
+            之后「刷新/续期」通过原生 ExchangeToken 换取新 JWT，不再依赖 BitBrowser 窗口。
+            旧账号若只有网页 JWT，请重新「更新接管」并完成授权。续期凭据被撤销或失效时仍需重新登录。
           </p>
         </section>
       </div>
