@@ -147,7 +147,7 @@ fn parse_risk_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64)
     // contract to policy lookup, retaining the exact-one-match ambiguity guard.
     let matches:Vec<_>=entries.iter().filter(|p|p["profile"].as_str().is_some_and(|p|p.eq_ignore_ascii_case(profile))).collect();
     if matches.is_empty() {
-        if video_spec(profile).is_some() {return neighboring_policy(value,profile,now);}
+        if video_spec(profile).is_some() {return neighboring_policy(value,profile,now).or_else(|error|missing_video_fallback(value,profile,now,error));}
         return default_chat_policy(profile);
     }
     if matches.len()!=1 {return Err("budget_policy_unconfigured".into());}
@@ -156,7 +156,7 @@ fn parse_risk_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64)
     if !p["source"].as_str().is_some_and(|s|!s.trim().is_empty()) {return Err("budget_policy_invalid".into());}
     let expires=p["expires_at_ms"].as_i64().ok_or("budget_policy_invalid")?;
     if expires<=now {
-        return if video_spec(profile).is_some() {neighboring_policy(value,profile,now).map_err(|e|if e=="budget_policy_unconfigured" {"budget_policy_expired".into()} else {e})} else {Err("budget_policy_expired".into())};
+        return if video_spec(profile).is_some() {neighboring_policy(value,profile,now).or_else(|e|missing_video_fallback(value,profile,now,if e=="budget_policy_unconfigured" {"budget_policy_expired".into()} else {e}))} else {Err("budget_policy_expired".into())};
     }
     let hold=micro(&p["hold_credits"])?;
     if hold<=0 {return Err("budget_policy_invalid".into());}
@@ -167,6 +167,24 @@ fn parse_risk_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64)
         return Err("reference_video_budget_metadata_required".into());
     }
     Ok((hold,version.into(),expires))
+}
+
+/// Administrator-owned temporary risk allowance, never an upstream price ceiling.
+/// Keep the request's actual profile; the marker identifies only how its hold was chosen.
+fn missing_video_fallback(value:&Value,profile:&str,now:i64,error:String)->Result<(i64,String,i64),String> {
+    if !matches!(error.as_str(),"budget_policy_unconfigured"|"budget_policy_expired") {return Err(error);}
+    if video_spec(profile).is_none() {return Err(error);}
+    let p=&value["video_fallback"];
+    if p.is_null() || p["enabled"]==false {return Err(error);}
+    if p["enabled"]!=true || p["model_family"]!="seedance2-fast" || p["baseline_resolution"]!="720p" || p["baseline_duration_seconds"]!=15 {
+        return Err("budget_policy_invalid".into());
+    }
+    let hold=p["hold_microcredits"].as_i64().filter(|n|*n>0).ok_or("budget_policy_invalid")?;
+    let version=p["policy_version"].as_str().filter(|s|s.trim()==*s && !s.is_empty() && s.len()<=96 && !s.chars().any(char::is_control)).ok_or("budget_policy_invalid")?;
+    if !p["source"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=512 && !s.chars().any(char::is_control)) {return Err("budget_policy_invalid".into());}
+    let expiry=p["expires_at_ms"].as_i64().ok_or("budget_policy_invalid")?;
+    if expiry<=now {return Err("budget_policy_expired".into());}
+    Ok((hold,format!("fallback-risk-720p15s-v1:{version}"),expiry))
 }
 
 fn video_spec(profile:&str)->Option<(String,String,i64)> {
@@ -181,9 +199,11 @@ fn video_spec(profile:&str)->Option<(String,String,i64)> {
     if videos>0 && (reference.len()!=3 || !reference[2].strip_prefix("ref_seconds").and_then(|s|s.parse::<u32>().ok()).is_some_and(|s|(1..=60).contains(&s))) {return None;}
     Some((fields[..4].join(":"),fields[5].into(),duration))
 }
-fn neighbor<'a,T>(target:i64,candidates:&'a [(i64,T)])->Option<&'a (i64,T)> {
-    candidates.iter().filter(|(d,_)|*d>=target).min_by_key(|(d,_)|*d)
-        .or_else(||candidates.iter().max_by_key(|(d,_)|*d))
+fn reference_cover(target:&str,candidate:&str)->Option<i64> {
+    let split=|s:&str|s.rsplit_once(":ref_seconds").and_then(|(class,seconds)|seconds.parse::<i64>().ok().map(|n|(class.to_owned(),n)));
+    if target==candidate {return Some(0);}
+    let (class,seconds)=split(target)?;let (other,total)=split(candidate)?;
+    (class==other && total>=seconds).then_some(total-seconds)
 }
 fn scale_hold(amount:i64,source:i64,target:i64)->Result<i64,String> {
     if amount<=0 || source<=0 || target<=0 {return Err("invalid video estimate".into());}
@@ -196,9 +216,14 @@ fn neighboring_policy(value:&Value,profile:&str,now:i64)->Result<(i64,String,i64
     let entries=value["profiles"].as_array().ok_or("budget_policy_invalid")?;
     let candidates:Vec<_>=entries.iter().filter_map(|p| {
         let name=p["profile"].as_str()?;let (f,r,d)=video_spec(name)?;
-        (name!=profile && f==family && r==reference && p["expires_at_ms"].as_i64().is_some_and(|t|t>now)).then_some((d,name))
+        let gap=reference_cover(&reference,&r)?;
+        (name!=profile && f==family && d>=target && p["expires_at_ms"].as_i64().is_some_and(|t|t>now)).then_some((d,(gap,name)))
     }).collect();
-    let (duration,name)=neighbor(target,&candidates).ok_or("budget_policy_unconfigured")?;
+    let (duration,(_,name))=candidates.iter().filter(|(d,_)|*d>=target).min_by_key(|(d,(gap,name))|(*d,*gap,*name))
+        .ok_or("budget_policy_unconfigured")?;
+    if entries.iter().filter(|p|p["profile"].as_str().is_some_and(|p|p.eq_ignore_ascii_case(name))).count()!=1 {
+        return Err("budget_policy_invalid".into());
+    }
     let (amount,version,expiry)=parse_risk_policy(value,name,now)?;
     let version:String=version.chars().take(96).collect();
     Ok((scale_hold(amount,*duration,target)?,format!("neighbor-risk-v1:{duration}s:{version}"),expiry))
@@ -209,13 +234,18 @@ fn observed_video_budget(prices:&[(String,i64)],profile:&str)->Result<Option<(i6
     }
     let Some((family,reference,target))=video_spec(profile) else {return Ok(None)};
     let candidates:Vec<_>=prices.iter().filter_map(|(p,amount)| {
-        let (f,r,d)=video_spec(p)?;(f==family && r==reference).then_some((d,*amount))
+        let (f,r,d)=video_spec(p)?;let gap=reference_cover(&reference,&r)?;
+        (f==family && d>=target).then_some((d,(gap,*amount)))
     }).collect();
-    let Some((duration,amount))=neighbor(target,&candidates) else {return Ok(None)};
+    let Some((duration,(_,amount)))=candidates.iter().filter(|(d,_)|*d>=target).min_by_key(|(d,(gap,amount))|(*d,*gap,-*amount))
+        else {return Ok(None)};
     Ok(Some((video_hold(scale_hold(*amount,*duration,target)?,0)?,format!("observed-neighbor-risk-v1:{duration}s"),"policy_only")))
 }
 fn fallback_video_budget(source:&dyn PreparationSource,profile:&str,now:i64,observed:Option<(i64,String,&'static str)>)->Result<(i64,String,i64,&'static str),String> {
     match source.policy(profile,now) {
+        Ok((_,version,_)) if version.starts_with("fallback-risk-720p15s-v1:") && observed.is_some()=> {
+            let (hold,version,evidence)=observed.unwrap();Ok((hold,version,i64::MAX,evidence))
+        },
         Ok((hold,version,expiry))=>Ok((hold,version,expiry,"policy_only")),
         Err(error) if matches!(error.as_str(),"budget_policy_unconfigured"|"budget_policy_expired")=> {
             observed.map(|(hold,version,evidence)|(hold,version,i64::MAX,evidence)).ok_or(error)
@@ -413,6 +443,51 @@ pub(super) fn video_hold(estimate:i64,observed:i64)->Result<i64,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fallback_policy() -> Value {
+        json!({"version":1,"profiles":[],"video_fallback":{"enabled":true,"model_family":"seedance2-fast","baseline_resolution":"720p","baseline_duration_seconds":15,"hold_microcredits":413_000_000,"policy_version":"fixture","source":"test risk allowance","expires_at_ms":200}})
+    }
+    #[test]
+    fn fallback_covers_missing_specs_without_changing_generation_parameters() {
+        let policy=fallback_policy();
+        for resolution in ["480p","720p"] {for duration in 4..=15 {for ratio in ["16:9","9:16","1:1"] {
+            let (body,profile,_)=video_profile(&json!({"prompt":"cat","duration":duration,"resolution":resolution,"ratio":ratio,"video_asset_ids":["owned-video"]})).unwrap();
+            let quote=parse_risk_policy(&policy,&format!("{profile}:ref_seconds11"),100).unwrap();
+            assert_eq!(quote.0,413_000_000);assert!(quote.1.starts_with("fallback-risk-720p15s-v1:"));
+            assert_eq!(body["duration"],duration);assert_eq!(body["resolution"],resolution);assert_eq!(body["ratio"],ratio);
+        }}}
+        for profile in ["other:720p:16:9:10s:images0:video0","seedance2-fast:1080p:16:9:10s:images0:video0","seedance2-fast:720p:16:9:16s:images0:video0","seedance2-fast:720p:16:9:10s:images0:video1"] {
+            assert!(parse_risk_policy(&policy,profile,100).is_err());
+        }
+    }
+    #[test]
+    fn fallback_never_bypasses_disabled_expired_invalid_or_ambiguous_policy() {
+        let profile="seedance2-fast:720p:16:9:10s:images0:video1:ref_seconds11";
+        for (field,bad) in [("enabled",json!(false)),("expires_at_ms",json!(99)),("hold_microcredits",json!(0)),("baseline_duration_seconds",json!(10)),("source",json!(""))] {
+            let mut p=fallback_policy();p["video_fallback"][field]=bad;
+            assert!(parse_risk_policy(&p,profile,100).is_err(),"invalid {field}");
+        }
+        let mut p=fallback_policy();let entry=json!({"profile":profile,"hold_credits":"10","policy_version":"exact","source":"fixture","expires_at_ms":200});
+        p["profiles"]=json!([entry.clone(),entry]);assert!(parse_risk_policy(&p,profile,100).is_err());
+        let mut neighbor=p["profiles"][0].clone();neighbor["profile"]=json!("seedance2-fast:720p:16:9:15s:images0:video1:ref_seconds15");
+        p["profiles"]=json!([neighbor.clone(),neighbor]);assert!(parse_risk_policy(&p,profile,100).is_err(),"ambiguous covering neighbors must not silently fall back");
+    }
+    #[test]
+    fn longer_reference_neighbor_covers_but_shorter_reference_does_not() {
+        let mut p=fallback_policy();p["profiles"]=json!([
+            {"profile":"seedance2-fast:720p:16:9:10s:images0:video1:ref_seconds6","hold_credits":"100","policy_version":"short","source":"fixture","expires_at_ms":200},
+            {"profile":"seedance2-fast:720p:16:9:15s:images0:video1:ref_seconds15","hold_credits":"300","policy_version":"long","source":"fixture","expires_at_ms":200}]);
+        let q=parse_risk_policy(&p,"seedance2-fast:720p:16:9:10s:images0:video1:ref_seconds11",100).unwrap();assert_eq!(q.0,300_000_000);
+        p["profiles"].as_array_mut().unwrap().pop();
+        assert_eq!(parse_risk_policy(&p,"seedance2-fast:720p:16:9:10s:images0:video1:ref_seconds11",100).unwrap().0,413_000_000);
+        p["profiles"]=json!([{"profile":"seedance2-fast:720p:16:9:5s:images0:video1:ref_seconds15","hold_credits":"100","policy_version":"short-output","source":"fixture","expires_at_ms":200}]);
+        assert_eq!(parse_risk_policy(&p,"seedance2-fast:720p:16:9:10s:images0:video1:ref_seconds11",100).unwrap().0,413_000_000);
+    }
+    #[test]
+    fn shorter_output_price_is_not_a_covering_quote() {
+        let mut p=fallback_policy();p["profiles"]=json!([{"profile":"seedance2-fast:720p:16:9:5s:images0:video0","hold_credits":"100","policy_version":"short","source":"fixture","expires_at_ms":200}]);
+        assert_eq!(parse_risk_policy(&p,"seedance2-fast:720p:16:9:10s:images0:video0",100).unwrap().0,413_000_000);
+        assert!(observed_video_budget(&[("seedance2-fast:720p:16:9:5s:images0:video0".into(),100_000_000)],"seedance2-fast:720p:16:9:10s:images0:video0").unwrap().is_none());
+    }
     #[test]
     fn missing_video_spec_uses_longer_neighbor_without_crossing_reference_class() {
         let policies=json!({"version":1,"profiles":[
@@ -422,7 +497,7 @@ mod tests {
         let quote=parse_risk_policy(&policies,"seedance2-fast:720p:16:9:7s:images0:video0",100).unwrap();
         assert_eq!(quote.0,280_000_000);
         assert!(quote.1.contains("neighbor"));
-        assert_eq!(parse_risk_policy(&policies,"seedance2-fast:720p:16:9:12s:images0:video0",100).unwrap().0,336_000_000);
+        assert!(parse_risk_policy(&policies,"seedance2-fast:720p:16:9:12s:images0:video0",100).is_err());
         for other in ["seedance2-fast:480p:16:9:7s:images0:video0","seedance2-fast:720p:16:9:7s:images1:video0",
             "seedance2-fast:720p:16:9:7s:images0:video1:ref_seconds6"] {
             assert!(parse_risk_policy(&policies,other,100).is_err());
@@ -437,7 +512,7 @@ mod tests {
         assert_eq!((exact.0,exact.2),(132_000_000,"observed_actual"));
         let neighbor=observed_video_budget(&prices,"seedance2-fast:720p:16:9:7s:images1:video0").unwrap().unwrap();
         assert_eq!((neighbor.0,neighbor.2),(275_000_000,"policy_only"));
-        assert_eq!(observed_video_budget(&prices,"seedance2-fast:720p:16:9:12s:images1:video0").unwrap().unwrap().0,330_000_000);
+        assert!(observed_video_budget(&prices,"seedance2-fast:720p:16:9:12s:images1:video0").unwrap().is_none());
         for other in ["seedance2-fast:480p:16:9:7s:images1:video0","seedance2-fast:720p:16:9:7s:images0:video0",
             "seedance2-fast:720p:16:9:7s:images1:video1:ref_seconds6"] {
             assert!(observed_video_budget(&prices,other).unwrap().is_none());
@@ -452,32 +527,38 @@ mod tests {
             fn select(&self,_:bool,_:&HashSet<String>)->Result<PickedAccount,String> {Ok(PickedAccount {uid:"account".into(),jwt:"fixture".into(),device_id:"d".into(),machine_id:"d".into(),domain:String::new(),enterprise_id:String::new(),global_region:false})}
             fn capacity(&self,_:&PickedAccount)->Result<Vec<Value>,String> {Ok(vec![pack(208,"1000","0",0,4102444800)])}
             fn estimate(&self,_:&PickedAccount,_:i64)->Result<i64,String> {Err("native_estimate_unavailable".into())}
-            fn policy(&self,_:&str,_:i64)->Result<(i64,String,i64),String> {if self.known.load(Ordering::SeqCst) {Ok((40_000_000,"first-risk".into(),i64::MAX))} else {Err("budget_policy_unconfigured".into())}}
+            fn policy(&self,p:&str,now:i64)->Result<(i64,String,i64),String> {if self.known.load(Ordering::SeqCst) {let mut policy=fallback_policy();policy["video_fallback"]["expires_at_ms"]=json!(i64::MAX);parse_risk_policy(&policy,p,now)} else {Err("budget_policy_unconfigured".into())}}
             fn normalize(&self,_:&PickedAccount,b:&Value,_:bool,_:&str)->Result<Value,String> {Ok(b.clone())}
+            fn reference_seconds(&self,_:&Value)->Result<Option<u64>,String> {Ok(Some(11))}
         }
         let dir=std::env::temp_dir().join(format!("aiwork-calibrated-price-{:032x}",rand::random::<u128>()));
         let runtime=BridgeBudgetRuntime::start(&dir).unwrap();
         runtime.with_store(|s,_| {s.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").map_err(|e|e.to_string())}).unwrap();
         let now=chrono::Utc::now().timestamp_millis();
-        let mut req=PrepareRequest {wire_version:2,parent_request_id:"first".into(),request_id:"first".into(),core_key_id:"key-a".into(),request_fingerprint:"first-fingerprint".into(),endpoint:"videos".into(),model:"seedance".into(),step_kind:"video".into(),body:json!({"prompt":"cat","duration":5,"resolution":"480p"})};
+        let mut req=PrepareRequest {wire_version:2,parent_request_id:"first".into(),request_id:"first".into(),core_key_id:"key-a".into(),request_fingerprint:"first-fingerprint".into(),endpoint:"videos".into(),model:"seedance".into(),step_kind:"video".into(),body:json!({"prompt":"cat","duration":10,"resolution":"720p","ratio":"9:16","video_asset_ids":["owned-video"]})};
         let source=Source {known:AtomicBool::new(true)};
         let first=prepare(&runtime,&req,&source,now-7000).unwrap();
+        assert_eq!(first.authorization.hold_credits.as_microcredits(),413_000_000);
+        assert_eq!(first.evidence_level,"policy_only");
         runtime.with_store(|s,l| {
             use super::super::{bridge_prepared::ConsumeOutcome,bridge_execution::ExecutionState};
             let ConsumeOutcome::Granted(ctx)=s.consume_budget(l,&first,now-6000)? else {return Err("consume".into())};
+            assert_eq!(ctx.body["upstream"],video_profile(&req.body)?.0);
             s.mark_budget_send_intent(l,&first.authorization.budget_id,&ctx.consume_epoch)?;
             s.bind_budget_task(l,&first.authorization.budget_id,"video-fixture")?;
             s.finish_budget_result(l,&first.authorization.budget_id,ExecutionState::Succeeded,&json!({"status":"completed"}),now+1000)?;
-            super::super::bridge_receipts::tests::cache(&dir,s,&[(&first.authorization.budget_id,"56.208")],2000);
+            super::super::bridge_receipts::tests::cache(&dir,s,&[(&first.authorization.budget_id,"456")],2000);
             s.confirm_budget_usage(l,&first.authorization.budget_id)?;Ok(())
         }).unwrap();
         runtime.begin_close();drop(runtime);
         let runtime=BridgeBudgetRuntime::start(&dir).unwrap();source.known.store(false,Ordering::SeqCst);
-        req.request_id="next".into();req.parent_request_id="next".into();req.request_fingerprint="next-fingerprint".into();
+        req.request_id="next".into();req.parent_request_id="next".into();req.request_fingerprint="next-fingerprint".into();req.body["ratio"]=json!("1:1");
         let next=prepare(&runtime,&req,&source,now+4000).expect("a verified final sample must replace missing precise policy after restart");
-        assert_eq!(next.authorization.hold_credits.as_microcredits(),62_000_000);
+        assert_eq!(next.authorization.hold_credits.as_microcredits(),502_000_000);
         assert_eq!(next.evidence_level,"observed_actual");
         runtime.with_store(|s,_| {
+            assert_eq!(s.confirmed_video_prices("account",now-10000,now+4000)?,vec![("seedance2-fast:720p:16:9:10s:images0:video1:ref_seconds11".into(),456_000_000)]);
+            assert!(s.confirmed_video_prices("different-account",now-10000,now+4000)?.is_empty());
             s.connection.execute("UPDATE bridge_budget_receipts SET receipt_state='conflict' WHERE budget_id=?1",[&first.authorization.budget_id]).map_err(|e|e.to_string())?;
             assert!(s.confirmed_video_prices("account",now-10000,now+4000)?.is_empty(),"conflicted receipts must immediately stop calibrating future holds");
             Ok(())
