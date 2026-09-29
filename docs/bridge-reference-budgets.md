@@ -38,6 +38,17 @@ Reference input errors return HTTP 400 with one of
 `reference_asset_unavailable`. Missing/expired administrator policies remain
 configuration errors, separate from invalid client data and capacity errors.
 
+2026-09-29 public tail-reference acceptance used original image plus a
+verified parent tail: `seedance2-fast:480p:16:9:5s:images2:video0`.
+Request `request_vxaGh0i2QQhr6CFE3XiVpg` had matched final video cost56.208;
+the temporary bounded test hold124 was replaced locally with hold62
+(10% buffer, rounded up), expiring1791150800000. This is one calibrated
+sample, not an official maximum or calibration for other reference counts.
+The helper uses the existing built-in2-credit bounded allowance, separately
+settled by its exact receipt; adding an unused `assist:` policy is unnecessary.
+Operators must refresh expired policies or collect a new bounded calibration;
+do not delete references, freeze an entire Key, or treat missing prices as free.
+
 The native uploader uses `override_resource_id` when provided, falling back to
 `store_uri` and removing the query suffix, matching the installed native
 remote-attachment uploader. The PUT storage location is not necessarily the
