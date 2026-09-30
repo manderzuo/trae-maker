@@ -110,7 +110,7 @@ fn chat_profile(input:&Value,model:&str,kind:&str)->Result<(Value,String),String
     if serde_json::to_vec(&text_only).map_err(|_|"invalid chat input")?.len()>64*1024 {
         return Err("budget_chat_input_too_large".into());
     }
-    body["model"]=json!(model);body["max_tokens"]=json!(if kind=="assist" {1024} else {4096});
+    body["model"]=json!(model);body["max_tokens"]=json!(4096);
     if kind=="assist" {body.as_object_mut().unwrap().remove("tools");body.as_object_mut().unwrap().remove("tool_choice");}
     let profile=if images==0 {format!("{kind}:{model}")} else {format!("{kind}:{model}:images{images}")};
     Ok((body,profile))
