@@ -59,6 +59,39 @@ impl BridgeBudgetRuntime {
     pub(super) fn sweep_expired_budgets(&self,now:i64)->Result<usize,String> {
         self.with_store(|s,l|s.expire_unconsumed_budgets(l,now))
     }
+    pub(super) fn sweep_interrupted_text(&self,now:i64)->Result<usize,String> {
+        let requests=self.with_store(|store,lease| {
+            if !lease.charge_ready() || lease.is_closing() {return Ok(Vec::new());}
+            // The exclusive host/instance lease outlives every local worker.
+            // A different preparation generation therefore proves loss of its
+            // LOCAL text execution, not upstream cancellation or free usage.
+            // Videos remain unknown: their asynchronous task may still run.
+            let ids={
+                let mut stmt=store.connection.prepare("SELECT e.budget_id FROM bridge_budget_executions e
+                    JOIN bridge_prepared_budgets p ON p.budget_id=e.budget_id
+                    WHERE e.execution_state IN ('running','unknown') AND e.finished_at_ms IS NULL
+                      AND e.step_kind IN ('assist','chat') AND e.bridge_instance_id=?1
+                      AND p.event_generation<>?2 ORDER BY e.budget_id LIMIT 64").map_err(|e|e.to_string())?;
+                let rows=stmt.query_map(rusqlite::params![lease.instance_id(),lease.generation()],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?
+            };
+            let mut ended=Vec::new();let mut failed=false;
+            for id in ids {
+                let result=serde_json::json!({"status":"failed","error":{"code":"bridge_execution_interrupted",
+                    "message":"原网关进程已退出，文字步骤的执行结果丢失；不会自动重发。费用继续按原会话真实账单核对。"}});
+                // Uses the same immutable encrypted result and P->R transaction
+                // as the executor. No receipts/amounts are manufactured here.
+                match store.finish_budget_result(lease,&id,super::bridge_execution::ExecutionState::Failed,&result,now) {
+                    Ok(())=>ended.push(store.budget_execution(&id)?.ok_or("recovered execution missing")?.request_id),Err(_)=>failed=true,
+                }
+            }
+            if failed {Err("interrupted text recovery retained invalid evidence for review".into())} else {Ok(ended)}
+        })?;
+        // Wake the existing bounded usage queue after releasing the lease/DB
+        // lock. No network here; startup discovery remains the durable fallback.
+        for request in &requests {let _=super::usage_refresh::request_refresh_for_dir(&self.data_dir,request);}
+        Ok(requests.len())
+    }
     pub(super) fn start_maintenance(runtime:&Arc<Self>,stop:Arc<std::sync::atomic::AtomicBool>) {
         let weak=Arc::downgrade(runtime);
         tokio::spawn(async move {
@@ -68,7 +101,11 @@ impl BridgeBudgetRuntime {
                 tick.tick().await;
                 if stop.load(std::sync::atomic::Ordering::Acquire) {break;}
                 let Some(runtime)=weak.upgrade() else {break};
-                match tokio::task::spawn_blocking(move ||runtime.sweep_expired_budgets(chrono::Utc::now().timestamp_millis())).await {
+                match tokio::task::spawn_blocking(move || {
+                    let now=chrono::Utc::now().timestamp_millis();
+                    runtime.sweep_interrupted_text(now)?;
+                    runtime.sweep_expired_budgets(now)
+                }).await {
                     Ok(Ok(_))=>{},_=>eprintln!("[bridge-v2] expiry recovery requires attention; no unknown sends were released"),
                 }
             }
@@ -133,6 +170,45 @@ impl Drop for BridgeBudgetRuntime {
 mod tests {
     use super::*;
     use super::super::{bridge_prepared::tests::fixture,bridge_receipts::tests::{send,cache}};
+    #[test]
+    fn prior_host_text_execution_ends_without_zero_bill_and_late_receipt_settles_once() {
+        use super::super::{bridge_prepared::{tests::input,ConsumeOutcome},bridge_execution::ExecutionState};
+        let (dir,mut store,lease)=fixture();let mut value=input();
+        value.step_kind="assist".into();value.model="glm-5.3-flash".into();
+        value.request_id="old-helper".into();
+        let helper=store.prepare_budget(&lease,&value,None,10).unwrap();
+        let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&helper,20).unwrap() else {panic!("consume")};
+        store.mark_budget_send_intent(&lease,&helper.authorization.budget_id,&ctx.consume_epoch).unwrap();
+        value.step_kind="video".into();value.request_id="old-video".into();
+        let video=store.prepare_budget(&lease,&value,None,10).unwrap();
+        let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&video,20).unwrap() else {panic!("consume")};
+        store.mark_budget_send_intent(&lease,&video.authorization.budget_id,&ctx.consume_epoch).unwrap();
+        drop(lease);drop(store);
+        let runtime=BridgeBudgetRuntime::start(&dir).unwrap();let status=runtime.recovery_status().unwrap();
+        runtime.recover_local_instance(&status.instance_id,&status.generation,true).unwrap();
+        assert_eq!(runtime.sweep_interrupted_text(chrono::Utc::now().timestamp_millis()).unwrap(),1);
+        assert_eq!(runtime.sweep_interrupted_text(chrono::Utc::now().timestamp_millis()).unwrap(),0);
+        runtime.with_store(|s,l| {
+            let h=&helper.authorization.budget_id;
+            assert_eq!(s.budget_execution(h)?.unwrap().state,ExecutionState::Failed);
+            assert_eq!(s.load_budget_result(h)?.unwrap()["error"]["code"],"bridge_execution_interrupted");
+            assert_eq!(s.budget_execution(&video.authorization.budget_id)?.unwrap().state,ExecutionState::Unknown);
+            assert!(s.latest_budget_receipt_event(h)?.is_none(),"host loss is not a zero-cost receipt");
+            assert_eq!(s.capacity_totals("account")?.awaiting_receipt,40_000_000);
+            cache(&dir,s,&[(h,"0.0968")],2000);
+            s.confirm_budget_usage(l,h)?;s.confirm_budget_usage(l,h)?;
+            assert_eq!(s.latest_budget_receipt_event(h)?.unwrap().receipt.unwrap().actual_credits.unwrap().as_microcredits(),96_800);
+            assert_eq!(s.budget_receipt_events(l.generation(),0,10)?.len(),1);
+            assert_eq!(s.capacity_totals("account")?.awaiting_receipt,0);
+            value.step_kind="chat".into();value.request_id="current-chat".into();
+            let current=s.prepare_budget(l,&value,None,10)?;
+            let ConsumeOutcome::Granted(ctx)=s.consume_budget(l,&current,20)? else {panic!("consume")};
+            s.mark_budget_send_intent(l,&current.authorization.budget_id,&ctx.consume_epoch)?;
+            s.mark_budget_execution_unknown(l,&current.authorization.budget_id)?;Ok(())
+        }).unwrap();
+        assert_eq!(runtime.sweep_interrupted_text(chrono::Utc::now().timestamp_millis()).unwrap(),0,"current generation may still have a worker");
+        drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn explicit_runtime_recovery_retains_unknown_holds_and_fences_old_tokens() {
         use super::super::{bridge_prepared::{tests::input,ConsumeOutcome},bridge_budget::CapacitySnapshot};

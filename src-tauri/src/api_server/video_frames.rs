@@ -497,7 +497,11 @@ pub(crate) mod tests {
                 std::env::temp_dir().join(format!("video-frames-{:032x}", rand::random::<u128>()));
             let exe = PathBuf::from("C:/Program Files/SteelSeries/GG/apps/moments/ffmpeg.exe");
             std::fs::create_dir_all(super::super::video_store::storage_dir(&root)).unwrap();
-            std::fs::write(root.join("video-frame-extractor.json"),serde_json::to_vec(&serde_json::json!({"path":exe,"sha256":"ff8d9e4fb41c9563022e2e3d4fc040130efb31595959bfc6613f1ae52f039d31"})).unwrap()).unwrap();
+            // Pin the actual local test dependency, not a stale installed-version
+            // digest. Production still requires its administrator-pinned hash;
+            // the dedicated bad-digest test continues to exercise rejection.
+            let sha=digest_file(&exe,256*1024*1024).unwrap();
+            std::fs::write(root.join("video-frame-extractor.json"),serde_json::to_vec(&serde_json::json!({"path":exe,"sha256":sha})).unwrap()).unwrap();
             let clip = super::super::video_store::artifact_path(&root, "synthetic").unwrap();
             assert!(Command::new(&exe)
                 .args([

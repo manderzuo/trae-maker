@@ -244,8 +244,11 @@ impl RefreshQueue {
 /// Queue one refresh only after checking the persisted, unique request mapping.
 /// This function never performs an upstream request or accepts a caller-chosen account.
 pub(crate) fn request_refresh(state: Arc<ApiSharedState>, request_id: &str) -> Result<(), String> {
+    request_refresh_for_dir(&state.data_dir,request_id)
+}
+pub(super) fn request_refresh_for_dir(data_dir:&Path, request_id:&str)->Result<(),String> {
     let (lookup, wake_identity) = {
-        let store = super::bridge_billing::BridgeBillingStore::open(&state.data_dir)?;
+        let store = super::bridge_billing::BridgeBillingStore::open(data_dir)?;
         let lookup = store.usage_session_for_request(request_id)?;
         let execution = store.budget_execution_for_request(request_id)?;
         if let Some(execution) = &execution {
@@ -268,7 +271,7 @@ pub(crate) fn request_refresh(state: Arc<ApiSharedState>, request_id: &str) -> R
             return Err("Core request has no unique upstream session mapping".into());
         }
     };
-    let key = data_dir_key(&state.data_dir);
+    let key = data_dir_key(data_dir);
     let queue = schedulers().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&key)
         .and_then(|registration| registration.queue.upgrade())

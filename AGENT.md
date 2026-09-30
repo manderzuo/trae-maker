@@ -507,6 +507,8 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 
 ## 24. 预算执行与结果独立持久化
 
+- 2026-09-30 收尾修复：当前独占宿主 lease 恢复收费后，5秒维护只把同实例、旧准备世代、无终态的 assist/chat 收尾为 `bridge_execution_interrupted` 失败；保留不可变加密原因和 P→R 占用，不伪造上游取消/成功/零账单，不补发。当前世代和异步视频 unknown 不动。收尾后唤醒既有只读用量队列，必须取得收尾时间之后的完整、唯一原会话观察才能实扣；迟到冲突保留原账并隔离。
+
 - v4 在首次 send-intent 同事务写入唯一 request/Key/account/session 执行记录；已有 v3 send-intent 迁移为 unknown，不能补发。后台用量刷新识别 v2 归属，不伪造旧 billing mode，跨新旧链路会话冲突保持 ambiguous。
 - 结果与执行终态、P→R 同事务提交，DPAPI 结果绑定完整预算归属；视频成功要求不可变 task_ref。已实扣 D 不会因随后执行终态再次占 R；账单未到时仍可读回已保存结果，失败执行不是免费证明。
 - 禁用 Key/关闭新收费准入不妨碍在途结果或真实金额保存；只接受持有本实例活动栅栏的事实写入。旧世代结果/实扣可以恢复，旧 token 不获得新的发送许可。
