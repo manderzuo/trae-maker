@@ -180,6 +180,9 @@ async fn read_request(state: Arc<ApiSharedState>, request: String, budget: Strin
                 let result = if execution.is_some() { store.load_budget_result(&budget)? } else { None };
                 value["status"] = json!(if result.is_some() { "ready" } else { "not_ready" });
                 value["result"] = json!(result);
+                if value["status"]=="not_ready" {
+                    value["diagnostic"]=json!(store.budget_diagnostic(&budget)?);
+                }
             }
             "billing" => {
                 let event = store.latest_budget_receipt_event(&budget)?;

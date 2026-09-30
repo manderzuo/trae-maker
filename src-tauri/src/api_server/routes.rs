@@ -4103,6 +4103,19 @@ pub(crate) fn make_upstream_request(
     machine_id: &str,
     body: &[u8],
 ) -> Result<Box<dyn Read + Send>, (u16, String, Option<u64>)> {
+    make_upstream_request_with_agent(jwt,device_id,machine_id,body,streaming_agent())
+}
+pub(crate) fn make_budget_upstream_request(jwt:&str,device_id:&str,machine_id:&str,body:&[u8])
+    -> Result<Box<dyn Read + Send>, (u16,String,Option<u64>)> {
+    // Bound the underlying read as well as semantic SSE progress. This agent is
+    // used only by v2 paid workers; ordinary long chats keep their own policy.
+    let agent=ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(600))
+        .timeout_connect(std::time::Duration::from_secs(10)).timeout_write(std::time::Duration::from_secs(30))
+        .timeout_read(std::time::Duration::from_secs(120)).build();
+    make_upstream_request_with_agent(jwt,device_id,machine_id,body,agent)
+}
+fn make_upstream_request_with_agent(jwt:&str,device_id:&str,machine_id:&str,body:&[u8],agent:ureq::Agent)
+    -> Result<Box<dyn Read + Send>, (u16,String,Option<u64>)> {
     let url = format!("{}{}", AGENT_HOST, EP_LLM_CHAT);
     let referer = format!("{}{}", REFERER_BASE, EP_LLM_CHAT);
     let trace_id = format!(
@@ -4112,7 +4125,7 @@ pub(crate) fn make_upstream_request(
     );
     let request_id = format!("req_{}", uuid_like_id());
 
-    let resp = streaming_agent()
+    let resp = agent
         .post(&url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
@@ -4162,7 +4175,7 @@ pub(crate) fn make_upstream_request(
             let detail = if err_str.contains("dns") || err_str.contains("resolve") || err_str.contains("name resolution") {
                 format!("DNS解析失败（{} 无法解析），请检查网络或代理设置: {}", AGENT_HOST, e)
             } else if err_str.contains("timed out") || err_str.contains("timeout") {
-                format!("连接超时（{} 10秒内未响应），请检查网络连通性: {}", AGENT_HOST, e)
+                format!("上游网络请求超时（连接、写入或等待响应阶段）: {}", e)
             } else if err_str.contains("tls") || err_str.contains("certificate") || err_str.contains("ssl") {
                 format!("TLS证书验证失败: {}", e)
             } else {

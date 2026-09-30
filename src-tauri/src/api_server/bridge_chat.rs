@@ -3,8 +3,14 @@
 
 use serde_json::{json,Value};
 use std::{collections::BTreeMap,io::{Read,BufRead,BufReader}};
+use super::super::bridge_diagnostics::Diagnostic;
 
-pub(crate) fn aggregate_live<R:Read+Send>(reader:R,id:&str,model:&str,mut emit:impl FnMut(Value))->Result<Value,String> {
+pub(crate) fn aggregate_live<R:Read+Send>(reader:R,id:&str,model:&str,emit:impl FnMut(Value))->Result<Value,Diagnostic> {
+    let start=std::time::Instant::now();
+    aggregate_with_clock(reader,id,model,emit,||start.elapsed(),std::time::Duration::from_secs(600),std::time::Duration::from_secs(120))
+}
+fn aggregate_with_clock<R:Read+Send>(reader:R,id:&str,model:&str,mut emit:impl FnMut(Value),mut elapsed:impl FnMut()->std::time::Duration,
+    total_limit:std::time::Duration,progress_limit:std::time::Duration)->Result<Value,Diagnostic> {
     // Take bounds even a single unterminated line. The aggregate and delta
     // copies are also bounded by this entire-wire limit, not only max_tokens.
     const LIMIT:u64=4*1024*1024;
@@ -12,12 +18,27 @@ pub(crate) fn aggregate_live<R:Read+Send>(reader:R,id:&str,model:&str,mut emit:i
     let mut total=0u64;let mut line=String::new();let mut st=super::SseState::new();
     let mut text=String::new();let mut reasoning=String::new();let mut tools=BTreeMap::<u64,Value>::new();
     let mut usage=None;let mut finish="stop".to_string();let mut done=false;
+    let mut last_progress=elapsed();
     loop {
-        line.clear();let n=br.read_line(&mut line).map_err(|_|"chat_stream_read_failed")?;
+        let now=elapsed();
+        if now>=total_limit {return Err("chat_stream_total_timeout".into());}
+        if now.saturating_sub(last_progress)>=progress_limit {return Err("chat_stream_progress_timeout".into());}
+        line.clear();let n=br.read_line(&mut line).map_err(|e|Diagnostic::from(if matches!(e.kind(),std::io::ErrorKind::TimedOut|std::io::ErrorKind::WouldBlock) {"chat_stream_read_timeout"} else {"chat_stream_read_failed"}))?;
+        // A blocking read is bounded by the dedicated budget HTTP agent; check
+        // again after it returns so late packets cannot erase an expired limit.
+        let now=elapsed();
+        if now>=total_limit {return Err("chat_stream_total_timeout".into());}
+        if now.saturating_sub(last_progress)>=progress_limit {return Err("chat_stream_progress_timeout".into());}
         total+=n as u64;if total>LIMIT {return Err("chat_stream_too_large".into());}if n==0 {break;}
         if line.trim().is_empty() && matches!(st.event.as_str(),"output"|"thought"|"done"|"turn_completion"|"token_usage"|"error")
             && !st.data.is_empty() && !serde_json::from_str::<Value>(&st.data).is_ok_and(|v|v.is_object()) {
             return Err("chat_stream_invalid_event".into());
+        }
+        // Read the structured error before scan_line clears its event buffer;
+        // SOLO accepts string and numeric provider codes.
+        if line.trim().is_empty() && st.event=="error" {
+            let value=serde_json::from_str::<Value>(&st.data).unwrap_or(Value::Null);
+            return Err(Diagnostic::provider(&value));
         }
         let Some(ev)=super::scan_line(&mut st,line.trim_end()) else {continue};
         match ev.event.as_str() {
@@ -57,7 +78,7 @@ pub(crate) fn aggregate_live<R:Read+Send>(reader:R,id:&str,model:&str,mut emit:i
                     }
                     if !converted.is_empty() {delta.insert("tool_calls".into(),json!(converted));}
                 }
-                if !delta.is_empty() {emit(Value::Object(delta));}
+                if !delta.is_empty() {last_progress=elapsed();emit(Value::Object(delta));}
             },
             _=>{},
         }
@@ -80,6 +101,41 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::{Cursor,Read};
+    #[test]
+    fn heartbeat_only_stream_cannot_reset_effective_progress_deadline() {
+        let mut tick=0;
+        let raw=": ping\n\n: ping\n\n: ping\n\n: ping\n\n";
+        let error=aggregate_with_clock(Cursor::new(raw),"id","model",|_|{},||{tick+=1;std::time::Duration::from_secs(tick)},
+            std::time::Duration::from_secs(100),std::time::Duration::from_secs(3)).unwrap_err();
+        assert_eq!(error.code,"chat_stream_progress_timeout");assert!(!error.outcome_known);
+    }
+    #[test]
+    fn continuous_output_cannot_exceed_total_deadline() {
+        let raw="event: output\ndata: {\"response\":\"x\"}\n\nevent: output\ndata: {\"response\":\"y\"}\n\nevent: done\ndata: {}\n\n";
+        let mut tick=0;
+        let error=aggregate_with_clock(Cursor::new(raw),"id","model",|_|{},||{tick+=1;std::time::Duration::from_secs(tick)},
+            std::time::Duration::from_secs(5),std::time::Duration::from_secs(100)).unwrap_err();
+        assert_eq!(error.code,"chat_stream_total_timeout");assert!(!error.outcome_known);
+    }
+    #[test]
+    fn provider_error_survives_as_safe_structured_diagnostic() {
+        let raw="event: error\ndata: {\"code\":\"MODEL_BUSY\",\"message\":\"Model overloaded; token=private-token\"}\n\n";
+        let error=aggregate_live(Cursor::new(raw),"id","model",|_|{}).unwrap_err();
+        let value=serde_json::to_value(error).unwrap();
+        assert_eq!(value["code"],"chat_upstream_error");
+        assert_eq!(value["upstream_error"]["code"],"MODEL_BUSY");
+        assert!(value["upstream_error"]["message"].as_str().unwrap().contains("Model overloaded"));
+        assert!(!value.to_string().contains("private-token"));
+    }
+    #[test]
+    fn interrupted_stream_reports_read_timeout_not_provider_rejection() {
+        struct Timeout;
+        impl Read for Timeout {fn read(&mut self,_:&mut [u8])->std::io::Result<usize> {Err(std::io::ErrorKind::TimedOut.into())}}
+        let value=serde_json::to_value(aggregate_live(Timeout,"id","model",|_|{}).unwrap_err()).unwrap();
+        assert_eq!(value["code"],"chat_stream_read_timeout");
+        assert_eq!(value["outcome_known"],false);
+        assert!(value["upstream_error"].is_null());
+    }
     struct Gated { first:Cursor<Vec<u8>>, rest:Cursor<Vec<u8>>, seen:std::sync::Arc<std::sync::atomic::AtomicBool> }
     impl Read for Gated {
         fn read(&mut self,b:&mut [u8])->std::io::Result<usize> {

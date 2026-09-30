@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::{json,Value};
 use super::{bridge_runtime::BridgeBudgetRuntime,bridge_prepared::{ConsumedBudget,PreparedBudget,ConsumeOutcome},bridge_execution::ExecutionState};
 
-pub(super) enum WorkerResult {Terminal(ExecutionState,Value),Unknown}
+pub(super) enum WorkerResult {Terminal(ExecutionState,Value),Unknown,Diagnostic(super::bridge_diagnostics::Diagnostic)}
 pub(super) fn run_consumed(runtime:&BridgeBudgetRuntime,ctx:&ConsumedBudget,send:impl FnOnce(&Value)->WorkerResult)->Result<(),String> {
     let id=&ctx.budget.authorization.budget_id;
     struct UnsentGuard<'a> {runtime:&'a BridgeBudgetRuntime,ctx:&'a ConsumedBudget}
@@ -30,6 +30,10 @@ pub(super) fn run_consumed(runtime:&BridgeBudgetRuntime,ctx:&ConsumedBudget,send
     match send(&body) {
         WorkerResult::Terminal(status,result)=>runtime.with_store(|s,l|s.finish_budget_result(l,id,status,&result,chrono::Utc::now().timestamp_millis())),
         WorkerResult::Unknown=>runtime.with_store(|s,l|s.mark_budget_execution_unknown(l,id)),
+        WorkerResult::Diagnostic(diagnostic)=>runtime.with_store(|s,l| {
+            if diagnostic.outcome_known {s.finish_budget_result(l,id,ExecutionState::Failed,&diagnostic.result(),chrono::Utc::now().timestamp_millis())}
+            else {s.save_budget_diagnostic(l,id,&diagnostic)}
+        }),
     }
 }
 
@@ -69,13 +73,13 @@ pub(super) fn dispatch(state:Arc<super::ApiSharedState>,runtime:Arc<BridgeBudget
             } else {
                 let _permit=permit;
                 let bytes=match serde_json::to_vec(body) {Ok(b)=>b,Err(_)=>return WorkerResult::Unknown};
-                match super::routes::make_upstream_request(&account.jwt,&account.uid,&account.device_id,&account.machine_id,&bytes) {
+                match super::routes::make_budget_upstream_request(&account.jwt,&account.device_id,&account.machine_id,&bytes) {
                     Ok(reader)=>match super::sse::aggregate_live(reader,&format!("chatcmpl-{}",ctx.budget.authorization.request_id),&ctx.budget.authorization.model,
                         |delta| {if let Some(writer)=&stream {writer.push(delta);}}) {
                         Ok(result)=>WorkerResult::Terminal(ExecutionState::Succeeded,result),
-                        _=>WorkerResult::Unknown,
+                        Err(diagnostic)=>WorkerResult::Diagnostic(diagnostic),
                     },
-                    Err(_)=>WorkerResult::Unknown,
+                    Err((status,body,_))=>WorkerResult::Diagnostic(super::bridge_diagnostics::Diagnostic::http(status,&body)),
                 }
             }
         });
