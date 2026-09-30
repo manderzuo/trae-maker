@@ -87,10 +87,20 @@ pub(crate) fn configured_extractor(data_dir: &Path) -> Result<PathBuf, String> {
     {
         return Err("frame_extractor_unavailable".into());
     }
-    if digest_file(&c.path, 256 * 1024 * 1024)? != c.sha256.to_ascii_lowercase() {
+    if digest_file(&c.path, 256 * 1024 * 1024).map_err(|_| "frame_extractor_unavailable")? != c.sha256.to_ascii_lowercase() {
         return Err("frame_extractor_digest_mismatch".into());
     }
     Ok(c.path)
+}
+/// Only these authenticated, local tool failures are definite. Never expose a
+/// command, filesystem path, decoder stderr or arbitrary provider message.
+pub(crate) fn public_tool_error(code: &str) -> Option<&'static str> {
+    match code {
+        "frame_extractor_unconfigured" => Some("frame_extractor_unconfigured"),
+        "frame_extractor_unavailable" => Some("frame_extractor_unavailable"),
+        "frame_extractor_digest_mismatch" => Some("frame_extractor_digest_mismatch"),
+        _ => None,
+    }
 }
 #[derive(Default)]
 struct Counts {
@@ -495,12 +505,14 @@ pub(crate) mod tests {
             );
             let root =
                 std::env::temp_dir().join(format!("video-frames-{:032x}", rand::random::<u128>()));
-            let exe = PathBuf::from("C:/Program Files/SteelSeries/GG/apps/moments/ffmpeg.exe");
+            let exe = std::env::var_os("SEEDANCE_TEST_FFMPEG").map(PathBuf::from)
+                .unwrap_or_else(||PathBuf::from("E:/AIWORK/tools/ffmpeg/9.0.2/ffmpeg.exe"));
             std::fs::create_dir_all(super::super::video_store::storage_dir(&root)).unwrap();
-            // Pin the actual local test dependency, not a stale installed-version
-            // digest. Production still requires its administrator-pinned hash;
-            // the dedicated bad-digest test continues to exercise rejection.
-            let sha=digest_file(&exe,256*1024*1024).unwrap();
+            // Tests use the same fixed, independent release; never discover or
+            // silently repin a different application's executable.
+            let lock:serde_json::Value=serde_json::from_str(include_str!("../../../build-assets/ffmpeg-release.json")).unwrap();
+            let sha=lock["executable_sha256"].as_str().unwrap();
+            assert_eq!(digest_file(&exe,256*1024*1024).unwrap(),sha,"install the pinned independent FFmpeg for tests");
             std::fs::write(root.join("video-frame-extractor.json"),serde_json::to_vec(&serde_json::json!({"path":exe,"sha256":sha})).unwrap()).unwrap();
             let clip = super::super::video_store::artifact_path(&root, "synthetic").unwrap();
             assert!(Command::new(&exe)
@@ -533,6 +545,32 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn damaged_executable_is_reported_as_tool_not_video_failure() {
+        let root=std::env::temp_dir().join(format!("frame-config-{:032x}",rand::random::<u128>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe=root.join("empty-ffmpeg.exe");std::fs::write(&exe,[]).unwrap();
+        std::fs::write(root.join("video-frame-extractor.json"),serde_json::to_vec(&serde_json::json!({"path":exe,"sha256":"00".repeat(32)})).unwrap()).unwrap();
+        let code=configured_extractor(&root).unwrap_err();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(code,"frame_extractor_unavailable");
+    }
+    #[test]
+    fn different_uploaded_videos_get_independent_fingerprints_and_frames() {
+        let f=Fixture::new();let first=extract_uploaded(&f.0,&std::fs::read(f.clip()).unwrap()).unwrap();
+        assert!(Command::new(&f.1).args(["-hide_banner","-loglevel","error","-f","lavfi","-i","color=c=blue:s=32x32:r=8:d=1","-an","-c:v","mjpeg","-threads","1","-y"]).arg(f.clip()).status().unwrap().success());
+        let bytes=std::fs::read(f.clip()).unwrap();let second=extract_uploaded(&f.0,&bytes).unwrap();
+        assert_ne!(first.source_sha256,second.source_sha256);assert_ne!(first.frame_sha256,second.frame_sha256);assert_ne!(first.path,second.path);
+        let repeated=extract_uploaded(&f.0,&bytes).unwrap();assert_eq!(repeated.path,second.path);
+        assert_eq!(configured_extractor(&f.0).unwrap(),f.1);
+    }
+    #[test]
+    fn independent_extractor_decodes_h264_mp4_tail() {
+        let f=Fixture::new();
+        assert!(Command::new(&f.1).args(["-hide_banner","-loglevel","error","-f","lavfi","-i","color=c=green:s=32x32:r=8:d=1","-an","-c:v","libx264","-pix_fmt","yuv420p","-threads","1","-y"]).arg(f.clip()).status().unwrap().success());
+        let frame=extract_uploaded(&f.0,&std::fs::read(f.clip()).unwrap()).unwrap();
+        assert_eq!((frame.width,frame.height,frame.timestamp_ms),(32,32,875));
     }
     #[test]
     fn short_clip_returns_last_decodable_frame() {

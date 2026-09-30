@@ -151,6 +151,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/internal/bridge/summary", get(super::bridge_api::summary))
         .route("/internal/bridge/quotes", post(super::bridge_api::quote))
         .route("/internal/bridge/v2/video-capabilities", get(super::video_capabilities::get))
+        .route("/internal/bridge/v2/frame-extractor/health", get(super::bridge_v2_api::frame_extractor_health))
         .route("/internal/bridge/v2/requests/:request_id/execution", get(super::bridge_v2_api::execution))
         .route("/internal/bridge/v2/requests/:request_id/result", get(super::bridge_v2_api::result))
         .route("/internal/bridge/v2/requests/:request_id/chunks", get(super::bridge_v2_api::chunks))
@@ -334,6 +335,35 @@ mod tests {
         assert_eq!(store.connection.query_row("SELECT COUNT(*) FROM bridge_prepared_budgets",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         let files=std::fs::read_dir(super::super::video_store::storage_dir(&f.dir)).unwrap().count();
         assert_eq!(files,0,"temporary uploaded source must be removed on success and decode failure");
+    }
+
+    #[tokio::test]
+    async fn frame_tool_health_and_upload_errors_are_authenticated_precise_and_non_billable() {
+        use super::super::bridge_billing::BridgeBillingStore;
+        let mut f=BridgeFixture::new();let app=f.take_app();
+        let request=|method:&str,path:&str,auth:bool| {
+            let mut b=Request::builder().method(method).uri(path).header("x-aiwork-core-key-id","key-fixture");
+            if auth {b=b.header("authorization",format!("Bearer {}",f.key));}
+            b.body(Body::from(if method=="POST"{b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2".to_vec()}else{vec![]})).unwrap()
+        };
+        let health="/internal/bridge/v2/frame-extractor/health";
+        assert_eq!(app.clone().oneshot(request("GET",health,false)).await.unwrap().status(),StatusCode::FORBIDDEN);
+        for path in [health,"/internal/bridge/v2/reference-last-frame"] {
+            let response=app.clone().oneshot(request(if path==health{"GET"}else{"POST"},path,true)).await.unwrap();
+            assert_eq!(response.status(),StatusCode::SERVICE_UNAVAILABLE);
+            let body:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),8192).await.unwrap()).unwrap();
+            assert_eq!(body["error"]["code"],"frame_extractor_unconfigured");
+        }
+        let exe=f.dir.join("pinned-tool.exe");std::fs::write(&exe,b"fake executable bytes").unwrap();
+        std::fs::write(f.dir.join("video-frame-extractor.json"),serde_json::to_vec(&serde_json::json!({"path":exe,"sha256":"00".repeat(32)})).unwrap()).unwrap();
+        for path in [health,"/internal/bridge/v2/reference-last-frame"] {
+            let response=app.clone().oneshot(request(if path==health{"GET"}else{"POST"},path,true)).await.unwrap();
+            let body:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),8192).await.unwrap()).unwrap();
+            assert_eq!(body["error"]["code"],"frame_extractor_digest_mismatch");
+            assert!(!body.to_string().contains("pinned-tool.exe"));
+        }
+        let store=BridgeBillingStore::open(&f.dir).unwrap();
+        assert_eq!(store.connection.query_row("SELECT COUNT(*) FROM bridge_prepared_budgets",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
 
     #[cfg(windows)]

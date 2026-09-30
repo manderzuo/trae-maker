@@ -8,6 +8,24 @@ use super::{ApiSharedState, bridge_billing::BridgeBillingStore, bridge_prepared:
 #[derive(Deserialize)]
 pub(crate) struct BudgetQuery { budget_id: String }
 
+/// Authenticated readiness check: no media, budget, upstream I/O or paid work.
+pub(super) async fn frame_extractor_health(State(state):State<Arc<ApiSharedState>>)->Response {
+    static SLOTS:std::sync::OnceLock<Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
+    let slots=SLOTS.get_or_init(||Arc::new(tokio::sync::Semaphore::new(4))).clone();
+    let permit=match slots.try_acquire_owned() {Ok(p)=>p,Err(_)=>return frame_error("frame_extractor_busy")};
+    match tokio::task::spawn_blocking(move||{let _permit=permit;super::video_frames::configured_extractor(&state.data_dir)}).await {
+        Ok(Ok(_))=>(StatusCode::OK,Json(json!({"status":"ready"}))).into_response(),
+        Ok(Err(code))=>frame_error(&code),
+        Err(_)=>frame_error("frame_extraction_unavailable"),
+    }
+}
+fn frame_error(code:&str)->Response {
+    let mut response=if code=="frame_extractor_busy" {error(StatusCode::TOO_MANY_REQUESTS,code)} else {
+        error(StatusCode::SERVICE_UNAVAILABLE,super::video_frames::public_tool_error(code).unwrap_or("frame_extraction_unavailable"))
+    };
+    response.headers_mut().insert("cache-control","no-store".parse().unwrap());response
+}
+
 /// Internal bridge authentication is enforced by the router middleware.
 /// This non-billable route accepts bytes only; Core verifies asset ownership.
 pub(super) async fn reference_last_frame(State(state):State<Arc<ApiSharedState>>,request:axum::extract::Request)->Response {
@@ -29,7 +47,7 @@ pub(super) async fn reference_last_frame(State(state):State<Arc<ApiSharedState>>
             .header("x-aiwork-core-key-id",key).header("x-aiwork-source-sha256",frame.source_sha256).header("x-aiwork-frame-sha256",frame.frame_sha256)
             .header("x-aiwork-frame-width",frame.width).header("x-aiwork-frame-height",frame.height).header("x-aiwork-frame-timestamp-ms",frame.timestamp_ms)
             .body(axum::body::Body::from(png)).unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"frame_output_unavailable")),
-        Ok(Err(code)) if code=="frame_extractor_busy"=>error(StatusCode::TOO_MANY_REQUESTS,"frame_extractor_busy"),
+        Ok(Err(code))=>frame_error(&code),
         _=>error(StatusCode::SERVICE_UNAVAILABLE,"frame_extraction_unavailable"),
     }
 }
@@ -272,6 +290,7 @@ pub(super) async fn last_frame(State(state):State<Arc<ApiSharedState>>,Path(requ
             .body(axum::body::Body::from(bytes)).unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"frame_output_unavailable")),
         Ok(Err(code)) if matches!(code.as_str(),"identity_conflict"|"frame_result_not_ready")=>error(StatusCode::CONFLICT,&code),
         Ok(Err(code)) if matches!(code.as_str(),"frame_extractor_busy"|"artifact_recovery_busy")=>{let mut r=error(StatusCode::TOO_MANY_REQUESTS,"frame_extractor_busy");r.headers_mut().insert("retry-after","2".parse().unwrap());r},
+        Ok(Err(code))=>frame_error(&code),
         _=>error(StatusCode::SERVICE_UNAVAILABLE,"frame_extraction_unavailable"),
     }
 }
