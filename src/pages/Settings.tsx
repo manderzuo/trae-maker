@@ -549,7 +549,7 @@ export default function Settings() {
 
           <h3 className="mb-1 font-medium">每日定时签到</h3>
           <p className="mb-3 text-xs text-slate-400">
-            通过 Windows 计划任务在指定时间自动运行签到脚本，无需启动应用界面。注册/删除需要管理员权限。
+            由 Windows 定时运行助手的安全签到入口，无需打开界面。需登录当前 Windows 用户；错过时间后补跑，今日已签到的账号不重复领取。通常无需管理员权限。
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <div className="relative flex items-center">
@@ -576,7 +576,7 @@ export default function Settings() {
               className={`mt-3 overflow-auto whitespace-pre-wrap rounded-lg p-3 text-xs ${
                 taskInfo.startsWith('❌')
                   ? 'max-h-80 border border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300'
-                  : 'max-h-40 bg-slate-50 dark:bg-zinc-950'
+                  : 'max-h-80 bg-slate-50 dark:bg-zinc-950'
               }`}
             >
               {taskInfo}

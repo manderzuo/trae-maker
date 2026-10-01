@@ -666,10 +666,12 @@ pub(crate) fn write_task_launcher(
 
 /// 构造每日签到计划任务的 /TR（复用 .cmd 启动器方案，见 write_task_launcher，
 /// 消除直接拼 python 长命令再次触碰 /TR 261 字符上限的回归）
-fn build_task_tr(state: &AppState) -> Result<String, String> {
-    let py = state.python_exe.clone();
-    let script = state.python_dir.join("auto_checkin.py");
+fn build_task_tr(state: &AppState, time: &str) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|_|"无法确定助手程序路径")?;
     let data_dir = state.data_dir.to_string_lossy().to_string();
+    if data_dir.contains(['%', '\r', '\n', '"']) || exe.to_string_lossy().contains(['%', '\r', '\n', '"']) {
+        return Err("定时签到路径包含不支持的脚本字符".into());
+    }
     // schtasks /TR 不会继承当前进程环境变量，启动器内显式 set AIWORKDATA_DIR。
     // 必须用 set "VAR=value"（带引号）以兼容含空格的路径；不再使用 /RL HIGHEST：
     // 签到脚本只读取/写入 %APPDATA% 并运行 python，无需提权（详见问题分析报告）。
@@ -677,25 +679,29 @@ fn build_task_tr(state: &AppState) -> Result<String, String> {
         state,
         "daily_checkin",
         format!(
-            "set \"AIWORKDATA_DIR={data_dir}\"\r\nset \"PYTHONIOENCODING=utf-8\"\r\n\"{py}\" \"{}\"",
-            script.to_string_lossy()
+            "setlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\nset \"AIWORK_DATA_DIR={data_dir}\"\r\nset \"AIWORKDATA_DIR={data_dir}\"\r\nset \"PYTHONIOENCODING=utf-8\"\r\n\"{}\" --daily-checkin --not-before {time}\r\nexit /b %errorlevel%",
+            exe.to_string_lossy()
         ),
     )
 }
 
 /// 注册每日签到任务（新任务名），供命令与旧任务迁移共用
-fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
-    let tr = build_task_tr(state)?;
+pub(crate) fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
+    validate_hhmm(time)?;
+    let tr = build_task_tr(state,time)?;
+    let user=Command::new("whoami").creation_flags(0x08000000).output().map_err(|_|"无法查询当前 Windows 用户")?;
+    if !user.status.success() {return Err("无法查询当前 Windows 用户".into());}
+    let username=String::from_utf8_lossy(&user.stdout).trim().to_owned();
+    let xml=daily_task_xml(&tr,time,&username);
+    let xml_path=state.data_dir.join("task_daily_checkin.xml");
+    std::fs::write(&xml_path,daily_task_xml_bytes(&xml)).map_err(|e|format!("写入签到任务失败: {e}"))?;
+    let xml_path=xml_path.to_string_lossy().to_string();
     let (ok, _stdout, stderr) = run_schtasks(&[
         "/Create",
         "/TN",
         TASK_NAME,
-        "/TR",
-        tr.as_str(),
-        "/SC",
-        "DAILY",
-        "/ST",
-        time,
+        "/XML",
+        &xml_path,
         "/F",
     ])?;
     if !ok {
@@ -706,21 +712,49 @@ fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
             || detail.contains("拒绝访问")
             || detail.contains("权限");
         if is_access_denied {
-            return Err(format!(
-                "权限不足（Access Denied）。\n\n\
-                 解决方法（任选其一）：\n\
-                 1. 右键 AI Work 助手 →「以管理员身份运行」后重新点击「注册任务」\n\
-                 2. 打开「管理员命令提示符」手动执行：\n\
-                    schtasks /Create /TN {TASK_NAME} /TR \"cmd /c set \\\"AIWORKDATA_DIR={}\\\" && \\\"{}\\\" \\\"{}\\\"\" /SC DAILY /ST {time} /F\n\
-                 3. 如不需最高权限，可去掉 /RL HIGHEST 后重试",
-                state.data_dir.to_string_lossy(),
-                state.python_exe.replace('\\', "/"),
-                state.python_dir.join("auto_checkin.py").to_string_lossy().replace('\\', "/")
-            ));
+            return Err("Windows 拒绝注册签到任务。请以管理员身份运行助手后重新注册；不要改为直接执行 Python，直接执行无法读取安全凭据。".into());
         }
         return Err(detail.to_string());
     }
     Ok(())
+}
+
+fn xml_escape(value:&str)->String {
+    value.replace('&',"&amp;").replace('<',"&lt;").replace('>',"&gt;").replace('"',"&quot;").replace('\'',"&apos;")
+}
+fn daily_task_xml_bytes(xml:&str)->Vec<u8> {
+    // schtasks imports UTF-16 reliably; its legacy XML reader may reject
+    // BOM-less UTF-8 with "unable to switch encoding" even for ASCII paths.
+    let mut bytes=vec![0xff,0xfe];
+    bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+    bytes
+}
+fn daily_task_xml(launcher:&str,time:&str,user:&str)->String {
+    let date=chrono::Local::now().format("%Y-%m-%d");
+    let user=xml_escape(user);let launcher=xml_escape(launcher);
+    format!(r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<RegistrationInfo><Description>AI Work vault-aware daily checkin v2</Description></RegistrationInfo>
+<Triggers><CalendarTrigger><StartBoundary>{date}T{time}:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
+<LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId><Delay>PT30S</Delay></LogonTrigger></Triggers>
+<Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT30M</ExecutionTimeLimit><Enabled>true</Enabled></Settings>
+<Actions Context="Author"><Exec><Command>cmd.exe</Command><Arguments>/d /c &quot;&quot;{launcher}&quot;&quot;</Arguments></Exec></Actions></Task>"#)
+}
+
+/// Refresh the generated launcher after upgrades; preserve the user's time.
+pub(crate) fn repair_daily_task(state:&AppState) {
+    if !task_exists(TASK_NAME) {return;}
+    if let Some(time)=legacy_task_start_time(TASK_NAME) {
+        let launcher=std::fs::read_to_string(state.data_dir.join("task_daily_checkin.cmd")).unwrap_or_default();
+        let current=std::env::current_exe().ok().map(|p|p.to_string_lossy().to_string()).unwrap_or_default();
+        if !current.is_empty() && launcher.contains(&format!("\"{current}\" --daily-checkin --not-before {time}")) {
+            return; // Do not reset task execution history on every app launch.
+        }
+        if let Err(reason)=register_daily_task(state,&time) {
+            crate::fs_utils::app_log(&state.data_dir,&format!("定时签到任务修复失败: {reason}"));
+        }
+    }
 }
 
 // 计划任务命令含 schtasks 子进程调用（可达数秒），标记 async 派发到线程池执行，避免阻塞 UI
@@ -823,7 +857,7 @@ pub fn try_migrate_legacy_task(state: &AppState) -> Option<String> {
 
 #[tauri::command(async)]
 pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, String> {
-    let (ok, stdout, stderr) = run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST"])?;
+    let (ok, stdout, stderr) = run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST", "/V"])?;
     if !ok {
         let detail = if !stderr.trim().is_empty() {
             stderr.trim()
@@ -840,7 +874,7 @@ pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, St
             // 尝试顺带迁移旧任务；迁移成功则再次查询
             if try_migrate_legacy_task(&state).is_some() && task_exists(TASK_NAME) {
                 let (ok2, stdout2, _e2) =
-                    run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST"])?;
+                    run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST", "/V"])?;
                 if ok2 {
                     return Ok(stdout2);
                 }
@@ -849,7 +883,12 @@ pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, St
         }
         return Err(detail.to_string());
     }
-    Ok(stdout)
+    let result=state.path("daily_checkin_last_run.json");
+    let detail=if result.exists() {
+        let report:crate::daily_checkin::LastRun=crate::fs_utils::read_json(&result);
+        crate::daily_checkin::describe(&report)
+    } else {"定时签到尚无执行结果；任务已注册不代表签到已成功。".into()};
+    Ok(format!("{detail}\n\n{stdout}"))
 }
 
 #[tauri::command(async)]
@@ -886,6 +925,21 @@ pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), S
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn daily_task_xml_has_matching_utf16_encoding_and_escaped_paths() {
+        let xml=daily_task_xml(r#"C:\签到 & 测试\task.cmd"#,"09:00",r#"host\user&test"#);
+        let bytes=daily_task_xml_bytes(&xml);
+        assert_eq!(&bytes[..2],&[0xff,0xfe]);
+        let wide:Vec<u16>=bytes[2..].chunks_exact(2).map(|b|u16::from_le_bytes([b[0],b[1]])).collect();
+        let decoded=String::from_utf16(&wide).unwrap();
+        assert_eq!(decoded,xml);
+        assert!(decoded.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>"));
+        assert!(decoded.contains(r#"C:\签到 &amp; 测试\task.cmd"#));
+        assert!(decoded.contains("<StartWhenAvailable>true</StartWhenAvailable>"));
+        assert!(decoded.contains("<LogonTrigger>"));
+        assert!(decoded.contains("T09:00:00</StartBoundary>"));
+    }
 
     /// 临时目录（独占 tag，避免测试间互踩）
     fn tmp_dir(tag: &str) -> PathBuf {

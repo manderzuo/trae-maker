@@ -3,6 +3,7 @@
 
 mod commands;
 mod checkin_results;
+mod daily_checkin;
 mod fs_utils;
 mod jwt;
 mod models;
@@ -30,6 +31,22 @@ pub struct TrayMenu {
 }
 
 fn main() {
+    let args:Vec<String>=std::env::args().collect();
+    if args.get(1).map(String::as_str)==Some("--register-daily-checkin") {
+        let code=match (AppState::new(),args.get(2)) {
+            (Ok(state),Some(time))=>if commands::misc::register_daily_task(&state,time).is_ok(){0}else{1},
+            _=>1,
+        };
+        std::process::exit(code);
+    }
+    if args.get(1).map(String::as_str)==Some("--daily-checkin") {
+        let before=args.windows(2).find(|v|v[0]=="--not-before").map(|v|v[1].as_str());
+        let code=match AppState::new() {
+            Ok(state)=>daily_checkin::run(&state,before),
+            Err(_)=>1,
+        };
+        std::process::exit(code);
+    }
     // 品牌迁移（老版本 Trae Work Assistant → AI Work 助手）：
     // 必须在 AppState::new 创建新数据目录之前执行；迁移为「复制」语义，
     // 旧数据目录原地保留（老应用可继续使用，两版并存），已迁移过则自动跳过
@@ -53,6 +70,7 @@ fn main() {
     if let Some(note) = commands::misc::try_migrate_legacy_task(&state) {
         fs_utils::app_log(&state.data_dir, &note);
     }
+    commands::misc::repair_daily_task(&state);
 
     // 单实例防护（仅正式版）：第二个进程启动时，本回调在首个实例中执行——把主窗口
     // 还原/显示/聚焦后，第二进程由插件自动退出。必须第一个注册（在创建窗口前持有互斥锁）。
@@ -85,7 +103,6 @@ fn main() {
         .manage(state)
         .manage(Mutex::new(Option::<commands::proxy::ProxyHandle>::None))
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
-        .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
             commands::env::env_check,
             commands::env::app_locate,

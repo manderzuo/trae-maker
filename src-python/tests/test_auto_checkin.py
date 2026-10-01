@@ -251,6 +251,19 @@ def test_resolve_claim_credits_layer3_fallback():
     assert resolve_claim_credits({}, None, recheck=_no_recheck) == (None, 0, "legacy")
 
 
+def test_missing_credentials_returns_failure_exit_code():
+    """Scheduled failures must not be reported as successful process exits."""
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as directory:
+        accounts = os.path.join(directory, "accounts.json")
+        with open(accounts, "w", encoding="utf-8") as stream:
+            json.dump({"accounts": [{"name": "test", "UserID": "u1", "jwt": ""}]}, stream)
+        with patch.object(sys, "argv", ["auto_checkin.py", "--accounts-file", accounts]), \
+             patch.object(auto_checkin, "DATA_SUBDIR", directory), \
+             patch.object(auto_checkin, "LOG_FILE", os.path.join(directory, "checkin.log")):
+            assert auto_checkin.main() == 1
+
+
 if __name__ == "__main__":
     test_extract_user_id()
     test_get_jwt_exp()
@@ -266,4 +279,5 @@ if __name__ == "__main__":
     test_resolve_claim_credits_layer1_claim_reward()
     test_resolve_claim_credits_layer2_balance_diff()
     test_resolve_claim_credits_layer3_fallback()
+    test_missing_credentials_returns_failure_exit_code()
     print("ALL TESTS PASSED")

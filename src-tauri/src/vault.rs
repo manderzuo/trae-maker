@@ -430,6 +430,11 @@ fn cleanup_temp_in(dir: &Path) -> usize {
 
 /// 启动时清理残留的临时凭据文件（进程崩溃/被杀时未及删除的明文文件）
 pub fn cleanup_temp_accounts(state: &AppState) {
+    // The independent scheduled worker may already be using a temporary file.
+    // Only clean when no checkin process owns this data directory.
+    let Ok(_guard) = crate::daily_checkin::ProcessGuard::acquire(&state.data_dir) else {
+        return;
+    };
     let n = cleanup_temp_in(&state.data_dir);
     if n > 0 {
         fs_utils::app_log(

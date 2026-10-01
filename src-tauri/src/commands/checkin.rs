@@ -9,10 +9,21 @@ use crate::state::AppState;
 use crate::commands::accounts::{build_account_views, resolve_user_ids};
 use crate::python::spawn_script;
 
-/// 签到运行防重入锁（应用级）：页面手动签到 / 托盘签到 / 静默签到共用，
-/// 占用期间 try_lock 失败即拒绝新的签到请求。
-/// 使用 tokio::sync::Mutex：其 Guard 为 Send，可在工作线程内持有到子进程结束
-pub struct CheckinGuard(pub tokio::sync::Mutex<()>);
+pub(crate) struct WorkerUi<'a>(pub Option<&'a AppHandle>);
+impl WorkerUi<'_> {
+    fn emit<T: serde::Serialize + Clone>(&self, event: &str, payload: T) -> Result<(),tauri::Error> {
+        match self.0 {Some(app)=>app.emit(event,payload),None=>Ok(())}
+    }
+    fn notify(&self, title:&str, message:&str) {
+        if let Some(app)=self.0 {crate::notify::notify(app,title,message);}
+    }
+}
+pub(crate) struct CheckinSummary {
+    pub ok:usize,
+    pub already:usize,
+    pub failed:usize,
+    pub message:String,
+}
 
 #[derive(Deserialize)]
 pub struct CheckinOpts {
@@ -69,7 +80,9 @@ pub fn start_checkin_core(
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     std::thread::spawn(move || {
         let st = app2.state::<AppState>();
-        run_checkin_worker(&app2, &st, opts, notify_done, tx);
+        if let Err(reason)=run_checkin_worker(&WorkerUi(Some(&app2)), &st, opts, notify_done, tx) {
+            fs_utils::app_log(&st.data_dir,&format!("签到执行失败: {reason}"));
+        }
     });
     // 等待启动阶段结果（抢锁 + 筛选 + 拉起子进程），通常毫秒级
     rx.recv().unwrap_or_else(|_| Err("签到工作线程异常退出".into()))
@@ -105,7 +118,7 @@ fn spawn_round(state: &AppState, uids: &[String]) -> Result<RoundProc, String> {
 
 /// 消费一轮子进程输出：NDJSON 解析 -> 事件 emit + 日志追加。
 /// 脚本自身的 done 事件不转发——最终 done 由调用方在各轮汇总后统一发（避免重复计数）。
-fn consume_round(app: &AppHandle, mut proc: RoundProc, log_path: &Path) -> RoundOutcome {
+fn consume_round(app: &WorkerUi<'_>, mut proc: RoundProc, log_path: &Path) -> RoundOutcome {
     let mut outcome = RoundOutcome::default();
     let stdout = proc.child.stdout.take();
     let stderr = proc.child.stderr.take();
@@ -196,15 +209,14 @@ fn consume_round(app: &AppHandle, mut proc: RoundProc, log_path: &Path) -> Round
 }
 
 /// 发送最终汇总 done 事件（checkin-progress + checkin-done），并按需发系统通知
-fn emit_final_done(app: &AppHandle, ok: usize, already: usize, failed: usize, total: usize, notify_done: bool) {
+fn emit_final_done(app: &WorkerUi<'_>, ok: usize, already: usize, failed: usize, total: usize, notify_done: bool) {
     let payload = serde_json::json!({
         "type": "done", "ok": ok, "already": already, "failed": failed, "total": total
     });
     let _ = app.emit("checkin-progress", &payload);
     let _ = app.emit("checkin-done", &payload);
     if notify_done {
-        crate::notify::notify(
-            app,
+        app.notify(
             "签到完成",
             &format!("成功 {ok} · 已签 {already} · 失败 {failed}"),
         );
@@ -212,32 +224,31 @@ fn emit_final_done(app: &AppHandle, ok: usize, already: usize, failed: usize, to
 }
 
 /// 签到工作线程主体：抢锁 → 筛选 → 全量轮 → 最多 2 轮失败重试（间隔加长）→ 汇总 done
-fn run_checkin_worker(
-    app: &AppHandle,
+pub(crate) fn run_checkin_worker(
+    app: &WorkerUi<'_>,
     state: &AppState,
     opts: CheckinOpts,
     notify_done: bool,
     tx: Sender<Result<(), String>>,
-) {
+) -> Result<CheckinSummary,String> {
     // 防重入：正在签到时直接拒绝
-    let guard = app.state::<CheckinGuard>();
-    let held = match guard.0.try_lock() {
+    let held = match crate::daily_checkin::ProcessGuard::acquire(&state.data_dir) {
         Ok(g) => g,
-        Err(_) => {
+        Err(reason) => {
             fs_utils::app_log(&state.data_dir, "签到拒绝: 已有签到任务运行中");
             if notify_done {
-                crate::notify::notify(app, "签到跳过", "已有签到任务正在进行中");
+                app.notify("签到跳过", &reason);
             }
-            let _ = tx.send(Err("已有签到任务正在进行中".into()));
-            return;
+            let _ = tx.send(Err(reason.clone()));
+            return Err(reason);
         }
     };
 
     let mut uids = match resolve_user_ids(state, &opts.scope, opts.user_ids) {
         Ok(u) => u,
         Err(e) => {
-            let _ = tx.send(Err(e));
-            return;
+            let _ = tx.send(Err(e.clone()));
+            return Err(e);
         }
     };
     // 全集视图一次构建：跳过原因登记与 start 事件全集清单共用
@@ -268,7 +279,7 @@ fn run_checkin_worker(
             }
             if opts.skip_expired && (v.jwt_exp_hours.is_none() || v.jwt_exp_hours.unwrap() <= 0.0)
             {
-                skip_reasons.insert(u.clone(), "expired");
+                skip_reasons.insert(u.clone(), if v.jwt_exp_hours.is_none(){"credentials_missing"}else{"expired"});
                 return false;
             }
             true
@@ -368,11 +379,15 @@ fn run_checkin_worker(
             serde_json::json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0, "empty": true }),
         );
         if notify_done {
-            crate::notify::notify(app, "签到完成", "没有需要签到的账号（全部已签/冷却中）");
+            app.notify("签到完成", "没有需要签到的账号（全部已签/冷却中）");
         }
         drop(held);
         let _ = tx.send(Ok(()));
-        return;
+        let already=skip_reasons.values().filter(|r|**r=="checked_in").count();
+        let failed=skip_reasons.len()-already;
+        return Ok(CheckinSummary {ok:0,already,failed,message:if failed>0 {
+            "没有可签到账号：存在过期/缺失凭据或冷却中的账号，请查看账号管理。".into()
+        } else {"今日账号已签到，或没有配置账号；未重复领取。".into()}});
     }
 
     let log_path = state.data_dir.join("logs").join("checkin.log");
@@ -384,8 +399,8 @@ fn run_checkin_worker(
     let proc = match spawn_round(state, &uids) {
         Ok(p) => p,
         Err(e) => {
-            let _ = tx.send(Err(e));
-            return; // held 在此自动释放
+            let _ = tx.send(Err(e.clone()));
+            return Err(e); // held 在此自动释放
         }
     };
     let total_all = uids.len();
@@ -501,6 +516,15 @@ fn run_checkin_worker(
     emit_final_done(app, ok, already, failed, total_all, notify_done);
     // _held 持有到全部轮次结束，线程退出自动释放
     let _held = held;
+    let skipped_failed=skip_reasons.values().filter(|r|**r!="checked_in").count();
+    let skipped_already=skip_reasons.values().filter(|r|**r=="checked_in").count();
+    let failures=failed+skipped_failed;
+    let message=if failures>0 {
+        let kinds:std::collections::BTreeSet<_>=round_error_types.values().cloned().collect();
+        format!("{} 个账号未成功；错误分类：{}。请查看签到日志和账号的凭据/冷却状态。",failures,
+            if kinds.is_empty(){"凭据不可用、接口拒绝或脚本未返回结果".into()}else{kinds.into_iter().collect::<Vec<_>>().join("、")})
+    } else {"签到完成；已签到账号不会重复领取。".into()};
+    Ok(CheckinSummary {ok,already:already+skipped_already,failed:failures,message})
 }
 
 /// 查询近 N 天签到结果趋势（按日期升序），供 Dashboard 堆叠图使用

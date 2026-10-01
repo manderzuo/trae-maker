@@ -781,7 +781,7 @@ def main():
         tout(f"[警告] 写入 {LOG_FILE} 失败: {e}")
 
     emit({"type": "done", "ok": total_ok, "already": already, "failed": failed})
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
