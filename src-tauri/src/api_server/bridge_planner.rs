@@ -305,7 +305,9 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         // Re-read under a quiescent fence before accepting the larger capacity.
         // Failure preserves the conservative snapshot; regular preflight below
         // can still admit a request within its already verified capacity.
-        let _=super::bridge_capacity_source::reconcile_increased_capacity(runtime,&account.uid,live.general,live.work,||source.capacity(&account));
+        if let Err(error)=super::bridge_capacity_source::reconcile_increased_capacity(runtime,&account.uid,live.general,live.work,||source.capacity(&account)) {
+            crate::fs_utils::app_log(runtime.data_dir(),&format!("Core 准入容量增长核对未更新快照：{}；继续执行原容量检查",super::bridge_capacity_source::safe_error_code(&error)));
+        }
     }
     let (hold,policy,expiry,evidence)=if video {
         let prices=runtime.with_store(|s,_|s.confirmed_video_prices(&account.uid,now.saturating_sub(7*86400*1000),now))?;
@@ -386,8 +388,10 @@ pub(super) fn parse_capacity(packs:&[Value],now:i64)->Result<LiveCapacity,String
         let start=time(&base["start_time"])?;
         let end=[time(&base["end_time"])?,time(&pack["expire_time"])?].into_iter().flatten().filter(|v|*v>0).min();
         if start.is_some_and(|v|v>now/1000) || end.is_some_and(|v|v<=now/1000) {continue;}
-        if pack["usage"].as_object().is_some_and(|m|m.is_empty()) {continue;}
-        let remaining=micro(&base["quota"]["credits_limit"])? .saturating_sub(micro(&pack["usage"]["credits_amount"])?).max(0);
+        let unused=super::bridge_capacity_source::native_unused_credit(pack);
+        if !unused && pack["usage"].as_object().is_some_and(|m|m.is_empty()) {continue;}
+        let used=if unused {0} else {micro(&pack["usage"]["credits_amount"])?};
+        let remaining=micro(&base["quota"]["credits_limit"])? .saturating_sub(used).max(0);
         let slot=if product==Some(209) {&mut live.work} else {&mut live.general};
         *slot=slot.checked_add(remaining).ok_or("capacity overflow")?;
         if remaining>0 {if let Some(end)=end {live.valid_until_ms=live.valid_until_ms.min(end.checked_mul(1000).ok_or("expiry overflow")?);}}

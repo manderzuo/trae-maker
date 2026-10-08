@@ -59,6 +59,39 @@ fn digest(value:&Value)->Result<String,String> {
     Ok(format!("{:x}",Sha256::digest(bytes)))
 }
 
+/// The native require_usage response represents an unused reward with status=1,
+/// active entitlement status=0 and an explicitly empty usage object. Generic
+/// missing/null usage is not that contract and remains unusable evidence.
+pub(super) fn native_unused_credit(pack:&Value)->bool {
+    let Some(base)=pack.get("entitlement_base_info") else {return false};
+    let id=base.get("entitlement_id").filter(|v|!v.is_null()).or_else(||pack.get("id"));
+    let identified=matches!(id,Some(Value::String(s)) if !s.is_empty() && s.len()<=256)
+        || matches!(id,Some(Value::Number(n)) if n.is_i64() || n.is_u64());
+    let start=time_ms(base.get("start_time")).ok().flatten();
+    let end=[time_ms(base.get("end_time")),time_ms(pack.get("expire_time"))]
+        .into_iter().filter_map(Result::ok).flatten().filter(|v|*v>0).min();
+    pack.get("status").and_then(Value::as_i64)==Some(1)
+        && base.get("ent_status").and_then(Value::as_i64)==Some(0)
+        && matches!(base.get("product_id").and_then(Value::as_i64),Some(208|209|221))
+        && pack.get("usage").and_then(Value::as_object).is_some_and(|u|u.is_empty())
+        && identified && matches!((start,end),(Some(a),Some(b)) if a>=0 && b>a)
+}
+/// Only closed diagnostic codes may reach logs; source responses and raw SQL
+/// errors can include identifiers and must never be interpolated there.
+pub(super) fn safe_error_code(error:&str)->&'static str {
+    match error {
+        "capacity_rebase_not_quiescent"=>"capacity_rebase_not_quiescent",
+        "capacity_source_missing_pack"=>"capacity_source_missing_pack",
+        "capacity_source_pack_changed"=>"capacity_source_pack_changed",
+        "capacity_source_debit_mismatch"=>"capacity_source_debit_mismatch",
+        "capacity_source_unknown_product"=>"capacity_source_unknown_product",
+        "upstream_capacity_unavailable"=>"upstream_capacity_unavailable",
+        "bridge_recovery_required"=>"bridge_recovery_required",
+        "capacity_refresh_stopped"=>"capacity_refresh_stopped",
+        _=>"capacity_reconciliation_unavailable",
+    }
+}
+
 impl PackObservation {
     pub(super) fn parse(packs:&[Value],now:i64)->Result<Self,String> {
         if now<0 || packs.len()>256 || serde_json::to_vec(packs).map_err(|_|"capacity_source_encoding_failed")?.len()>128*1024 {
@@ -72,15 +105,15 @@ impl PackObservation {
             if limit.is_none() && used.is_none() {continue;}
             let product=base.get("product_id").and_then(Value::as_i64).ok_or("capacity_source_invalid_product")?;
             if !matches!(product,208|209|221) {return Err("capacity_source_unknown_product".into());}
-            // Native read-only responses omit usage for sparse daily rewards.
-            // Do not invent zero use or authorize their full quota. Once exact
-            // usage appears, count the WHOLE observed use as a new-pack debit.
-            if used.is_none() && raw.get("usage").and_then(Value::as_object).is_some_and(|m|m.is_empty()) {continue;}
+            let unused=native_unused_credit(raw);
+            // Only the explicit native UNUSED contract can supply zero. Keep
+            // unknown sparse observations excluded and never create a receipt.
+            if !unused && used.is_none() && raw.get("usage").and_then(Value::as_object).is_some_and(|m|m.is_empty()) {continue;}
             let start_ms=time_ms(base.get("start_time"))?;
             let end_ms=match (time_ms(base.get("end_time"))?.filter(|v|*v>0),time_ms(raw.get("expire_time"))?.filter(|v|*v>0)) {
                 (Some(a),Some(b))=>Some(a.min(b)),(a,b)=>a.or(b),
             };
-            let item=PackUse {product,limit:credits(limit)?,used:credits(used)?,start_ms,end_ms};
+            let item=PackUse {product,limit:credits(limit)?,used:if unused {0} else {credits(used)?},start_ms,end_ms};
             let mut identity=raw.as_object().ok_or("capacity_source_invalid_pack")?.clone();
             identity.remove("usage");
             // An explicit pack ID cannot be counted twice merely because quota
@@ -110,7 +143,10 @@ impl PackObservation {
     pub(super) fn proves(&self,previous:&Self,actual:i64)->Result<(),String> {
         self.validate()?;previous.validate()?;
         if self.observed_at_ms<=previous.observed_at_ms || actual<0 {return Err("capacity_source_unproven".into());}
-        if previous.packs.keys().any(|key|!self.packs.contains_key(key)) {return Err("capacity_source_missing_pack".into());}
+        if previous.packs.iter().any(|(key,old)|!self.packs.contains_key(key)
+            && !(old.used==old.limit && old.end_ms.is_some_and(|end|end<=self.observed_at_ms))) {
+            return Err("capacity_source_missing_pack".into());
+        }
         let mut delta=0i64;
         for (key,next) in &self.packs {
             let prior=if let Some(old)=previous.packs.get(key) {
@@ -335,6 +371,59 @@ mod tests {
         assert_eq!(after.balances().unwrap(),(235_000_000,0));
         let mut malformed=pack("bad",208,"100","0");malformed["usage"]=Value::Null;
         assert!(PackObservation::parse(&[malformed],20_000).is_err());
+    }
+    #[test]
+    fn qa61_native_unused_rewards_are_capacity_with_their_explicit_source_status() {
+        let mut reward=pack("daily",208,"150","0");
+        reward["usage"]=json!({});reward["status"]=json!(1);
+        reward["entitlement_base_info"]["ent_status"]=json!(0);
+        let mut monthly=reward.clone();monthly["id"]=json!("monthly");
+        monthly["entitlement_base_info"]["product_id"]=json!(221);
+        monthly["entitlement_base_info"]["quota"]["credits_limit"]=json!("500");
+        let observation=PackObservation::parse(&[reward.clone(),monthly],10_000).unwrap();
+        assert_eq!(observation.balances().unwrap(),(650_000_000,0),"native unused reward status must not make real credits invisible");
+        assert_eq!(super::super::bridge_planner::parse_capacity(&[reward],10_000).unwrap().general,150_000_000,"admission and rebase must use the same native contract");
+    }
+    #[test]
+    fn qa61_expired_exhausted_monthly_pack_can_roll_over_without_a_fabricated_debit() {
+        let mut exhausted=pack("old-month",221,"500","500");exhausted["expire_time"]=json!(30);
+        let work=pack("work",209,"2000","1989.2356");
+        let before=PackObservation::parse(&[exhausted,work.clone()],10_000).unwrap();
+        let after=PackObservation::parse(&[work,pack("new-month",221,"500","0")],40_000).unwrap();
+        after.proves(&before,0).expect("an expired already exhausted entitlement cannot acquire additional debit");
+        assert_eq!(after.balances().unwrap(),(500_000_000,10_764_400));
+        assert!(after.proves(&before,1).is_err(),"rollover is not a receipt for one microcredit or any unknown request");
+    }
+    #[test]
+    fn qa61_sparse_usage_without_a_complete_unused_contract_stays_excluded() {
+        let mut reward=pack("daily",208,"150","0");
+        reward["usage"]=json!({});reward["status"]=json!(1);
+        reward["entitlement_base_info"]["ent_status"]=json!(0);
+        for mutate in 0..6 {
+            let mut bad=reward.clone();
+            match mutate {
+                0=>{bad.as_object_mut().unwrap().remove("status");},
+                1=>bad["status"]=json!(0),
+                2=>bad["entitlement_base_info"]["ent_status"]=json!(1),
+                3=>{bad.as_object_mut().unwrap().remove("id");},
+                4=>bad["expire_time"]=Value::Null,
+                _=>bad["usage"]=json!({"other":"unknown"}),
+            }
+            assert!(!native_unused_credit(&bad));
+            let parsed=PackObservation::parse(&[bad],10_000);
+            assert!(parsed.is_err() || parsed.unwrap().balances().unwrap()==(0,0),"incomplete native status cannot authorize quota");
+        }
+        reward["usage"]=json!({"credits_amount":"5"});
+        assert_eq!(PackObservation::parse(&[reward],10_000).unwrap().balances().unwrap(),(145_000_000,0),"reported use always wins over status metadata");
+    }
+    #[test]
+    fn qa61_missing_partial_or_unexpired_pack_still_cannot_cover_any_debit() {
+        for (used,expiry) in [("499",30),("500",1000)] {
+            let mut old=pack("old",221,"500",used);old["expire_time"]=json!(expiry);
+            let before=PackObservation::parse(&[old],10_000).unwrap();
+            let after=PackObservation::parse(&[pack("new",221,"500","0")],40_000).unwrap();
+            assert_eq!(after.proves(&before,0).unwrap_err(),"capacity_source_missing_pack");
+        }
     }
     #[cfg(windows)]
     #[test]

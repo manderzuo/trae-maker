@@ -612,7 +612,7 @@ fn refresh_pending_account(
                 crate::commands::accounts::query_ent_packs_for_bridge(&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id,..Default::default()})
                     .map_err(|_|"upstream_capacity_unavailable".into())
             });
-            if result.is_err() {crate::fs_utils::app_log(&state.data_dir,"Core 专用账号容量核对暂未通过；保留费用事实，等待下次核对");}
+            if let Err(error)=result {crate::fs_utils::app_log(&state.data_dir,&format!("Core 专用账号容量核对暂未通过：{}；保留费用事实，等待下次核对",super::bridge_capacity_source::safe_error_code(&error)));}
         }
     }
     match pending_refresh_accounts(&state.data_dir) {
