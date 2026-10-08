@@ -4,6 +4,41 @@ use super::{bridge_billing::BridgeBillingStore,bridge_budget_lease::BridgeBudget
 
 pub(super) struct BridgeBudgetRuntime { data_dir:PathBuf, lease:Mutex<BridgeBudgetLease>, planning:Mutex<std::collections::HashSet<String>>, receipt_cursors:Mutex<std::collections::HashMap<String,(String,String)>>,pub(super) chunks:super::bridge_chunks::Hub }
 pub(super) struct PlanningGuard<'a> {runtime:&'a BridgeBudgetRuntime,request:String}
+/// Explicit maintenance entry, never part of normal startup. It starts no HTTP
+/// listener, accesses no credentials and preserves all terminal unknown costs.
+pub(crate) fn recover_quiet_local_instance(data_dir:&Path,acknowledge_retained_unknowns:bool)->Result<serde_json::Value,String> {
+    if !acknowledge_retained_unknowns {return Err("bridge_recovery_confirmation_required".into());}
+    if !data_dir.is_absolute() || !data_dir.join("bridge-billing.sqlite3").is_file() {return Err("bridge_local_recovery_invalid_root".into());}
+    let quiet=|db:&rusqlite::Connection|->Result<(),String> {
+        let blocked:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_slots WHERE stage='P') OR EXISTS(SELECT 1 FROM bridge_budget_executions WHERE execution_state IN ('running','unknown') OR finished_at_ms IS NULL)",[],|r|r.get(0)).map_err(|_|"bridge_local_recovery_check_failed")?;
+        if blocked {Err("bridge_local_recovery_not_quiet".into())} else {Ok(())}
+    };
+    {
+        let db=rusqlite::Connection::open_with_flags(data_dir.join("bridge-billing.sqlite3"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_|"bridge_local_recovery_read_failed")?;
+        db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_|"bridge_local_recovery_read_failed")?;
+        db.execute_batch("PRAGMA query_only=ON").map_err(|_|"bridge_local_recovery_read_failed")?;
+        let schema:i64=db.query_row("SELECT schema_version FROM bridge_schema_meta WHERE singleton=1",[],|r|r.get(0)).map_err(|_|"bridge_local_recovery_read_failed")?;
+        if schema!=8 {return Err("bridge_local_recovery_schema_requires_review".into());}
+        quiet(&db)?;
+    }
+    let runtime=BridgeBudgetRuntime::start(data_dir).map_err(|_|"bridge_local_recovery_start_failed")?;
+    // Repeat the preflight after both exclusive OS leases have been acquired.
+    runtime.with_store(|s,_|quiet(&s.connection)).map_err(|e|if e=="bridge_local_recovery_not_quiet" {e} else {"bridge_local_recovery_check_failed".into()})?;
+    let before=runtime.recovery_status().map_err(|_|"bridge_local_recovery_check_failed")?;
+    let retained=before.retained_unresolved_budgets;
+    let recovered=before.recovery_required;
+    if recovered {
+        let after=runtime.recover_local_instance(&before.instance_id,&before.generation,true).map_err(|_|"bridge_local_recovery_failed")?;
+        if after.recovery_required || !after.charge_ready || after.retained_unresolved_budgets!=retained {
+            return Err("bridge_local_recovery_verification_failed".into());
+        }
+    }
+    drop(runtime);
+    let store=BridgeBillingStore::open(data_dir).map_err(|_|"bridge_local_recovery_close_failed")?;
+    if super::bridge_billing::is_dirty_bridge_generation(&store.bridge_identity().map_err(|_|"bridge_local_recovery_close_failed")?.1) {return Err("bridge_local_recovery_close_failed".into());}
+    Ok(serde_json::json!({"operation":"explicit_quiet_local_bridge_recovery","recovered":recovered,
+        "retained_unresolved_budgets":retained,"charged_dispatches":0,"network_calls":0,"credentials_read":false,"lease_closed":true}))
+}
 #[derive(serde::Serialize)]
 pub(super) struct RecoveryStatus {
     pub instance_id:String,pub generation:String,pub recovery_required:bool,pub charge_ready:bool,
@@ -242,6 +277,40 @@ mod tests {
         }).unwrap();
         assert!(runtime.recover_local_instance(&status.instance_id,&status.generation,true).is_err());
         drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn qa61_local_recovery_preserves_terminal_unknown_costs_and_closes_cleanly() {
+        let (dir,mut store,lease)=fixture();
+        let budget=super::super::bridge_receipts::tests::send(&mut store,&lease,"request-terminal-unbilled");
+        let before=store.capacity_totals("account").unwrap();
+        drop(lease);drop(store);
+        let result=super::recover_quiet_local_instance(&dir,true).expect("explicit quiet recovery must use existing lease recovery");
+        assert_eq!(result["retained_unresolved_budgets"],1);
+        assert_eq!(result["charged_dispatches"],0);
+        let store=BridgeBillingStore::open(&dir).unwrap();
+        assert_eq!(store.capacity_totals("account").unwrap(),before);
+        let facts:(String,i64,Option<i64>)=store.connection.query_row("SELECT stage,amount_microcredits,actual_microcredits FROM bridge_capacity_slots WHERE budget_id=?1",[budget],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(facts,("R".into(),40_000_000,None));
+        let receipts:i64=store.connection.query_row("SELECT COUNT(*) FROM bridge_budget_receipts",[],|r|r.get(0)).unwrap();assert_eq!(receipts,0);
+        assert!(!super::super::bridge_billing::is_dirty_bridge_generation(&store.bridge_identity().unwrap().1),"one-shot recovery must close its own lease before the GUI starts");
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn qa61_local_recovery_rejects_missing_acknowledgment_without_mutation() {
+        let (dir,store,lease)=fixture();let identity=store.bridge_identity().unwrap();
+        assert_eq!(super::recover_quiet_local_instance(&dir,false).unwrap_err(),"bridge_recovery_confirmation_required");
+        assert_eq!(store.bridge_identity().unwrap(),identity);
+        drop(lease);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn qa61_local_recovery_rejects_live_or_unsent_executions_without_lease_rotation() {
+        let (dir,mut store,lease)=fixture();
+        let prepared=store.prepare_budget(&lease,&super::super::bridge_prepared::tests::input(),None,10).unwrap();
+        let identity=store.bridge_identity().unwrap();
+        assert_eq!(super::recover_quiet_local_instance(&dir,true).unwrap_err(),"bridge_local_recovery_not_quiet");
+        assert_eq!(store.bridge_identity().unwrap(),identity);
+        assert_eq!(store.capacity_totals("account").unwrap().pending,40_000_000);
+        let _=prepared;drop(lease);drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn runtime_recovery_cannot_reenable_a_closing_server() {

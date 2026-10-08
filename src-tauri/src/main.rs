@@ -32,6 +32,25 @@ pub struct TrayMenu {
 
 fn main() {
     let args:Vec<String>=std::env::args().collect();
+    if args.get(1).map(String::as_str)==Some("--recover-local-bridge") {
+        let code=(||->Result<i32,()> {
+            if args.len()!=6 || args[3]!="--retain-unknowns" || args[4]!="--report" {return Err(());}
+            let root=std::path::PathBuf::from(&args[2]);let output=std::path::PathBuf::from(&args[5]);
+            let parent=output.parent().filter(|p|p.is_dir()).ok_or(())?.canonicalize().map_err(|_|())?;
+            let canonical_root=root.canonicalize().map_err(|_|())?;
+            if !output.is_absolute() || output.exists() || parent.starts_with(&canonical_root)
+                || output.extension().and_then(|s|s.to_str())!=Some("json") {return Err(());}
+            let result=api_server::bridge_runtime::recover_quiet_local_instance(&root,true);
+            let (code,value)=match result {
+                Ok(value)=>(0,value),
+                // The maintenance wrapper only emits closed local error codes.
+                Err(error)=>(1,serde_json::json!({"error":{"code":error},"charged_dispatches":0})),
+            };
+            std::fs::write(output,serde_json::to_vec_pretty(&value).map_err(|_|())?).map_err(|_|())?;
+            Ok(code)
+        })().unwrap_or(2);
+        std::process::exit(code);
+    }
     if args.get(1).map(String::as_str)==Some("--register-daily-checkin") {
         let code=match (AppState::new(),args.get(2)) {
             (Ok(state),Some(time))=>if commands::misc::register_daily_task(&state,time).is_ok(){0}else{1},
