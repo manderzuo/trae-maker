@@ -32,7 +32,20 @@ impl PreparationSource for NativePreparationSource<'_> {
     }
     fn capacity(&self,account:&PickedAccount)->Result<Vec<Value>,String> {
         crate::commands::accounts::query_ent_packs_for_bridge(&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id.clone(),..Default::default()})
-            .map_err(|_|"upstream_capacity_unavailable".into())
+            .map_err(|error| {
+                // Only closed diagnostic classes enter logs; raw upstream
+                // response text may contain account or credential material.
+                let cause = if error.contains("status code 401") { "http_401" }
+                    else if error.contains("status code 403") { "http_403" }
+                    else if error.contains("status code 429") { "http_429" }
+                    else if error.contains("user_entitlement_pack_list") { "response_shape" }
+                    else if error.contains("解析响应失败") { "response_json" }
+                    else if error.to_ascii_lowercase().contains("tls") { "tls" }
+                    else if error.to_ascii_lowercase().contains("dns") { "dns" }
+                    else { "request_failed" };
+                crate::fs_utils::app_log(&self.0.data_dir, &format!("Core 容量查询失败：{cause}"));
+                "upstream_capacity_unavailable".into()
+            })
     }
     fn estimate(&self,account:&PickedAccount,workload:i64)->Result<i64,String> {
         let item=format!("estimate-{:032x}",rand::random::<u128>());

@@ -34,6 +34,7 @@ pub mod limits;
 pub mod models_sync;
 pub mod pool;
 pub mod payload;
+mod text_protocol;
 pub mod phase2_smoke;
 #[cfg(test)]
 pub mod phase3_streaming_smoke;

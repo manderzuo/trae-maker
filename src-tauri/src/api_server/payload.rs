@@ -196,7 +196,7 @@ pub fn prepare_llm_chat_body_with_conversation(
     obj_mut.insert("prompt_max_tokens".into(), json!(168000));
     obj_mut.insert("mode".into(), json!("FunctionCall"));
     obj_mut.insert("ide_version".into(), json!(super::ide_version()));
-    obj_mut.insert("ide_version_code".into(), json!(super::ide_version_code()));
+    obj_mut.insert("ide_version_code".into(), json!(super::text_protocol::VERSION_CODE));
     obj_mut.insert("app_id".into(), json!(super::APP_ID));
     obj_mut.insert("package_type".into(), json!("stable_cn"));
 
@@ -495,6 +495,28 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn text_generation_uses_compatible_protocol_after_native_client_migration() {
+        for (model, function) in [
+            ("glm-5.3-flash", "solo_agent"),
+            ("glm-5.3", "solo_work_lite"),
+            ("DeepSeek-V4-Flash", "solo_work_lite"),
+        ] {
+            let src = json!({"model": model, "ide_version_code": "20250325",
+                "messages": [{"role": "user", "content": "hello"}]});
+            let prepared: Value = serde_json::from_slice(&prepare_llm_chat_body(
+                &serde_json::to_vec(&src).unwrap(), "deepseek-v4-flash",
+                "fixture-user", "fixture-device", "fixture-machine",
+            )).unwrap();
+            assert_eq!(prepared["ide_version_code"], "20260811", "{model}");
+            assert_eq!(prepared["config_name"], model);
+            assert_eq!(prepared["function"], function);
+            assert_eq!(prepared["user_id"], "fixture-user");
+            assert_eq!(prepared["device_id"], "fixture-device");
+            assert_eq!(prepared["messages"][0]["content"][0]["text"], "hello");
+        }
+    }
 
     #[test]
     fn selected_model_is_not_replaced_by_default_or_unknown_fallback() {

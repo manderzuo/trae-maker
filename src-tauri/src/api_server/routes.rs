@@ -4125,8 +4125,7 @@ fn make_upstream_request_with_agent(jwt:&str,device_id:&str,machine_id:&str,body
     );
     let request_id = format!("req_{}", uuid_like_id());
 
-    let resp = agent
-        .post(&url)
+    let resp = super::text_protocol::post(&agent, &url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
         .set("accept-encoding", "gzip, deflate, br, zstd")
@@ -4134,9 +4133,7 @@ fn make_upstream_request_with_agent(jwt:&str,device_id:&str,machine_id:&str,body
         .set("x-ide-token", jwt)
         .set("x-app-id", APP_ID)
         .set("x-app-version", "default")
-        .set("x-app-version-code", &super::ide_version_code())
         .set("x-ide-version", &super::ide_version())
-        .set("x-ide-version-code", &super::ide_version_code())
         .set("x-ide-version-type", "stable")
         .set("x-device-type", "windows")
         .set("x-device-brand", "CREFG-XX")

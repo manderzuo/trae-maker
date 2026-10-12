@@ -271,14 +271,13 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
     let mut last_err = String::new();
     let mut parsed: Option<Vec<ModelOption>> = None;
     for (account, device_id, machine_id) in &candidates {
-        let resp = agent
-            .post("https://api5-normal.mchost.guru/api/ide/v1/batch_get_detail_param")
+        let resp = super::text_protocol::post(&agent,
+            "https://api5-normal.mchost.guru/api/ide/v1/batch_get_detail_param")
             .set("Content-Type", "application/json")
             .set("Request-Traffic-Type", "prod")
             .set("User-Agent", "TraeClient/TTNet")
             .set("x-app-id", super::APP_ID)
             .set("x-app-version", "default")
-            .set("x-app-version-code", &super::ide_version_code())
             .set("x-bridge-transport", "aha")
             .set("x-device-brand", "CREFG-XX")
             .set("x-device-cpu", "Intel")
@@ -286,7 +285,6 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
             .set("x-device-type", "windows")
             .set("x-ide-token", account.jwt.trim())
             .set("x-ide-version", &super::ide_version())
-            .set("x-ide-version-code", &super::ide_version_code())
             .set("x-ide-version-type", "stable")
             .set("x-lgw-req-sdk-type", "3")
             .set("x-machine-id", machine_id)
