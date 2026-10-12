@@ -22,7 +22,7 @@ pub struct NativeClientProfile {
 impl NativeClientProfile {
     pub fn storage_path(&self) -> PathBuf { self.data_dir.join("User/globalStorage/storage.json") }
     pub fn user_agent(&self) -> String {
-        format!("VSCode/{} ({})", self.base_version, if self.target_app == "Trae" { "TRAE CN" } else { "TRAE SOLO CN" })
+        format!("VSCode {} ({})", self.base_version, if self.target_app == "Trae" { "TRAE CN" } else { "TRAE SOLO CN" })
     }
 }
 

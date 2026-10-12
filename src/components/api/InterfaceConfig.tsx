@@ -235,7 +235,7 @@ curl -X POST http://${host}:${p}/v1/chat/completions \\
     "stream": true
   }'
 
-# Seedance 视频生成（Trae Work CN Work 积分；异步任务）
+# Seedance 视频生成（TRAE CN Work 积分；异步任务）
 # 与文字请求共用上面的 Base URL 和 API Key
 curl -X POST http://${host}:${p}/v1/videos/generations \\
   -H "Content-Type: application/json" \\

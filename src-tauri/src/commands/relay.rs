@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::os::windows::process::CommandExt;
 use std::time::Duration;
 use tauri::State;
 use tungstenite::{connect, Message};
@@ -344,12 +345,12 @@ fn share_request(req: ureq::Request, jwt: &str, device: &DeviceEntry) -> ureq::R
         .set("x-preferenced-language", "zh-CN")
         .set("x-trae-user-timezone", "Asia/Shanghai")
         .set("x-user-region", "CN")
-        .set("user-agent", "VSCode 1.107.1 (TRAE SOLO CN)")
+        .set("user-agent", &crate::native_client::resolve_default().user_agent())
         .set("origin", "vscode-file://vscode-app")
         .set("x-app-id", "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8")
         .set("x-app-version", "default")
         .set("x-app-version-code", "20260901")
-        .set("x-ide-version", "0.1.65")
+        .set("x-ide-version", &crate::native_client::resolve_default().app_version)
         .set("x-ide-version-code", "20260901")
         .set("x-ide-version-type", "stable")
         .set("x-device-type", "windows")
@@ -364,7 +365,7 @@ fn share_request(req: ureq::Request, jwt: &str, device: &DeviceEntry) -> ureq::R
         .set("package-type", "stable_cn")
         .set("x-lscbd-aid", "787976")
         .set("x-lscbd-platform", "windows")
-        .set("app-version", "0.1.65")
+        .set("app-version", &crate::native_client::resolve_default().app_version)
         .set("x-request-id", &request_id)
         .set("x-ss-dp", "787976")
         .set("x-tt-trace-id", &trace_id);
@@ -716,6 +717,15 @@ fn trae_cdp_target() -> Result<String, String> {
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
         .unwrap_or(TRAE_CDP_DEFAULT_PORT);
+    // Bind the loopback CDP socket to this installed client's default data profile.
+    let profile = crate::native_client::resolve_default();
+    let expected_exe = profile.exe.as_ref().ok_or("未检测到 TRAE CN 客户端")?;
+    let ps = format!("$listener=Get-NetTCPConnection -State Listen -LocalPort {} -ErrorAction SilentlyContinue | Select-Object -First 1; if($listener){{ $p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$listener.OwningProcess); if($p.CommandLine -notmatch '--user-data-dir'){{ $p.ExecutablePath }} }}", port);
+    let owner = Command::new("powershell").args(["-NoProfile", "-Command", &ps]).creation_flags(0x08000000).output().map_err(|e| e.to_string())?;
+    let actual_exe = String::from_utf8_lossy(&owner.stdout).trim().to_string();
+    if !actual_exe.eq_ignore_ascii_case(&expected_exe.to_string_lossy()) {
+        return Err("本地调试端口不属于当前 TRAE CN 默认实例，已拒绝接力；请通过助手打开客户端".into());
+    }
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))
         .timeout_read(Duration::from_secs(3))
@@ -765,7 +775,10 @@ fn trae_lite_call(
 ) -> Result<Value, String> {
     let ws_url = trae_cdp_target()?;
     let (mut socket, _) = connect(&ws_url)
-        .map_err(|e| format!("连接 Trae Work 本地调试桥失败：{e}"))?;
+        .map_err(|e| format!("连接 TRAE CN 本地调试桥失败：{e}"))?;
+    if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        stream.set_read_timeout(Some(Duration::from_secs(20))).map_err(|e| e.to_string())?;
+    }
     let connect_session_id = random_connect_session_id();
     let channel_id = random_connect_session_id();
     let request = json!({

@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import threading
 import time
+import native_client
 import atexit
 import base64
 import random
@@ -855,7 +856,7 @@ def update_account_jwt(user_id, jwt_full):
         return "appended"
 
 
-def update_account_refresh_token(user_id, refresh_token):
+def update_account_refresh_token(user_id, refresh_token, oauth_client_id=None):
     """按 user_id 查找账号，更新 refresh_token 字段。
     仅当新 token 非空且与旧值不同时才写盘。返回 'updated' / 'not_found' / 'unchanged'。"""
     cfg = load_accounts()
@@ -868,8 +869,12 @@ def update_account_refresh_token(user_id, refresh_token):
                 break
         if not target:
             return "not_found"
-        if target.get("refresh_token") == refresh_token:
+        if target.get("refresh_token") == refresh_token and (not oauth_client_id or target.get("oauth_client_id") == oauth_client_id):
             return "unchanged"
+        if oauth_client_id in (native_client.LEGACY_CLIENT_ID, native_client.TRAE_CLIENT_ID):
+            target["oauth_client_id"] = oauth_client_id
+        elif target.get("refresh_token") != refresh_token:
+            target.pop("oauth_client_id", None)
         target["refresh_token"] = refresh_token
         target["refresh_token_updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
         log(f"  [refresh_token 更新] user={user_id} 账号={target.get('name', '?')}")
@@ -877,36 +882,40 @@ def update_account_refresh_token(user_id, refresh_token):
         return "updated"
 
 
-def try_capture_refresh_token_from_response(host, path, resp_body):
+def try_capture_refresh_token_from_response(host, path, resp_body, request_body=b""):
     """从 ExchangeToken 响应体中提取 refresh_token 并写回 accounts.json。
     ExchangeToken 响应格式（本项目协议分析）：
     {"code":0,"data":{"access_token":"<jwt>","refresh_token":"<rt>",...}}
     或 {"code":0,"data":{"token":"<jwt>","refresh_token":"<rt>",...}}
     """
-    if not resp_body or b"refresh_token" not in resp_body:
+    if not resp_body or (b"refresh_token" not in resp_body and b"RefreshToken" not in resp_body):
         return
     try:
         body_str = resp_body.decode("utf-8", "replace")
         data = json.loads(body_str)
     except Exception:
         return
-    inner = data.get("data", data) if isinstance(data, dict) else None
+    inner = data.get("Result") or data.get("result") or data.get("data", data) if isinstance(data, dict) else None
     if not isinstance(inner, dict):
         return
-    rt = inner.get("refresh_token")
+    rt = inner.get("refresh_token") or inner.get("refreshToken") or inner.get("RefreshToken")
     if not rt or not isinstance(rt, str):
         return
     # 尝试从 access_token/token 提取 user_id
-    at = inner.get("access_token") or inner.get("token") or ""
+    at = inner.get("access_token") or inner.get("token") or inner.get("UserJwt") or inner.get("Token") or ""
     if at:
-        validated = _valid_cloud_ide_jwt(at) if not at.startswith("Cloud-IDE-JWT") else at
-        if not validated:
-            validated = _valid_cloud_ide_jwt(at)
+        validated = _valid_cloud_ide_jwt(at.removeprefix("Cloud-IDE-JWT ").strip())
         if validated:
             uid = extract_user_id(validated)
             if uid:
                 update_account_jwt(uid, validated)  # 同时更新 accessToken
-                update_account_refresh_token(uid, rt)
+                try:
+                    request = json.loads(request_body) if request_body else {}
+                except (ValueError, TypeError):
+                    request = {}
+                if request.get("UserID") and str(request["UserID"]) != str(uid):
+                    return
+                update_account_refresh_token(uid, rt, request.get("ClientID"))
                 return
     # 如果响应中没有 access_token，尝试用请求中的 user_id（由调用方注入）
     log(f"  [refresh_token] 响应中含 refresh_token 但无法提取 user_id，跳过")
@@ -1026,8 +1035,7 @@ def _trae_app_dirs():
     env = os.environ.get("TRAE_APP_DIR")
     if env:
         return [env]
-    base = os.environ.get("APPDATA", "")
-    return [os.path.join(base, "TRAE SOLO CN"), os.path.join(base, "Trae CN")]
+    return [native_client.resolve()["data_dir"]]
 
 
 def _chrome_aes_key(app_dir):
@@ -1123,6 +1131,15 @@ def _capture_from_app_dir(app_dir):
     if not os.path.isdir(app_dir):
         log("[local] 目录不存在，跳过")
         return 0
+    auth = native_client.read_auth(app_dir)
+    if auth:
+        validated = _valid_cloud_ide_jwt(str(auth.get("token", "")).removeprefix("Cloud-IDE-JWT ").strip())
+        uid = extract_user_id(validated) if validated else None
+        if uid and str(auth.get("userId", "")) == str(uid):
+            if update_account_jwt(uid, validated) in ("updated", "appended"):
+                found += 1
+            if auth.get("refreshToken"):
+                update_account_refresh_token(uid, auth["refreshToken"], auth.get("clientId"))
     key = _chrome_aes_key(app_dir)
     if key is None:
         log("[local] 未取得 AES 密钥(需 Windows 已登录用户 + pywin32)；将仅扫描明文值")
@@ -1908,7 +1925,7 @@ def forward_upstream(host, port, method, path, headers, body, client_sock):
         send_response(client_sock, resp.status, resp.reason, resp_header_pairs, resp_body)
         # 捕获 ExchangeToken 响应中的 refresh_token
         if "ExchangeToken" in path or "oauth" in path.lower():
-            try_capture_refresh_token_from_response(host, path, resp_body)
+            try_capture_refresh_token_from_response(host, path, resp_body, body)
         # 豆包会话凭证抓取（sessionid / sid_guard，自动回写当前账号）
         try_capture_doubao_credentials(host, headers, resp.getheaders())
         # 记录到代理请求日志

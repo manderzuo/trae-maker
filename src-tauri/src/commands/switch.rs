@@ -300,6 +300,9 @@ pub fn save_current_login(
     // 审查修复（入参校验）：同 switch_account，uid 白名单校验与其余入口对齐
     let target_app = Some(crate::native_client::resolve_for(target_app.as_deref().unwrap_or("TraeWork"), &state.settings()).target_app).filter(|_| matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae"))).or(target_app);
     fs_utils::ensure_uid_safe(user_id.trim())?;
+    if matches!(target_app.as_deref(), Some("TraeWork") | Some("Trae")) && crate::commands::trae_apps::infer_current_cloud_uid(target_app.as_deref().unwrap()).as_deref() != Some(user_id.trim()) {
+        return Err("当前 TRAE CN 登录账号与保存目标不一致，已拒绝覆盖快照".into());
+    }
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
     fs_utils::app_log(

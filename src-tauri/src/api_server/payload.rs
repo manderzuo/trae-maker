@@ -195,8 +195,8 @@ pub fn prepare_llm_chat_body_with_conversation(
     obj_mut.insert("workspace_id".into(), json!("e04cdd"));
     obj_mut.insert("prompt_max_tokens".into(), json!(168000));
     obj_mut.insert("mode".into(), json!("FunctionCall"));
-    obj_mut.insert("ide_version".into(), json!(super::IDE_VERSION));
-    obj_mut.insert("ide_version_code".into(), json!(super::IDE_VERSION_CODE));
+    obj_mut.insert("ide_version".into(), json!(super::ide_version()));
+    obj_mut.insert("ide_version_code".into(), json!(super::ide_version_code()));
     obj_mut.insert("app_id".into(), json!(super::APP_ID));
     obj_mut.insert("package_type".into(), json!("stable_cn"));
 

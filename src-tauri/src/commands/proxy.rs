@@ -167,6 +167,7 @@ fn maybe_emit_auto_switch_request(app: &AppHandle, line: &str) {
 
     let payload = serde_json::json!({
         "currentUid": current_uid.clone(),
+        "targetApp": crate::native_client::resolve_for("TraeWork", &settings).target_app,
         "reason": reason,
         "status": status,
         "path": path,
@@ -200,6 +201,7 @@ pub fn proxy_auto_switch_simulate(
         "auto-switch-request",
         serde_json::json!({
             "currentUid": current_uid,
+            "targetApp": crate::native_client::resolve_for("TraeWork", &state.settings()).target_app,
             "reason": "quota",
             "status": 402,
             "path": "/api/ide/v1/tool_text_to_video_stream",

@@ -10,7 +10,7 @@ export function HelpModal({ open, onClose }: { open: boolean; onClose: () => voi
             <Globe size={15} /> OAuth 登录（自动保存账号）
           </h3>
           <p className="text-xs leading-relaxed text-amber-800 dark:text-amber-200">
-            点击「OAuth 登录」按钮，在浏览器中完成 Trae 账号登录（Trae Work 与 Trae 同一账号体系，登录任一应用均可）。
+            点击「OAuth 登录」按钮，在浏览器中完成 Trae 账号登录（TRAE CN 与 Trae 同一账号体系，登录任一应用均可）。
             登录完成后将回调 URL 粘贴回应用，系统会自动解析 JWT 并保存账号信息，无需手动粘贴 token。
             适合首次添加账号或 JWT 过期后重新登录。
           </p>
@@ -21,12 +21,12 @@ export function HelpModal({ open, onClose }: { open: boolean; onClose: () => voi
             <Save size={15} className="text-amber-500" /> 保存当前登录态
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            在 Trae Work 或 Trae 中登录某个账号后，点击该账号行的「保存」图标并选择目标应用（Trae Work / Trae），
+            在 TRAE CN 或 Trae 中登录某个账号后，点击该账号行的「保存」图标并选择目标应用（TRAE CN / Trae），
             系统会关闭所选应用 → 精准备份 9 类核心登录文件（storage.json、state.vscdb、machineid、aha、Network 等）
             → 重新启动所选应用。每个账号的登录态独立存储，互不干扰。
           </p>
           <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
-            ⚠ BitBrowser 首次接管会自动创建 Trae Work 快照；只有手动在 Trae/Trae Work 登录的账号，才需要点击「保存」创建快照。
+            ⚠ BitBrowser 首次接管会自动创建 TRAE CN 快照；只有手动在 Trae/TRAE CN 登录的账号，才需要点击「保存」创建快照。
           </p>
         </section>
 
@@ -35,14 +35,14 @@ export function HelpModal({ open, onClose }: { open: boolean; onClose: () => voi
             <LogIn size={15} className="text-amber-500" /> 切换账号流程
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            <li>点击目标账号行的「切换」图标，并选择目标应用（Trae Work 或 Trae）</li>
+            <li>点击目标账号行的「切换」图标，并选择目标应用（TRAE CN 或 Trae）</li>
             <li>系统自动保存当前登录态到当前账号槽位（如果已知当前账号 ID）</li>
             <li>同时备份到 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">last</code> 槽位作为安全回退</li>
             <li>恢复目标账号在该应用的登录态（含设备标识）</li>
             <li>重新启动所选应用，自动以目标账号登录</li>
           </ol>
           <p className="mt-1 text-xs leading-relaxed text-slate-500 dark:text-zinc-400">
-            同一账号可分别为 Trae Work 与 Trae 创建快照，两应用快照相互独立、可分别切换。
+            同一账号可分别为 TRAE CN 与 Trae 创建快照，两应用快照相互独立、可分别切换。
           </p>
           <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
             ⚠ BitBrowser 接管的账号会在首次导入时自动生成快照；若是旧账号且没有快照，请在扫描结果中点击「更新接管」一次。
@@ -86,7 +86,7 @@ export function HelpModal({ open, onClose }: { open: boolean; onClose: () => voi
             <KeyRound size={15} /> JWT 续期与刷新
           </h3>
           <p className="text-xs leading-relaxed text-sky-800 dark:text-sky-200">
-            JWT 是短期 access token，Trae Work 通常签发约 8 小时；长期有效的是原生 refresh_token。
+            JWT 是短期 access token，TRAE CN 通常签发约 8 小时；长期有效的是原生 refresh_token。
             从 BitBrowser「加入/更新接管」时，请在打开的 TRAE 官方授权页完成原生授权（最长等待 5 分钟）。
             成功后才会保存 refresh_token 并生成 TRAE Work CN 快照；授权失败不会覆盖已有凭据。
             之后「刷新/续期」通过原生 ExchangeToken 换取新 JWT，不再依赖 BitBrowser 窗口。

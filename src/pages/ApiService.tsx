@@ -457,7 +457,7 @@ export default function ApiService() {
             {resourceCategory === 'text'
               ? '文字模型消耗通用积分'
               : resourceCategory === 'video'
-                ? 'Seedance 使用 Trae Work 原生额度'
+                ? 'Seedance 使用 TRAE CN 原生额度'
                 : '图片服务尚未接入'}
           </span>
         </div>
@@ -478,7 +478,7 @@ export default function ApiService() {
             </>
           ) : resourceCategory === 'video' ? (
               <span>
-                Seedance 由 Trae Work CN 原生接口调用，网关按账号的 Work 积分取号并自动冷却/换号；通用积分只用于文字模型，不会与 Work 积分混用。
+                Seedance 由 TRAE CN 原生接口调用，网关按账号的 Work 积分取号并自动冷却/换号；通用积分只用于文字模型，不会与 Work 积分混用。
             </span>
           ) : (
             <span>GPT Image 2.5 本地转发尚未启用，接入后再配置独立的模型、账号与额度口径。</span>
@@ -573,7 +573,7 @@ export default function ApiService() {
             <Badge tone="blue">Seedance</Badge>
           </div>
           <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-zinc-400">
-            Trae Work CN 内置视频插件，走本地代理转发原生生成链路。
+            TRAE CN 内置视频插件，走本地代理转发原生生成链路。
           </p>
         </button>
 
@@ -930,10 +930,10 @@ export default function ApiService() {
               <div className="space-y-4">
                 <div className="rounded-lg border border-sky-200 bg-sky-50/70 p-3 dark:border-sky-800/60 dark:bg-sky-900/15">
                   <p className="text-sm font-medium text-sky-800 dark:text-sky-200">
-                    Trae Work CN 内置 Seedance 视频插件
+                    TRAE CN 内置 Seedance 视频插件
                   </p>
                   <p className="mt-1 text-xs leading-5 text-sky-700/80 dark:text-sky-300/80">
-                    当前通过 AI Work 助手本地代理转发 Trae Work 的原生请求，使用 Trae Work 当前登录账号与原生额度；它不是文字模型目录中的一行模型。
+                    当前通过 AI Work 助手本地代理转发 TRAE CN 的原生请求，使用 TRAE CN 当前登录账号与原生额度；它不是文字模型目录中的一行模型。
                   </p>
                 </div>
 
@@ -965,14 +965,14 @@ export default function ApiService() {
                 <div className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
                   <p className="text-xs font-semibold text-slate-700 dark:text-zinc-200">使用方式</p>
                   <ol className="mt-2 list-decimal space-y-1 pl-4 text-xs leading-5 text-slate-500 dark:text-zinc-400">
-                    <li>本地 API 调用无需打开 Trae Work 窗口；原生插件测试仍保持代理运行（当前状态：{proxy.running ? `127.0.0.1:${proxy.port}` : '未运行'}）。</li>
+                    <li>本地 API 调用无需打开 TRAE CN 窗口；原生插件测试仍保持代理运行（当前状态：{proxy.running ? `127.0.0.1:${proxy.port}` : '未运行'}）。</li>
                     <li>向 API 网关提交 JSON 后得到 task id，再轮询 GET /v1/videos/:task_id。</li>
-                    <li>任务完成后返回 Trae Work CN 资源地址；原生插件路径仍可作为降级入口。</li>
+                    <li>任务完成后返回 TRAE CN 资源地址；原生插件路径仍可作为降级入口。</li>
                   </ol>
                 </div>
 
                 <p className="text-xs leading-5 text-slate-400 dark:text-zinc-500">
-                  说明：Seedance 已作为独立资源类目和本地 API 任务接入；接口按 Work 积分取号，并保留原生 Trae Work CN 插件路径。GPT Image 仍保持未接入。
+                  说明：Seedance 已作为独立资源类目和本地 API 任务接入；接口按 Work 积分取号，并保留原生 TRAE CN 插件路径。GPT Image 仍保持未接入。
                 </p>
               </div>
             </>

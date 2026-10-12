@@ -19,7 +19,7 @@ use super::pool::PickedAccount;
 use super::pool::ResourceKind;
 use super::trae_resource_upload::{self, NativeUploadError};
 use super::limits::{Permit, RateLimiter};
-use super::{ApiSharedState, ErrKind, APP_ID, AGENT_HOST, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
+use super::{ApiSharedState, ErrKind, APP_ID, AGENT_HOST, REFERER_BASE};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1221,8 +1221,8 @@ pub(super) fn resolve_resource_url(account: &PickedAccount, uri: &str) -> Result
         .set("x-device-id", &account.device_id)
         .set("x-machine-id", &account.machine_id)
         .set("x-os-version", "Windows 10 Pro")
-        .set("x-ide-version", IDE_VERSION)
-        .set("x-ide-version-code", IDE_VERSION_CODE)
+        .set("x-ide-version", &super::ide_version())
+        .set("x-ide-version-code", &super::ide_version_code())
         .set("x-ide-version-type", "stable")
         .set("x-custom-trace-id", &trace_short)
         .send_json(body)
@@ -1356,9 +1356,9 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
                 .set("x-ide-token", &account.jwt)
                 .set("x-app-id", APP_ID)
                 .set("x-app-version", "default")
-                .set("x-app-version-code", IDE_VERSION_CODE)
-                .set("x-ide-version", IDE_VERSION)
-                .set("x-ide-version-code", IDE_VERSION_CODE)
+                .set("x-app-version-code", &super::ide_version_code())
+                .set("x-ide-version", &super::ide_version())
+                .set("x-ide-version-code", &super::ide_version_code())
                 .set("x-ide-version-type", "stable")
                 .set("x-device-type", "windows")
                 .set("x-device-brand", "H610E-B")
@@ -1372,7 +1372,7 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
                 .set("x-lscbd-aid", "787976")
                 .set("x-lscbd-platform", "windows")
                 .set("x-ss-dp", "787976")
-                .set("app-version", IDE_VERSION)
+                .set("app-version", &super::ide_version())
                 .set("x-custom-trace-id", &trace_short)
                 .set("x-request-id", &request_id)
                 .set("referer", &referer)

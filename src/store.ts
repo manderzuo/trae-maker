@@ -366,7 +366,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             return;
           }
           get().pushToast('info', `检测到${reasonText}，正在切换到账号 ${target.user_id}…`);
-          await get().switchAndContinue(target.user_id, 'TraeWork');
+          await get().switchAndContinue(target.user_id, event.targetApp ?? get().env?.target_app ?? 'TraeWork');
         } finally {
           desktopAutoSwitchInFlight = false;
         }
@@ -585,7 +585,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   refreshEnv: async () => {
     try {
       const env = await api.env.check();
-      set({ env });
+      set({ env, ...(get().env === null ? { profileApp: env.target_app ?? 'TraeWork' } : {}) });
     } catch (err) {
       get().pushToast('error', `环境检测失败：${String(err)}`);
     }
@@ -868,7 +868,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `切换失败：${String(err)}`);
     }
   },
-  switchAndContinue: async (userId, targetApp = 'TraeWork') => {
+  switchAndContinue: async (userId, targetApp = get().env?.target_app ?? 'TraeWork') => {
     if (get().relayActive || get().switchingTo || get().savingLogin) {
       get().pushToast('warn', '已有切换/保存任务进行中，请稍候');
       return;

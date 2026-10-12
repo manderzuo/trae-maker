@@ -56,6 +56,7 @@ pub fn spawn_script(
         .args(args)
         .creation_flags(0x08000000)
         .env("AIWORKDATA_DIR", &data_dir)
+        .env("AIWORK_NATIVE_CLIENT", serde_json::to_string(&crate::native_client::resolve_for("TraeWork", &state.settings())).map_err(|e| e.to_string())?)
         .env("PYTHONIOENCODING", "utf-8");
     if capture {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());

@@ -121,7 +121,7 @@ export default function Credits() {
   const pushToast = useAppStore((s) => s.pushToast);
   const [refreshing, setRefreshing] = useState(false);
 
-  // ---- 消耗明细（Trae Work 接口，按本地日聚合落盘；fresh=true 增量拉取） ----
+  // ---- 消耗明细（TRAE CN 接口，按本地日聚合落盘；fresh=true 增量拉取） ----
   const [usage, setUsage] = useState<UsageHistoryResult | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
   const [range, setRange] = useState<RangeKey>('7d');
@@ -455,7 +455,7 @@ export default function Credits() {
               className="btn-ghost flex items-center gap-1.5 text-sm"
               onClick={() => void loadUsage(true)}
               disabled={usageLoading}
-              title="从 Trae Work 接口增量拉取消耗明细（历史已拉取部分不重复拉取）"
+              title="从 TRAE CN 接口增量拉取消耗明细（历史已拉取部分不重复拉取）"
             >
               <RefreshCw size={14} className={usageLoading ? 'animate-spin' : ''} />
               {usageLoading ? '拉取中' : '刷新数据'}

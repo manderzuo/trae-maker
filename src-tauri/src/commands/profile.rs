@@ -128,6 +128,9 @@ pub fn profile_backup(
     // uid 直接作为快照槽目录名传给 PS 桥，先做防路径注入校验
     fs_utils::ensure_uid_safe(user_id.trim())?;
     let target = normalize_target_app(target_app.as_deref());
+    if matches!(target.as_str(), "TraeWork" | "Trae") && crate::commands::trae_apps::infer_current_cloud_uid(&target).as_deref() != Some(user_id.trim()) {
+        return Err("当前 TRAE CN 登录账号与保存目标不一致，已拒绝覆盖快照".into());
+    }
     // 复用全局解析（便携模式 TAURI_RESOURCE_DIR / 默认资源目录），与 switch.rs 同源
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");

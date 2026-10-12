@@ -37,8 +37,8 @@ fn app_data_dirs(app_kind: &str) -> Vec<std::path::PathBuf> {
 
 fn app_label(app_kind: &str) -> &str {
     match app_kind {
-        "TraeWork" => "Trae Work",
-        "Trae" => "Trae",
+        "TraeWork" => "TRAE WORK CN（旧版）",
+        "Trae" => "TRAE CN",
         _ => app_kind,
     }
 }
@@ -252,6 +252,14 @@ fn select_cloud_uid(evidence: HashMap<String, UidEvidence>) -> Option<String> {
 
 /// 推导应用当前登录账号的 Cloud-IDE uid（合并 storage.json 与 state.vscdb 证据）
 fn infer_cloud_uid(app_kind: &str, storage: &serde_json::Value) -> Option<String> {
+    if let Some(encoded) = storage.get("iCubeAuthInfo://icube.cloudide") {
+        let plain = crate::native_snapshot::decrypt_tc(encoded.as_str()?).ok()?;
+        let auth: serde_json::Value = serde_json::from_str(&plain).ok()?;
+        let uid = auth["userId"].as_str().filter(|u| is_uid_token(u))?;
+        crate::native_credentials::validate_refresh_uid(uid, auth["token"].as_str()?).ok()?;
+        return Some(uid.to_string());
+    }
+    if crate::native_client::canonical_target(app_kind) == "Trae" { return None; }
     let mut merged = vscdb_uid_evidence(app_kind);
     for (uid, e) in storage_uid_evidence(storage) {
         let slot = merged.entry(uid).or_default();
@@ -369,7 +377,7 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
                     in_pool: known.contains(&cloud_uid),
                     dc_uid: dc_uids.first().cloned(),
                     uid_confident: true,
-                    user_id: cloud_uid,
+                    user_id: cloud_uid.clone(),
                     app: kind.to_string(),
                     app_label: app_label(kind).to_string(),
                     storage_path: path_display.clone(),
@@ -378,8 +386,8 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
                     window_seq: None,
                     window_name: None,
                     page_url: None,
-                    token_present: false,
-                    token_exp_timestamp: None,
+                    token_present: crate::native_snapshot::read_native_auth(std::path::Path::new(&path_display)).and_then(|a| a["token"].as_str().map(str::to_string)).is_some_and(|token| crate::native_credentials::validate_refresh_uid(&cloud_uid, &token).is_ok()),
+                    token_exp_timestamp: crate::native_snapshot::read_native_auth(std::path::Path::new(&path_display)).and_then(|a| a["token"].as_str().and_then(|token| crate::jwt::parse(token).exp_timestamp)),
                     read_error: None,
                 });
             }
@@ -535,11 +543,15 @@ pub fn apps_account_add(
     } else {
         name.trim().to_string()
     };
+    let native = crate::native_client::resolve_for(&app, &state.settings());
+    let auth = crate::native_snapshot::read_native_auth(&native.storage_path()).filter(|a| a["userId"].as_str() == Some(uid.as_str()));
+    let native_jwt = auth.as_ref().and_then(|a| a["token"].as_str()).filter(|t| crate::native_credentials::validate_refresh_uid(&uid, t).is_ok()).unwrap_or_default().to_string();
+    let native_rt = auth.as_ref().and_then(|a| a["refreshToken"].as_str()).filter(|t| !t.is_empty()).map(str::to_string);
     accounts.accounts.push(crate::models::RawAccount {
         name: display_name.clone(),
         user_id: Some(uid.clone()),
-        jwt: String::new(),
-        refresh_token: None,
+        jwt: native_jwt.clone(),
+        refresh_token: native_rt.clone(),
         added_at: Some(fs_utils::now_iso()),
         updated_at: Some(fs_utils::now_iso()),
         // 预留记录账户中心 id（仅当发现结果置信时传入；实测该值设备级恒定，不作账号区分）
@@ -548,6 +560,9 @@ pub fn apps_account_add(
         oauth_client_id: None,
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
+    if !native_jwt.is_empty() {
+        crate::native_snapshot::ensure_native_snapshot(&state, &uid, &native_jwt, native_rt.as_deref(), &display_name)?;
+    }
     fs_utils::app_log(
         &state.data_dir,
         &format!("自动发现入池 [{}]: uid={} app={}", display_name, uid, app),

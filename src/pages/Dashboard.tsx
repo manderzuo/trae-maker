@@ -188,7 +188,7 @@ export default function Dashboard() {
           hint={
             [
               env?.installed || localEntitlement?.work
-                ? `Trae Work：${workLogin ?? '未登录'}`
+                ? `TRAE CN：${workLogin ?? '未登录'}`
                 : null,
               envCn?.installed || localEntitlement?.cn ? `Trae：${cnLogin ?? '未登录'}` : null,
             ]
@@ -218,8 +218,8 @@ export default function Dashboard() {
           <div className="flex items-center gap-3">
             <ShieldAlert className="text-amber-500" />
             <div>
-              <div className="font-medium">未检测到 Trae Work / Trae 安装</div>
-              <div className="text-xs text-slate-500">代理捕获与账号切换同时支持 Trae Work 与 Trae，安装任一应用即可开始。</div>
+              <div className="font-medium">未检测到 TRAE CN 安装</div>
+              <div className="text-xs text-slate-500">安装 TRAE CN 后即可使用代理捕获、签到和账号切换。</div>
             </div>
           </div>
           <button

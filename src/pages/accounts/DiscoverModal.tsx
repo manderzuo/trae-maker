@@ -2,7 +2,7 @@ import { CheckCircle2, Loader2, Plus, RefreshCw } from 'lucide-react';
 import { Badge, Modal } from '../../components/ui';
 import type { DiscoveredAccount } from '../../types';
 
-/** F-08/F-75 自动发现弹框：展示本机 Trae 与 BitBrowser Trae Work 登录账号 */
+/** F-08/F-75 自动发现弹框：展示本机 Trae 与 BitBrowser TRAE CN 登录账号 */
 export function DiscoverModal({
   open,
   scanning,
@@ -25,7 +25,7 @@ export function DiscoverModal({
     <Modal open={open} onClose={onClose} title="扫描 Trae / BitBrowser 登录账号" size="lg">
       <div className="space-y-3 text-sm">
         <p className="text-xs leading-relaxed text-slate-500 dark:text-zinc-400">
-          本机 Trae Work / Trae 通过 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">storage.json</code> 与
+          本机 TRAE CN / Trae 通过 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">storage.json</code> 与
           {' '}<code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">state.vscdb</code> 识别登录账号；
           BitBrowser 扫描网页登录账号后，会打开 TRAE 官方原生授权页；完成授权才能接管可自动续期的长期登录态。
           完整凭据仅在本机加密保存，不会在列表或日志中展示。
@@ -46,7 +46,7 @@ export function DiscoverModal({
 
         {!scanning && discovered && discovered.length === 0 && (
           <div className="py-4 text-center text-sm text-slate-400">
-            未发现已登录账号（本机应用未登录，或 BitBrowser 未运行/没有 Trae Work profile）
+            未发现已登录账号（本机应用未登录，或 BitBrowser 未运行/没有 TRAE CN profile）
           </div>
         )}
 
@@ -54,7 +54,7 @@ export function DiscoverModal({
           <>
             {[
               { key: 'local', label: '本机 Trae 应用', list: discovered.filter((d) => d.source !== 'bitbrowser') },
-              { key: 'bitbrowser', label: 'BitBrowser · Trae Work', list: discovered.filter((d) => d.source === 'bitbrowser') },
+              { key: 'bitbrowser', label: 'BitBrowser · TRAE CN', list: discovered.filter((d) => d.source === 'bitbrowser') },
             ].map(({ key, label, list }) => {
               if (list.length === 0) return null;
               return (

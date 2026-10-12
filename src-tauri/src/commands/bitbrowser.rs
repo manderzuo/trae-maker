@@ -17,7 +17,7 @@ use crate::state::AppState;
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:54345";
 const TRAE_APP: &str = "TraeWork";
-const TRAE_LABEL: &str = "BitBrowser · Trae Work";
+const TRAE_LABEL: &str = "BitBrowser · TRAE CN";
 const DETAIL_INTERVAL: Duration = Duration::from_millis(450);
 
 /// BitBrowser Local API 返回的一个 profile（字段在不同版本中略有差异，故用 Value 解析）。
@@ -1217,7 +1217,7 @@ mod tests {
         // Existing destination avoids cloning any installed client's profile in this regression.
         std::fs::create_dir_all(state.path("profiles").join("123456789")).unwrap();
         let profile=BrowserProfile{id:"fixture".into(),seq:None,name:Some("fixture".into()),status:Some(true),hint:"trae".into()};
-        let captured=CapturedToken{token:"fixture-web-jwt".into(),refresh_token:None,user_id:"123456789".into(),exp_timestamp:None,page_url:"https://www.trae.cn/work".into()};
+        let captured=CapturedToken{token:"fixture-web-jwt".into(),refresh_token:None,user_id:"123456789".into(),exp_timestamp:None,page_url:"https://www.trae.cn".into()};
         let result=persist_captured_token(&state,&profile,&captured,None);
         assert!(result.is_err(),"web JWT without renewable credentials must not report a completed takeover");
         assert!(!state.path("checkin_accounts.json").exists(),"failed takeover must not replace account records");

@@ -779,6 +779,7 @@ export interface SaveLoginDoneEvent {
 }
 
 export interface AutoSwitchRequestEvent {
+  targetApp?: 'TraeWork' | 'Trae';
   /** 由代理从 Trae Work Authorization 推导的当前账号，无法推导时为 null */
   currentUid: string | null;
   /** auth=鉴权失效，quota=额度不足 */

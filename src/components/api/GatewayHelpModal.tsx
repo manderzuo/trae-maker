@@ -129,7 +129,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
             <p className="font-medium text-slate-700 dark:text-zinc-200">端点</p>
             <Endpoint method="POST" path="/v1/chat/completions" note="OpenAI 兼容" />
             <Endpoint method="POST" path="/v1/messages" note="Anthropic 兼容（x-api-key 或 Bearer）" />
-            <Endpoint method="POST" path="/v1/videos/generations" note="Trae Work CN Seedance（Work 积分，异步任务）" />
+            <Endpoint method="POST" path="/v1/videos/generations" note="TRAE CN Seedance（Work 积分，异步任务）" />
             <Endpoint method="GET" path="/v1/videos/:task_id" note="查询 Seedance 任务状态与资源地址" />
             <Endpoint method="GET" path="/v1/videos/:task_id/content" note="下载网关缓存视频（API Key 隔离，失败时回退上游地址）" />
             <Endpoint method="POST" path="/v1/assets" note="上传参考图/视频（API Key 隔离）" />

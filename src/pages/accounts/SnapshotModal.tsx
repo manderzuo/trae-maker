@@ -56,8 +56,8 @@ export function ProfileModal({
           <span className="text-xs text-slate-500 dark:text-zinc-400">目标应用</span>
           <div className="flex overflow-hidden rounded-lg border border-slate-200 dark:border-zinc-700">
             {([
-              { app: 'TraeWork', label: 'Trae Work' },
-              { app: 'Trae', label: 'Trae CN' },
+              { app: 'TraeWork', label: '旧版 Work / 自动兼容' },
+              { app: 'Trae', label: 'TRAE CN' },
             ] as const).map((opt) => (
               <button
                 key={opt.app}

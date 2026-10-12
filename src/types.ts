@@ -34,6 +34,7 @@ export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
 
 
 export interface EnvStatus {
+  target_app?: 'TraeWork' | 'Trae';
   installed: boolean;
   running: boolean;
   version: string | null;

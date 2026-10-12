@@ -82,7 +82,7 @@ export default function EcoAccess() {
           className="btn-outline flex items-center gap-1 !py-1.5 text-xs"
           onClick={() => void registerSeedanceMcp()}
           disabled={ccBusy !== null}
-          title="把 Trae Work CN Seedance 注册为 Claude Code 的 MCP 工具；不作为文字模型 provider"
+          title="把 TRAE CN Seedance 注册为 Claude Code 的 MCP 工具；不作为文字模型 provider"
         >
           {ccBusy === 'seedance' ? '注册中…' : '注册 Seedance MCP（Claude Code）'}
         </button>

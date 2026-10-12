@@ -84,22 +84,13 @@ function TraeTopBar() {
   return (
     <>
       <div className="flex items-center gap-2">
-        {envCn?.installed ? (
-          <Badge tone="green" title={envCn.version ? `Trae 当前版本：v${envCn.version}` : '未检测到 Trae 版本号'}>
-            <MonitorCheck size={13} /> Trae 已安装
-          </Badge>
-        ) : (
-          <Badge tone="red">
-            <MonitorX size={13} /> Trae 未安装
-          </Badge>
-        )}
         {env?.installed ? (
-          <Badge tone="green" title={env.version ? `Trae Work 当前版本：v${env.version}` : '未检测到 Trae Work 版本号'}>
-            <MonitorCheck size={13} /> Trae Work 已安装
+          <Badge tone="green" title={env.version ? `TRAE CN 当前版本：v${env.version}` : '未检测到 TRAE CN 版本号'}>
+            <MonitorCheck size={13} /> TRAE CN 已安装
           </Badge>
         ) : (
           <Badge tone="red">
-            <MonitorX size={13} /> Trae Work 未安装
+            <MonitorX size={13} /> TRAE CN 未安装
           </Badge>
         )}
         {certInstalled ? (
@@ -119,11 +110,11 @@ function TraeTopBar() {
         </Badge>
       </div>
       <div className="flex items-center gap-2">
-        <button onClick={openTraeCn} className="btn-outline" title="打开 Trae CN IDE">
-          <ExternalLink size={15} /> 打开 Trae
-        </button>
+        {envCn?.installed && env?.target_app !== 'Trae' && <button onClick={openTraeCn} className="btn-outline" title="打开 TRAE CN">
+          <ExternalLink size={15} /> 打开 TRAE CN
+        </button>}
         <button onClick={openTrae} className="btn-outline">
-          <ExternalLink size={15} /> {env?.installed ? '打开 Trae Work' : '下载 Trae Work'}
+          <ExternalLink size={15} /> {env?.installed ? '打开 TRAE CN' : '下载 TRAE CN'}
         </button>
         {proxy.running ? (
           <button onClick={stopProxy} className="btn-outline">

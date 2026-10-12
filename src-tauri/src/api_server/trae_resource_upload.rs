@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use super::assets::AssetRecord;
 use super::pool::PickedAccount;
-use super::{streaming_agent, APP_ID, AGENT_HOST, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
+use super::{streaming_agent, APP_ID, AGENT_HOST, REFERER_BASE};
 
 #[cfg(test)]
 const RESOURCE_BIZ_TYPE: &str = "remote_resource";
@@ -274,9 +274,9 @@ fn common_request(account: &PickedAccount, path: &str) -> ureq::Request {
         .set("x-ide-token", &account.jwt)
         .set("x-app-id", APP_ID)
         .set("x-app-version", "default")
-        .set("x-app-version-code", IDE_VERSION_CODE)
-        .set("x-ide-version", IDE_VERSION)
-        .set("x-ide-version-code", IDE_VERSION_CODE)
+        .set("x-app-version-code", &super::ide_version_code())
+        .set("x-ide-version", &super::ide_version())
+        .set("x-ide-version-code", &super::ide_version_code())
         .set("x-ide-version-type", "stable")
         .set("x-device-type", "windows")
         .set("x-device-brand", "H610E-B")
@@ -290,7 +290,7 @@ fn common_request(account: &PickedAccount, path: &str) -> ureq::Request {
         .set("x-lscbd-aid", "787976")
         .set("x-lscbd-platform", "windows")
         .set("x-ss-dp", "787976")
-        .set("app-version", IDE_VERSION)
+        .set("app-version", &super::ide_version())
         .set("referer", &referer)
 }
 

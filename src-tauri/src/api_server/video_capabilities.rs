@@ -26,7 +26,7 @@ pub(crate) fn load(data_dir: &std::path::Path) -> Result<VideoCapabilities, Stri
     use sha2::{Digest, Sha256};
     let Some(config_bytes)=read_small(&data_dir.join("video-capabilities.json")) else { return Ok(unverified()); };
     let Ok(config)=serde_json::from_slice::<CapabilityConfig>(&config_bytes) else { return Ok(unverified()); };
-    if config.provider!="trae_native" || config.client_version!=super::IDE_VERSION
+    if config.provider!="trae_native" || config.client_version!=super::ide_version()
         || config.plugin_version!="1.0.1" || !matches!(config.contract_version.as_str(),"tail-reference-v1"|"video-reference-continuation-v1") {
         return Ok(unverified());
     }
@@ -95,7 +95,7 @@ mod tests {
         let save=|value:&serde_json::Value| {
             let bytes=serde_json::to_vec(value).unwrap();
             std::fs::write(dir.join("video-continuation-evidence.json"),&bytes).unwrap();
-            let config=serde_json::json!({"provider":"trae_native","client_version":super::super::IDE_VERSION,"plugin_version":"1.0.1","contract_version":"video-reference-continuation-v1","evidence_digest":format!("{:x}",Sha256::digest(&bytes))});
+            let config=serde_json::json!({"provider":"trae_native","client_version":super::super::ide_version(),"plugin_version":"1.0.1","contract_version":"video-reference-continuation-v1","evidence_digest":format!("{:x}",Sha256::digest(&bytes))});
             std::fs::write(dir.join("video-capabilities.json"),serde_json::to_vec(&config).unwrap()).unwrap();
         };
         save(&proof);let result=load(&dir).unwrap();
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn capability_provider_version_mismatch_disables_native() {
         let dir = fixture();
-        evidence(&dir, super::super::IDE_VERSION);
+        evidence(&dir, &super::super::ide_version());
         assert!(load(&dir).unwrap().tail_reference);
         evidence(&dir, "unverified-client-upgrade");
         let result=load(&dir).unwrap();
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn capability_changed_evidence_cannot_enable_continuation() {
         let dir=fixture();
-        evidence(&dir, super::super::IDE_VERSION);
+        evidence(&dir, &super::super::ide_version());
         assert!(load(&dir).unwrap().tail_reference);
         std::fs::write(dir.join("video-continuation-evidence.json"), b"{}").unwrap();
         assert!(!load(&dir).unwrap().tail_reference);

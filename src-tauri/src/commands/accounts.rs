@@ -113,6 +113,7 @@ pub fn ide_query_post(
     } else {
         format!("Cloud-IDE-JWT {}", jwt.trim())
     };
+    let native = crate::native_client::resolve_default();
     let request_id = crate::commands::oauth::random_hex(32);
     let trace_id = format!("00-{}-01", crate::commands::oauth::random_hex(16));
     let mut req = agent
@@ -121,8 +122,8 @@ pub fn ide_query_post(
         .set("accept-language", "zh-CN")
         .set("authorization", &auth)
         .set("content-type", "application/json")
-        .set("user-agent", "VSCode 1.107.1 (TRAE SOLO CN)")
-        .set("x-market-client-id", "VSCode 1.107.1")
+        .set("user-agent", &native.user_agent())
+        .set("x-market-client-id", &format!("VSCode {}", native.base_version))
         .set("x-market-user-id", dev.market_user_id.as_deref().unwrap_or(""))
         .set("x-user-region", "CN")
         .set("x-device-id", &dev.device_id)
@@ -131,7 +132,7 @@ pub fn ide_query_post(
         .set("x-request-id", &request_id)
         .set("x-lscbd-aid", "787976")
         .set("x-lscbd-platform", "windows")
-        .set("app-version", "0.1.45")
+        .set("app-version", &native.app_version)
         .set("x-tt-trace-id", &trace_id)
         .set("sec-fetch-dest", "empty")
         .set("sec-fetch-mode", "no-cors")
@@ -669,8 +670,10 @@ pub fn account_delete(
     if delete_profile {
         // P0 防目录逃逸：user_id 直接拼进 profiles/ 路径并整目录删除，先做字符集白名单校验
         fs_utils::ensure_uid_safe(&user_id)?;
-        let p = state.path("profiles").join(&user_id);
-        let _ = std::fs::remove_dir_all(p);
+        for profiles in ["profiles", "profiles_trae"] {
+            let p = state.data_path(profiles).join(&user_id);
+            let _ = std::fs::remove_dir_all(p);
+        }
     }
     Ok(())
 }

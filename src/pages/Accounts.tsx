@@ -96,7 +96,7 @@ export default function Accounts() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [oauthOpen, setOAuthOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
-  // F-08/F-75 自动发现：扫描本机应用 + BitBrowser 中 Trae Work 的登录账号
+  // F-08/F-75 自动发现：扫描本机应用 + BitBrowser 中 TRAE CN 的登录账号
   const [scanOpen, setScanOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [discovered, setDiscovered] = useState<DiscoveredAccount[] | null>(null);
@@ -359,7 +359,7 @@ export default function Accounts() {
             <button onClick={() => void refreshAccountsAndPay()} className="btn-outline" title="刷新账号列表、套餐与积分数据">
               <RefreshCw size={15} /> 刷新
             </button>
-            <button onClick={() => void runDiscover()} className="btn-outline" title="扫描本机 Trae 应用与 BitBrowser Trae Work profile">
+            <button onClick={() => void runDiscover()} className="btn-outline" title="扫描本机 Trae 应用与 BitBrowser TRAE CN profile">
               <ScanSearch size={15} /> 扫描本机 + BitBrowser
             </button>
             <button onClick={() => setOAuthOpen(true)} className="btn-outline" title="通过 OAuth 授权登录添加账号">
@@ -421,7 +421,7 @@ export default function Accounts() {
             <EmptyState
               icon={<Plus size={28} />}
               title={filter === 'all' ? '还没有账号' : '此分组下没有账号'}
-              hint="点击右上角「添加账号」粘贴 JWT，或先启动代理，在 Trae Work / Trae 中登录后自动捕获。"
+              hint="点击右上角「添加账号」粘贴 JWT，或先启动代理，在 TRAE CN / Trae 中登录后自动捕获。"
             />
           </div>
         ) : (
@@ -454,8 +454,8 @@ export default function Accounts() {
                         />
                         {/* 客户端当前登录标记：本机 storage.json/vscdb 推导的登录 uid 与账号池匹配 */}
                         {a.user_id && a.user_id === localEntitlement?.work?.uid && (
-                          <Badge tone="green" title="当前 Trae Work 客户端登录的账号">
-                            Trae Work 登录中
+                          <Badge tone="green" title="当前 TRAE CN 客户端登录的账号">
+                            TRAE CN 登录中
                           </Badge>
                         )}
                         {a.user_id && a.user_id === localEntitlement?.cn?.uid && (
@@ -538,8 +538,8 @@ export default function Accounts() {
                                 : a.credential_source === 'bitbrowser'
                                   ? '续期 JWT（原生续期；旧账号需重新从 BitBrowser 导入一次以接管 refresh_token）'
                                   : a.credential_source == null
-                                    ? '续期 JWT（使用原生 Trae Work CN refresh_token）'
-                                    : '续期 JWT（使用原生 Trae Work CN refresh_token）'
+                                    ? '续期 JWT（使用原生 TRAE CN refresh_token）'
+                                    : '续期 JWT（使用原生 TRAE CN refresh_token）'
                             }
                             onClick={() => void renewJwt(a.user_id, a.credential_source)}
                             disabled={busy}
@@ -583,7 +583,7 @@ export default function Accounts() {
                         </div>
                         <button
                           title={relayActive ? '正在切换并接力工作…' : '切换并继续工作（保存当前项目后切换账号）'}
-                          onClick={() => void switchAndContinue(a.user_id, 'TraeWork')}
+                          onClick={() => void switchAndContinue(a.user_id)}
                           disabled={busy || relayActive}
                           className={`btn-ghost !p-2 text-violet-500 hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-violet-500/10 ${relayActive ? 'animate-pulse' : ''}`}
                         >
@@ -633,8 +633,8 @@ export default function Accounts() {
             </div>
             <div className="grid grid-cols-2 gap-2 p-3 pt-1.5">
               {([
-                { app: 'Trae', label: 'Trae CN', desc: 'Trae CN IDE 客户端', Icon: SquareTerminal },
-                { app: 'TraeWork', label: 'TRAE SOLO CN', desc: 'Trae Work 桌面端', Icon: AppWindow },
+                { app: 'Trae', label: 'TRAE CN', desc: '统一客户端', Icon: SquareTerminal },
+                { app: 'TraeWork', label: '旧版 Work / 自动兼容', desc: '保留有效旧配置；已升级则使用 TRAE CN', Icon: AppWindow },
               ] as const).map((opt) => (
                 <button
                   key={opt.app}

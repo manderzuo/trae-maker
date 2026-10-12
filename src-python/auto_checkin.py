@@ -38,6 +38,7 @@ import urllib.error
 import socket
 import gzip
 import zlib
+import native_client
 import argparse
 import time
 from typing import Optional
@@ -251,14 +252,15 @@ def get_device_for(user_id, device_map):
 
 def _build_headers(jwt, dev):
     """签到/状态接口共用的请求头（按账号独立设备 id 与 session）。"""
+    profile = native_client.resolve()
     return {
         "accept": "*/*",
         "accept-encoding": "gzip, deflate",
         "accept-language": "zh-CN",
         "authorization": jwt if jwt.startswith("Cloud-IDE-JWT ") else f"Cloud-IDE-JWT {jwt}",
         "content-type": "application/json",
-        "user-agent": "VSCode 1.107.1 (TRAE SOLO CN)",
-        "x-market-client-id": "VSCode 1.107.1",
+        "user-agent": native_client.user_agent(profile),
+        "x-market-client-id": "VSCode " + profile["base_version"],
         "x-market-user-id": dev["market_user_id"],
         "x-user-region": "CN",
         "x-device-id": dev["device_id"],
@@ -267,7 +269,7 @@ def _build_headers(jwt, dev):
         "x-request-id": str(uuid.uuid4()),
         "x-lscbd-aid": "787976",
         "x-lscbd-platform": "windows",
-        "app-version": "0.1.45",
+        "app-version": profile["app_version"],
         "x-tt-trace-id": f"00-{uuid.uuid4().hex[:16]}-01",
         "vscode-sessionid": dev["session_id"],
         "sec-fetch-dest": "empty",

@@ -79,6 +79,15 @@ pub const EP_LLM_CHAT: &str = "/api/agent/v3/llm_utils_chat";
 pub const APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
 pub const IDE_VERSION: &str = "0.1.50";
 pub const IDE_VERSION_CODE: &str = "20260811";
+
+pub fn ide_version() -> String {
+    let p = crate::native_client::resolve_default();
+    if p.target_app == "Trae" { p.app_version } else { IDE_VERSION.into() }
+}
+pub fn ide_version_code() -> String {
+    let p = crate::native_client::resolve_default();
+    if p.target_app == "Trae" { p.version_code } else { IDE_VERSION_CODE.into() }
+}
 pub const FUNCTION: &str = "solo_work_lite";
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";

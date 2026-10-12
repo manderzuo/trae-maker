@@ -126,7 +126,7 @@ pub(crate) fn migrate_legacy_profiles(root: &Path) -> Result<usize, String> {
         let result = (|| {
             fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
             for relative in ["User/globalStorage/storage.json", "User/globalStorage/state.vscdb", "User/globalStorage/state.vscdb.backup",
-                "machineid", "aha", "Preferences", "Local State", "Local Storage", "Network", "Partitions/trae-webview", "Partitions/icube-web-crawler"] {
+                "machineid", "aha", "Preferences", "Local State", "Local Storage", "Network", "Partitions/trae-webview", "Partitions/icube-web-crawler-shared-session-v1.0"] {
                 copy_tree(&path.join(relative), &staging.join(relative))?;
             }
             fs::write(staging.join("migration.json"), serde_json::to_vec_pretty(&json!({"version":1,"source_app":"TraeWork","target_app":"Trae","source_slot":slot})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -324,8 +324,10 @@ pub(crate) fn ensure_native_snapshot(
                 if !staging.join("machineid").exists() {
                     fs::write(staging.join("machineid"), random_hex(32)).map_err(|e| e.to_string())?;
                 }
+                if read_native_auth(&profile.storage_path()).is_some_and(|a| a["userId"].as_str() == Some(user_id)) {
                 let _ = copy_tree(&root.join("Partitions").join("trae-webview"), &staging.join("Partitions").join("trae-webview"));
                 let _ = copy_tree(&root.join("Partitions").join("icube-web-crawler-shared-session-v1.0"), &staging.join("Partitions").join("icube-web-crawler-shared-session-v1.0"));
+                }
             }
             let meta = json!({"schemaVersion": 1, "layout": "icube", "source": "bitbrowser", "uid": user_id, "savedAt": Utc::now().to_rfc3339()});
             write_atomic(&staging.join("meta.json"), &serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?)?;

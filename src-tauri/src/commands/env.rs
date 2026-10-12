@@ -11,6 +11,7 @@ pub struct EnvStatus {
     pub running: bool,
     pub version: Option<String>,
     pub path: Option<String>,
+    pub target_app: String,
 }
 
 /// 为跨模块的项目接力命令解析 Trae 可执行文件。仅返回已存在的 exe，
@@ -34,12 +35,14 @@ pub(crate) fn detect_target_exe(state: &AppState, target_app: &str) -> Result<St
 pub fn env_check(_app: AppHandle, state: State<AppState>) -> EnvStatus {
     let profile = crate::native_client::resolve_for("TraeWork", &state.settings());
     let running = !crate::commands::process::images_running(&crate::commands::process::images_for_app(&profile.target_app)).is_empty();
+    let target_app = profile.target_app.clone();
     let (installed, path, version) = detected_profile(profile);
     EnvStatus {
         installed,
         running,
         version,
         path,
+        target_app,
     }
 }
 
@@ -105,7 +108,7 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
 pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
     let (installed, path, version) = detect_trae_cn(state.settings().trae_cn_path.clone());
     let running = is_running_cn();
-    EnvStatus { installed, running, version, path }
+    EnvStatus { installed, running, version, path, target_app: "Trae".into() }
 }
 
 /// 打开 Trae CN IDE。与 Trae Work 同款代理注入：传入 proxy_port 时以 --proxy-server 启动，
