@@ -798,8 +798,10 @@ def save_accounts():
                 json.dump(_accounts_cache, f, ensure_ascii=False, indent=2)
             os.replace(tmp, ACCOUNTS_FILE)
             _accounts_mtime = os.path.getmtime(ACCOUNTS_FILE)
+            return True
         except Exception as e:
             log(f"  [accounts] 写入失败: {e}")
+            return False
 
 
 def update_account_jwt(user_id, jwt_full):
@@ -904,8 +906,7 @@ def update_account_native_credentials(user_id, jwt_full, refresh_token, oauth_cl
             target.pop("oauth_client_id", None)
         target["refresh_token"] = refresh_token
         target["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-        save_accounts()
-        return "updated"
+        return "updated" if save_accounts() else "not_saved"
 
 
 def try_capture_refresh_token_from_response(host, path, resp_body, request_body=b""):
@@ -942,7 +943,13 @@ def try_capture_refresh_token_from_response(host, path, resp_body, request_body=
                     return
                 if request.get("UserID") and str(request["UserID"]) != str(uid):
                     return
-                update_account_native_credentials(uid, validated, rt, request.get("ClientID"))
+                outcome = update_account_native_credentials(uid, validated, rt, request.get("ClientID"))
+                if outcome == "updated" and request.get("ClientID") in (native_client.LEGACY_CLIENT_ID, native_client.TRAE_CLIENT_ID):
+                    try:
+                        import native_proof
+                        native_proof.captured_device(DATA_DIR, uid, request.get("DeviceInfo"))
+                    except Exception:
+                        log("  [native proof] 设备上下文未捕获，请重新原生授权；未记录敏感内容")
                 return
     # 如果响应中没有 access_token，尝试用请求中的 user_id（由调用方注入）
     log(f"  [refresh_token] 响应中含 refresh_token 但无法提取 user_id，跳过")

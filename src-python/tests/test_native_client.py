@@ -85,6 +85,21 @@ class NativeClientMigrationTests(unittest.TestCase):
                 json.dumps({"UserID":"123", "ClientID":"ono9krqynydwx5"}).encode())
             self.assertEqual(path.read_bytes(), before)
 
+    def test_proxy_older_response_keeps_device_binding_with_credentials(self):
+        import device_proxy, native_proof
+        device_proxy._accounts_cache = None
+        def token(exp):
+            return base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').decode().rstrip('=')+'.'+base64.urlsafe_b64encode(json.dumps({'data':{'id':'123'},'exp':exp}).encode()).decode().rstrip('=')+'.fixture'
+        path=self.root/'assistant/data/checkin_accounts.json';path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text(json.dumps({'accounts':[{'UserID':'123','jwt':token(2000000000),'refresh_token':'latest-rt'}]}))
+        before=path.read_bytes()
+        with patch.object(device_proxy,'ACCOUNTS_FILE',str(path)), patch.object(native_proof,'captured_device') as binding:
+            device_proxy.try_capture_refresh_token_from_response('api.trae.cn','/oauth/ExchangeToken',
+                json.dumps({'Result':{'UserJwt':token(1999999999),'RefreshToken':'older-rt'}}).encode(),
+                json.dumps({'ClientID':'ono9krqynydwx5','DeviceInfo':{'DevicePublicKey':'older-key'}}).encode())
+            self.assertEqual(path.read_bytes(),before)
+            binding.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

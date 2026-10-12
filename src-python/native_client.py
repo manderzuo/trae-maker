@@ -67,14 +67,18 @@ def user_agent(profile=None):
 
 def read_auth(data_dir):
     """Return integrity-checked tc auth only in memory; never log its contents."""
+    storage = _json(Path(data_dir) / "User/globalStorage/storage.json")
+    return decode_tc(storage.get("iCubeAuthInfo://icube.cloudide", ""))
+
+
+def decode_tc(value):
     import base64
     import hashlib
     import hmac
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.padding import PKCS7
     try:
-        storage = _json(Path(data_dir) / "User/globalStorage/storage.json")
-        raw = base64.b64decode(storage["iCubeAuthInfo://icube.cloudide"], validate=True)
+        raw = base64.b64decode(value, validate=True)
         if len(raw) < 54 or raw[:3] != b"tc\x05":
             return None
         salt = bytes(a ^ b for a, b in zip(JQ, WQ))

@@ -109,6 +109,7 @@ struct NativeOAuthRequest {
     callback_port: u16,
     client_id: String,
     url: String,
+    device_key_ref: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -292,14 +293,29 @@ fn build_native_oauth_request(callback_port: u16) -> NativeOAuthRequest {
 }
 
 fn build_native_oauth_for_profile(callback_port: u16, profile: &crate::native_client::NativeClientProfile) -> NativeOAuthRequest {
+    build_native_oauth_for_device(callback_port, profile, native_device_info())
+}
+
+fn build_signed_native_oauth_request(state: &AppState, callback_port: u16) -> Result<NativeOAuthRequest, String> {
+    let profile = crate::native_client::resolve_for("TraeWork", &state.settings());
+    let context = crate::native_credentials::device_proof(state, serde_json::json!({"action":"prepare"}))?;
+    let mut device = native_device_info();
+    device.device_public_key = context["public_key"].as_str().ok_or("原生设备公钥缺失")?.into();
+    device.device_id = context["device_id"].as_str().ok_or("原生设备标识缺失")?.into();
+    let mut request = build_native_oauth_for_device(callback_port, &profile, device);
+    request.device_key_ref = Some(context["key_ref"].as_str().ok_or("原生设备签名标识缺失")?.into());
+    Ok(request)
+}
+
+fn build_native_oauth_for_device(callback_port: u16, profile: &crate::native_client::NativeClientProfile, mut device: NativeDeviceInfo) -> NativeOAuthRequest {
     let state = random_hex(32);
     // random_hex 本身使用 Windows BCryptGenRandom；将其作为 verifier 的
     // 字节源再做一次 URL-safe 编码，满足 PKCE 的高熵要求。
     let verifier = base64url(random_hex(96).as_bytes());
     let challenge = base64url(&Sha256::digest(verifier.as_bytes()));
     let trace_id = trace_id();
-    let mut device = native_device_info();
     device.client_version = profile.app_version.clone();
+    device.platform_code = if profile.target_app == "Trae" { "IDE_PC" } else { "SOLO_PC" }.into();
     let mut params = vec![
         query_param("login_version", "1"),
         query_param("auth_from", &profile.auth_from),
@@ -339,6 +355,7 @@ fn build_native_oauth_for_profile(callback_port: u16, profile: &crate::native_cl
         callback_port,
         client_id: profile.oauth_client_id.clone(),
         url: format!("https://www.trae.cn/authorization?{}", params.join("&")),
+        device_key_ref: None,
     }
 }
 
@@ -630,6 +647,7 @@ fn wait_native_callback_timeout(
 }
 
 fn exchange_native_auth_code(
+    state: &AppState,
     callback: &NativeCallback,
     request: &NativeOAuthRequest,
     cloudide_token: Option<String>,
@@ -684,6 +702,10 @@ fn exchange_native_auth_code(
         json_i64(result.get("TokenExpireAt")).map(|millis| millis / 1000)
     });
     let refresh_exp_timestamp = json_i64(result.get("RefreshExpireAt")).map(|millis| millis / 1000);
+    crate::native_credentials::validate_refresh_uid(&user_id, &jwt)?;
+    if let Some(key_ref) = &request.device_key_ref {
+        crate::native_credentials::device_proof(state, serde_json::json!({"action":"bind","uid":user_id,"key_ref":key_ref,"device_info":request.device}))?;
+    }
     Ok(NativeTokenExchange {
         oauth_client_id: request.client_id.clone(),
         jwt,
@@ -812,7 +834,7 @@ pub(crate) fn native_oauth_exchange_for_bitbrowser(
         .local_addr()
         .map_err(|error| format!("读取 OAuth 回调端口失败：{error}"))?
         .port();
-    let request = build_native_oauth_request(callback_port);
+    let request = build_signed_native_oauth_request(state, callback_port)?;
     let cloudide_token = crate::commands::bitbrowser::capture_profile_token_by_id(&base, profile_id);
     crate::commands::bitbrowser::navigate_profile_url(&base, profile_id, &request.url)?;
     let callback = wait_native_callback_timeout(
@@ -822,7 +844,7 @@ pub(crate) fn native_oauth_exchange_for_bitbrowser(
         &request.trace_id,
         timeout,
     )?;
-    exchange_native_auth_code(&callback, &request, cloudide_token)
+    exchange_native_auth_code(state, &callback, &request, cloudide_token)
 }
 
 /// 通过 BitBrowser 完成 Trae 原生 OAuth 登录，并自动接管长效凭据。
@@ -859,16 +881,16 @@ pub fn oauth_login_bitbrowser(
 }
 
 /// 生成 OAuth 登录 URL
-#[tauri::command]
-pub fn oauth_get_login_url() -> OAuthLoginUrl {
+#[tauri::command(async)]
+pub fn oauth_get_login_url(app_state: State<AppState>) -> Result<OAuthLoginUrl, String> {
     // 普通浏览器复用与原生 Trae 相同的 PKCE 握手，避免回调只有 code
     // 而旧逻辑要求 refreshToken 导致登录链路中断。
-    let request = build_native_oauth_request(17388);
+    let request = build_signed_native_oauth_request(&app_state, 17388)?;
     let state = request.state.clone();
     *LAST_NATIVE_REQUEST.lock().unwrap_or_else(|e| e.into_inner()) = Some(request.clone());
     let auto_callback = start_oauth_callback_listener();
 
-    OAuthLoginUrl {
+    Ok(OAuthLoginUrl {
         url: request.url,
         // 记录最近签发的 state 供回调校验（CSRF）
         state: {
@@ -877,7 +899,7 @@ pub fn oauth_get_login_url() -> OAuthLoginUrl {
         },
         redirect_uri: OAUTH_REDIRECT_URI.to_string(),
         auto_callback,
-    }
+    })
 }
 
 /// 取出普通浏览器 OAuth 回环监听器收到的一次性回调 URL。
@@ -1052,25 +1074,32 @@ fn exchange_token(refresh_token: &str) -> Result<(String, Option<String>), Strin
 }
 
 /// GetUserInfo：获取用户信息
-fn get_user_info(access_token: &str) -> Result<(String, String), String> {
+pub(crate) fn get_user_info(access_token: &str) -> Result<(String, String), String> {
     let auth = if access_token.starts_with("Cloud-IDE-JWT ") {
         access_token.to_string()
     } else {
         format!("Cloud-IDE-JWT {}", access_token)
     };
 
-    let resp = short_agent()
-        .post("https://api.trae.com.cn/cloudide/api/v3/trae/GetUserInfo")
-        .set("authorization", &auth)
-        .set("content-type", "application/json")
-        .set("accept", "*/*")
-        .send_json(ureq::json!({}))
+    let profile = crate::native_client::resolve_default();
+    let resp = user_info_request(&auth)
+        .send_json(ureq::json!({"ReqSource":if profile.target_app == "Trae" { "IDE" } else { "Lite" },"IDEVersion":profile.app_version}))
         .map_err(|e| format!("GetUserInfo 请求失败: {}", e))?;
 
     let body: serde_json::Value =
         resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
 
-    let data = body.get("data").or(body.get("result")).ok_or("响应中缺少 data 字段")?;
+    parse_user_info(&body)
+}
+
+fn user_info_request(token: &str) -> ureq::Request {
+    short_agent().post("https://api.trae.com.cn/cloudide/api/v3/trae/GetUserInfo")
+        .set("x-cloudide-token", token.trim().strip_prefix("Cloud-IDE-JWT ").unwrap_or(token.trim()))
+        .set("content-type", "application/json").set("accept", "application/json")
+}
+
+fn parse_user_info(body: &Value) -> Result<(String, String), String> {
+    let data = body.get("Result").or(body.get("data")).or(body.get("result")).ok_or("响应中缺少用户信息")?;
 
     let user_id = data
         .get("user_id")
@@ -1081,7 +1110,8 @@ fn get_user_info(access_token: &str) -> Result<(String, String), String> {
         .to_string();
 
     let user_name = data
-        .get("name")
+        .get("ScreenName")
+        .or_else(|| data.get("name"))
         .or_else(|| data.get("user_name"))
         .or_else(|| data.get("userName"))
         .or_else(|| data.get("nickname"))
@@ -1113,7 +1143,7 @@ pub fn oauth_login(
             .take()
             .ok_or_else(|| "OAuth 原生请求已过期，请重新点击打开登录页".to_string())?;
         let callback = parse_native_callback(&callback_url, &request.state, &request.trace_id)?;
-        let exchange = exchange_native_auth_code(&callback, &request, None)?;
+        let exchange = exchange_native_auth_code(&state, &callback, &request, None)?;
         return persist_native_oauth_account(&state, exchange, account_name, group_id);
     }
 
@@ -1231,6 +1261,39 @@ fn replace_compat_credentials(account: &mut RawAccount, jwt: &str, refresh_token
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_signed_login_snapshot_and_refresh_share_bound_device() {
+        let root = std::env::temp_dir().join(format!("native-proof-wire-{}", rand::random::<u64>()));
+        let exe = root.join("Trae CN/Trae CN.exe");
+        std::fs::create_dir_all(exe.parent().unwrap().join("resources/app")).unwrap();
+        std::fs::write(&exe, "fixture").unwrap();
+        std::fs::write(exe.parent().unwrap().join("resources/app/product.json"), r#"{"appVersion":"3.4.2"}"#).unwrap();
+        std::fs::create_dir_all(root.join("conf")).unwrap();
+        std::fs::write(root.join("conf/app_settings.json"), serde_json::json!({"trae_path":exe}).to_string()).unwrap();
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let state = AppState { data_dir: root.clone(), python_dir: manifest.parent().unwrap().join("src-python"), python_exe: manifest.join("target/python-runtime/python.exe").to_string_lossy().into(), jwt_refresh_lock: std::sync::Mutex::new(()) };
+        let request = build_signed_native_oauth_request(&state, 17388).unwrap();
+        assert!(request.url.contains(&format!("device_id={}", request.device.device_id)));
+        assert_eq!(request.device.platform_code, "IDE_PC");
+        crate::native_credentials::device_proof(&state, serde_json::json!({"action":"bind","uid":"123","key_ref":request.device_key_ref,"device_info":request.device})).unwrap();
+        let profile = crate::native_client::resolve_for("Trae", &state.settings());
+        crate::native_snapshot::ensure_native_snapshot_for_profile(&state, &profile, "123", "fixture-jwt", Some("fixture-rt"), "fixture").unwrap();
+        let storage: Value = crate::fs_utils::read_json(&root.join("data/profiles_trae/123/User/globalStorage/storage.json"));
+        let decoded = crate::native_snapshot::decrypt_tc(storage["iCubeAuthInfo://icube-dc:123"].as_str().unwrap()).unwrap();
+        let key: Value = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(key["publicKeyPEM"], request.device.device_public_key);
+        let body = crate::native_credentials::device_proof(&state, serde_json::json!({"action":"refresh","uid":"123","client_id":request.client_id,"refresh_token":"fixture-rt","version":"3.4.2"})).unwrap();
+        assert_eq!(body["DeviceInfo"]["DevicePublicKey"], key["publicKeyPEM"]);
+        assert!(body["DeviceProof"]["Signature"].as_str().is_some_and(|v| !v.is_empty()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn native_user_info_uses_cloudide_token_and_native_result_envelope() {
+        let request = user_info_request("Cloud-IDE-JWT fixture-token");
+        assert_eq!(request.header("x-cloudide-token"), Some("fixture-token"));
+        let user = parse_user_info(&serde_json::json!({"Result":{"UserID":"123","ScreenName":"fixture"}})).unwrap();
+        assert_eq!(user, ("123".into(), "fixture".into()));
+    }
     #[test]
     fn native_compat_callback_replaces_stale_refresh_issuer() {
         let mut account: RawAccount = serde_json::from_value(serde_json::json!({"name":"fixture", "UserID":"123", "jwt":"old", "refresh_token":"old-rt", "oauth_client_id":crate::native_client::TRAE_CLIENT_ID})).unwrap();

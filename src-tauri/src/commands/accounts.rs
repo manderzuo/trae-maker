@@ -188,7 +188,7 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
 
             let jwt_source = if has_rt { "session" } else { "manual" };
 
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "name": v.name,
                 "cloudIdeJwt": jwt_full,
                 "deviceId": device_id,
@@ -215,9 +215,10 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
                 "creditsExpireAt": v.credits_expire_at,
                 "credentialSource": v.credential_source,
                 "oauthClientId": raw.and_then(|a| a.oauth_client_id.clone()),
-            })
+                "nativeDeviceBinding": crate::native_credentials::export_device(&state, &v.user_id)?,
+            }))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
 
     // 兜底：视图未覆盖的原始账号（如既无 user_id 又无有效 JWT 的坏行）也导出，保证数据不丢
     let view_uids: std::collections::HashSet<&str> =
@@ -230,17 +231,18 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
             !view_uids.contains(uid)
         })
         .map(|a| {
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "name": a.name,
                 "cloudIdeJwt": a.jwt,
                 "refreshToken": a.refresh_token.clone().unwrap_or_default(),
                 "userId": a.user_id,
                 "dcId": a.dc_id,
                 "oauthClientId": a.oauth_client_id,
+                "nativeDeviceBinding": a.user_id.as_deref().map(|uid| crate::native_credentials::export_device(&state, uid)).transpose()?,
                 "addedAt": a.added_at,
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
 
     let groups_arr: Vec<serde_json::Value> = groups
         .groups
@@ -446,6 +448,9 @@ pub fn accounts_import(
         if let Some(value) = pick_i64(entry, &["creditsExpireAt", "credits_expire_at"]) {
             credits.expire_times.insert(uid.clone(), value);
             imported_local_state = true;
+        }
+        if let Some(device) = entry.get("nativeDeviceBinding").filter(|value| value.is_object()) {
+            crate::native_credentials::device_proof(&state, serde_json::json!({"action":"import","uid":uid,"device":device}))?;
         }
         accounts.accounts.push(RawAccount {
             name,
@@ -1620,17 +1625,19 @@ pub fn refresh_jwt_for_profile(state: &AppState, user_id: &str, profile: &crate:
         .ok_or("该账号无 refresh_token，无法自动刷新")?;
 
     let client_id = crate::native_credentials::refresh_client_id(account.oauth_client_id.as_deref())?;
-    // 调用 ExchangeToken API
+    let device_binding = state.data_dir.join("conf/native_oauth_bindings").join(format!("{user_id}.json"));
+    let native_refresh = client_id == crate::native_client::TRAE_CLIENT_ID || device_binding.is_file();
+    let (endpoint, payload) = if native_refresh {
+        ("https://api.trae.cn/trae/api/v3/oauth/ExchangeToken", crate::native_credentials::device_proof(state, serde_json::json!({"action":"refresh","uid":user_id,"client_id":client_id,"refresh_token":refresh_token,"version":profile.app_version}))?)
+    } else {
+        ("https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken", serde_json::json!({"ClientID":client_id,"RefreshToken":refresh_token,"ClientSecret":"-","UserID":""}))
+    };
     let resp = short_agent()
-        .post("https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken")
+        .post(endpoint)
         .set("content-type", "application/json")
         .set("accept", "*/*")
-        .send_json(ureq::json!({
-            "ClientID": client_id,
-            "RefreshToken": refresh_token,
-            "ClientSecret": "-",
-            "UserID": ""
-        }))
+        .set("x-cloudide-token", account.jwt.trim().strip_prefix("Cloud-IDE-JWT ").unwrap_or(account.jwt.trim()))
+        .send_json(payload)
         .map_err(|e| format!("ExchangeToken 请求失败: {}", e))?;
 
     let body: serde_json::Value =

@@ -802,12 +802,12 @@ fn user_name_fast(access_token: &str) -> Option<String> {
     };
     let response = agent()
         .post("https://api.trae.com.cn/cloudide/api/v3/trae/GetUserInfo")
-        .set("authorization", &auth)
+        .set("x-cloudide-token", auth.strip_prefix("Cloud-IDE-JWT ").unwrap_or(&auth))
         .set("content-type", "application/json")
         .send_json(json!({}))
         .ok()?;
     let body: Value = response.into_json().ok()?;
-    let data = body.get("data").or_else(|| body.get("result"))?;
+    let data = body.get("Result").or_else(|| body.get("data")).or_else(|| body.get("result"))?;
     let uid = data
         .get("user_id")
         .or_else(|| data.get("UserID"))
@@ -815,7 +815,8 @@ fn user_name_fast(access_token: &str) -> Option<String> {
         .and_then(Value::as_str)
         .unwrap_or_default();
     let name = data
-        .get("name")
+        .get("ScreenName")
+        .or_else(|| data.get("name"))
         .or_else(|| data.get("user_name"))
         .or_else(|| data.get("userName"))
         .or_else(|| data.get("nickname"))

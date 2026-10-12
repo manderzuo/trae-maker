@@ -285,6 +285,16 @@ pub(crate) fn ensure_native_snapshot(
     ensure_native_snapshot_for_profile(state, &profile, user_id, token, refresh_token, name)
 }
 
+fn storage_with_bound_device(state: &AppState, template: Option<&Path>, user_id: &str, token: &str, refresh_token: Option<&str>, name: &str) -> Result<String, String> {
+    let text = storage_with_auth(template, user_id, token, refresh_token, name)?;
+    let binding: Value = crate::fs_utils::read_json(&state.data_dir.join("conf/native_oauth_bindings").join(format!("{user_id}.json")));
+    if binding["key_ref"].as_str().is_none() { return Ok(text); }
+    let pair = crate::native_credentials::device_proof(state, json!({"action":"keypair","uid":user_id}))?;
+    let mut storage: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    storage[format!("iCubeAuthInfo://icube-dc:{user_id}")] = Value::String(encrypt_tc(&pair.to_string())?);
+    serde_json::to_string_pretty(&storage).map_err(|e| e.to_string())
+}
+
 pub fn ensure_native_snapshot_for_profile(
     state: &AppState, profile: &crate::native_client::NativeClientProfile, user_id: &str,
     token: &str, refresh_token: Option<&str>, name: &str,
@@ -313,7 +323,7 @@ pub fn ensure_native_snapshot_for_profile(
         let result = (|| {
             let storage_path = staging.join("User").join("globalStorage").join("storage.json");
             fs::create_dir_all(storage_path.parent().unwrap()).map_err(|e| e.to_string())?;
-            let storage = storage_with_auth(template_storage.as_deref(), user_id, token, refresh_token, name)?;
+            let storage = storage_with_bound_device(state, template_storage.as_deref(), user_id, token, refresh_token, name)?;
             write_atomic(&storage_path, &storage)?;
             let native_user = native_root.as_ref().map(|p| p.join("User"));
             if let Some(root) = native_user.as_ref() {
@@ -347,7 +357,7 @@ pub fn ensure_native_snapshot_for_profile(
 
     let storage_path = destination.join("User").join("globalStorage").join("storage.json");
     fs::create_dir_all(storage_path.parent().unwrap()).map_err(|e| format!("创建快照目录失败: {e}"))?;
-    let storage = storage_with_auth(Some(&storage_path), user_id, token, refresh_token, name)?;
+    let storage = storage_with_bound_device(state, Some(&storage_path), user_id, token, refresh_token, name)?;
     write_atomic(&storage_path, &storage)?;
     let native_data = native_root.as_ref().map(|p| p.join("User").join("globalStorage").join("state.vscdb"));
     ensure_state_db(&destination.join("User").join("globalStorage").join("state.vscdb"), native_data.as_deref())?;

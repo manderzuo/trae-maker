@@ -13,6 +13,30 @@ pub fn validate_refresh_uid(expected: &str, token: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn device_proof(state: &crate::state::AppState, mut request: serde_json::Value) -> Result<serde_json::Value, String> {
+    use std::os::windows::process::CommandExt;
+    use std::io::Write;
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().map_err(|_| "设备凭据锁不可用")?;
+    request["root"] = serde_json::json!(state.data_dir);
+    let mut child = std::process::Command::new(&state.python_exe)
+        .arg(state.python_dir.join("native_proof.py"))
+        .env("AIWORKDATA_DIR", &state.data_dir)
+        .env("AIWORK_NATIVE_CLIENT", serde_json::to_string(&crate::native_client::resolve_for("TraeWork", &state.settings())).map_err(|_| "设备身份编码失败")?)
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+        .creation_flags(0x08000000).spawn().map_err(|_| "原生设备签名程序无法启动")?;
+    child.stdin.take().ok_or("设备签名输入不可用")?.write_all(&serde_json::to_vec(&request).map_err(|_| "设备签名输入编码失败")?).map_err(|_| "设备签名输入失败")?;
+    let output = child.wait_with_output().map_err(|_| "设备签名程序未正常结束")?;
+    if !output.status.success() { return Err("原生设备凭据不可用，请重新进行原生授权；现有登录凭据已保留".into()); }
+    serde_json::from_slice(&output.stdout).map_err(|_| "设备签名结果不可用".into())
+}
+
+pub fn export_device(state: &crate::state::AppState, uid: &str) -> Result<Option<serde_json::Value>, String> {
+    if crate::fs_utils::ensure_uid_safe(uid).is_err() || !state.data_dir.join("conf/native_oauth_bindings").join(format!("{uid}.json")).is_file() { return Ok(None); }
+    device_proof(state, serde_json::json!({"action":"export","uid":uid})).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
