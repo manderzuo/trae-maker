@@ -15,6 +15,7 @@
 ## Global Constraints
 
 - 不自动升版本号、推送、合并或发布 GitHub Release。
+- 2026-10-12 后续授权：用户已明确要求将修复推送仓库并更新相关资料，本次同步迁移分支与 `main`；产品版本号、安装器及 GitHub Release 保持原计划，不作发布。
 - 旧账号、refresh token 归属、快照和运行资源必须可恢复。
 - 不改 solo_work_lite、计费 fail-closed、Core host lease 与 unknown 恢复约束。
 - 验证清除 AIWORK_* 环境，使用隔离 fixture 与已有 E 盘工具链，不下载工具链、不运行全量 Tauri 测试。

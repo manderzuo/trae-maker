@@ -524,7 +524,7 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 - `failed_no_charge` 只来自持久取消/no-send 决定，不能由 HTTP 错误、任务失败或空账单产生。未知金额不造 0。冲突事件保留原账并隔离该账号的新派发容量，不影响已保存结果读取；Core 消费者必须按事件 kind 分流到冲突接口，不能把 conflict 携带的候选 receipt 当新 Final。
 - v2 Final/FailedNoCharge/Conflict 不再占普通待结账号轮询；不同 Key 始终按 budget/request 唯一关联。禁止把 v2 记录写成旧 mode 或用假旧 Final 使轮询退队。真实运行器、自动确认驱动、HTTP 路由及 Core 事件消费尚待接入，本节原语测试不等于公网交付。
 
-## 26. V2 准备、执行与查询接线（生产尚未启用）
+## 26. V2 准备、执行与查询接线（初始接线历史；当前状态见第30节）
 
 - API server 持有 `BridgeBudgetRuntime`，用量与收费 worker 共享 Arc；停止时先关闭新收费许可，最后一个 worker/观察者释放引用后才可写 clean-close 标记，不能只克隆身份字符串。
 - GET/POST `/internal/bridge/v2/recovery` 沿用桥接管理员鉴权；GET只显示实例/世代/恢复态/保留占用聚合。POST须匹配当前instance/generation并明确acknowledge_retained_unknowns，只在独占本机OS锁且未进入关服的恢复态激活。事务将遗留running标unknown、中止未提交rebase、旋转世代；绝不取消旧prepared/consumed/send_intent或清除P/R/D、receipt-conflict。旧未知项不占新世代TTL扫描页，不支持跨机多活恢复。生产尚未执行此操作。
@@ -562,4 +562,11 @@ if (Get-ChildItem Env: | Where-Object { $_.Name -like 'AIWORK_*' }) { throw 'AIW
 - 复用现有4个用量后台worker和退避，已结回执但未完成容量核对的账号仍可在重启后发现；查询不持数据库或runtime锁，单次权益查询最多15秒。单Key回执outbox先独立提交，不等待账号容量重核。无待结工作不轮询所有账号。
 - 准备请求发现新增容量时，可在静止栅栏内再次读取并核对零扣费增量，避免充值后无回执触发而永远沿用旧容量；失败仍使用保守旧值及实时余额双重检查。旧包消失/原始身份不稳定时保持阻断，不能猜测已覆盖费用。
 - 专用账号源的真实字段稳定性、实际结算延迟、生产副本迁移和真实公网验收仍须验证；schema7写入后旧schema6二进制不能直接打开。详见`docs/bridge-dedicated-accounts.md`。禁止将本地合成回归称作线上已结算。
+
+## 30. 2026-10-12 统一 TRAE CN 迁移当前交付
+
+- 本次运行代码基线 `3c9e86e`，包含文字修复 `cda3d62`；后续资料提交不改变EXE。文字协议码20260811、视频适配器0.1.50/20260811与真实桌面登录身份分离，原能力证据字节保留。
+- 实际桥接账本为Schema9（与独立Core账本版本不同）。新专用UNUSED包本金与当前确认单独保存，旧P/R/D与回执不改；Schema8→9原子升级，最新布局损坏拒绝开库，不自动补洞。恢复入口兼容8/9，紧急开关`--disable-new-package-capacity`在同一兼容EXE生效，禁止回放旧数据库覆盖新费用。
+- 独立复审通过；129项聚焦检查、离线locked release及两种真实静止恢复通过。公网普通生成、尾帧参考、完整视频参考均完成、全流解码与真实结算；只覆盖5秒/480p/16:9，严格首帧锁定仍false，未逐档验收其余规格。
+- 更新前17张原表2827行一致，旧21笔待核费用逐笔保留；原失败任务与已结束诊断未重放。运行EXE SHA256和完整验收见`docs/video-migration-repair-20261012.md`。本次用户授权源码推送，迁移分支与main同步；Studio Web和云端应用发布包未因本次视频修复替换，没有自动发新安装器或升版本号。
 - 真实只读核查已发现221为每月登录通用积分，原生稳定身份为`entitlement_base_info.entitlement_id`，签到包可能`usage:{}`；预算与对账均支持208/209/221，空用量包不挡住其余已知余额，但不假定已用0来授权其额度。以后出现精确用量时将全部已用纳入增量。单账号两次零差额查询已通过，仍不代表真实扣费回执覆盖已验收。
