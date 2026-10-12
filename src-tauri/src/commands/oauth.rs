@@ -107,6 +107,7 @@ struct NativeOAuthRequest {
     trace_id: String,
     device: NativeDeviceInfo,
     callback_port: u16,
+    client_id: String,
     url: String,
 }
 
@@ -118,6 +119,7 @@ struct NativeCallback {
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeTokenExchange {
+    pub(crate) oauth_client_id: String,
     pub(crate) jwt: String,
     pub(crate) refresh_token: String,
     pub(crate) user_id: String,
@@ -135,15 +137,7 @@ fn short_agent() -> ureq::Agent {
         .build()
 }
 
-fn storage_json_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|appdata| {
-        PathBuf::from(appdata)
-            .join("TRAE SOLO CN")
-            .join("User")
-            .join("globalStorage")
-            .join("storage.json")
-    })
-}
+fn storage_json_path() -> Option<PathBuf> { Some(crate::native_client::resolve_default().storage_path()) }
 
 fn storage_string(storage: &Value, key: &str) -> Option<String> {
     storage
@@ -168,10 +162,7 @@ fn extract_log_field(line: &str, field: &str) -> Option<String> {
 /// 读取原生 Trae 最近一次 OAuth 请求中记录的设备描述。
 /// DevicePublicKey 是公钥，可安全复用；私钥从不读取或落盘。
 fn latest_native_device_fields() -> HashMap<String, String> {
-    let Some(appdata) = std::env::var_os("APPDATA") else {
-        return HashMap::new();
-    };
-    let root = PathBuf::from(appdata).join("TRAE SOLO CN").join("logs");
+    let root = crate::native_client::resolve_default().data_dir.join("logs");
     let Ok(entries) = std::fs::read_dir(root) else {
         return HashMap::new();
     };
@@ -297,20 +288,25 @@ fn query_param(key: &str, value: &str) -> String {
 }
 
 fn build_native_oauth_request(callback_port: u16) -> NativeOAuthRequest {
+    build_native_oauth_for_profile(callback_port, &crate::native_client::resolve_default())
+}
+
+fn build_native_oauth_for_profile(callback_port: u16, profile: &crate::native_client::NativeClientProfile) -> NativeOAuthRequest {
     let state = random_hex(32);
     // random_hex 本身使用 Windows BCryptGenRandom；将其作为 verifier 的
     // 字节源再做一次 URL-safe 编码，满足 PKCE 的高熵要求。
     let verifier = base64url(random_hex(96).as_bytes());
     let challenge = base64url(&Sha256::digest(verifier.as_bytes()));
     let trace_id = trace_id();
-    let device = native_device_info();
+    let mut device = native_device_info();
+    device.client_version = profile.app_version.clone();
     let mut params = vec![
         query_param("login_version", "1"),
-        query_param("auth_from", "solo"),
+        query_param("auth_from", &profile.auth_from),
         query_param("login_channel", "native_ide"),
         query_param("plugin_version", &device.client_version),
         query_param("auth_type", "local"),
-        query_param("client_id", OAUTH_CLIENT_ID),
+        query_param("client_id", &profile.oauth_client_id),
         query_param("redirect", "0"),
         query_param("login_trace_id", &trace_id),
         query_param(
@@ -341,6 +337,7 @@ fn build_native_oauth_request(callback_port: u16) -> NativeOAuthRequest {
         trace_id,
         device,
         callback_port,
+        client_id: profile.oauth_client_id.clone(),
         url: format!("https://www.trae.cn/authorization?{}", params.join("&")),
     }
 }
@@ -647,7 +644,7 @@ fn exchange_native_auth_code(
     let ide_version = request.device.client_version.clone();
     let response = request_builder
         .send_json(ureq::json!({
-            "ClientID": OAUTH_CLIENT_ID,
+            "ClientID": request.client_id,
             "AuthCode": callback.auth_code,
             "CodeVerifier": request.verifier,
             "DeviceInfo": request.device.clone(),
@@ -688,6 +685,7 @@ fn exchange_native_auth_code(
     });
     let refresh_exp_timestamp = json_i64(result.get("RefreshExpireAt")).map(|millis| millis / 1000);
     Ok(NativeTokenExchange {
+        oauth_client_id: request.client_id.clone(),
         jwt,
         refresh_token,
         user_id,
@@ -737,6 +735,7 @@ pub(crate) fn persist_native_oauth_account(
         account.jwt = exchange.jwt.clone();
         account.refresh_token = Some(exchange.refresh_token.clone());
         account.credential_source = Some("native_oauth".into());
+        account.oauth_client_id = Some(exchange.oauth_client_id.clone());
         if account.name.trim().is_empty() || account.name.starts_with("Trae Work-…") {
             account.name = name.clone();
         }
@@ -752,6 +751,7 @@ pub(crate) fn persist_native_oauth_account(
             updated_at: Some(fs_utils::now_iso()),
             dc_id: None,
             credential_source: Some("native_oauth".into()),
+            oauth_client_id: Some(exchange.oauth_client_id.clone()),
         });
         if let Some(group) = group_id {
             let mut groups: crate::models::GroupsFile =
@@ -1191,6 +1191,7 @@ pub fn oauth_login(
             updated_at: Some(fs_utils::now_iso()),
             dc_id: None,
             credential_source: None,
+            oauth_client_id: None,
         });
         crate::vault::save_accounts(&state, &mut accounts)?;
 
@@ -1245,6 +1246,19 @@ mod tests {
         let target = format!("/authorize?authCodeInfo={info}&state=other");
         let error = parse_native_callback(&target, "expected", "trace").unwrap_err();
         assert!(error.contains("state"));
+    }
+
+    #[test]
+    fn unified_oauth_binds_client_and_installed_version() {
+        let mut profile = crate::native_client::resolve_default();
+        profile.oauth_client_id = "ono9krqynydwx5".into();
+        profile.app_version = "3.4.2".into(); profile.auth_from = "trae".into();
+        let request = build_native_oauth_for_profile(45678, &profile);
+        assert_eq!(request.client_id, "ono9krqynydwx5");
+        assert_eq!(request.device.client_version, "3.4.2");
+        assert!(request.url.contains("client_id=ono9krqynydwx5"));
+        assert!(request.url.contains("auth_from=trae"));
+        assert!(request.url.contains("plugin_version=3.4.2"));
     }
 
     #[test]

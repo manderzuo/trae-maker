@@ -488,6 +488,7 @@ mod tests {
                     updated_at: Some("t".into()),
                     dc_id: None,
                     credential_source: None,
+                    oauth_client_id: None,
                 },
                 // 无 uid 的账号不占位（vault 无法按 uid 键存储）
                 RawAccount {
@@ -499,6 +500,7 @@ mod tests {
                     updated_at: None,
                     dc_id: None,
                     credential_source: None,
+                    oauth_client_id: None,
                 },
             ],
         };

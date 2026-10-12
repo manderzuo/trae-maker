@@ -51,7 +51,7 @@ mod tests {
     use serde_json::json;
     fn pool()->ApiPool {
         let pool=ApiPool::new();
-        let account=crate::models::RawAccount {name:"fixture".into(),user_id:Some("a".into()),jwt:"fixture-not-real".into(),refresh_token:None,dc_id:None,added_at:None,updated_at:None,credential_source:None};
+        let account=crate::models::RawAccount {name:"fixture".into(),user_id:Some("a".into()),jwt:"fixture-not-real".into(),refresh_token:None,dc_id:None,added_at:None,updated_at:None,credential_source:None,oauth_client_id:None};
         pool.sync_from_accounts_with_balances(&[account],&["a".into()],&[],&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new());pool
     }
     #[test]
@@ -92,7 +92,7 @@ mod tests {
         std::fs::write(dir.join("bridge-dedicated-accounts.json"),serde_json::to_vec(&json!({"version":1,"accounts":["account"]})).unwrap()).unwrap();
         store.finish_activity_lease_cleanly(&mut lease,||Ok(())).unwrap();drop(lease);drop(store);
         let runtime=BridgeBudgetRuntime::start(&dir).unwrap();
-        let pool=ApiPool::new();let account=crate::models::RawAccount {name:"fixture".into(),user_id:Some("account".into()),jwt:"fixture-not-real".into(),refresh_token:None,dc_id:None,added_at:None,updated_at:None,credential_source:None};
+        let pool=ApiPool::new();let account=crate::models::RawAccount {name:"fixture".into(),user_id:Some("account".into()),jwt:"fixture-not-real".into(),refresh_token:None,dc_id:None,added_at:None,updated_at:None,credential_source:None,oauth_client_id:None};
         pool.sync_from_accounts_with_balances(&[account],&["account".into()],&[],&std::collections::HashMap::new(),&std::collections::HashMap::new(),&std::collections::HashMap::new(),&std::collections::HashMap::new(),&std::collections::HashMap::new(),&std::collections::HashMap::new(),&std::collections::HashMap::new());
         let reward=json!({"id":"reward","status":1,"entitlement_base_info":{"product_id":208,"ent_status":0,"quota":{"credits_limit":"150"},"start_time":1},"usage":{},"expire_time":4102444800_i64});
         let mut reads=0;
@@ -117,7 +117,7 @@ mod tests {
         std::fs::write(dir.join("bridge-dedicated-accounts.json"),serde_json::to_vec(&json!({"version":1,"accounts":["account"]})).unwrap()).unwrap();
         store.finish_activity_lease_cleanly(&mut lease,||Ok(())).unwrap();drop(lease);drop(store);
         let runtime=BridgeBudgetRuntime::start(&dir).unwrap();let pool=ApiPool::new();
-        let account=crate::models::RawAccount {name:"fixture".into(),user_id:Some("account".into()),jwt:"fixture-not-real".into(),refresh_token:None,dc_id:None,added_at:None,updated_at:None,credential_source:None};
+        let account=crate::models::RawAccount {name:"fixture".into(),user_id:Some("account".into()),jwt:"fixture-not-real".into(),refresh_token:None,dc_id:None,added_at:None,updated_at:None,credential_source:None,oauth_client_id:None};
         pool.sync_from_accounts_with_balances(&[account],&["account".into()],&[],&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new());
         let reward=json!({"id":"reward","status":1,"entitlement_base_info":{"product_id":208,"ent_status":0,"quota":{"credits_limit":"150"},"start_time":1},"usage":{},"expire_time":4102444800_i64});let mut reads=0;
         assert_eq!(refresh_one_with_runtime(&pool,"account",Some(&runtime),|_|{reads+=1;Ok(vec![g.clone(),w.clone(),reward.clone()])}).unwrap_err(),"capacity_rebase_not_quiescent");

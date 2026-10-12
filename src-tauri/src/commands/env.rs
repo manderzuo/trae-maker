@@ -17,8 +17,8 @@ pub struct EnvStatus {
 /// 不会修改设置或启动进程；调用方可在真正启动成功后自行持久化路径。
 pub(crate) fn detect_target_exe(state: &AppState, target_app: &str) -> Result<String, String> {
     let (installed, path, _) = match target_app {
-        "TraeWork" => detect_trae(state.settings().trae_path),
-        "Trae" => detect_trae_cn(state.settings().trae_cn_path.clone()),
+        "TraeWork" => detected_profile(crate::native_client::resolve_for("TraeWork", &state.settings())),
+        "Trae" => detected_profile(crate::native_client::resolve_for("Trae", &state.settings())),
         _ => return Err("仅支持 TraeWork 或 Trae CN".into()),
     };
     if !installed {
@@ -32,8 +32,9 @@ pub(crate) fn detect_target_exe(state: &AppState, target_app: &str) -> Result<St
 
 #[tauri::command(async)]
 pub fn env_check(_app: AppHandle, state: State<AppState>) -> EnvStatus {
-    let (installed, path, version) = detect_trae(state.settings().trae_path);
-    let running = is_running();
+    let profile = crate::native_client::resolve_for("TraeWork", &state.settings());
+    let running = !crate::commands::process::images_running(&crate::commands::process::images_for_app(&profile.target_app)).is_empty();
+    let (installed, path, version) = detected_profile(profile);
     EnvStatus {
         installed,
         running,
@@ -57,12 +58,14 @@ pub fn open_trae_website(_app: AppHandle) -> Result<(), String> {
 /// 无需用户在 Trae 设置里手动配置代理。
 #[tauri::command(async)]
 pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
-    let (installed, path, _) = detect_trae(state.settings().trae_path);
+    let profile = crate::native_client::resolve_for("TraeWork", &state.settings());
+    let target = profile.target_app.clone();
+    let (installed, path, _) = detected_profile(profile);
     if !installed {
         return Err("未检测到本地 Trae Work 安装，请在「环境配置」中指定 exe 路径".into());
     }
     let exe = path.ok_or("未找到 Trae Work 可执行文件路径")?;
-    persist_detected_path(&state, "trae_path", &exe);
+    persist_detected_path(&state, if target == "Trae" { "trae_cn_path" } else { "trae_path" }, &exe);
     // 直开（不注入代理）前，清理可能指向已停止本地代理的残留系统代理，避免请求被 RESET
     if proxy_port.is_none() {
         crate::commands::proxy::cleanup_stale_local_proxy(&state);
@@ -81,7 +84,7 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
         // CDP 端口，供本地会话接力调用 Aha RPC；关闭开关则不暴露端口。
         .or_else(|| state.settings().desktop_auto_switch.then_some(9333));
     if proxy_port.is_some() || cdp_port.is_some() {
-        crate::commands::process::graceful_kill_app("TraeWork")?;
+        crate::commands::process::graceful_kill_app(&target)?;
     }
     let mut cmd = Command::new(&exe);
     if let Some(port) = proxy_port {
@@ -123,7 +126,8 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
     let cdp_port = std::env::var("AIWORK_TRAE_CDP_PORT")
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
-        .filter(|port| *port > 0);
+        .filter(|port| *port > 0)
+        .or_else(|| state.settings().desktop_auto_switch.then_some(9333));
     if proxy_port.is_some() || cdp_port.is_some() {
         crate::commands::process::graceful_kill_app("Trae")?;
     }
@@ -568,6 +572,10 @@ fn is_running_codebuddy() -> bool {
 
 /// app_locate 的内部版本（供 open_* 命令与 workbuddy 模块复用；无需 Option 包装）
 pub(crate) fn app_locate_inner(state: &State<AppState>, app: &str) -> AppLocate {
+    if matches!(app, "trae_work" | "TraeWork" | "trae" | "Trae" | "trae_cn" | "traecn") {
+        let p = crate::native_client::resolve_for(if matches!(app, "trae_work" | "TraeWork") { "TraeWork" } else { "Trae" }, &state.settings());
+        return AppLocate { app: p.target_app.clone(), exe: p.exe.as_ref().map(|v| v.to_string_lossy().into()), user_data_dir: p.data_dir.to_string_lossy().into(), version: p.exe.as_ref().map(|_| p.app_version), source: if p.exe.is_some() { "native_client" } else { "not_found" }.into() };
+    }
     let profile = app_profile(Some(app));
 
     if let Some(sk) = profile.settings_key {
@@ -744,4 +752,8 @@ fn process_exe_path(proc_names: &[&str]) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+fn detected_profile(p: crate::native_client::NativeClientProfile) -> (bool, Option<String>, Option<String>) {
+    (p.exe.is_some(), p.exe.as_ref().map(|v| v.to_string_lossy().into()), p.exe.as_ref().map(|_| p.app_version))
 }

@@ -16,6 +16,8 @@ mod api_server;
 mod core_migration;
 mod workbuddy_cli;
 mod native_snapshot;
+mod native_client;
+mod native_credentials;
 
 use state::AppState;
 use std::sync::Mutex;
@@ -79,6 +81,13 @@ fn main() {
         }
     };
 
+    if native_client::resolve_for("TraeWork", &state.settings()).target_app == "Trae" {
+        match native_snapshot::migrate_legacy_profiles(&state.data_dir) {
+            Ok(n) if n > 0 => fs_utils::app_log(&state.data_dir, &format!("TRAE CN 已迁移 {n} 个旧账号快照，旧槽保留")),
+            Err(e) => fs_utils::app_log(&state.data_dir, &e),
+            _ => {}
+        }
+    }
     if let Some(note) = &migrate_note {
         fs_utils::app_log(&state.data_dir, note);
         eprintln!("{note}");

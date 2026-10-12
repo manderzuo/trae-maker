@@ -213,6 +213,7 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
                 "jwtAutoRefresh": v.jwt_auto_refresh,
                 "creditsExpireAt": v.credits_expire_at,
                 "credentialSource": v.credential_source,
+                "oauthClientId": raw.and_then(|a| a.oauth_client_id.clone()),
             })
         })
         .collect();
@@ -234,6 +235,7 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
                 "refreshToken": a.refresh_token.clone().unwrap_or_default(),
                 "userId": a.user_id,
                 "dcId": a.dc_id,
+                "oauthClientId": a.oauth_client_id,
                 "addedAt": a.added_at,
             })
         })
@@ -453,6 +455,7 @@ pub fn accounts_import(
             updated_at: Some(fs_utils::now_iso()),
             dc_id: pick_str(entry, &["dcId", "DcID", "dc_id"]),
             credential_source: pick_str(entry, &["credentialSource", "credential_source"]),
+            oauth_client_id: pick_str(entry, &["oauthClientId", "oauth_client_id"]),
         });
         report.added += 1;
     }
@@ -634,6 +637,7 @@ pub fn account_add_manual(
         updated_at: Some(fs_utils::now_iso()),
         dc_id: None,
         credential_source: None,
+        oauth_client_id: None,
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     if let Some(g) = group_id {
@@ -1607,13 +1611,14 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
         .filter(|s| !s.is_empty())
         .ok_or("该账号无 refresh_token，无法自动刷新")?;
 
+    let client_id = crate::native_credentials::refresh_client_id(account.oauth_client_id.as_deref())?;
     // 调用 ExchangeToken API
     let resp = short_agent()
         .post("https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken")
         .set("content-type", "application/json")
         .set("accept", "*/*")
         .send_json(ureq::json!({
-            "ClientID": "en1oxy7wnw8j9n",
+            "ClientID": client_id,
             "RefreshToken": refresh_token,
             "ClientSecret": "-",
             "UserID": ""
@@ -1715,15 +1720,8 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
     } else {
         format!("Cloud-IDE-JWT {}", new_access_token)
     };
+    crate::native_credentials::validate_refresh_uid(user_id, &new_jwt_full)?;
     let new_info = jwt::parse(&new_jwt_full);
-    if let Some(ref new_uid) = new_info.user_id {
-        if new_uid.as_str() != user_id {
-            return Err(format!(
-                "刷新后 user_id 不匹配: 期望={}, 实际={}",
-                user_id, new_uid
-            ));
-        }
-    }
 
     // 原子写回
     let (log_name, effective_refresh_token) = {

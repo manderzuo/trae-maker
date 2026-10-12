@@ -1094,6 +1094,7 @@ mod tests {
             added_at: None,
             updated_at: None,
             credential_source: None,
+            oauth_client_id: None,
         }
     }
 

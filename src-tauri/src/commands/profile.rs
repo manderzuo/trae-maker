@@ -22,7 +22,8 @@ pub struct ProfileInfo {
 /// authfile 布局）——profiles_workbuddy 由切换桥按 -TargetApp WorkBuddy 写入，
 /// 此处映射保证通用快照命令（list/backup/restore/delete）与桥同源，防误操作 TraeWork 快照
 fn profiles_dir(state: &State<AppState>, target_app: Option<&str>) -> PathBuf {
-    match target_app {
+    let target = normalize_target_app(target_app);
+    match Some(target.as_str()) {
         Some("Trae") => state.data_dir.join("data").join("profiles_trae"),
         Some("Doubao") => state.data_dir.join("data").join("profiles_doubao"),
         Some("CodeBuddy") => state.data_dir.join("data").join("profiles_codebuddy"),
@@ -33,13 +34,13 @@ fn profiles_dir(state: &State<AppState>, target_app: Option<&str>) -> PathBuf {
 
 /// 归一化 target_app：仅接受 "Trae"（Trae CN IDE）/ "Doubao"（豆包）/ "CodeBuddy"（CodeBuddy 桌面）/
 /// "WorkBuddy"（WorkBuddy 桌面，authfile 布局），其余一律视为 TraeWork
-fn normalize_target_app(target_app: Option<&str>) -> &'static str {
+fn normalize_target_app(target_app: Option<&str>) -> String {
     match target_app {
-        Some("Trae") => "Trae",
-        Some("Doubao") => "Doubao",
-        Some("CodeBuddy") => "CodeBuddy",
-        Some("WorkBuddy") => "WorkBuddy",
-        _ => "TraeWork",
+        Some("Trae") => "Trae".into(),
+        Some("Doubao") => "Doubao".into(),
+        Some("CodeBuddy") => "CodeBuddy".into(),
+        Some("WorkBuddy") => "WorkBuddy".into(),
+        _ => crate::native_client::canonical_target("TraeWork"),
     }
 }
 
@@ -88,7 +89,7 @@ pub fn profile_list(state: State<AppState>, target_app: Option<String>) -> Vec<P
                 // `last` 是切换桥的安全回退槽，`*.bak` 是覆盖前的一代备份，
                 // `.seed-*` 是导入原子提交时的临时目录；它们不是可切换账号，
                 // 不应在账号快照列表里显示成“新账号”。
-                if slot == "last" || slot.ends_with(".bak") || slot.starts_with(".seed-") {
+                if slot == "last" || slot.ends_with(".bak") || slot.starts_with('.') {
                     continue;
                 }
                 let (size, count) = dir_stats(&entry.path());
@@ -151,12 +152,16 @@ pub fn profile_backup(
         "-UserId",
         &user_id,
         "-TargetApp",
-        target,
+        &target,
         "-Json",
     ]);
     // C4：豆包快照可选纳入 IndexedDB
     if target == "Doubao" && state.settings().doubao_snapshot_include_idb {
         cmd.arg("-IncludeIndexedDB");
+    }
+    cmd.env("AIWORKDATA_DIR", &state.data_dir);
+    if matches!(target.as_str(), "TraeWork" | "Trae") {
+        if let Some(exe) = crate::native_client::resolve_for(&target, &state.settings()).exe { cmd.env("AIWORK_NATIVE_EXE", exe); }
     }
     let mut child = cmd
         .creation_flags(0x08000000)
@@ -266,12 +271,16 @@ pub fn profile_restore(
         "-UserId",
         &user_id,
         "-TargetApp",
-        target,
+        &target,
         "-Json",
     ]);
     // C4：豆包快照可选纳入 IndexedDB（恢复侧桥脚本对快照内含 IndexedDB 一律回写，此开关主要影响备份）
     if target == "Doubao" && state.settings().doubao_snapshot_include_idb {
         cmd.arg("-IncludeIndexedDB");
+    }
+    cmd.env("AIWORKDATA_DIR", &state.data_dir);
+    if matches!(target.as_str(), "TraeWork" | "Trae") {
+        if let Some(exe) = crate::native_client::resolve_for(&target, &state.settings()).exe { cmd.env("AIWORK_NATIVE_EXE", exe); }
     }
     let mut child = cmd
         .creation_flags(0x08000000)

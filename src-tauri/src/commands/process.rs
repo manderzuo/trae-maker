@@ -86,7 +86,8 @@ pub fn graceful_kill_images(images: &[&str]) -> Result<(), String> {
 
 /// 按应用类别返回候选映像名（与 env.rs 的安装探测保持一致）。
 pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
-    match app_kind {
+    let target = crate::native_client::canonical_target(app_kind);
+    match target.as_str() {
         // Trae Work（SOLO CN）及其历史版本名
         "TraeWork" => vec!["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"],
         // Trae CN IDE

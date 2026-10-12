@@ -70,23 +70,15 @@ struct LocalResource {
     content_type: String,
 }
 
-fn app_data_dirs(target_app: &str) -> Vec<PathBuf> {
-    let appdata = std::env::var("APPDATA").unwrap_or_default();
-    match target_app {
-        "TraeWork" => vec![
-            PathBuf::from(&appdata).join("TRAE SOLO CN"),
-            PathBuf::from(&appdata).join("TRAE SOLO"),
-        ],
-        "Trae" => vec![PathBuf::from(&appdata).join("Trae CN")],
-        _ => vec![],
-    }
+fn app_data_dirs(target_app: &str) -> Vec<std::path::PathBuf> {
+    crate::native_client::data_dirs(target_app)
 }
 
 fn normalize_target(target_app: Option<String>) -> Result<String, String> {
     let target = target_app.unwrap_or_else(|| "TraeWork".to_string());
     match target.as_str() {
-        "TraeWork" | "Trae" => Ok(target),
-        _ => Err("接力目前只支持 Trae Work CN 或 Trae CN".into()),
+        "TraeWork" | "Trae" => Ok(crate::native_client::canonical_target(&target)),
+        _ => Err("接力目前只支持 TRAE CN 或旧版 Work".into()),
     }
 }
 

@@ -98,6 +98,47 @@ pub(crate) fn decrypt_tc(encoded: &str) -> Result<String, String> {
     String::from_utf8(plain[64..].to_vec()).map_err(|e| e.to_string())
 }
 
+pub(crate) fn read_native_auth(path: &Path) -> Option<Value> {
+    let storage: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    let plaintext = decrypt_tc(storage["iCubeAuthInfo://icube.cloudide"].as_str()?).ok()?;
+    serde_json::from_str(&plaintext).ok()
+}
+
+/// Copy valid missing legacy slots only; rename publishes a fully copied slot.
+pub(crate) fn migrate_legacy_profiles(root: &Path) -> Result<usize, String> {
+    let source = root.join("data/profiles");
+    let target = root.join("data/profiles_trae");
+    if !source.is_dir() { return Ok(0); }
+    fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+    let mut copied = 0;
+    for entry in fs::read_dir(&source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let slot = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() || slot == "last"
+            || slot.starts_with('.') || slot.ends_with(".bak") || crate::fs_utils::ensure_uid_safe(&slot).is_err()
+            || target.join(&slot).exists() { continue; }
+        let path = entry.path();
+        let Some(auth) = read_native_auth(&path.join("User/globalStorage/storage.json")) else { continue; };
+        let token = auth["token"].as_str().unwrap_or_default();
+        if auth["userId"].as_str() != Some(&slot) || crate::native_credentials::validate_refresh_uid(&slot, token).is_err()
+            || !path.join("User/globalStorage/state.vscdb").is_file() { continue; }
+        let staging = target.join(format!(".migrate-{slot}-{}", random_hex(8)));
+        let result = (|| {
+            fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+            for relative in ["User/globalStorage/storage.json", "User/globalStorage/state.vscdb", "User/globalStorage/state.vscdb.backup",
+                "machineid", "aha", "Preferences", "Local State", "Local Storage", "Network", "Partitions/trae-webview", "Partitions/icube-web-crawler"] {
+                copy_tree(&path.join(relative), &staging.join(relative))?;
+            }
+            fs::write(staging.join("migration.json"), serde_json::to_vec_pretty(&json!({"version":1,"source_app":"TraeWork","target_app":"Trae","source_slot":slot})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            fs::rename(&staging, target.join(&slot)).map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = result { let _ = fs::remove_dir_all(&staging); return Err(format!("迁移账号快照 {slot} 失败：{error}")); }
+        copied += 1;
+    }
+    Ok(copied)
+}
+
 fn iso_millis(timestamp: i64) -> String {
     chrono::DateTime::<Utc>::from_timestamp(timestamp, 0)
         .unwrap_or_else(Utc::now)
@@ -117,13 +158,7 @@ fn native_token(token: &str) -> String {
 }
 
 fn native_storage_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|appdata| {
-        PathBuf::from(appdata)
-            .join("TRAE SOLO CN")
-            .join("User")
-            .join("globalStorage")
-            .join("storage.json")
-    })
+    Some(crate::native_client::resolve_default().storage_path())
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<bool, String> {
@@ -252,15 +287,14 @@ pub(crate) fn ensure_native_snapshot(
     {
         return Err("无效的账号 UserID，无法创建原生快照".into());
     }
-    let profiles = state.path("profiles");
+    let profile = crate::native_client::resolve_for("TraeWork", &state.settings());
+    let profiles = state.data_path(&profile.profiles_name);
     fs::create_dir_all(&profiles).map_err(|e| format!("创建账号快照目录失败: {e}"))?;
     let destination = profiles.join(user_id);
     let existed = destination.is_dir();
-    let native_root = native_storage_path().map(|path| {
-        path.parent().unwrap().parent().unwrap().parent().unwrap().to_path_buf()
-    });
-    let native_storage = native_storage_path();
-    let template_storage = if native_storage.as_ref().is_some_and(|p| p.exists()) {
+    let native_root = Some(profile.data_dir.clone());
+    let native_storage = Some(profile.storage_path());
+    let template_storage = if !existed && native_storage.as_ref().and_then(|p| read_native_auth(p)).is_some_and(|auth| auth["userId"].as_str() == Some(user_id)) {
         native_storage.clone()
     } else {
         Some(destination.join("User").join("globalStorage").join("storage.json"))
@@ -276,7 +310,7 @@ pub(crate) fn ensure_native_snapshot(
             write_atomic(&storage_path, &storage)?;
             let native_user = native_root.as_ref().map(|p| p.join("User"));
             if let Some(root) = native_user.as_ref() {
-                for relative in ["Preferences", "Local State", "Local Storage", "Network", "Session Storage"] {
+                for relative in ["Preferences"] {
                     let _ = copy_tree(&root.join(relative), &staging.join("User").join(relative));
                 }
             }
@@ -317,6 +351,29 @@ pub(crate) fn ensure_native_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn migrate_legacy_slots_is_atomic_and_never_overwrites_new_slots() {
+        let root = std::env::temp_dir().join(format!("aiwork-migrate-{}", rand::random::<u64>()));
+        for uid in ["123", "456", "789", "last", ".seed-123", "123.bak"] {
+            let slot = root.join("data/profiles").join(uid);
+            fs::create_dir_all(slot.join("User/globalStorage")).unwrap();
+            let token = format!("e30.{}.signature", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"data":{{"id":"{uid}"}}}}"#)));
+            fs::write(slot.join("User/globalStorage/storage.json"), storage_with_auth(None, uid, &token, Some("fixture-refresh"), "fixture").unwrap()).unwrap();
+            fs::write(slot.join("User/globalStorage/state.vscdb"), "fixture-db").unwrap();
+            fs::write(slot.join("machineid"), "fixture-machine").unwrap();
+        }
+        fs::write(root.join("data/profiles/789/User/globalStorage/storage.json"), "{}").unwrap();
+        let existing = root.join("data/profiles_trae/456");
+        fs::create_dir_all(&existing).unwrap(); fs::write(existing.join("sentinel"), "new login").unwrap();
+        assert_eq!(migrate_legacy_profiles(&root).unwrap(), 1);
+        assert!(root.join("data/profiles_trae/123/User/globalStorage/storage.json").is_file());
+        assert_eq!(fs::read_to_string(existing.join("sentinel")).unwrap(), "new login");
+        assert!(!root.join("data/profiles_trae/789").exists());
+        assert!(!root.join("data/profiles_trae/last").exists());
+        assert!(root.join("data/profiles/123").is_dir());
+        assert_eq!(migrate_legacy_profiles(&root).unwrap(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn tc_roundtrip() {

@@ -21,6 +21,7 @@ pub fn switch_account(
 ) -> Result<(), String> {
     // 审查修复（入参校验/路径遍历）：user_id 会拼进豆包探测槽路径（probe_slot_session_alive）
     // 与桥的快照槽路径，与其余 uid 入口（profile.rs/doubao.rs 等）统一过白名单
+    let target_app = Some(crate::native_client::resolve_for(target_app.as_deref().unwrap_or("TraeWork"), &state.settings()).target_app).filter(|_| matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae"))).or(target_app);
     fs_utils::ensure_uid_safe(user_id.trim())?;
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
@@ -43,7 +44,7 @@ pub fn switch_account(
     // JWT 预检仅 TRAE 双应用（TraeWork/Trae，含默认）：WorkBuddy/CodeBuddy 会话模型不同，
     // 且其 uid 与 TRAE 账号池撞库时会被误探活错误拦截——非 trae 一律放行（CodeBuddy 同 WorkBuddy）
     let is_trae = matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae"));
-    let is_trae_work = matches!(target_app.as_deref(), None | Some("TraeWork"));
+    let is_trae_work = is_trae;
     let include_idb = is_doubao && state.settings().doubao_snapshot_include_idb;
     // C1：一键以账号打开时注入代理（>0 才传给桥）
     let inject_port = proxy_port.filter(|p| *p > 0);
@@ -200,6 +201,9 @@ pub fn switch_account(
     }
     // 数据目录注入：桥的 ProfilesDir/日志按 AIWORKDATA_DIR 解析（便携模式/默认 %APPDATA% 均一致）
     cmd.env("AIWORKDATA_DIR", &state.data_dir);
+    if matches!(target_app.as_deref(), Some("TraeWork") | Some("Trae")) {
+        if let Some(exe) = crate::native_client::resolve_for(target_app.as_deref().unwrap(), &state.settings()).exe { cmd.env("AIWORK_NATIVE_EXE", exe); }
+    }
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -294,6 +298,7 @@ pub fn save_current_login(
     target_app: Option<String>,
 ) -> Result<(), String> {
     // 审查修复（入参校验）：同 switch_account，uid 白名单校验与其余入口对齐
+    let target_app = Some(crate::native_client::resolve_for(target_app.as_deref().unwrap_or("TraeWork"), &state.settings()).target_app).filter(|_| matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae"))).or(target_app);
     fs_utils::ensure_uid_safe(user_id.trim())?;
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
@@ -346,6 +351,9 @@ pub fn save_current_login(
     }
     // 数据目录注入（同 switch_account）
     cmd.env("AIWORKDATA_DIR", &state.data_dir);
+    if matches!(target_app.as_deref(), Some("TraeWork") | Some("Trae")) {
+        if let Some(exe) = crate::native_client::resolve_for(target_app.as_deref().unwrap(), &state.settings()).exe { cmd.env("AIWORK_NATIVE_EXE", exe); }
+    }
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -439,10 +447,7 @@ pub fn reset_device_ids(
     state: State<AppState>,
     target_app: Option<String>,
 ) -> Result<(), String> {
-    let target = match target_app.as_deref() {
-        Some("Trae") => "Trae",
-        _ => "TraeWork",
-    };
+    let target = crate::native_client::resolve_for(target_app.as_deref().unwrap_or("TraeWork"), &state.settings()).target_app;
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
     fs_utils::app_log(
@@ -470,7 +475,7 @@ pub fn reset_device_ids(
             "-Action",
             "ResetDeviceIds",
             "-TargetApp",
-            target,
+            &target,
             "-Json",
         ])
         // 数据目录注入：桥日志按 AIWORKDATA_DIR 解析，与主进程保持一致

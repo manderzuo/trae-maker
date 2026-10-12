@@ -32,15 +32,7 @@ const VSCDB_SUFFIX: &str = r"User\globalStorage\state.vscdb";
 
 /// 单个应用的数据目录候选（按优先级）
 fn app_data_dirs(app_kind: &str) -> Vec<std::path::PathBuf> {
-    let appdata = std::env::var("APPDATA").unwrap_or_default();
-    match app_kind {
-        "TraeWork" => vec![
-            std::path::PathBuf::from(&appdata).join("TRAE SOLO CN"),
-            std::path::PathBuf::from(&appdata).join("TRAE SOLO"),
-        ],
-        "Trae" => vec![std::path::PathBuf::from(&appdata).join("Trae CN")],
-        _ => vec![],
-    }
+    crate::native_client::data_dirs(app_kind)
 }
 
 fn app_label(app_kind: &str) -> &str {
@@ -352,6 +344,7 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
 
     let mut out = Vec::new();
     for kind in ["TraeWork", "Trae"] {
+        if crate::native_client::canonical_target(kind) != kind { continue; }
         // 记录实际命中的 storage 路径用于展示
         let mut path_display = String::new();
         for dir in app_data_dirs(kind) {
@@ -442,6 +435,7 @@ pub fn backfill_dc_id_for(data_dir: &std::path::Path, user_id: &str) -> Option<S
     // 候选来源：live 两应用 → 该账号两体系快照
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     for kind in ["TraeWork", "Trae"] {
+        if crate::native_client::canonical_target(kind) != kind { continue; }
         for dir in app_data_dirs(kind) {
             candidates.push(dir.join(STORAGE_SUFFIX));
         }
@@ -551,6 +545,7 @@ pub fn apps_account_add(
         // 预留记录账户中心 id（仅当发现结果置信时传入；实测该值设备级恒定，不作账号区分）
         dc_id: dc_id.filter(|s| !s.trim().is_empty()),
         credential_source: Some("local".to_string()),
+        oauth_client_id: None,
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     fs_utils::app_log(

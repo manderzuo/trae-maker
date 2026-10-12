@@ -55,6 +55,9 @@ pub struct RawAccount {
     /// 仅记录预留供未来与外部数据源对账合并，不参与去重/合并/展示（用户确认 2026-09-07）
     #[serde(rename = "DcID", default)]
     pub dc_id: Option<String>,
+    /// OAuth issuer; absent means historical legacy compatibility, never infer from a moved directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
     /// 登录态来源。BitBrowser 导入账号续期时走 CDP 重捕获，不依赖本机快照。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_source: Option<String>,

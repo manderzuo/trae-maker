@@ -16,7 +16,7 @@ use crate::state::AppState;
 const REGISTRY_FILE: &str = "trae_instances.json";
 const INSTANCES_DIR: &str = "trae_instances";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const TRAE_WORK_IMAGES: &[&str] = &["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"];
+const TRAE_WORK_IMAGES: &[&str] = &["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe", "Trae CN.exe"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraeInstance {
@@ -177,7 +177,7 @@ pub fn trae_instance_create(
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建实例目录失败：{e}"))?;
 
     if seed_snapshot {
-        let snapshot = state.data_path("profiles").join(&uid);
+        let snapshot = state.data_path(&crate::native_client::resolve_for("TraeWork", &state.settings()).profiles_name).join(&uid);
         if !snapshot.is_dir() {
             let _ = std::fs::remove_dir_all(&dir);
             return Err("所选账号没有 Trae Work 快照，请先保存当前登录态，或取消“使用已有快照”".into());
@@ -198,7 +198,7 @@ pub fn trae_instance_create(
             .to_string(),
         account_uid: uid,
         data_dir: dir.to_string_lossy().to_string(),
-        target_app: "TraeWork".into(),
+        target_app: crate::native_client::resolve_for("TraeWork", &state.settings()).target_app,
         created_at: now_ts(),
         pid: None,
     };
@@ -237,13 +237,14 @@ pub fn trae_instance_start(
     if !dir_canon.starts_with(&root_canon) || !dir.is_dir() {
         return Err("实例数据目录无效，必须位于 AIWorkAssistant/data/trae_instances 下".into());
     }
-    let exe = crate::commands::env::detect_target_exe(&state, "TraeWork")?;
+    let exe = crate::commands::env::detect_target_exe(&state, &item.target_app)?;
     let mut cmd = Command::new(&exe);
     cmd.arg(format!("--user-data-dir={}", dir.display()))
         .arg("--new-window");
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }
+    item.target_app = crate::native_client::resolve_for(&item.target_app, &state.settings()).target_app;
     let child = cmd
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()

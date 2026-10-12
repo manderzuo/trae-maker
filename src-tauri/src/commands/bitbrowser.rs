@@ -952,6 +952,7 @@ fn persist_captured_token(
         account.jwt = captured.token.clone();
         if let Some(refresh_token) = captured.refresh_token.clone() {
             account.refresh_token = Some(refresh_token);
+            account.oauth_client_id = None; // web capture does not prove a native OAuth issuer
         }
         effective_refresh_token = account
             .refresh_token
@@ -981,6 +982,7 @@ fn persist_captured_token(
             updated_at: Some(crate::fs_utils::now_iso()),
             dc_id: None,
             credential_source: Some(if captured.refresh_token.is_some() { "native" } else { "bitbrowser" }.to_string()),
+            oauth_client_id: None,
         });
     }
     crate::vault::save_accounts(state, &mut accounts)?;

@@ -1,4 +1,4 @@
-﻿<#
+﻿﻿<#
 .SYNOPSIS
     Trae Work 账号切换集成桥（非交互模式）
 .DESCRIPTION
@@ -81,9 +81,26 @@ $Script:ProjectStateFile = "$Script:AppDataDir\data\trae_relay\current-project-s
 #   Doubao  = Chromium User Data 目录级快照（Local State + Default/Network/Cookies，方案见 doubao-trae-switch-plan.md §2.1）
 #   WorkBuddy = auth 文件快照 + 用户数据目录双层恢复（方案见 workbuddy-switch-plan.md §2.2）
 # 两者的快照/恢复/设备重置管线随各自应用批次接入（SnapshotLayout 非 icube 时显式报错）。
+if ($TargetApp -eq 'TraeWork') {
+    $nativeSettings = $null
+    $nativeSettingsFile = Join-Path $Script:AppDataDir 'conf\app_settings.json'
+    if (Test-Path -LiteralPath $nativeSettingsFile) { try { $nativeSettings = Get-Content -LiteralPath $nativeSettingsFile -Raw | ConvertFrom-Json } catch {} }
+    $explicitOld = $nativeSettings -and $nativeSettings.trae_path -and (Test-Path -LiteralPath $nativeSettings.trae_path -PathType Leaf)
+    $cnCandidates = @($nativeSettings.trae_cn_path, "$env:LOCALAPPDATA\Programs\Trae CN\Trae CN.exe", "$env:ProgramFiles\Trae CN\Trae CN.exe")
+    foreach ($candidate in $cnCandidates) {
+        if ($explicitOld) { break }
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            $productFile = Join-Path (Split-Path $candidate) 'resources\app\product.json'
+            try {
+                $product = Get-Content -LiteralPath $productFile -Raw | ConvertFrom-Json
+                if ([version]$product.appVersion -ge [version]'3.4.0') { $TargetApp = 'Trae'; break }
+            } catch {}
+        }
+    }
+}
 switch ($TargetApp) {
     'Trae' {
-        $Script:AppName         = 'Trae'
+        $Script:AppName         = 'TRAE CN'
         $Script:SnapshotLayout  = 'icube'
         $Script:TraeDataDir     = "$env:APPDATA\Trae CN"
         $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles_trae"
@@ -285,6 +302,7 @@ function Test-ExeMatchesApp {
 }
 
 function Find-TraeExe {
+    if ($env:AIWORK_NATIVE_EXE -and (Test-Path -LiteralPath $env:AIWORK_NATIVE_EXE -PathType Leaf) -and (Test-ExeMatchesApp $env:AIWORK_NATIVE_EXE)) { return $env:AIWORK_NATIVE_EXE }
     # ── 顺序原则（修复「首次切换误用 Trae CN.exe」）─────────────────────────────
     # 旧逻辑把「运行中进程」作为最高优先级，导致残留/错误的 Trae 进程（如旧的
     # Trae CN.exe）被优先采用，从而启动错误的 exe。现改为：
