@@ -5,6 +5,10 @@ from cryptography.hazmat.primitives import hashes,serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 class NativeProofTests(unittest.TestCase):
+    def setUp(self):
+        scratch=Path(__file__).resolve().parents[2]/'.superpowers/sdd/2026-10-12-trae-cn-unified-migration'
+        scratch.mkdir(parents=True,exist_ok=True)
+
     def test_signed_refresh_is_bound_to_original_device_and_exact_native_message(self):
         import native_proof
         scratch=Path(__file__).resolve().parents[2]/'.superpowers/sdd/2026-10-12-trae-cn-unified-migration'

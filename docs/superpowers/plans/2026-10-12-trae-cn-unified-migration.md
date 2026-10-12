@@ -10,6 +10,8 @@
 
 **Spec:** docs/superpowers/specs/2026-10-12-trae-cn-unified-migration-design.md
 
+**Execution status:** 四项任务已完成源码适配、本地构建与激活；实际检查结果和端到端验证限制见 [交付验证记录](../../trae-cn-migration-validation-2026-10-12.md)。以下复选项保留计划原文。
+
 ## Global Constraints
 
 - 不自动升版本号、推送、合并或发布 GitHub Release。
