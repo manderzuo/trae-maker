@@ -740,13 +740,17 @@ fn trae_cdp_target(profile: &crate::native_client::NativeClientProfile) -> Resul
         .map_err(|e| format!("读取 Trae Work 本地调试目标失败：{e}"))?;
     let targets: Vec<Value> = serde_json::from_str(&body)
         .map_err(|e| format!("解析 Trae Work 本地调试目标失败：{e}"))?;
-    targets
-        .iter()
-        .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
-        .filter_map(|target| target.get("webSocketDebuggerUrl").and_then(Value::as_str))
-        .next()
-        .map(str::to_string)
-        .ok_or_else(|| "Trae Work 本地调试桥没有可用页面目标；请先打开 Trae Work 主窗口".into())
+    select_native_cdp_page(&targets, port)
+}
+
+fn select_native_cdp_page(targets: &[Value], port: u16) -> Result<String, String> {
+    targets.iter().filter(|t| t["type"] == "page")
+        .filter(|t| t["url"].as_str().is_some_and(|u| {
+            u.contains("/resources/app/out/") && ["solo-lite.html", "workbenchLiteDesktop.html", "workbenchDesktop.html", "workbench.html"].iter().any(|name| u.split('?').next().is_some_and(|path| path.ends_with(name)))
+        }))
+        .filter_map(|t| t["webSocketDebuggerUrl"].as_str())
+        .find(|ws| url::Url::parse(ws).is_ok_and(|url| url.scheme() == "ws" && url.host_str() == Some("127.0.0.1") && url.port() == Some(port) && url.username().is_empty() && url.password().is_none()))
+        .map(str::to_string).ok_or_else(|| "本地调试桥没有可用 TRAE 会话页面，请先打开客户端主窗口".into())
 }
 
 fn random_connect_session_id() -> String {
@@ -1435,6 +1439,16 @@ mod tests {
         chosen.exe = Some(PathBuf::from("E:/chosen/Trae CN.exe"));
         assert!(validate_cdp_owner(&chosen, &json!({"ExecutablePath":"E:/chosen/Trae CN.exe", "CommandLine":"\"E:/chosen/Trae CN.exe\" --remote-debugging-port=9333"})).is_ok());
         assert!(validate_cdp_owner(&chosen, &json!({"ExecutablePath":"E:/legacy/TRAE SOLO CN.exe", "CommandLine":"\"E:/legacy/TRAE SOLO CN.exe\""})).is_err());
+    }
+    #[test]
+    fn native_cdp_skips_floating_button_and_remote_targets() {
+        let targets = vec![
+            json!({"type":"page","url":"vscode-file://vscode-app/resources/app/out/vs/platform/media/floatingButton.html","webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/page/floating"}),
+            json!({"type":"page","url":"vscode-file://vscode-app/resources/app/out/vs/code/electron-browser/solo/solo-lite.html","webSocketDebuggerUrl":"ws://192.0.2.1:9333/devtools/page/remote"}),
+            json!({"type":"page","url":"vscode-file://vscode-app/resources/app/out/vs/code/electron-browser/solo/solo-lite.html","webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/page/main"})
+        ];
+        assert_eq!(select_native_cdp_page(&targets, 9333).unwrap(), "ws://127.0.0.1:9333/devtools/page/main");
+        assert!(select_native_cdp_page(&targets[..2], 9333).is_err());
     }
 
     #[test]
