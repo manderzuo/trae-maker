@@ -37,6 +37,14 @@ struct CapturedToken {
     user_id: String,
     exp_timestamp: Option<i64>,
     page_url: String,
+    oauth_client_id: Option<String>,
+}
+
+impl CapturedToken {
+    fn from_native(exchange: crate::commands::oauth::NativeTokenExchange, page_url: String) -> Self {
+        Self { token: exchange.jwt, refresh_token: Some(exchange.refresh_token), user_id: exchange.user_id,
+            exp_timestamp: exchange.token_exp_timestamp, page_url, oauth_client_id: Some(exchange.oauth_client_id) }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -684,6 +692,7 @@ fn capture_token(target: &Value) -> Result<CapturedToken, String> {
             user_id,
             exp_timestamp: info.exp_timestamp,
             page_url: target_page_url(target),
+            oauth_client_id: None,
         });
     }
     Err("Trae Work 页面未找到有效的 Cloud-IDE-Token（可能尚未登录或页面尚未加载完成）".into())
@@ -952,7 +961,7 @@ fn persist_captured_token(
         account.jwt = captured.token.clone();
         if let Some(refresh_token) = captured.refresh_token.clone() {
             account.refresh_token = Some(refresh_token);
-            account.oauth_client_id = None; // web capture does not prove a native OAuth issuer
+            account.oauth_client_id = captured.oauth_client_id.clone();
         }
         effective_refresh_token = account
             .refresh_token
@@ -982,7 +991,7 @@ fn persist_captured_token(
             updated_at: Some(crate::fs_utils::now_iso()),
             dc_id: None,
             credential_source: Some(if captured.refresh_token.is_some() { "native" } else { "bitbrowser" }.to_string()),
-            oauth_client_id: None,
+            oauth_client_id: captured.oauth_client_id.clone(),
         });
     }
     crate::vault::save_accounts(state, &mut accounts)?;
@@ -1148,14 +1157,7 @@ pub fn bitbrowser_account_import(
     if exchange.user_id != captured.user_id {
         return Err("授权账号与扫描账号不一致，已取消接管；未覆盖已有账号凭据".into());
     }
-    let info = crate::jwt::parse(&exchange.jwt);
-    captured = CapturedToken {
-        token: exchange.jwt,
-        refresh_token: Some(exchange.refresh_token),
-        user_id: exchange.user_id,
-        exp_timestamp: info.exp_timestamp,
-        page_url: captured.page_url,
-    };
+    captured = CapturedToken::from_native(exchange, captured.page_url);
 
     persist_captured_token(&state, &profile, &captured, account_name)
 }
@@ -1163,6 +1165,23 @@ pub fn bitbrowser_account_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_bitbrowser_authorization_preserves_refresh_issuer() {
+        let exchange = crate::commands::oauth::NativeTokenExchange {
+            jwt: "fixture-jwt".into(), refresh_token: "fixture-rt".into(), user_id: "123".into(), oauth_client_id: crate::native_client::TRAE_CLIENT_ID.into(), name: None, token_exp_timestamp: None, refresh_exp_timestamp: None,
+        };
+        let captured = CapturedToken::from_native(exchange, "https://www.trae.cn".into());
+        assert_eq!(captured.oauth_client_id.as_deref(), Some(crate::native_client::TRAE_CLIENT_ID));
+        assert_eq!(captured.refresh_token.as_deref(), Some("fixture-rt"));
+        let root = std::env::temp_dir().join(format!("native-bit-issuer-{}", rand::random::<u64>()));
+        let state = AppState { data_dir: root.clone(), python_dir: root.clone(), python_exe: "unused".into(), jwt_refresh_lock: std::sync::Mutex::new(()) };
+        let browser = BrowserProfile { id: "fixture".into(), seq: None, name: Some("fixture".into()), status: Some(true), hint: "trae".into() };
+        persist_captured_token(&state, &browser, &captured, Some("fixture".into())).unwrap();
+        let accounts = crate::vault::load_accounts(&state);
+        assert_eq!(accounts.accounts[0].oauth_client_id.as_deref(), Some(crate::native_client::TRAE_CLIENT_ID));
+        assert_eq!(accounts.accounts[0].refresh_token.as_deref(), Some("fixture-rt"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn cdp_command_ignores_events_and_accepts_matching_response() {
@@ -1217,7 +1236,7 @@ mod tests {
         // Existing destination avoids cloning any installed client's profile in this regression.
         std::fs::create_dir_all(state.path("profiles").join("123456789")).unwrap();
         let profile=BrowserProfile{id:"fixture".into(),seq:None,name:Some("fixture".into()),status:Some(true),hint:"trae".into()};
-        let captured=CapturedToken{token:"fixture-web-jwt".into(),refresh_token:None,user_id:"123456789".into(),exp_timestamp:None,page_url:"https://www.trae.cn".into()};
+        let captured=CapturedToken{token:"fixture-web-jwt".into(),refresh_token:None,user_id:"123456789".into(),exp_timestamp:None,page_url:"https://www.trae.cn".into(),oauth_client_id:None};
         let result=persist_captured_token(&state,&profile,&captured,None);
         assert!(result.is_err(),"web JWT without renewable credentials must not report a completed takeover");
         assert!(!state.path("checkin_accounts.json").exists(),"failed takeover must not replace account records");

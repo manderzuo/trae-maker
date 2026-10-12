@@ -46,6 +46,12 @@ pub struct ProxyStatus {
     pub started_at: Option<i64>,
 }
 
+pub(crate) fn running_port(app: &AppHandle) -> Option<u16> {
+    let state = app.try_state::<Mutex<Option<ProxyHandle>>>()?;
+    let held = safe_lock(&state);
+    held.as_ref().map(|proxy| proxy.port)
+}
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

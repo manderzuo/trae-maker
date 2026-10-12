@@ -55,11 +55,23 @@ fn is_unified(exe: &Path) -> bool {
 }
 
 fn valid(path: &Option<String>) -> Option<PathBuf> {
-    path.as_ref().map(|s| PathBuf::from(s.trim())).filter(|p| p.is_file())
+    path.as_ref().map(|s| PathBuf::from(s.trim())).filter(|p| p.is_file() && client_kind(p).is_some())
+}
+
+fn client_kind(path: &Path) -> Option<&'static str> {
+    match path.file_name()?.to_string_lossy().to_ascii_lowercase().as_str() {
+        "trae cn.exe" => Some("Trae"),
+        "trae solo cn.exe" | "trae solo.exe" | "trae.exe" => Some("TraeWork"),
+        _ => None,
+    }
 }
 
 fn resolve_at(target: &str, settings: &Settings, local: &Path, appdata: &Path, pf: &Path) -> NativeClientProfile {
-    let cn = valid(&settings.trae_cn_path).or_else(|| [local.join("Programs/Trae CN/Trae CN.exe"), pf.join("Trae CN/Trae CN.exe")].into_iter().find(|p| p.is_file()));
+    resolve_at_with_discovery(target, settings, local, appdata, pf, &[])
+}
+
+fn resolve_at_with_discovery(target: &str, settings: &Settings, local: &Path, appdata: &Path, pf: &Path, discovered: &[PathBuf]) -> NativeClientProfile {
+    let cn = valid(&settings.trae_cn_path).filter(|p| client_kind(p) == Some("Trae")).or_else(|| [local.join("Programs/Trae CN/Trae CN.exe"), pf.join("Trae CN/Trae CN.exe")].into_iter().find(|p| p.is_file())).or_else(|| discovered.iter().find(|p| p.is_file() && client_kind(p) == Some("Trae")).cloned());
     if matches!(target.to_ascii_lowercase().as_str(), "trae" | "trae_cn" | "traecn" | "ide") {
         return profile(cn, "Trae", appdata);
     }
@@ -74,15 +86,46 @@ fn resolve_at(target: &str, settings: &Settings, local: &Path, appdata: &Path, p
         return profile(cn, "Trae", appdata);
     }
     let old = ["TRAE SOLO CN/TRAE SOLO CN.exe", "TRAE SOLO/TRAE SOLO.exe", "Trae/Trae.exe"].into_iter()
-        .flat_map(|name| [local.join("Programs").join(name), pf.join(name)]).find(|p| p.is_file());
+        .flat_map(|name| [local.join("Programs").join(name), pf.join(name)]).find(|p| p.is_file()).or_else(|| discovered.iter().find(|p| p.is_file() && client_kind(p) == Some("TraeWork")).cloned());
     if old.is_some() { return profile(old, "TraeWork", appdata); }
     if cn.is_some() { return profile(cn, "Trae", appdata); }
     profile(None, "TraeWork", appdata)
 }
 
 pub fn resolve_for(target: &str, settings: &Settings) -> NativeClientProfile {
-    resolve_at(target, settings, &PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()),
-        &PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()), &PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_default()))
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default());
+    let appdata = PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default());
+    let pf = PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_default());
+    let initial = resolve_at(target, settings, &local, &appdata, &pf);
+    if valid(&settings.trae_path).is_some() && target == "TraeWork" || initial.target_app == "Trae" && initial.exe.is_some() { return initial; }
+    let mut found = Vec::new();
+    if let Some(exe) = crate::commands::env::discover_native_exe("Trae") { found.push(PathBuf::from(exe)); }
+    if initial.exe.is_none() && !matches!(target, "Trae" | "trae" | "trae_cn" | "traecn" | "ide") {
+        if let Some(exe) = crate::commands::env::discover_native_exe("TraeWork") { found.push(PathBuf::from(exe)); }
+    }
+    resolve_at_with_discovery(target, settings, &local, &appdata, &pf, &found)
+}
+
+pub fn cdp_port(settings: &Settings) -> Option<u16> {
+    std::env::var("AIWORK_TRAE_CDP_PORT").ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0)
+        .or_else(|| settings.desktop_auto_switch.then_some(9333))
+}
+
+pub fn launch_args(proxy_port: Option<u16>, cdp_port: Option<u16>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(port) = proxy_port.filter(|p| *p > 0) { args.push(format!("--proxy-server=http://127.0.0.1:{port}")); }
+    if let Some(port) = cdp_port.filter(|p| *p > 0) {
+        args.extend([format!("--remote-debugging-port={port}"), "--remote-debugging-address=127.0.0.1".into(), "--remote-allow-origins=*".into()]);
+    }
+    args
+}
+
+pub fn bridge_env(state: &crate::state::AppState, target: &str, cmd: &mut std::process::Command) {
+    cmd.env("AIWORKDATA_DIR", &state.data_dir);
+    if matches!(target, "Trae" | "TraeWork") {
+        if let Some(exe) = resolve_for(target, &state.settings()).exe { cmd.env("AIWORK_NATIVE_EXE", exe); }
+        cmd.env("AIWORK_NATIVE_CDP_PORT", cdp_port(&state.settings()).unwrap_or(0).to_string());
+    }
 }
 
 pub fn resolve_default() -> NativeClientProfile {
@@ -106,6 +149,20 @@ pub fn data_dirs(target: &str) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+    #[test]
+    fn native_nondefault_install_and_launch_keep_selected_identity() {
+        let root = std::env::temp_dir().join(format!("native-review-{}", rand::random::<u64>()));
+        let exe = installation(&root.join("external"), "Trae CN", "3.4.2");
+        let p = resolve_at_with_discovery("TraeWork", &Settings::default(), &root.join("empty"), &root.join("roaming"), &root.join("pf"), &[exe.clone()]);
+        assert_eq!(p.exe, Some(exe));
+        assert_eq!(p.target_app, "Trae");
+        assert_eq!(p.data_dir, root.join("roaming/Trae CN"));
+        let args = launch_args(Some(8899), Some(9333));
+        assert!(args.contains(&"--remote-debugging-address=127.0.0.1".into()));
+        assert!(args.contains(&"--remote-debugging-port=9333".into()));
+        assert!(args.contains(&"--proxy-server=http://127.0.0.1:8899".into()));
+        fs::remove_dir_all(root).unwrap();
+    }
     fn installation(root: &std::path::Path, name: &str, version: &str) -> std::path::PathBuf {
         let dir = root.join("Programs").join(name);
         fs::create_dir_all(dir.join("resources/app")).unwrap();

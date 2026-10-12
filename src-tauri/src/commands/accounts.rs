@@ -1594,6 +1594,11 @@ pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, St
 
 /// refresh_jwt 核心逻辑（&AppState，供命令与测试探针共用）
 pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, String> {
+    let profile = crate::native_client::resolve_for("TraeWork", &state.settings());
+    refresh_jwt_for_profile(state, user_id, &profile)
+}
+
+pub fn refresh_jwt_for_profile(state: &AppState, user_id: &str, profile: &crate::native_client::NativeClientProfile) -> Result<String, String> {
     // 并发安全：持锁防止多个并发请求同时 ExchangeToken
     let _lock = state
         .jwt_refresh_lock
@@ -1744,8 +1749,9 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
 
     // 原生续期成功后同步更新 icube 快照。BitBrowser 只承担首次注册/登录；
     // 后续 JWT/refresh_token 续期完全走本地 ExchangeToken，不再依赖 BitBrowser 窗口。
-    if let Err(error) = crate::native_snapshot::ensure_native_snapshot(
+    if let Err(error) = crate::native_snapshot::ensure_native_snapshot_for_profile(
         state,
+        profile,
         user_id,
         &new_jwt_full,
         effective_refresh_token.as_deref(),

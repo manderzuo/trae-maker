@@ -17,6 +17,20 @@ use std::time::{Duration, Instant};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    #[test]
+    fn native_default_shutdown_and_cdp_exclude_independent_instances() {
+        let exe = std::path::Path::new("E:/apps/Trae CN.exe");
+        assert!(owns_default_process(exe, "E:/apps/Trae CN.exe", "\"E:/apps/Trae CN.exe\" --remote-debugging-port=9333"));
+        for command in ["\"E:/apps/Trae CN.exe\" --user-data-dir=E:/isolated", "\"E:/apps/Trae CN.exe\" --user-data-dir E:/isolated", "\"E:/apps/Trae CN.exe\" --type=renderer"] {
+            assert!(!owns_default_process(exe, "E:/apps/Trae CN.exe", command));
+        }
+        assert!(!owns_default_process(exe, "E:/other/Trae CN.exe", "\"E:/other/Trae CN.exe\""));
+    }
+}
+
 /// 检查任一映像名是否仍在运行（tasklist 精确匹配 IMAGENAME）
 pub fn images_running(images: &[&str]) -> Vec<String> {
     let mut alive = Vec::new();
@@ -105,9 +119,46 @@ pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
 
 /// 便捷入口：按应用类别三级关闭
 pub fn graceful_kill_app(app_kind: &str) -> Result<(), String> {
+    if matches!(app_kind, "TraeWork" | "Trae") {
+        return graceful_kill_native(&crate::native_client::resolve_for(app_kind, &crate::fs_utils::read_json(&crate::state::resolve_data_dir()?.join("conf/app_settings.json"))));
+    }
     let images = images_for_app(app_kind);
     if images.is_empty() {
         return Err(format!("未知的应用类别: {app_kind}"));
     }
     graceful_kill_images(&images)
+}
+
+pub(crate) fn owns_default_process(exe: &std::path::Path, actual_exe: &str, command_line: &str) -> bool {
+    !command_line.trim().is_empty()
+        && exe.to_string_lossy().replace('\\', "/").eq_ignore_ascii_case(&actual_exe.replace('\\', "/"))
+        && !command_line.to_ascii_lowercase().contains("--user-data-dir")
+        && !command_line.to_ascii_lowercase().contains("--type=")
+        && !command_line.to_ascii_lowercase().contains("--type ")
+        && !command_line.to_ascii_lowercase().contains("--utility-sub-type")
+}
+
+fn native_root_pids(profile: &crate::native_client::NativeClientProfile) -> Result<Vec<u32>, String> {
+    let Some(exe) = profile.exe.as_ref() else { return Err("未找到目标 TRAE 客户端路径".into()); };
+    let ps = format!("@(Get-CimInstance Win32_Process -Filter \"ExecutablePath='{}'\" | Select-Object ProcessId,ExecutablePath,CommandLine) | ConvertTo-Json -Compress", exe.to_string_lossy().replace('\\', "\\\\").replace('\'', "''"));
+    let out = Command::new("powershell").args(["-NoProfile", "-Command", &ps]).creation_flags(CREATE_NO_WINDOW).output().map_err(|e| e.to_string())?;
+    if !out.status.success() { return Err("无法确定目标进程归属，请手动关闭客户端".into()); }
+    if out.stdout.iter().all(u8::is_ascii_whitespace) { return Ok(vec![]); }
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| "无法读取目标进程信息")?;
+    let rows = value.as_array().cloned().unwrap_or_else(|| if value.is_object() { vec![value] } else { vec![] });
+    Ok(rows.iter().filter(|v| owns_default_process(exe, v["ExecutablePath"].as_str().unwrap_or_default(), v["CommandLine"].as_str().unwrap_or_default()))
+        .filter_map(|v| v["ProcessId"].as_u64().map(|id| id as u32)).collect())
+}
+
+pub(crate) fn graceful_kill_native(profile: &crate::native_client::NativeClientProfile) -> Result<(), String> {
+    let pids = native_root_pids(profile)?;
+    if pids.is_empty() { return Ok(()); }
+    for pid in &pids { run_taskkill(&["/PID", &pid.to_string()]); }
+    let alive = || -> Vec<u32> { native_root_pids(profile).unwrap_or_else(|_| pids.clone()).into_iter().filter(|p| pids.contains(p)).collect() };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline { if alive().is_empty() { return Ok(()); } std::thread::sleep(Duration::from_millis(250)); }
+    for pid in alive() { run_taskkill(&["/T", "/F", "/PID", &pid.to_string()]); }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline { if alive().is_empty() { return Ok(()); } std::thread::sleep(Duration::from_millis(250)); }
+    Err("目标 TRAE 默认实例未能关闭，请手动关闭后重试；独立实例已保留".into())
 }

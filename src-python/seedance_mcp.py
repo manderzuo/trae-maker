@@ -466,7 +466,7 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
             },
             {
                 "name": "seedance_generate",
-                "description": "通过 AI Work Assistant 的 Trae Work CN Seedance 生成视频，等待完成并自动下载到本机 Downloads。",
+                "description": "通过 AI Work Assistant 的 TRAE CN Seedance 生成视频，等待完成并自动下载到本机 Downloads。",
                 "inputSchema": {
                     "type": "object",
                     "required": ["prompt"],

@@ -54,7 +54,8 @@ pub fn switch_account(
     // refresh_token 同步进原生快照。这样即使 BitBrowser 页面捕获的是临近过期
     // 的旧 JWT，切换也不会把失效登录态恢复到 TRAE SOLO CN。
     if is_trae_work {
-        let snapshot = state.path("profiles").join(user_id.trim());
+        let native_profile = crate::native_client::resolve_for(target_app.as_deref().unwrap_or("TraeWork"), &state.settings());
+        let snapshot = state.data_path(&native_profile.profiles_name).join(user_id.trim());
         let accounts = crate::vault::load_accounts(&state);
         let account = accounts
             .accounts
@@ -71,7 +72,7 @@ pub fn switch_account(
                 .unwrap_or(true);
             let mut refreshed = false;
             if has_refresh_token && near_expiry {
-                match crate::commands::accounts::refresh_jwt_impl(&state, user_id.trim()) {
+                match crate::commands::accounts::refresh_jwt_for_profile(&state, user_id.trim(), &native_profile) {
                     Ok(_) => {
                         refreshed = true;
                         fs_utils::app_log(
@@ -97,8 +98,9 @@ pub fn switch_account(
             if (!snapshot.is_dir() || has_refresh_token || refreshed)
                 && !latest_account.jwt.trim().is_empty()
             {
-                match crate::native_snapshot::ensure_native_snapshot(
+                match crate::native_snapshot::ensure_native_snapshot_for_profile(
                     &state,
+                    &native_profile,
                     user_id.trim(),
                     &latest_account.jwt,
                     latest_account.refresh_token.as_deref(),
@@ -200,10 +202,8 @@ pub fn switch_account(
         cmd.args(["-ExpectedCurrentUid", &expected_uid]);
     }
     // 数据目录注入：桥的 ProfilesDir/日志按 AIWORKDATA_DIR 解析（便携模式/默认 %APPDATA% 均一致）
-    cmd.env("AIWORKDATA_DIR", &state.data_dir);
-    if matches!(target_app.as_deref(), Some("TraeWork") | Some("Trae")) {
-        if let Some(exe) = crate::native_client::resolve_for(target_app.as_deref().unwrap(), &state.settings()).exe { cmd.env("AIWORK_NATIVE_EXE", exe); }
-    }
+    crate::native_client::bridge_env(&state, target_app.as_deref().unwrap_or("TraeWork"), &mut cmd);
+    cmd.env("AIWORK_NATIVE_PROXY_PORT", crate::commands::proxy::running_port(&app).unwrap_or(0).to_string());
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -353,10 +353,8 @@ pub fn save_current_login(
         cmd.arg("-IncludeIndexedDB");
     }
     // 数据目录注入（同 switch_account）
-    cmd.env("AIWORKDATA_DIR", &state.data_dir);
-    if matches!(target_app.as_deref(), Some("TraeWork") | Some("Trae")) {
-        if let Some(exe) = crate::native_client::resolve_for(target_app.as_deref().unwrap(), &state.settings()).exe { cmd.env("AIWORK_NATIVE_EXE", exe); }
-    }
+    crate::native_client::bridge_env(&state, target_app.as_deref().unwrap_or("TraeWork"), &mut cmd);
+    cmd.env("AIWORK_NATIVE_PROXY_PORT", crate::commands::proxy::running_port(&app).unwrap_or(0).to_string());
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -468,8 +466,8 @@ pub fn reset_device_ids(
 
     fs_utils::app_log(&state.data_dir, "开始 6 层设备标识重置");
 
-    let mut child = Command::new("powershell")
-        .args([
+    let mut cmd = Command::new("powershell");
+    cmd.args([
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
@@ -481,8 +479,10 @@ pub fn reset_device_ids(
             &target,
             "-Json",
         ])
-        // 数据目录注入：桥日志按 AIWORKDATA_DIR 解析，与主进程保持一致
-        .env("AIWORKDATA_DIR", &state.data_dir)
+        ;
+    crate::native_client::bridge_env(&state, &target, &mut cmd);
+    cmd.env("AIWORK_NATIVE_PROXY_PORT", crate::commands::proxy::running_port(&app).unwrap_or(0).to_string());
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .creation_flags(0x08000000) // CREATE_NO_WINDOW：隐藏控制台窗口

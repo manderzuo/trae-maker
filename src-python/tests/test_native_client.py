@@ -71,6 +71,20 @@ class NativeClientMigrationTests(unittest.TestCase):
             self.assertEqual(account["oauth_client_id"], "ono9krqynydwx5")
             self.assertEqual(account["refresh_token"], "fixture-refresh")
 
+    def test_proxy_rejects_cross_account_response_before_any_write(self):
+        import device_proxy
+        device_proxy._accounts_cache = None
+        path = self.root / "assistant/data/checkin_accounts.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"accounts":[{"UserID":"456", "name":"fixture", "jwt":"old-jwt", "refresh_token":"old-rt"}]}))
+        before = path.read_bytes()
+        jwt = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').decode().rstrip("=") + "." + base64.urlsafe_b64encode(json.dumps({"data":{"id":"456"}, "exp":1999999999}).encode()).decode().rstrip("=") + ".fixture"
+        with patch.object(device_proxy, "ACCOUNTS_FILE", str(path)):
+            device_proxy.try_capture_refresh_token_from_response("api.trae.cn", "/oauth/ExchangeToken",
+                json.dumps({"Result":{"UserJwt":jwt,"RefreshToken":"wrong-rt"}}).encode(),
+                json.dumps({"UserID":"123", "ClientID":"ono9krqynydwx5"}).encode())
+            self.assertEqual(path.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

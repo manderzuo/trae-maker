@@ -882,6 +882,32 @@ def update_account_refresh_token(user_id, refresh_token, oauth_client_id=None):
         return "updated"
 
 
+def update_account_native_credentials(user_id, jwt_full, refresh_token, oauth_client_id=None):
+    """Commit one validated native credential pair, retaining downgrade protection."""
+    with _accounts_lock:
+        cfg = load_accounts()
+        accounts = cfg.setdefault("accounts", [])
+        target = next((a for a in accounts if str(a.get("UserID", "")) == str(user_id)), None)
+        if target:
+            _, old_exp = get_jwt_exp(target.get("jwt", ""))
+            _, new_exp = get_jwt_exp(jwt_full)
+            if target.get("jwt") != jwt_full and old_exp and new_exp and new_exp <= old_exp:
+                return "skipped"
+        else:
+            target = {"UserID": str(user_id), "name": f"auto_{str(user_id)[:8]}",
+                "added_at": datetime.datetime.now().isoformat(timespec="seconds")}
+            accounts.append(target)
+        target["jwt"] = jwt_full
+        if oauth_client_id in (native_client.LEGACY_CLIENT_ID, native_client.TRAE_CLIENT_ID):
+            target["oauth_client_id"] = oauth_client_id
+        elif target.get("refresh_token") != refresh_token:
+            target.pop("oauth_client_id", None)
+        target["refresh_token"] = refresh_token
+        target["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        save_accounts()
+        return "updated"
+
+
 def try_capture_refresh_token_from_response(host, path, resp_body, request_body=b""):
     """从 ExchangeToken 响应体中提取 refresh_token 并写回 accounts.json。
     ExchangeToken 响应格式（本项目协议分析）：
@@ -908,14 +934,15 @@ def try_capture_refresh_token_from_response(host, path, resp_body, request_body=
         if validated:
             uid = extract_user_id(validated)
             if uid:
-                update_account_jwt(uid, validated)  # 同时更新 accessToken
                 try:
                     request = json.loads(request_body) if request_body else {}
                 except (ValueError, TypeError):
-                    request = {}
+                    return
+                if not isinstance(request, dict):
+                    return
                 if request.get("UserID") and str(request["UserID"]) != str(uid):
                     return
-                update_account_refresh_token(uid, rt, request.get("ClientID"))
+                update_account_native_credentials(uid, validated, rt, request.get("ClientID"))
                 return
     # 如果响应中没有 access_token，尝试用请求中的 user_id（由调用方注入）
     log(f"  [refresh_token] 响应中含 refresh_token 但无法提取 user_id，跳过")

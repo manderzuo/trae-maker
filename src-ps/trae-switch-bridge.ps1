@@ -217,6 +217,9 @@ switch ($TargetApp) {
 $Script:CurrentAccountFile = "$Script:ProfilesDir\current_account.txt"
 # C1：启动代理端口（>0 = 启动时注入 --proxy-server，供一键以账号打开复用切换管线）
 $Script:LaunchProxyPort = $ProxyPort
+if ($ProxyPort -eq 0 -and $TargetApp -in @('TraeWork','Trae') -and $env:AIWORK_NATIVE_PROXY_PORT -match '^\d+$') { $Script:LaunchProxyPort = [int]$env:AIWORK_NATIVE_PROXY_PORT }
+$Script:LaunchCdpPort = 0
+if ($env:AIWORK_NATIVE_CDP_PORT -match "^\d+$") { $Script:LaunchCdpPort = [int]$env:AIWORK_NATIVE_CDP_PORT }
 
 function Find-ProjectStatePython {
     $candidates = @(
@@ -474,97 +477,59 @@ function Set-CurrentAccount {
     } catch {}
 }
 
+function Test-DefaultTraeProcess {
+    param($Process, [string]$ExpectedExe)
+    return ($Process.ExecutablePath -and $Process.ExecutablePath -eq $ExpectedExe -and $Process.CommandLine -and
+        $Process.CommandLine -notmatch '--user-data-dir|--type[= ]|--utility-sub-type')
+}
+
+function Get-TraeLaunchArguments {
+    $argsList = @()
+    if ($Script:LaunchProxyPort -gt 0) { $argsList += "--proxy-server=http://127.0.0.1:$($Script:LaunchProxyPort)" }
+    if ($Script:TargetApp -in @('TraeWork', 'Trae') -and $Script:LaunchCdpPort -gt 0) {
+        $argsList += "--remote-debugging-port=$($Script:LaunchCdpPort)", '--remote-debugging-address=127.0.0.1', '--remote-allow-origins=*'
+    }
+    return $argsList
+}
+
 function Stop-Trae {
-    # 排除本助手自身进程：本应用进程名为 "ai-work-assistant"（旧版为 "Trae Work 助手"，以
-    # "Trae" 开头、会被 Get-Process -Name 'Trae*' 命中并被 Stop-Process 误杀导致 App 退出；
-    # 新版不以 Trae 开头，保留排除逻辑兼容旧版运行场景）。
-    $selfPid = $PID
-    $parentPid = $selfPid
-    $KnownAppName = 'ai-work-assistant'
-    $parentName = $KnownAppName
-    try {
-        $pp = (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $selfPid" -ErrorAction SilentlyContinue).ParentProcessId
-        if ($pp) {
-            $parentPid = $pp
-            $pproc = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
-            if ($pproc) { $parentName = $pproc.Name }
-        }
-    } catch {}
-    $p = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
-        $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
-    }
-    if ($p) {
-        Write-Step -Stage 'stop' -Message "正在关闭 $($Script:AppName)" -Status 'running'
-        # 在关闭前缓存 exe 路径，供 Start-Trae 使用
-        $exePath = $p | Select-Object -First 1 -ExpandProperty Path -ErrorAction SilentlyContinue
-        if ((Test-Path $exePath) -and (Test-ExeMatchesApp -Path $exePath)) {
-            $Script:_TraeExeCache = $exePath
-        }
-        # F-47 三级关闭：先优雅关闭（CloseMainWindow 发送 WM_CLOSE，让 Electron 正常落盘，
-        # 避免强杀导致 leveldb/vscdb 文件锁），等待最长 3 秒（实测通常 1s 内退出）；
-        # 仍未退出再强制结束。
-        $graceful = $p | Where-Object { -not $_.HasExited } | ForEach-Object {
-            try { $_.CloseMainWindow() | Out-Null; $_ } catch {}
-        }
-        if ($graceful) {
-            $gw = if ($Script:GracefulWaitSecs) { $Script:GracefulWaitSecs } else { 3 }
-            Write-Step -Stage 'stop' -Message "已发送优雅关闭请求，等待进程退出（最长 $gw 秒）" -Status 'running'
-            $waited = 0
-            while ($waited -lt $gw) {
-                Start-Sleep -Seconds 1
-                $waited++
-                $still = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
-                    $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
-                }
-                if (-not $still) { break }
-            }
-        }
-        # 第二级：仍有存活进程 → 强杀
-        $p = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
-            $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
-        }
-        if ($p) {
-            Write-Step -Stage 'stop' -Message '优雅关闭超时，强制结束进程' -Status 'warn'
-            $p | Stop-Process -Force
-        }
-        # 等待进程完全退出，最多再等 5 秒（强杀后 handle 释放）
-        $waited = 0
-        while ($waited -lt 5) {
-            Start-Sleep -Seconds 1
-            $waited++
-            $still = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
-                $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
-            }
-            if (-not $still) { break }
-        }
-        if ($waited -ge 5) {
-            Write-Step -Stage 'stop' -Message "进程未在 $waited 秒内完全退出，可能仍有文件锁，请手动关闭后重试" -Status 'error'
-        }
-    } else {
-        Write-Step -Stage 'stop' -Message "$($Script:AppName) 未运行" -Status 'skip'
-        # 进程未运行时也尝试查找 exe 路径并缓存
-        if (-not $Script:_TraeExeCache) {
-            $found = Find-TraeExe
-            if ($found) {
-                $Script:_TraeExeCache = $found
-            }
-        }
-    }
+    $exe = Find-TraeExe
+    if (-not $exe) { throw '无法确定目标应用路径，已停止关闭操作' }
+    $Script:_TraeExeCache = $exe
+    $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    $roots = @($all | Where-Object { Test-DefaultTraeProcess $_ $exe })
+    if (-not $roots) { Write-Step -Stage 'stop' -Message "$($Script:AppName) 默认实例未运行" -Status 'skip'; return }
+    # Capture only descendants of these exact roots. Same-name isolated instances
+    # and their children never enter the shutdown set.
+    $ids = @($roots | ForEach-Object { [int]$_.ProcessId })
+    do {
+        $children = @($all | Where-Object { $ids -contains [int]$_.ParentProcessId -and $ids -notcontains [int]$_.ProcessId })
+        $ids += @($children | ForEach-Object { [int]$_.ProcessId })
+    } while ($children.Count -gt 0)
+    Write-Step -Stage 'stop' -Message "正在关闭 $($Script:AppName) 默认实例" -Status 'running'
+    $roots | ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null } }
+    $deadline = (Get-Date).AddSeconds(3)
+    do {
+        $still = @(Get-Process -Id $ids -ErrorAction SilentlyContinue)
+        if (-not $still) { return }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    $still | Stop-Process -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds(5)
+    do {
+        if (-not (Get-Process -Id $ids -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    throw '目标应用默认实例尚未退出，请手动关闭后重试'
 }
 
 function Start-Trae {
     $exe = Find-TraeExe
-    if (-not $exe) {
-        Write-Step -Stage 'start' -Message "未找到 $($Script:AppName) 安装路径，请在设置中指定" -Status 'error'
-        throw "未找到 $($Script:AppName) 可执行文件"
-    }
-    if ($Script:LaunchProxyPort -gt 0) {
-        Write-Step -Stage 'start' -Message "正在启动 $($Script:AppName)（注入代理 127.0.0.1:$($Script:LaunchProxyPort)）: $exe" -Status 'running'
-        Start-Process -FilePath $exe -ArgumentList "--proxy-server=http://127.0.0.1:$($Script:LaunchProxyPort)" -WindowStyle Normal
-    } else {
-        Write-Step -Stage 'start' -Message "正在启动 $($Script:AppName): $exe" -Status 'running'
-        Start-Process -FilePath $exe -WindowStyle Normal
-    }
+    if (-not $exe) { throw "未找到 $($Script:AppName) 可执行文件" }
+    $argsList = @(Get-TraeLaunchArguments)
+    Write-Step -Stage 'start' -Message "正在启动 $($Script:AppName): $exe" -Status 'running'
+    if ($argsList.Count) { Start-Process -FilePath $exe -ArgumentList $argsList -WindowStyle Hidden }
+    else { Start-Process -FilePath $exe -WindowStyle Hidden }
 }
 
 # icube 布局启动后登录态确认。

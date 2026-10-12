@@ -1138,6 +1138,7 @@ pub fn oauth_login(
         .clone()
         .or_else(|| jwt_info.user_id.clone())
         .ok_or_else(|| "无法从回调或 JWT 中获取 user_id".to_string())?;
+    crate::native_credentials::validate_refresh_uid(&user_id, &jwt)?;
 
     // 5. 尝试获取用户名
     let name = account_name
@@ -1171,9 +1172,7 @@ pub fn oauth_login(
             .iter_mut()
             .find(|a| a.user_id.as_deref() == Some(&user_id))
             .unwrap();
-        acct.jwt = jwt.clone();
-        acct.refresh_token = Some(final_refresh_token.clone());
-        acct.updated_at = Some(fs_utils::now_iso());
+        replace_compat_credentials(acct, &jwt, &final_refresh_token, callback_info.access_token.is_none());
         crate::vault::save_accounts(&state, &mut accounts)?;
 
         fs_utils::app_log(
@@ -1191,7 +1190,7 @@ pub fn oauth_login(
             updated_at: Some(fs_utils::now_iso()),
             dc_id: None,
             credential_source: None,
-            oauth_client_id: None,
+            oauth_client_id: callback_info.access_token.is_none().then(|| OAUTH_CLIENT_ID.to_string()),
         });
         crate::vault::save_accounts(&state, &mut accounts)?;
 
@@ -1222,9 +1221,24 @@ pub fn oauth_login(
     })
 }
 
+fn replace_compat_credentials(account: &mut RawAccount, jwt: &str, refresh_token: &str, exchanged: bool) {
+    account.jwt = jwt.into();
+    account.refresh_token = Some(refresh_token.into());
+    account.oauth_client_id = exchanged.then(|| OAUTH_CLIENT_ID.to_string());
+    account.updated_at = Some(fs_utils::now_iso());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_compat_callback_replaces_stale_refresh_issuer() {
+        let mut account: RawAccount = serde_json::from_value(serde_json::json!({"name":"fixture", "UserID":"123", "jwt":"old", "refresh_token":"old-rt", "oauth_client_id":crate::native_client::TRAE_CLIENT_ID})).unwrap();
+        replace_compat_credentials(&mut account, "new", "new-rt", true);
+        assert_eq!(account.oauth_client_id.as_deref(), Some(OAUTH_CLIENT_ID));
+        replace_compat_credentials(&mut account, "manual", "manual-rt", false);
+        assert_eq!(account.oauth_client_id, None);
+    }
 
     #[test]
     fn native_callback_decodes_auth_code_and_user_name() {

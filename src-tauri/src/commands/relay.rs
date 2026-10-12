@@ -326,7 +326,7 @@ fn share_agent() -> ureq::Agent {
         .build()
 }
 
-fn share_request(req: ureq::Request, jwt: &str, device: &DeviceEntry) -> ureq::Request {
+fn share_request(profile: &crate::native_client::NativeClientProfile, req: ureq::Request, jwt: &str, device: &DeviceEntry) -> ureq::Request {
     let request_id = crate::commands::oauth::random_hex(32);
     let trace_id = format!("00-{}-01", crate::commands::oauth::random_hex(16));
     // Trae Work 的 remote/share 接口以 x-ide-token 为主鉴权头；保留
@@ -345,12 +345,12 @@ fn share_request(req: ureq::Request, jwt: &str, device: &DeviceEntry) -> ureq::R
         .set("x-preferenced-language", "zh-CN")
         .set("x-trae-user-timezone", "Asia/Shanghai")
         .set("x-user-region", "CN")
-        .set("user-agent", &crate::native_client::resolve_default().user_agent())
+        .set("user-agent", &profile.user_agent())
         .set("origin", "vscode-file://vscode-app")
         .set("x-app-id", "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8")
         .set("x-app-version", "default")
         .set("x-app-version-code", "20260901")
-        .set("x-ide-version", &crate::native_client::resolve_default().app_version)
+        .set("x-ide-version", &profile.app_version)
         .set("x-ide-version-code", "20260901")
         .set("x-ide-version-type", "stable")
         .set("x-device-type", "windows")
@@ -358,14 +358,14 @@ fn share_request(req: ureq::Request, jwt: &str, device: &DeviceEntry) -> ureq::R
         .set("x-device-cpu", "Intel")
         .set("x-machine-id", &machine_id)
         .set("request-traffic-type", "prod")
-        .set("x-market-client-id", "VSCode 1.107.1")
+        .set("x-market-client-id", &format!("VSCode {}", profile.base_version))
         .set("x-market-user-id", device.market_user_id.as_deref().unwrap_or(""))
         .set("x-device-id", &device.device_id)
         .set("x-lgw-req-sdk-type", "3")
         .set("package-type", "stable_cn")
         .set("x-lscbd-aid", "787976")
         .set("x-lscbd-platform", "windows")
-        .set("app-version", &crate::native_client::resolve_default().app_version)
+        .set("app-version", &profile.app_version)
         .set("x-request-id", &request_id)
         .set("x-ss-dp", "787976")
         .set("x-tt-trace-id", &trace_id);
@@ -434,14 +434,14 @@ fn log_share_failure(data_dir: &Path, stage: &str, error: &str) {
     );
 }
 
-fn post_share_json(agent: &ureq::Agent, url: &str, jwt: &str, device: &DeviceEntry, body: &Value, operation: &str) -> Result<Value, String> {
-    let req = share_request(agent.post(url), jwt, device);
+fn post_share_json(profile: &crate::native_client::NativeClientProfile, agent: &ureq::Agent, url: &str, jwt: &str, device: &DeviceEntry, body: &Value, operation: &str) -> Result<Value, String> {
+    let req = share_request(profile, agent.post(url), jwt, device);
     let resp = req.send_json(body).map_err(|e| share_error(e, operation))?;
     response_json(resp, operation)
 }
 
-fn get_share_json(agent: &ureq::Agent, url: &str, jwt: &str, device: &DeviceEntry, operation: &str) -> Result<Value, String> {
-    let req = share_request(agent.get(url), jwt, device);
+fn get_share_json(profile: &crate::native_client::NativeClientProfile, agent: &ureq::Agent, url: &str, jwt: &str, device: &DeviceEntry, operation: &str) -> Result<Value, String> {
+    let req = share_request(profile, agent.get(url), jwt, device);
     let resp = req.call().map_err(|e| share_error(e, operation))?;
     response_json(resp, operation)
 }
@@ -712,20 +712,22 @@ fn messages_from_data(data: &Value) -> Vec<Value> {
 /// 读取 Trae Work 的页面 CDP 目标。Trae Work 的会话数据不在 renderer 的
 /// HTTP 层，而是由页面里的 `window.vscode.ahaIpc` 转发到内置 ai-agent。
 /// 这里只连接 127.0.0.1，绝不扫描或连接远端调试端口。
-fn trae_cdp_target() -> Result<String, String> {
+fn validate_cdp_owner(profile: &crate::native_client::NativeClientProfile, process: &Value) -> Result<(), String> {
+    let exe = profile.exe.as_ref().ok_or("未检测到目标 TRAE 客户端")?;
+    if crate::commands::process::owns_default_process(exe, process["ExecutablePath"].as_str().unwrap_or_default(), process["CommandLine"].as_str().unwrap_or_default()) { Ok(()) }
+    else { Err("本地调试端口不属于所选 TRAE 默认实例，已拒绝接力；请通过助手打开客户端".into()) }
+}
+
+fn trae_cdp_target(profile: &crate::native_client::NativeClientProfile) -> Result<String, String> {
     let port = std::env::var("AIWORK_TRAE_CDP_PORT")
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
         .unwrap_or(TRAE_CDP_DEFAULT_PORT);
     // Bind the loopback CDP socket to this installed client's default data profile.
-    let profile = crate::native_client::resolve_default();
-    let expected_exe = profile.exe.as_ref().ok_or("未检测到 TRAE CN 客户端")?;
-    let ps = format!("$listener=Get-NetTCPConnection -State Listen -LocalPort {} -ErrorAction SilentlyContinue | Select-Object -First 1; if($listener){{ $p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$listener.OwningProcess); if($p.CommandLine -notmatch '--user-data-dir'){{ $p.ExecutablePath }} }}", port);
+    let ps = format!("$listener=Get-NetTCPConnection -State Listen -LocalPort {} -ErrorAction SilentlyContinue | Select-Object -First 1; if($listener){{ Get-CimInstance Win32_Process -Filter ('ProcessId='+$listener.OwningProcess) | Select-Object ExecutablePath,CommandLine | ConvertTo-Json -Compress }}", port);
     let owner = Command::new("powershell").args(["-NoProfile", "-Command", &ps]).creation_flags(0x08000000).output().map_err(|e| e.to_string())?;
-    let actual_exe = String::from_utf8_lossy(&owner.stdout).trim().to_string();
-    if !actual_exe.eq_ignore_ascii_case(&expected_exe.to_string_lossy()) {
-        return Err("本地调试端口不属于当前 TRAE CN 默认实例，已拒绝接力；请通过助手打开客户端".into());
-    }
+    let process: Value = serde_json::from_slice(&owner.stdout).map_err(|_| "本地调试端口未启动，请通过助手打开客户端")?;
+    validate_cdp_owner(profile, &process)?;
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(2))
         .timeout_read(Duration::from_secs(3))
@@ -768,12 +770,13 @@ fn random_connect_session_id() -> String {
 /// ai-agent 明确拒绝。因此这里必须复刻 Trae 自身 TransportManager 的
 /// `request` 外层包，并携带 user_info/client_info 等字段。
 fn trae_lite_call(
+    profile: &crate::native_client::NativeClientProfile,
     session_id: &str,
     method: &str,
     data: Value,
     user_info: &Value,
 ) -> Result<Value, String> {
-    let ws_url = trae_cdp_target()?;
+    let ws_url = trae_cdp_target(profile)?;
     let (mut socket, _) = connect(&ws_url)
         .map_err(|e| format!("连接 TRAE CN 本地调试桥失败：{e}"))?;
     if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
@@ -896,10 +899,12 @@ fn trae_lite_call(
 }
 
 fn collect_share_messages_via_local_bridge(
+    profile: &crate::native_client::NativeClientProfile,
     session_id: &str,
     user_info: &Value,
 ) -> Result<(Value, Vec<Value>), String> {
     let session = trae_lite_call(
+        profile,
         session_id,
         "get_chat_session",
         json!({ "chat_session_id": session_id, "env": "local" }),
@@ -919,6 +924,7 @@ fn collect_share_messages_via_local_bridge(
             request_data["page_token"] = Value::String(token.clone());
         }
         let page = data_of(trae_lite_call(
+            profile,
             session_id,
             "get_messages",
             request_data,
@@ -955,6 +961,7 @@ fn collect_share_messages_via_local_bridge(
 }
 
 fn collect_share_messages(
+    profile: &crate::native_client::NativeClientProfile,
     agent: &ureq::Agent,
     base: &str,
     session_id: &str,
@@ -972,7 +979,7 @@ fn collect_share_messages(
         "scope": "marscode",
         "loginScope": "trae",
     });
-    let bridge_error = match collect_share_messages_via_local_bridge(session_id, &user_info) {
+    let bridge_error = match collect_share_messages_via_local_bridge(profile, session_id, &user_info) {
         Ok(value) => return Ok(value),
         Err(error) => error,
     };
@@ -983,6 +990,7 @@ fn collect_share_messages(
     }
     let encoded = urlencoding::encode(session_id);
     let session_body = get_share_json(
+            profile,
         agent,
         &format!("{base}/api/remote/v1/chat_sessions/{encoded}?env=local"),
         jwt,
@@ -999,7 +1007,7 @@ fn collect_share_messages(
             url.push_str("&page_token=");
             url.push_str(&urlencoding::encode(token));
         }
-        let data = data_of(get_share_json(agent, &url, jwt, device, "读取 Trae 会话消息")?);
+        let data = data_of(get_share_json(profile, agent, &url, jwt, device, "读取 Trae 会话消息")?);
         all.extend(messages_from_data(&data));
         let next = data.get("next_page_token").and_then(Value::as_str).map(str::to_string);
         if next.as_deref().is_none() || !seen_tokens.insert(next.clone().unwrap_or_default()) {
@@ -1103,7 +1111,7 @@ fn collect_share_resources(
     Ok((resources, unavailable))
 }
 
-fn upload_share_resources(
+fn upload_share_resources(profile: &crate::native_client::NativeClientProfile,
     agent: &ureq::Agent,
     base: &str,
     session_id: &str,
@@ -1123,6 +1131,7 @@ fn upload_share_resources(
             "env": "local",
         });
         let data = data_of(post_share_json(
+            profile,
             agent,
             &format!("{base}/api/remote/v1/share/local_conversation/resources/presign-upload"),
             jwt,
@@ -1160,12 +1169,13 @@ fn upload_share_resources(
     Ok(uploaded)
 }
 
-fn poll_share_audit(agent: &ureq::Agent, base: &str, share_id: &str, jwt: &str, device: &DeviceEntry) -> Result<String, String> {
+fn poll_share_audit(profile: &crate::native_client::NativeClientProfile, agent: &ureq::Agent, base: &str, share_id: &str, jwt: &str, device: &DeviceEntry) -> Result<String, String> {
     let encoded = urlencoding::encode(share_id);
     let mut last = "auditing".to_string();
     for attempt in 0..15 {
         if attempt > 0 { std::thread::sleep(Duration::from_secs(1)); }
         let data = data_of(get_share_json(
+            profile,
             agent,
             &format!("{base}/api/remote/v1/share/{encoded}/audit_status"),
             jwt,
@@ -1244,7 +1254,8 @@ fn create_share_inner(
     let device = crate::commands::accounts::resolve_device(&state, &source_uid);
     let base = detect_share_remote_base(&state.logs_dir());
     let agent = share_agent();
-    let (session, messages) = match collect_share_messages(&agent, &base, &session_id, &source_uid, &jwt, &device) {
+    let profile = crate::native_client::resolve_for(&target, &state.settings());
+    let (session, messages) = match collect_share_messages(&profile, &agent, &base, &session_id, &source_uid, &jwt, &device) {
         Ok(value) => value,
         Err(error) => {
             log_share_failure(&state.data_dir, "读取会话消息", &error);
@@ -1278,7 +1289,7 @@ fn create_share_inner(
         &state.data_dir,
         &format!("Trae 分享资源收集完成: resources={} unavailable={}", resources.len(), unavailable_files.len()),
     );
-    let uploaded = match upload_share_resources(&agent, &base, &session_id, &jwt, &device, &resources) {
+    let uploaded = match upload_share_resources(&profile, &agent, &base, &session_id, &jwt, &device, &resources) {
         Ok(value) => value,
         Err(error) => {
             log_share_failure(&state.data_dir, "上传分享资源", &error);
@@ -1304,6 +1315,7 @@ fn create_share_inner(
         payload.as_object_mut().map(|obj| obj.remove("env"));
     }
     let created = match post_share_json(
+        &profile,
         &agent,
         &format!("{base}/api/remote/v1/share/local_conversation"),
         &jwt,
@@ -1325,7 +1337,7 @@ fn create_share_inner(
             return Err(error);
         }
     };
-    let status = match poll_share_audit(&agent, &base, &share_id, &jwt, &device) {
+    let status = match poll_share_audit(&profile, &agent, &base, &share_id, &jwt, &device) {
         Ok(value) => value,
         Err(error) => {
             log_share_failure(&state.data_dir, "等待分享审核", &error);
@@ -1403,15 +1415,11 @@ pub fn open_trae_project(
         return Err(format!("项目路径不存在：{}", project.display()));
     }
     let exe = crate::commands::env::detect_target_exe(&state, &target)?;
-    if proxy_port.is_none() {
-        crate::commands::proxy::cleanup_stale_local_proxy(&state);
-    } else {
-        crate::commands::process::graceful_kill_app(&target)?;
-    }
+    if proxy_port.is_none() { crate::commands::proxy::cleanup_stale_local_proxy(&state); }
+    let cdp_port = crate::native_client::cdp_port(&state.settings());
+    if proxy_port.is_some() || cdp_port.is_some() { crate::commands::process::graceful_kill_app(&target)?; }
     let mut cmd = Command::new(&exe);
-    if let Some(port) = proxy_port {
-        cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
-    }
+    cmd.args(crate::native_client::launch_args(proxy_port, cdp_port));
     // Electron/VS Code fork 接受目录作为位置参数；--reuse-window 避免额外打开第二个窗口。
     cmd.args(["--reuse-window", project.to_string_lossy().as_ref()]);
     cmd.spawn().map_err(|e| format!("打开 Trae 项目失败：{e}"))?;
@@ -1421,6 +1429,13 @@ pub fn open_trae_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_cdp_validation_uses_explicit_profile() {
+        let mut chosen = crate::native_client::resolve_for("Trae", &crate::models::Settings::default());
+        chosen.exe = Some(PathBuf::from("E:/chosen/Trae CN.exe"));
+        assert!(validate_cdp_owner(&chosen, &json!({"ExecutablePath":"E:/chosen/Trae CN.exe", "CommandLine":"\"E:/chosen/Trae CN.exe\" --remote-debugging-port=9333"})).is_ok());
+        assert!(validate_cdp_owner(&chosen, &json!({"ExecutablePath":"E:/legacy/TRAE SOLO CN.exe", "CommandLine":"\"E:/legacy/TRAE SOLO CN.exe\""})).is_err());
+    }
 
     #[test]
     fn uri_decode_handles_windows_path() {
@@ -1469,6 +1484,7 @@ mod tests {
                 "loginScope": "trae"
             });
         let direct_session = trae_lite_call(
+            &crate::native_client::resolve_default(),
             &session_id,
             "get_chat_session",
             json!({ "chat_session_id": session_id, "env": "local" }),
@@ -1477,6 +1493,7 @@ mod tests {
         .expect("get session");
         eprintln!("bridge session result code={:?} message={:?}", direct_session.get("code"), direct_session.get("message"));
         let direct_messages = trae_lite_call(
+            &crate::native_client::resolve_default(),
             &session_id,
             "get_messages",
             json!({ "chat_session_id": session_id, "page_size": 100, "env": "local" }),
@@ -1484,7 +1501,7 @@ mod tests {
         )
         .expect("get messages");
         eprintln!("bridge messages result code={:?} message={:?} items={}", direct_messages.get("code"), direct_messages.get("message"), messages_from_data(&data_of(direct_messages.clone())).len());
-        let (session, messages) = collect_share_messages_via_local_bridge(&session_id, &user_info)
+        let (session, messages) = collect_share_messages_via_local_bridge(&crate::native_client::resolve_default(), &session_id, &user_info)
         .expect("local bridge call");
         assert!(session.is_object());
         assert!(!messages.is_empty());
@@ -1513,6 +1530,7 @@ mod tests {
             "loginScope": "trae"
         });
         let result = trae_lite_call(
+            &crate::native_client::resolve_default(),
             "probe-session",
             "list_chat_sessions",
             json!({ "page_size": 100, "env": "local" }),

@@ -6,6 +6,22 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use serde::Deserialize;
 use crate::fs_utils;
 use crate::state::AppState;
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    #[test]
+    fn native_checkin_refreshes_expired_renewable_only_in_scope() {
+        let views: Vec<crate::models::AccountView> = ["renew", "checked", "cooled", "no-refresh", "outside"].into_iter().map(|uid| crate::models::AccountView {
+            user_id: uid.into(), jwt_exp_hours: Some(-1.0), has_refresh_token: uid != "no-refresh", checked_today: Some(uid == "checked"), cooldown_type: (uid == "cooled").then_some("SessionDead".into()), ..Default::default()
+        }).collect();
+        let mut refreshed = Vec::new();
+        let scope = ["renew", "checked", "cooled", "no-refresh"].map(String::from);
+        let errors = refresh_checkin_candidates(&views, &scope, true, |uid| { refreshed.push(uid.to_string()); Ok("fixture-new-jwt".into()) });
+        assert!(errors.is_empty());
+        assert_eq!(refreshed, vec!["renew"]);
+    }
+}
 use crate::commands::accounts::{build_account_views, resolve_user_ids};
 use crate::python::spawn_script;
 
@@ -223,7 +239,18 @@ fn emit_final_done(app: &WorkerUi<'_>, ok: usize, already: usize, failed: usize,
     }
 }
 
-/// 签到工作线程主体：抢锁 → 筛选 → 全量轮 → 最多 2 轮失败重试（间隔加长）→ 汇总 done
+fn refresh_checkin_candidates(
+    views: &[crate::models::AccountView], scope: &[String], skip_checked: bool,
+    mut refresh: impl FnMut(&str) -> Result<String, String>,
+) -> Vec<(String, String)> {
+    views.iter().filter(|view| scope.contains(&view.user_id)
+        && view.has_refresh_token && view.cooldown_type.is_none()
+        && !(skip_checked && view.checked_today == Some(true))
+        && view.jwt_exp_hours.is_none_or(|hours| hours <= 2.0 / 60.0))
+        .filter_map(|view| refresh(&view.user_id).err().map(|error| (view.user_id.clone(), error))).collect()
+}
+
+/// 签到工作线程主体：抢锁 → 续期 → 筛选 → 全量轮 → 最多 2 轮失败重试 → 汇总 done
 pub(crate) fn run_checkin_worker(
     app: &WorkerUi<'_>,
     state: &AppState,
@@ -252,6 +279,10 @@ pub(crate) fn run_checkin_worker(
         }
     };
     // 全集视图一次构建：跳过原因登记与 start 事件全集清单共用
+    let initial_views = build_account_views(state);
+    for (uid, error) in refresh_checkin_candidates(&initial_views, &uids, opts.skip_checked_in, |uid| crate::commands::accounts::refresh_jwt_impl(state, uid)) {
+        fs_utils::app_log(&state.data_dir, &format!("签到前凭据续期失败: uid={uid} error={error}"));
+    }
     let views_all = build_account_views(state);
     // scope 内全集（跳过规则过滤前快照）：start 事件清单只覆盖本次签到范围，
     // 避免把范围外账号误显示为「跳过」

@@ -79,25 +79,12 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
     // （无代理时正常打开，不杀进程。）
     // 自动切换/会话接力需要页面内置 Aha RPC；仅在明确传入环境变量时启用
     // Chromium 回环调试端口，避免普通启动暴露调试面。
-    let cdp_port = std::env::var("AIWORK_TRAE_CDP_PORT")
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
-        .filter(|port| *port > 0)
-        // 开启桌面自动切换时，默认给 Trae Work 注入仅回环可访问的
-        // CDP 端口，供本地会话接力调用 Aha RPC；关闭开关则不暴露端口。
-        .or_else(|| state.settings().desktop_auto_switch.then_some(9333));
+    let cdp_port = crate::native_client::cdp_port(&state.settings());
     if proxy_port.is_some() || cdp_port.is_some() {
         crate::commands::process::graceful_kill_app(&target)?;
     }
     let mut cmd = Command::new(&exe);
-    if let Some(port) = proxy_port {
-        // Electron/Chromium 支持 --proxy-server 启动参数
-        cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
-    }
-    if let Some(port) = cdp_port {
-        cmd.arg(format!("--remote-debugging-port={port}"))
-            .arg("--remote-allow-origins=*");
-    }
+    cmd.args(crate::native_client::launch_args(proxy_port, cdp_port));
     cmd.spawn()
         .map_err(|e| format!("启动 Trae Work 失败: {e}"))?;
     Ok(())
@@ -106,7 +93,7 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
 /// 检测 Trae CN IDE（与 Trae Work/SOLO CN 是两个独立应用）
 #[tauri::command(async)]
 pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
-    let (installed, path, version) = detect_trae_cn(state.settings().trae_cn_path.clone());
+    let (installed, path, version) = detected_profile(crate::native_client::resolve_for("Trae", &state.settings()));
     let running = is_running_cn();
     EnvStatus { installed, running, version, path, target_app: "Trae".into() }
 }
@@ -115,7 +102,7 @@ pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
 /// 让 Trae 的流量也走本地 MITM 代理（捕获账号/观察请求）。
 #[tauri::command(async)]
 pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
-    let (installed, path, _) = detect_trae_cn(state.settings().trae_cn_path.clone());
+    let (installed, path, _) = detected_profile(crate::native_client::resolve_for("Trae", &state.settings()));
     if !installed {
         return Err("未检测到 Trae 安装，请在「环境配置」中指定 Trae 安装路径".into());
     }
@@ -126,22 +113,12 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
         crate::commands::proxy::cleanup_stale_local_proxy(&state);
     }
     // Electron 单实例：已运行的窗口会忽略新启动参数，注入代理前先三级关闭现有进程确保生效
-    let cdp_port = std::env::var("AIWORK_TRAE_CDP_PORT")
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
-        .filter(|port| *port > 0)
-        .or_else(|| state.settings().desktop_auto_switch.then_some(9333));
+    let cdp_port = crate::native_client::cdp_port(&state.settings());
     if proxy_port.is_some() || cdp_port.is_some() {
         crate::commands::process::graceful_kill_app("Trae")?;
     }
     let mut cmd = Command::new(&exe);
-    if let Some(port) = proxy_port {
-        cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
-    }
-    if let Some(port) = cdp_port {
-        cmd.arg(format!("--remote-debugging-port={port}"))
-            .arg("--remote-allow-origins=*");
-    }
+    cmd.args(crate::native_client::launch_args(proxy_port, cdp_port));
     cmd.spawn().map_err(|e| format!("启动 Trae 失败: {e}"))?;
     Ok(())
 }
@@ -759,4 +736,18 @@ fn process_exe_path(proc_names: &[&str]) -> Option<String> {
 
 fn detected_profile(p: crate::native_client::NativeClientProfile) -> (bool, Option<String>, Option<String>) {
     (p.exe.is_some(), p.exe.as_ref().map(|v| v.to_string_lossy().into()), p.exe.as_ref().map(|_| p.app_version))
+}
+
+pub(crate) fn discover_native_exe(target: &str) -> Option<String> {
+    // Keep registry/process discovery for custom installation locations. Cache
+    // briefly because account request headers resolve the identity repeatedly.
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Option<String>)>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Ok(map) = cache.lock() {
+        if let Some((at, result)) = map.get(target) { if at.elapsed().as_secs() < 10 { return result.clone(); } }
+    }
+    let p = app_profile(Some(if target == "Trae" { "trae" } else { "trae_work" }));
+    let result = registry_app_path(&p).or_else(|| process_exe_path(p.proc_names));
+    if let Ok(mut map) = cache.lock() { map.insert(target.into(), (std::time::Instant::now(), result.clone())); }
+    result
 }

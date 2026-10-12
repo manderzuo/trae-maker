@@ -281,13 +281,20 @@ pub(crate) fn ensure_native_snapshot(
     refresh_token: Option<&str>,
     name: &str,
 ) -> Result<NativeSnapshotOutcome, String> {
+    let profile = crate::native_client::resolve_for("TraeWork", &state.settings());
+    ensure_native_snapshot_for_profile(state, &profile, user_id, token, refresh_token, name)
+}
+
+pub fn ensure_native_snapshot_for_profile(
+    state: &AppState, profile: &crate::native_client::NativeClientProfile, user_id: &str,
+    token: &str, refresh_token: Option<&str>, name: &str,
+) -> Result<NativeSnapshotOutcome, String> {
     if user_id.trim().is_empty()
         || user_id.len() > 64
         || !user_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
     {
         return Err("无效的账号 UserID，无法创建原生快照".into());
     }
-    let profile = crate::native_client::resolve_for("TraeWork", &state.settings());
     let profiles = state.data_path(&profile.profiles_name);
     fs::create_dir_all(&profiles).map_err(|e| format!("创建账号快照目录失败: {e}"))?;
     let destination = profiles.join(user_id);
@@ -354,6 +361,21 @@ pub(crate) fn ensure_native_snapshot(
 mod tests {
     use super::*;
     #[test]
+    fn native_explicit_snapshot_does_not_touch_legacy_slot() {
+        let root = std::env::temp_dir().join(format!("native-target-{}", rand::random::<u64>()));
+        let state = AppState { data_dir: root.clone(), python_dir: root.clone(), python_exe: String::new(), jwt_refresh_lock: std::sync::Mutex::new(()) };
+        let mut p = crate::native_client::resolve_for("Trae", &crate::models::Settings::default());
+        p.data_dir = root.join("fixture-native");
+        fs::create_dir_all(root.join("data/profiles/123")).unwrap();
+        fs::write(root.join("data/profiles/123/sentinel"), "old login").unwrap();
+        ensure_native_snapshot_for_profile(&state, &p, "123", "fixture-new-jwt", Some("fixture-rt"), "fixture").unwrap();
+        let auth = read_native_auth(&root.join("data/profiles_trae/123/User/globalStorage/storage.json")).unwrap();
+        assert_eq!(auth["token"], "fixture-new-jwt");
+        assert_eq!(fs::read_to_string(root.join("data/profiles/123/sentinel")).unwrap(), "old login");
+        assert!(!root.join("data/profiles/123/User").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn migrate_legacy_slots_is_atomic_and_never_overwrites_new_slots() {
         let root = std::env::temp_dir().join(format!("aiwork-migrate-{}", rand::random::<u64>()));
         for uid in ["123", "456", "789", "last", ".seed-123", "123.bak"] {
@@ -405,6 +427,11 @@ mod tests {
             jwt_refresh_lock: std::sync::Mutex::new(()),
         };
         fs::create_dir_all(&state.data_dir).unwrap();
+        let exe = root.join("Programs/TRAE SOLO CN/TRAE SOLO CN.exe");
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, "fixture").unwrap();
+        fs::create_dir_all(state.data_dir.join("conf")).unwrap();
+        fs::write(state.data_dir.join("conf/app_settings.json"), serde_json::json!({"trae_path":exe.to_string_lossy()}).to_string()).unwrap();
         let old_appdata = std::env::var_os("APPDATA");
         std::env::set_var("APPDATA", &root);
         let out = ensure_native_snapshot(&state, "u-test", "not-a-jwt", None, "Demo").unwrap();

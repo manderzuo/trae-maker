@@ -561,7 +561,7 @@ pub fn apps_account_add(
     });
     crate::vault::save_accounts(&state, &mut accounts)?;
     if !native_jwt.is_empty() {
-        crate::native_snapshot::ensure_native_snapshot(&state, &uid, &native_jwt, native_rt.as_deref(), &display_name)?;
+        crate::native_snapshot::ensure_native_snapshot_for_profile(&state, &native, &uid, &native_jwt, native_rt.as_deref(), &display_name)?;
     }
     fs_utils::app_log(
         &state.data_dir,

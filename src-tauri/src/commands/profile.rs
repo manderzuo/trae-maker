@@ -162,10 +162,8 @@ pub fn profile_backup(
     if target == "Doubao" && state.settings().doubao_snapshot_include_idb {
         cmd.arg("-IncludeIndexedDB");
     }
-    cmd.env("AIWORKDATA_DIR", &state.data_dir);
-    if matches!(target.as_str(), "TraeWork" | "Trae") {
-        if let Some(exe) = crate::native_client::resolve_for(&target, &state.settings()).exe { cmd.env("AIWORK_NATIVE_EXE", exe); }
-    }
+    crate::native_client::bridge_env(&state, &target, &mut cmd);
+    cmd.env("AIWORK_NATIVE_PROXY_PORT", crate::commands::proxy::running_port(&app).unwrap_or(0).to_string());
     let mut child = cmd
         .creation_flags(0x08000000)
         .stdout(std::process::Stdio::piped())
@@ -281,10 +279,8 @@ pub fn profile_restore(
     if target == "Doubao" && state.settings().doubao_snapshot_include_idb {
         cmd.arg("-IncludeIndexedDB");
     }
-    cmd.env("AIWORKDATA_DIR", &state.data_dir);
-    if matches!(target.as_str(), "TraeWork" | "Trae") {
-        if let Some(exe) = crate::native_client::resolve_for(&target, &state.settings()).exe { cmd.env("AIWORK_NATIVE_EXE", exe); }
-    }
+    crate::native_client::bridge_env(&state, &target, &mut cmd);
+    cmd.env("AIWORK_NATIVE_PROXY_PORT", crate::commands::proxy::running_port(&app).unwrap_or(0).to_string());
     let mut child = cmd
         .creation_flags(0x08000000)
         .stdout(std::process::Stdio::piped())

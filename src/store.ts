@@ -994,7 +994,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       // BitBrowser 只负责首次注册/登录和一次性接管 refresh_token。
       // 后续续期统一走本机 Trae ExchangeToken，不再依赖 BitBrowser 窗口是否存在。
-      get().pushToast('info', '正在通过原生 Trae Work CN 凭据续期 JWT…');
+      get().pushToast('info', '正在通过原生 TRAE CN 凭据续期 JWT…');
       await api.accounts.refreshJwt(userId);
       await get().refreshAccounts();
       get().pushToast('success', 'JWT 已续期，原生切换快照已同步');
