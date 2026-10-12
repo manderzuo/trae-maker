@@ -50,15 +50,16 @@ impl PreparationSource for NativePreparationSource<'_> {
     fn estimate(&self,account:&PickedAccount,workload:i64)->Result<i64,String> {
         let item=format!("estimate-{:032x}",rand::random::<u128>());
         let url=format!("{}/api/v1/commercial/check_estimated_balance",super::AGENT_HOST);
-        let response=ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20)).build().post(&url)
+        let agent=ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20)).build();
+        let response=super::video_protocol::post(&agent,&url)
             .set("content-type","application/json").set("accept","application/json").set("user-agent","TraeClient/TTNet")
             .set("x-ide-token",account.jwt.strip_prefix("Cloud-IDE-JWT ").unwrap_or(&account.jwt).trim())
-            .set("x-app-id",super::APP_ID).set("x-app-version","default").set("x-app-version-code",&super::ide_version_code())
-            .set("x-ide-version",&super::ide_version()).set("x-ide-version-code",&super::ide_version_code()).set("x-ide-version-type","stable")
+            .set("x-app-id",super::APP_ID).set("x-app-version","default")
+            .set("x-ide-version-type","stable")
             .set("x-device-type","windows").set("x-device-brand","H610E-B").set("x-device-cpu","Intel")
             .set("x-device-id",&account.device_id).set("x-machine-id",&account.machine_id).set("x-os-version","Windows 10 Pro")
             .set("request-traffic-type","prod").set("package-type","stable_cn").set("x-lgw-req-sdk-type","3")
-            .set("x-lscbd-aid","787976").set("x-lscbd-platform","windows").set("x-ss-dp","787976").set("app-version",&super::ide_version())
+            .set("x-lscbd-aid","787976").set("x-lscbd-platform","windows").set("x-ss-dp","787976")
             .set("x-request-id",&item).set("referer",&url)
             .send_json(json!({"access_type":"SoloLite","items":[{"item_id":item,"estimated_token_usage":{"completion_tokens":workload},
                 "config_name":"seedance2-fast","function":"video_generation"}]}))
@@ -308,10 +309,24 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         let fenced:bool=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_accounts WHERE account_ref=?1 AND rebase_state!='open')",[&account.uid],|r|r.get(0)).map_err(|e|e.to_string())?;
         if fenced {Err("capacity snapshot stale or account fenced".into())} else {Ok(())}
     })?;
-    let packs=source.capacity(&account)?;
+    let packs_started_at=chrono::Utc::now().timestamp_millis();
+    let dedicated=super::bridge_capacity_source::dedicated_enabled(runtime.data_dir(),&account.uid)?;
+    let packs=match source.capacity(&account) {
+        Ok(packs)=>packs,
+        Err(error)=>{
+            if dedicated {runtime.with_store(|store,lease|store.invalidate_native_grants(lease,&account.uid,packs_started_at))?;}
+            return Err(error);
+        },
+    };
+    if dedicated {
+        if let Err(error)=runtime.with_store(|store,lease|store.refresh_native_grants(lease,&account.uid,&packs,packs_started_at)) {
+            crate::fs_utils::app_log(runtime.data_dir(),&format!("Core 新积分包容量暂不可用：{}",if error.starts_with("capacity_grant_") {"capacity_grant_unavailable"} else {"capacity_source_unavailable"}));
+            return Err("upstream_capacity_unavailable".into());
+        }
+    }
     let live=parse_capacity(&packs,now)?;
-    let observation=if super::bridge_capacity_source::dedicated_enabled(runtime.data_dir(),&account.uid)? {
-        Some(super::bridge_capacity_source::PackObservation::parse(&packs,now)?)
+    let observation=if dedicated {
+        Some(super::bridge_capacity_source::PackObservation::parse(&packs,now).map_err(|_|"upstream_capacity_unavailable")?)
     } else {None};
     if observation.is_some() {
         // A top-up with no outstanding debit has no receipt-triggered worker.

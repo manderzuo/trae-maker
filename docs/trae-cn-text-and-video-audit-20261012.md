@@ -2,6 +2,8 @@
 
 Date: 2026-10-12, Asia/Shanghai. Scope: the already migrated local AI Work bridge, GLM assist recovery, and video submission compatibility. No Studio UI change or deployment was needed for this repair.
 
+**Correction after source investigation:** the video audit below records the state before the video migration repair. Client 0.1.50 in continuation evidence denotes the compiled video adapter, not the installed desktop application's GUI version. `docs/seedance-continuation-capabilities.md` states this explicitly. The adapter remains 0.1.50 / 20260811; desktop login, renewal and entitlement reads remain 3.4.2 / 20250325. Relabeling evidence as 3.4.2 is unnecessary and would misidentify its contract. The repair and final acceptance evidence are tracked in `docs/video-migration-repair-20261012.md`.
+
 ## Confirmed text failure and repair
 
 The original Core parent `request_2b9rq9OniwECm_VLhF-3gw` failed in its GLM-5.3-Flash assist step `request_KYVxbRC5xXSEO-yQbw8suA`. There was no video step. The provider returned 4001 (invalid parameter); the original financial disposition remains pending and was not rewritten or replayed.
@@ -60,6 +62,6 @@ This disables advertised tail-reference/video-reference continuation after migra
 
 1. Reconcile existing unknown/confirmed capacity obligations using authoritative session receipts and the existing capacity coverage rules, preserving actual charges and unresolved records. Investigate the queued/continuation status separately so capacity rejection is visible rather than appearing as endless queuing.
 2. Once legitimate capacity allows admission, run one controlled Seedance generation on the migrated native client, inspect the actual provider response and settle its unique receipt. Do not replay the ended diagnostic or original failed video.
-3. Verify migrated-client tail/reference continuation with real completed outputs and settled receipts, then issue fresh evidence bound to client 3.4.2. Do not turn capabilities on based solely on the text repair or fee preflight.
+3. Verify migrated-login tail/reference continuation with real completed outputs and settled receipts. Preserve the unchanged adapter's 0.1.50 binding and original evidence bytes; do not bind adapter evidence to desktop display version 3.4.2. Do not claim visual acceptance from the text repair or fee preflight alone.
 
 Conclusion: GLM assist repair is activated and demonstrated by a real Core assist. Video generation is not fully accepted: its fee preflight works, its controlled generation was blocked before submission, and continuation capability verification has a confirmed client-version mismatch.

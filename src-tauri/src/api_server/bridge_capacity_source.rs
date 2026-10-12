@@ -28,10 +28,10 @@ pub(super) fn validate_schema(tx:&Transaction<'_>)->Result<(),String> {
 
 #[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct PackUse {product:i64,limit:i64,used:i64,start_ms:Option<i64>,end_ms:Option<i64>}
+pub(super) struct PackUse {pub(super) product:i64,pub(super) limit:i64,pub(super) used:i64,pub(super) start_ms:Option<i64>,pub(super) end_ms:Option<i64>}
 #[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct PackObservation {pub observed_at_ms:i64,packs:BTreeMap<String,PackUse>}
+pub(super) struct PackObservation {pub observed_at_ms:i64,pub(super) packs:BTreeMap<String,PackUse>}
 
 fn credits(value:Option<&Value>)->Result<i64,String> {
     let text=match value {Some(Value::String(s))=>s.clone(),Some(Value::Number(n))=>n.to_string(),_=>return Err("capacity_source_invalid_credits".into())};
@@ -129,7 +129,7 @@ impl PackObservation {
         }
         let observation=Self {observed_at_ms:now,packs:observed};observation.validate()?;Ok(observation)
     }
-    fn validate(&self)->Result<(),String> {
+    pub(super) fn validate(&self)->Result<(),String> {
         if self.observed_at_ms<0 || self.packs.len()>256 {return Err("capacity_source_bounds".into());}
         for (key,p) in &self.packs {
             if key.len()!=64 || !key.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -273,6 +273,11 @@ fn reconcile_with_mode(runtime:&super::bridge_runtime::BridgeBudgetRuntime,accou
     })?;
     let Some(fence)=fence else {return Ok(false)};
     let mut guard=FenceGuard {runtime,fence,committed:false};
+    // This authoritative read supersedes any earlier additive confirmation,
+    // including the planner's first read. While fenced it cannot authorize a
+    // grant; a successful rebase absorbs present packages into the snapshot.
+    let started=chrono::Utc::now().timestamp_millis();
+    runtime.with_store(|s,l|s.invalidate_native_grants(l,account,started))?;
     let packs=fetch()?; // No DB transaction/runtime mutex across upstream I/O.
     let observed=PackObservation::parse(&packs,chrono::Utc::now().timestamp_millis())?;
     if !dedicated_enabled(runtime.data_dir(),account)? {return Err("dedicated_account_disabled".into());}
@@ -286,6 +291,37 @@ mod tests {
     use serde_json::json;
     fn pack(id:&str,product:i64,limit:&str,used:&str)->Value {
         json!({"id":id,"entitlement_base_info":{"product_id":product,"quota":{"credits_limit":limit},"start_time":1},"usage":{"credits_amount":used},"expire_time":1000})
+    }
+    #[cfg(windows)]
+    #[test]
+    fn newer_rebase_read_cannot_keep_a_missing_grant_or_refresh_it_on_failure() {
+        use super::super::{bridge_runtime::BridgeBudgetRuntime,bridge_prepared::tests::{fixture,input}};
+        for failed in [false,true] {
+            let (dir,mut store,mut lease)=fixture();
+            let base=|id:&str,product:i64|json!({"status":1,"entitlement_base_info":{"entitlement_id":id,"ent_status":0,"product_id":product,"quota":{"credits_limit":"100"},"start_time":0,"end_time":9999999999_i64},"usage":{"credits_amount":"0"}});
+            let bases=vec![base("g",208),base("w",209)];
+            store.initialize_capacity_anchor(&lease,"account",&PackObservation::parse(&bases,1).unwrap()).unwrap();
+            std::fs::write(dir.join("bridge-dedicated-accounts.json"),b"{\"version\":1,\"accounts\":[\"account\"]}").unwrap();
+            store.finish_activity_lease_cleanly(&mut lease,||Ok(())).unwrap();drop(lease);drop(store);
+            let runtime=BridgeBudgetRuntime::start(&dir).unwrap();
+            let now=chrono::Utc::now().timestamp_millis()-50;
+            let mut first=bases.clone();let mut extra=base("new-credit",221);
+            extra["usage"]=json!({});extra["entitlement_base_info"]["quota"]["credits_limit"]=json!("1000");first.push(extra);
+            runtime.with_store(|s,l|s.refresh_native_grants(l,"account",&first,now)).unwrap();
+            let result=reconcile_increased_capacity(&runtime,"account",1_100_000_000,100_000_000,|| {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                if failed {Err("fixture outage".into())} else {Ok(bases)}
+            });
+            if failed {assert!(result.is_err());} else {assert!(result.unwrap());}
+            runtime.with_store(|s,l| {
+                let valid:i64=s.connection.query_row("SELECT current_valid FROM bridge_capacity_grants",[],|r|r.get(0)).unwrap();assert_eq!(valid,0);
+                let mut next=input();next.request_id="request-after-newer-read".into();next.hold_microcredits=400_000_000;next.expires_at_ms=now+60_000;
+                next.snapshot_epoch=s.connection.query_row("SELECT snapshot_epoch FROM bridge_capacity_accounts",[],|r|r.get(0)).unwrap();
+                assert!(s.prepare_budget(l,&next,None,chrono::Utc::now().timestamp_millis()).is_err(),"missing grant must not authorize more than the current baseline");
+                assert_eq!(s.capacity_totals("account")?.pending,0);Ok(())
+            }).unwrap();
+            drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+        }
     }
     #[cfg(windows)]
     #[test]

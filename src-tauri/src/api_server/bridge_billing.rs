@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const BILLING_DB_FILE: &str = "bridge-billing.sqlite3";
 const BRIDGE_SCHEMA_META_TABLE: &str = "bridge_schema_meta";
-const BRIDGE_SCHEMA_VERSION: i64 = 8;
+const BRIDGE_SCHEMA_VERSION: i64 = 9;
 const BRIDGE_ACTIVE_OWNER_PREFIX: &str = "bridge-active-v1-";
 const BRIDGE_RECOVERY_REQUIRED_PREFIX: &str = "bridge-recovery-required-v1-";
 
@@ -1462,6 +1462,15 @@ where F: Fn(&Transaction<'_>) -> Result<(), String>,
         if changed!=1 {return Err("bridge diagnostics migration lost version CAS".into());}
         validate_versioned_bridge_schema(&transaction)?;
     }
+    if read_bridge_schema_metadata(&transaction)?.0 == 8 {
+        super::bridge_capacity_grants::create_schema(&transaction)?;
+        super::bridge_capacity_grants::validate_schema(&transaction)?;
+        hook(&transaction)?;
+        let changed=transaction.execute("UPDATE bridge_schema_meta SET schema_version=9 WHERE singleton=1 AND schema_version=8",[])
+            .map_err(|_|"bridge capacity grant migration failed")?;
+        if changed!=1 {return Err("bridge capacity grant migration lost version CAS".into());}
+        validate_versioned_bridge_schema(&transaction)?;
+    }
     transaction.commit().map_err(|error| format!("bridge capacity migration commit failed: {error}"))
 }
 
@@ -1488,6 +1497,7 @@ fn validate_versioned_bridge_schema(transaction: &Transaction<'_>) -> Result<(),
     if version >= 6 { super::bridge_rebase::validate_schema(transaction)?; }
     if version >= 7 { super::bridge_capacity_source::validate_schema(transaction)?; }
     if version >= 8 { super::bridge_diagnostics::validate_schema(transaction)?; }
+    if version >= 9 { super::bridge_capacity_grants::validate_schema(transaction)?; }
     validate_bridge_identity(&instance_id, &generation)?;
     validate_foreign_key_integrity(transaction)?;
     Ok(())
@@ -1556,6 +1566,9 @@ fn validate_bridge_schema(
     }
     if versioned && read_bridge_schema_metadata(transaction)?.0 >= 8 {
         objects.retain(|(_,name)| !super::bridge_diagnostics::SCHEMA_OBJECTS.iter().any(|(_,expected,_)|name==expected));
+    }
+    if versioned && read_bridge_schema_metadata(transaction)?.0 >= 9 {
+        objects.retain(|(_,name)| !super::bridge_capacity_grants::SCHEMA_OBJECTS.iter().any(|(_,expected,_)|name==expected));
     }
     let required_count = LEGACY_OBJECTS.len() + usize::from(versioned);
     let complete = objects.len() == required_count
@@ -2269,6 +2282,13 @@ fn test_dir(label: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn drop_package_grant_schema(connection:&Connection) {
+        // Build historic-version fixtures from the current schema. Only these
+        // isolated tests may drop witness tables, never deployment recovery.
+        for (kind,name,_) in super::super::bridge_capacity_grants::SCHEMA_OBJECTS.iter().rev() {
+            connection.execute_batch(&format!("DROP {kind} {name}")).unwrap();
+        }
+    }
 
     #[test]
     #[ignore = "explicit immutable production backup migration rehearsal, never the live data directory"]
@@ -2410,6 +2430,7 @@ mod tests {
         let prepared=store.prepare_budget(&lease,&input(),None,10).unwrap();
         let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&prepared,20).unwrap() else {panic!("first consume")};
         store.mark_budget_send_intent(&lease,&prepared.authorization.budget_id,&ctx.consume_epoch).unwrap();
+        drop_package_grant_schema(&store.connection);
         store.connection.execute_batch("DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; DROP TABLE bridge_budget_executions; UPDATE bridge_schema_meta SET schema_version=3").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
@@ -2431,6 +2452,7 @@ mod tests {
         use super::super::bridge_prepared::tests::{fixture,input,cleanup};
         let (dir,mut store,lease)=fixture();
         let prepared=store.prepare_budget(&lease,&input(),None,10).unwrap();
+        drop_package_grant_schema(&store.connection);
         store.connection.execute_batch("DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; UPDATE bridge_schema_meta SET schema_version=4").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
@@ -2451,6 +2473,7 @@ mod tests {
         use super::super::{bridge_prepared::tests::{fixture,cleanup},bridge_receipts::tests::{send,cache}};
         let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"request-schema6");
         cache(&dir,&store,&[(&id,"50")],2000);store.confirm_budget_usage(&lease,&id).unwrap();
+        drop_package_grant_schema(&store.connection);
         store.connection.execute_batch("DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; UPDATE bridge_schema_meta SET schema_version=5").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
@@ -2473,6 +2496,7 @@ mod tests {
         use super::super::{bridge_prepared::tests::{fixture,cleanup},bridge_receipts::tests::{send,cache}};
         let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"request-schema7");
         cache(&dir,&store,&[(&id,"50")],2000);store.confirm_budget_usage(&lease,&id).unwrap();
+        drop_package_grant_schema(&store.connection);
         store.connection.execute_batch("DROP TABLE bridge_execution_diagnostics; DROP TABLE IF EXISTS bridge_capacity_anchors; UPDATE bridge_schema_meta SET schema_version=6").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
@@ -2498,6 +2522,7 @@ mod tests {
         cache(&dir,&store,&[(&id,"50")],2000);store.confirm_budget_usage(&lease,&id).unwrap();
         let totals=store.capacity_totals("account").unwrap();
         let receipt=store.latest_budget_receipt_event(&id).unwrap();
+        drop_package_grant_schema(&store.connection);
         store.connection.execute_batch("DROP TABLE bridge_execution_diagnostics; UPDATE bridge_schema_meta SET schema_version=7").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|_|Err("injected-v8-migration-failure".into()));
@@ -2507,6 +2532,28 @@ mod tests {
         assert_eq!(store.capacity_totals("account").unwrap(),totals);
         assert_eq!(serde_json::to_value(store.latest_budget_receipt_event(&id).unwrap()).unwrap(),serde_json::to_value(receipt).unwrap());
         assert!(store.budget_diagnostic(&id).unwrap().is_none());
+        cleanup(dir,store,lease);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_grant_v9_migration_rolls_back_without_changing_receipts_or_holds() {
+        use super::super::{bridge_prepared::tests::{fixture,cleanup},bridge_receipts::tests::{send,cache}};
+        let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"request-schema9");
+        cache(&dir,&store,&[(&id,"50")],2000);store.confirm_budget_usage(&lease,&id).unwrap();
+        let totals=store.capacity_totals("account").unwrap();
+        let receipt=serde_json::to_value(store.latest_budget_receipt_event(&id).unwrap()).unwrap();
+        drop_package_grant_schema(&store.connection);
+        store.connection.execute("UPDATE bridge_schema_meta SET schema_version=8",[]).unwrap();
+        let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
+        assert!(upgrade_bridge_capacity_schema(&mut store.connection,&|_|Err("injected-v9-migration-failure".into())).unwrap_err().contains("injected-v9"));
+        assert_eq!((schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap()),before);
+        drop(store);let store=BridgeBillingStore::open(&dir).unwrap();
+        assert_eq!(bridge_metadata(&store.connection).unwrap().unwrap().0,9);
+        assert_eq!(store.capacity_totals("account").unwrap(),totals);
+        assert_eq!(serde_json::to_value(store.latest_budget_receipt_event(&id).unwrap()).unwrap(),receipt);
+        store.connection.execute_batch("DROP TRIGGER bridge_capacity_grants_immutable").unwrap();
+        assert!(BridgeBillingStore::open(&dir).is_err(),"latest schema must not repair a missing grant-principal guard");
         cleanup(dir,store,lease);
     }
 

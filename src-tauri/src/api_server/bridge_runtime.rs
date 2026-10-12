@@ -18,7 +18,7 @@ pub(crate) fn recover_quiet_local_instance(data_dir:&Path,acknowledge_retained_u
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_|"bridge_local_recovery_read_failed")?;
         db.execute_batch("PRAGMA query_only=ON").map_err(|_|"bridge_local_recovery_read_failed")?;
         let schema:i64=db.query_row("SELECT schema_version FROM bridge_schema_meta WHERE singleton=1",[],|r|r.get(0)).map_err(|_|"bridge_local_recovery_read_failed")?;
-        if schema!=8 {return Err("bridge_local_recovery_schema_requires_review".into());}
+        if !matches!(schema,8|9) {return Err("bridge_local_recovery_schema_requires_review".into());}
         quiet(&db)?;
     }
     let runtime=BridgeBudgetRuntime::start(data_dir).map_err(|_|"bridge_local_recovery_start_failed")?;
@@ -37,7 +37,8 @@ pub(crate) fn recover_quiet_local_instance(data_dir:&Path,acknowledge_retained_u
     let store=BridgeBillingStore::open(data_dir).map_err(|_|"bridge_local_recovery_close_failed")?;
     if super::bridge_billing::is_dirty_bridge_generation(&store.bridge_identity().map_err(|_|"bridge_local_recovery_close_failed")?.1) {return Err("bridge_local_recovery_close_failed".into());}
     Ok(serde_json::json!({"operation":"explicit_quiet_local_bridge_recovery","recovered":recovered,
-        "retained_unresolved_budgets":retained,"charged_dispatches":0,"network_calls":0,"credentials_read":false,"lease_closed":true}))
+        "retained_unresolved_budgets":retained,"charged_dispatches":0,"network_calls":0,"credentials_read":false,"lease_closed":true,
+        "capacity_grants_enabled":super::bridge_capacity_grants::enabled_for_process()}))
 }
 #[derive(serde::Serialize)]
 pub(super) struct RecoveryStatus {

@@ -26,7 +26,7 @@ pub(crate) fn load(data_dir: &std::path::Path) -> Result<VideoCapabilities, Stri
     use sha2::{Digest, Sha256};
     let Some(config_bytes)=read_small(&data_dir.join("video-capabilities.json")) else { return Ok(unverified()); };
     let Ok(config)=serde_json::from_slice::<CapabilityConfig>(&config_bytes) else { return Ok(unverified()); };
-    if config.provider!="trae_native" || config.client_version!=super::ide_version()
+    if config.provider!="trae_native" || config.client_version!=super::video_protocol::CLIENT_VERSION
         || config.plugin_version!="1.0.1" || !matches!(config.contract_version.as_str(),"tail-reference-v1"|"video-reference-continuation-v1") {
         return Ok(unverified());
     }
@@ -95,13 +95,27 @@ mod tests {
         let save=|value:&serde_json::Value| {
             let bytes=serde_json::to_vec(value).unwrap();
             std::fs::write(dir.join("video-continuation-evidence.json"),&bytes).unwrap();
-            let config=serde_json::json!({"provider":"trae_native","client_version":super::super::ide_version(),"plugin_version":"1.0.1","contract_version":"video-reference-continuation-v1","evidence_digest":format!("{:x}",Sha256::digest(&bytes))});
+            let config=serde_json::json!({"provider":"trae_native","client_version":"0.1.50","plugin_version":"1.0.1","contract_version":"video-reference-continuation-v1","evidence_digest":format!("{:x}",Sha256::digest(&bytes))});
             std::fs::write(dir.join("video-capabilities.json"),serde_json::to_vec(&config).unwrap()).unwrap();
         };
         save(&proof);let result=load(&dir).unwrap();
         assert!(result.native_video_extend && result.tail_reference);assert!(!result.native_first_frame);
         proof["native_video_extend_evidence"]["financial_state"]=serde_json::json!("pending");save(&proof);assert!(!load(&dir).unwrap().native_video_extend);
         proof["native_video_extend_evidence"]["financial_state"]=serde_json::json!("settled");proof["parameter_mapping"]["native_video_extend"]=serde_json::json!("first_frame");save(&proof);assert!(!load(&dir).unwrap().native_video_extend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn desktop_migration_keeps_evidence_for_the_unchanged_video_adapter() {
+        let dir = fixture();
+        // Historical evidence binds the validated wire adapter, not the
+        // separately installed desktop app used to acquire credentials.
+        evidence(&dir, "0.1.50");
+        let result = load(&dir).unwrap();
+        assert!(result.tail_reference);
+        assert_eq!(result.contract_version, "tail-reference-v1");
+        evidence(&dir, "3.4.2");
+        assert!(!load(&dir).unwrap().tail_reference,
+            "desktop metadata must not certify an unverified wire adapter");
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -115,7 +129,7 @@ mod tests {
     #[test]
     fn capability_provider_version_mismatch_disables_native() {
         let dir = fixture();
-        evidence(&dir, &super::super::ide_version());
+        evidence(&dir, "0.1.50");
         assert!(load(&dir).unwrap().tail_reference);
         evidence(&dir, "unverified-client-upgrade");
         let result=load(&dir).unwrap();
@@ -125,7 +139,7 @@ mod tests {
     #[test]
     fn capability_changed_evidence_cannot_enable_continuation() {
         let dir=fixture();
-        evidence(&dir, &super::super::ide_version());
+        evidence(&dir, "0.1.50");
         assert!(load(&dir).unwrap().tail_reference);
         std::fs::write(dir.join("video-continuation-evidence.json"), b"{}").unwrap();
         assert!(!load(&dir).unwrap().tail_reference);

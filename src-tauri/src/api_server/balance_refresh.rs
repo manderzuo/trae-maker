@@ -12,11 +12,22 @@ fn refresh_one_with_runtime<F>(pool:&ApiPool,uid:&str,runtime:Option<&super::bri
 where F:FnMut(&super::pool::PickedAccount)->Result<Vec<serde_json::Value>,String> {
     let Some(account)=pool.completed_resource_credentials(uid) else {return Ok(())};
     let observed=chrono::Utc::now().timestamp_millis();
-    let packs=read(&account)?;
+    let dedicated=match runtime {Some(r)=>super::bridge_capacity_source::dedicated_enabled(r.data_dir(),uid)?,None=>false};
+    let packs=match read(&account) {
+        Ok(packs)=>packs,
+        Err(error)=>{
+            if let Some(runtime)=runtime.filter(|_|dedicated) {runtime.with_store(|s,l|s.invalidate_native_grants(l,uid,observed))?;}
+            return Err(error);
+        }
+    };
     // Financial reconciliation uses the unmodified source response and its
     // explicit UNUSED contract, independently of dashboard interpretation.
+    let mut witness_error=None;
     let native=if let Some(runtime)=runtime {
-        if super::bridge_capacity_source::dedicated_enabled(runtime.data_dir(),uid)? {
+        if dedicated {
+            // Display balance remains independent of lease/recovery/fence
+            // availability. Financial admission still fails closed below.
+            witness_error=runtime.with_store(|s,l|s.refresh_native_grants(l,uid,&packs,observed)).err();
             Some(super::bridge_capacity_source::PackObservation::parse(&packs,observed)?.balances()?)
         } else {None}
     } else {None};
@@ -33,6 +44,7 @@ where F:FnMut(&super::pool::PickedAccount)->Result<Vec<serde_json::Value>,String
     }
     let (general,work)=super::bridge_capacity_source::PackObservation::parse(&display,observed)?.balances()?;
     pool.observe_verified_capacity(uid,general,work,observed)?;
+    if let Some(error)=witness_error {return Err(error);}
     if let (Some(runtime),Some((general,work)))=(runtime,native) {
         // The existing rebase enforces quietness, original debit proof, lease
         // identity and atomic anchor/snapshot updates. Its second source read
@@ -129,6 +141,48 @@ mod tests {
             let epoch:i64=s.connection.query_row("SELECT snapshot_epoch FROM bridge_capacity_accounts WHERE account_ref='account'",[],|r|r.get(0)).unwrap();assert_eq!(epoch,1);
             let receipts:i64=s.connection.query_row("SELECT COUNT(*) FROM bridge_budget_receipts",[],|r|r.get(0)).unwrap();assert_eq!(receipts,0);Ok(())
         }).unwrap();drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn a_fenced_account_still_updates_successfully_read_display_balances() {
+        use super::super::{bridge_prepared::tests::fixture,bridge_capacity_source::PackObservation,bridge_runtime::BridgeBudgetRuntime};
+        let (dir,mut store,mut lease)=fixture();
+        let packs=vec![json!({"id":"g","entitlement_base_info":{"product_id":208,"quota":{"credits_limit":"100"}},"usage":{"credits_amount":"0"}}),json!({"id":"w","entitlement_base_info":{"product_id":209,"quota":{"credits_limit":"100"}},"usage":{"credits_amount":"0"}})];
+        store.initialize_capacity_anchor(&lease,"account",&PackObservation::parse(&packs,1).unwrap()).unwrap();
+        std::fs::write(dir.join("bridge-dedicated-accounts.json"),b"{\"version\":1,\"accounts\":[\"account\"]}").unwrap();
+        store.finish_activity_lease_cleanly(&mut lease,||Ok(())).unwrap();drop(lease);drop(store);
+        let runtime=BridgeBudgetRuntime::start(&dir).unwrap();let pool=ApiPool::new();
+        let account=crate::models::RawAccount {name:"fixture".into(),user_id:Some("account".into()),jwt:"fixture-not-real".into(),refresh_token:None,dc_id:None,added_at:None,updated_at:None,credential_source:None,oauth_client_id:None};
+        pool.sync_from_accounts_with_balances(&[account],&["account".into()],&[],&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new());
+        let fence=runtime.with_store(|s,l|s.begin_capacity_rebase(l,"account",chrono::Utc::now().timestamp_millis())).unwrap();
+        assert!(refresh_one_with_runtime(&pool,"account",Some(&runtime),|_|Ok(packs.clone())).is_err());
+        let balances=pool.bridge_credit_snapshots();assert_eq!((balances[0].1,balances[0].2),(Some(100.0),Some(100.0)));assert!(balances[0].3.is_some());
+        runtime.with_store(|s,l|s.abort_capacity_rebase(l,&fence)).unwrap();drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn newer_background_read_rejects_missing_grants_and_network_failure_without_releasing_holds() {
+        use super::super::{bridge_prepared::tests::fixture,bridge_capacity_source::PackObservation,bridge_runtime::BridgeBudgetRuntime,bridge_receipts::tests::send};
+        for failed in [false,true] {
+            let (dir,mut store,mut lease)=fixture();
+            let base=|id:&str,product:i64|json!({"status":1,"entitlement_base_info":{"entitlement_id":id,"ent_status":0,"product_id":product,"quota":{"credits_limit":"100"},"start_time":0,"end_time":9999999999_i64},"usage":{"credits_amount":"0"}});
+            let bases=vec![base("g",208),base("w",209)];
+            store.initialize_capacity_anchor(&lease,"account",&PackObservation::parse(&bases,1).unwrap()).unwrap();
+            let old=send(&mut store,&lease,"request-unknown-cost");
+            std::fs::write(dir.join("bridge-dedicated-accounts.json"),b"{\"version\":1,\"accounts\":[\"account\"]}").unwrap();
+            let mut first=bases.clone();let mut extra=base("new-credit",221);extra["usage"]=json!({});first.push(extra);
+            store.refresh_native_grants(&lease,"account",&first,chrono::Utc::now().timestamp_millis()-50).unwrap();
+            store.finish_activity_lease_cleanly(&mut lease,||Ok(())).unwrap();drop(lease);drop(store);
+            let runtime=BridgeBudgetRuntime::start(&dir).unwrap();let pool=ApiPool::new();
+            let account=crate::models::RawAccount {name:"fixture".into(),user_id:Some("account".into()),jwt:"fixture-not-real".into(),refresh_token:None,dc_id:None,added_at:None,updated_at:None,credential_source:None,oauth_client_id:None};
+            pool.sync_from_accounts_with_balances(&[account],&["account".into()],&[],&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new());
+            let result=refresh_one_with_runtime(&pool,"account",Some(&runtime),|_|if failed {Err("fixture outage".into())} else {Ok(bases.clone())});
+            if failed {assert!(result.is_err());} else {result.unwrap();}
+            runtime.with_store(|s,_| {
+                let valid:i64=s.connection.query_row("SELECT current_valid FROM bridge_capacity_grants",[],|r|r.get(0)).unwrap();assert_eq!(valid,0);
+                let old:(String,i64,Option<i64>)=s.connection.query_row("SELECT stage,amount_microcredits,actual_microcredits FROM bridge_capacity_slots WHERE budget_id=?1",[old],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();assert_eq!(old,("R".into(),40_000_000,None));Ok(())
+            }).unwrap();drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }
 

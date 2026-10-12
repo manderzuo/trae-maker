@@ -33,7 +33,11 @@ pub struct TrayMenu {
 }
 
 fn main() {
-    let args:Vec<String>=std::env::args().collect();
+    let mut args:Vec<String>=std::env::args().collect();
+    if args.iter().any(|a|a=="--disable-new-package-capacity") {
+        api_server::bridge_capacity_grants::disable_for_process();
+        args.retain(|a|a!="--disable-new-package-capacity");
+    }
     if args.get(1).map(String::as_str)==Some("--recover-local-bridge") {
         let code=(||->Result<i32,()> {
             if args.len()!=6 || args[3]!="--retain-unknowns" || args[4]!="--report" {return Err(());}

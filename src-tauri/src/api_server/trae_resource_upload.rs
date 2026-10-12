@@ -266,17 +266,13 @@ fn request_error(status: u16, body: &str, context: &str) -> NativeUploadError {
 fn common_request(account: &PickedAccount, path: &str) -> ureq::Request {
     let url = format!("{AGENT_HOST}{path}");
     let referer = format!("{REFERER_BASE}{path}");
-    streaming_agent()
-        .post(&url)
+    super::video_protocol::post(&streaming_agent(), &url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
         .set("user-agent", "TraeClient/TTNet")
         .set("x-ide-token", &account.jwt)
         .set("x-app-id", APP_ID)
         .set("x-app-version", "default")
-        .set("x-app-version-code", &super::ide_version_code())
-        .set("x-ide-version", &super::ide_version())
-        .set("x-ide-version-code", &super::ide_version_code())
         .set("x-ide-version-type", "stable")
         .set("x-device-type", "windows")
         .set("x-device-brand", "H610E-B")
@@ -290,7 +286,6 @@ fn common_request(account: &PickedAccount, path: &str) -> ureq::Request {
         .set("x-lscbd-aid", "787976")
         .set("x-lscbd-platform", "windows")
         .set("x-ss-dp", "787976")
-        .set("app-version", &super::ide_version())
         .set("referer", &referer)
 }
 
@@ -517,6 +512,19 @@ fn detect_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uploaded_video_resources_keep_the_verified_adapter_identity() {
+        let account=PickedAccount {uid:"fixture-user".into(),jwt:"fixture-token".into(),
+            device_id:"fixture-device".into(),machine_id:"fixture-machine".into(),
+            domain:String::new(),enterprise_id:String::new(),global_region:false};
+        let request=common_request(&account,"/api/ide/v1/get_resource_upload_url");
+        assert_eq!(request.all("x-ide-version"),vec!["0.1.50"]);
+        assert_eq!(request.all("x-ide-version-code"),vec!["20260811"]);
+        assert_eq!(request.all("x-app-version-code"),vec!["20260811"]);
+        assert_eq!(request.header("app-version"),Some("0.1.50"));
+        assert_eq!(request.header("x-ide-token"),Some("fixture-token"));
+        assert_eq!(request.header("x-device-id"),Some("fixture-device"));
+    }
     use super::*;
 
     #[test]

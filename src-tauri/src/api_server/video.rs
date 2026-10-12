@@ -1208,8 +1208,7 @@ pub(super) fn resolve_resource_url(account: &PickedAccount, uri: &str) -> Result
     let body = serde_json::json!({ "uri_list": [uri] });
     let trace = now_id("trace");
     let trace_short = trace.chars().take(32).collect::<String>();
-    let response = super::streaming_agent()
-        .post(&url)
+    let response = super::video_protocol::post(&super::streaming_agent(), &url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
         .set("user-agent", "TraeClient/TTNet")
@@ -1221,8 +1220,6 @@ pub(super) fn resolve_resource_url(account: &PickedAccount, uri: &str) -> Result
         .set("x-device-id", &account.device_id)
         .set("x-machine-id", &account.machine_id)
         .set("x-os-version", "Windows 10 Pro")
-        .set("x-ide-version", &super::ide_version())
-        .set("x-ide-version-code", &super::ide_version_code())
         .set("x-ide-version-type", "stable")
         .set("x-custom-trace-id", &trace_short)
         .send_json(body)
@@ -1347,8 +1344,7 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
             let referer = format!("{}{}", REFERER_BASE, "/api/ide/v1/tool_text_to_video_stream");
             let request_id = now_id("req");
             let trace_short = trace.chars().take(32).collect::<String>();
-            let response = super::streaming_agent()
-                .post(&url)
+            let response = super::video_protocol::post(&super::streaming_agent(), &url)
                 .set("content-type", "application/json")
                 .set("accept", "text/event-stream")
                 .set("accept-encoding", "gzip, deflate")
@@ -1356,9 +1352,6 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
                 .set("x-ide-token", &account.jwt)
                 .set("x-app-id", APP_ID)
                 .set("x-app-version", "default")
-                .set("x-app-version-code", &super::ide_version_code())
-                .set("x-ide-version", &super::ide_version())
-                .set("x-ide-version-code", &super::ide_version_code())
                 .set("x-ide-version-type", "stable")
                 .set("x-device-type", "windows")
                 .set("x-device-brand", "H610E-B")
@@ -1372,7 +1365,6 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
                 .set("x-lscbd-aid", "787976")
                 .set("x-lscbd-platform", "windows")
                 .set("x-ss-dp", "787976")
-                .set("app-version", &super::ide_version())
                 .set("x-custom-trace-id", &trace_short)
                 .set("x-request-id", &request_id)
                 .set("referer", &referer)

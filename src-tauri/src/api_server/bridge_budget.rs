@@ -168,6 +168,9 @@ pub(super) fn check_capacity(connection: &Connection, input: &CapacityReservatio
             else { return Err("invalid capacity eligibility".into()); }
         } else { return Err("invalid capacity stage".into()); }
     }
+    let (new_general,new_work)=super::bridge_capacity_grants::usable_grants(connection,&input.account_ref,chrono::Utc::now().timestamp_millis())?;
+    let general=checked_add(general,new_general)?;
+    let work=checked_add(work,new_work)?;
     let total_safe=checked_add(general,work)?.saturating_sub(d).max(0);
     let general_safe=general.saturating_sub(d).max(0);
     let needed=checked_add(checked_add(q,f)?,input.hold)?;
@@ -272,6 +275,39 @@ pub(super) fn validate_schema(transaction: &Transaction<'_>) -> Result<(), Strin
 mod tests {
     use super::*;
     use std::{path::PathBuf, sync::{Arc, Barrier}, thread};
+
+    #[test]
+    fn new_unused_package_capacity_keeps_old_unknown_holds_and_debits() {
+        // Pure SQLite consumer test: no production host lease or credentials.
+        let dir=std::env::temp_dir().join(format!("new-native-packs-{}",rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bridge-dedicated-accounts.json"),b"{\"version\":1,\"accounts\":[\"account\"]}").unwrap();
+        let conn = Connection::open(dir.join("bridge-billing.sqlite3")).unwrap();
+        conn.execute_batch("CREATE TABLE bridge_capacity_accounts(account_ref TEXT,general_microcredits INTEGER,work_microcredits INTEGER,snapshot_epoch INTEGER,rebase_state TEXT);
+            CREATE TABLE bridge_capacity_slots(budget_id TEXT,account_ref TEXT,eligibility TEXT,stage TEXT,amount_microcredits INTEGER);
+            CREATE TABLE bridge_capacity_covered(budget_id TEXT,owner_nonce TEXT);
+            CREATE TABLE bridge_capacity_rebases(owner_nonce TEXT,state TEXT);
+            CREATE TABLE bridge_capacity_anchors(account_ref TEXT,snapshot_epoch INTEGER,observation_json TEXT);
+            CREATE TABLE bridge_capacity_grant_observations(account_ref TEXT,last_observed_at_ms INTEGER);
+            CREATE TABLE bridge_capacity_grants(account_ref TEXT,pack_ref TEXT,product INTEGER,limit_microcredits INTEGER,start_ms INTEGER,end_ms INTEGER,first_observed_at_ms INTEGER,last_observed_at_ms INTEGER,current_valid INTEGER);
+            INSERT INTO bridge_capacity_accounts VALUES('account',100,0,1,'open');
+            INSERT INTO bridge_capacity_slots VALUES('old-unknown','account','general_or_work','R',30),('old-final','account','general_or_work','D',10);
+            INSERT INTO bridge_capacity_anchors VALUES('account',1,'{\"packs\":{}}');").unwrap();
+        let now=chrono::Utc::now().timestamp_millis();
+        conn.execute("INSERT INTO bridge_capacity_grants VALUES('account',?1,208,100,?2,?3,?4,?4,1)",
+            params!["ab".repeat(32),now-1000,now+600_000,now]).unwrap();
+        conn.execute("INSERT INTO bridge_capacity_grant_observations VALUES('account',?1)",[now]).unwrap();
+        let request=reservation("new","key-a",CapacityEligibility::GeneralOrWork,100);
+        assert!(check_capacity(&conn,&request).is_ok(),
+            "new provider-proven unused credits must be independently available without clearing old unknown costs");
+        let old:Vec<(String,i64)>=conn.prepare("SELECT stage,amount_microcredits FROM bridge_capacity_slots ORDER BY stage").unwrap()
+            .query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().map(Result::unwrap).collect();
+        assert_eq!(old,vec![("D".into(),10),("R".into(),30)]);
+        assert!(check_capacity(&conn,&reservation("too-large","key-a",CapacityEligibility::GeneralOrWork,161)).is_err());
+        std::fs::write(dir.join("bridge-dedicated-accounts.json"),b"{\"version\":1,\"accounts\":[]}").unwrap();
+        assert!(check_capacity(&conn,&request).is_err(),"revoking dedicated authorization must take effect immediately");
+        drop(conn);std::fs::remove_dir_all(dir).unwrap();
+    }
 
     struct Fixture { dir: PathBuf, store: BridgeBillingStore, lease: BridgeBudgetLease }
     fn fixture() -> Fixture {
