@@ -2,7 +2,7 @@
 use std::{path::{Path,PathBuf},sync::{Arc,Mutex}};
 use super::{bridge_billing::BridgeBillingStore,bridge_budget_lease::BridgeBudgetLease};
 
-pub(super) struct BridgeBudgetRuntime { data_dir:PathBuf, lease:Mutex<BridgeBudgetLease>, planning:Mutex<std::collections::HashSet<String>>, receipt_cursors:Mutex<std::collections::HashMap<String,(String,String)>>,pub(super) chunks:super::bridge_chunks::Hub }
+pub(super) struct BridgeBudgetRuntime { data_dir:PathBuf, lease:Mutex<BridgeBudgetLease>, planning:Mutex<std::collections::HashSet<String>>, receipt_cursors:Mutex<std::collections::HashMap<String,(String,String)>>,video_diagnostic_cursor:Mutex<String>,pub(super) chunks:super::bridge_chunks::Hub }
 pub(super) struct PlanningGuard<'a> {runtime:&'a BridgeBudgetRuntime,request:String}
 /// Explicit maintenance entry, never part of normal startup. It starts no HTTP
 /// listener, accesses no credentials and preserves all terminal unknown costs.
@@ -59,7 +59,7 @@ impl BridgeBudgetRuntime {
     pub(super) fn start(data_dir:&Path)->Result<Arc<Self>,String> {
         let store=BridgeBillingStore::open(data_dir)?;
         let lease=BridgeBudgetLease::try_acquire(&store)?.ok_or("bridge activity already owned by another server")?;
-        Ok(Arc::new(Self {data_dir:data_dir.into(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),chunks:Default::default()}))
+        Ok(Arc::new(Self {data_dir:data_dir.into(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),video_diagnostic_cursor:Mutex::new(String::new()),chunks:Default::default()}))
     }
     pub(super) fn begin_planning(&self,request:&str)->Result<PlanningGuard<'_>,String> {
         let mut busy=self.planning.lock().map_err(|_|"budget planner unavailable")?;
@@ -128,6 +128,39 @@ impl BridgeBudgetRuntime {
         for request in &requests {let _=super::usage_refresh::request_refresh_for_dir(&self.data_dir,request);}
         Ok(requests.len())
     }
+    pub(super) fn diagnose_interrupted_videos(&self)->Result<usize,String> {
+        let mut cursor=self.video_diagnostic_cursor.lock().map_err(|_|"video diagnostic scan unavailable")?;
+        let tasks=self.with_store(|store,lease| {
+            if !lease.charge_ready() || lease.is_closing() { return Ok(Vec::new()); }
+            let rows={
+                let mut query=store.connection.prepare("SELECT e.budget_id,e.task_ref FROM bridge_budget_executions e
+                    JOIN bridge_prepared_budgets p ON p.budget_id=e.budget_id
+                    WHERE e.step_kind='video' AND p.state='send_intent' AND e.execution_state IN ('running','unknown') AND e.finished_at_ms IS NULL
+                      AND e.bridge_instance_id=?1 AND p.event_generation<>?2 AND e.budget_id>?3
+                    ORDER BY e.budget_id LIMIT 64").map_err(|e|e.to_string())?;
+                let rows=query.query_map(rusqlite::params![lease.instance_id(),lease.generation(),cursor.as_str()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).map_err(|e|e.to_string())?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?
+            };
+            let next=if rows.len()==64 {rows.last().unwrap().0.clone()} else {String::new()};
+            let mut tasks=Vec::new();
+            for (id,task) in rows {
+                // Losing the local worker does not establish upstream failure,
+                // cancellation, success or cost. Preserve the paid hold intact.
+                let existing=store.budget_diagnostic(&id)?;
+                let fresh=existing.is_none();
+                let diagnostic=existing.unwrap_or_else(||super::bridge_diagnostics::Diagnostic {code:"video_execution_interrupted".into(),stage:"video_stream".into(),outcome_known:false,upstream_error:None});
+                if fresh {store.save_budget_diagnostic(lease,&id,&diagnostic)?;}
+                if let Some(task)=task {
+                    let stale=super::video::get(&task).is_some_and(|t| !matches!(t.status.as_str(),"completed"|"failed"|"canceled"|"timeout") && (t.status!="unknown" || t.execution_diagnostic.as_ref()!=Some(&diagnostic)));
+                    if fresh || stale {tasks.push((task,diagnostic));}
+                }
+            }
+            *cursor=next;
+            Ok(tasks)
+        })?;
+        for (task,diagnostic) in &tasks {super::video::mark_native_worker_diagnostic(task,diagnostic.clone());}
+        Ok(tasks.len())
+    }
     pub(super) fn start_maintenance(runtime:&Arc<Self>,stop:Arc<std::sync::atomic::AtomicBool>) {
         let weak=Arc::downgrade(runtime);
         tokio::spawn(async move {
@@ -140,6 +173,7 @@ impl BridgeBudgetRuntime {
                 match tokio::task::spawn_blocking(move || {
                     let now=chrono::Utc::now().timestamp_millis();
                     runtime.sweep_interrupted_text(now)?;
+                    runtime.diagnose_interrupted_videos()?;
                     runtime.sweep_expired_budgets(now)
                 }).await {
                     Ok(Ok(_))=>{},_=>eprintln!("[bridge-v2] expiry recovery requires attention; no unknown sends were released"),
@@ -246,6 +280,72 @@ mod tests {
         drop(runtime);std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn interrupted_video_diagnostic_retains_hold_identity_and_accepts_late_result() {
+        use super::super::{bridge_prepared::{tests::input,ConsumeOutcome},bridge_execution::ExecutionState};
+        let (dir,mut store,lease)=fixture();let mut value=input();value.step_kind="video".into();value.request_id="old-video-diagnostic".into();
+        let prepared=store.prepare_budget(&lease,&value,None,10).unwrap();
+        let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&prepared,20).unwrap() else {panic!("consume")};
+        let id=prepared.authorization.budget_id;
+        store.mark_budget_send_intent(&lease,&id,&ctx.consume_epoch).unwrap();store.bind_budget_task(&lease,&id,"video-retained").unwrap();
+        value.request_id="old-unsent-video".into();let unsent=store.prepare_budget(&lease,&value,None,10).unwrap();
+        assert!(matches!(store.consume_budget(&lease,&unsent,20).unwrap(),ConsumeOutcome::Granted(_)));
+        let before=store.capacity_totals("account").unwrap();drop(lease);drop(store);
+        let runtime=BridgeBudgetRuntime::start(&dir).unwrap();let status=runtime.recovery_status().unwrap();
+        assert_eq!(runtime.diagnose_interrupted_videos().unwrap(),0);
+        runtime.recover_local_instance(&status.instance_id,&status.generation,true).unwrap();
+        assert_eq!(runtime.diagnose_interrupted_videos().unwrap(),1);assert_eq!(runtime.diagnose_interrupted_videos().unwrap(),0);
+        runtime.with_store(|s,l| {
+            assert_eq!(s.capacity_totals("account")?,before);assert!(s.latest_budget_receipt_event(&id)?.is_none());assert!(s.load_budget_result(&id)?.is_none());
+            assert!(s.budget_diagnostic(&unsent.authorization.budget_id)?.is_none(),"unsent consumed budgets cannot block diagnostic recovery");
+            let diagnostic=s.budget_diagnostic(&id)?.unwrap();assert_eq!(diagnostic.code,"video_execution_interrupted");assert!(!diagnostic.outcome_known);
+            let execution=s.budget_execution(&id)?.unwrap();assert_eq!(execution.state,ExecutionState::Unknown);assert_eq!(execution.task_ref.as_deref(),Some("video-retained"));assert!(execution.finished_at_ms.is_none());
+            assert!(s.mark_budget_send_intent(l,&id,&ctx.consume_epoch).is_err());
+            let result=serde_json::json!({"id":"video-retained","status":"completed","resource_uri":"tos://late"});
+            s.finish_budget_result(l,&id,ExecutionState::Succeeded,&result,chrono::Utc::now().timestamp_millis())?;assert_eq!(s.load_budget_result(&id)?,Some(result));
+            value.request_id="current-video-diagnostic".into();let current=s.prepare_budget(l,&value,None,10)?;
+            let ConsumeOutcome::Granted(ctx)=s.consume_budget(l,&current,20)? else {panic!("consume")};
+            s.mark_budget_send_intent(l,&current.authorization.budget_id,&ctx.consume_epoch)?;s.bind_budget_task(l,&current.authorization.budget_id,"video-current")?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(runtime.diagnose_interrupted_videos().unwrap(),0,"current workers must not be interrupted by maintenance");
+        drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn existing_video_diagnostic_repairs_stale_task_dto_after_restart() {
+        use super::super::bridge_prepared::{tests::input,ConsumeOutcome};
+        let (dir,mut store,lease)=fixture();let mut value=input();value.step_kind="video".into();value.request_id="stale-dto-video".into();
+        let prepared=store.prepare_budget(&lease,&value,None,10).unwrap();
+        let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&prepared,20).unwrap() else {panic!("consume")};
+        let id=prepared.authorization.budget_id;store.mark_budget_send_intent(&lease,&id,&ctx.consume_epoch).unwrap();
+        let task=super::super::video::create_pending("seedance".into(),"fixture".into());store.bind_budget_task(&lease,&id,&task.id).unwrap();
+        let diagnostic=super::super::video_stream::Fault::Read.diagnostic();store.save_budget_diagnostic(&lease,&id,&diagnostic).unwrap();
+        let before=store.capacity_totals("account").unwrap();drop(lease);drop(store);
+        let runtime=BridgeBudgetRuntime::start(&dir).unwrap();let status=runtime.recovery_status().unwrap();runtime.recover_local_instance(&status.instance_id,&status.generation,true).unwrap();
+        assert_eq!(runtime.diagnose_interrupted_videos().unwrap(),1);assert_eq!(runtime.diagnose_interrupted_videos().unwrap(),0);
+        let task=super::super::video::get(&task.id).unwrap();assert_eq!(task.status,"unknown");assert_eq!(task.execution_diagnostic,Some(diagnostic.clone()));
+        runtime.with_store(|s,_| {assert_eq!(s.capacity_totals("account")?,before);assert_eq!(s.budget_diagnostic(&id)?,Some(diagnostic));assert!(s.latest_budget_receipt_event(&id)?.is_none());Ok(())}).unwrap();
+        drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn video_diagnostic_scan_advances_past_sixty_four_existing_records() {
+        use super::super::bridge_prepared::{tests::input,ConsumeOutcome};
+        let (dir,mut store,lease)=fixture();let diagnostic=super::super::video_stream::Fault::Read.diagnostic();let mut ids=Vec::new();
+        for index in 0..65 {
+            let mut value=input();value.step_kind="video".into();value.request_id=format!("paged-video-{index}");value.hold_microcredits=1_000_000;
+            let prepared=store.prepare_budget(&lease,&value,None,10).unwrap();
+            let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&prepared,20).unwrap() else {panic!("consume")};
+            let id=prepared.authorization.budget_id;store.mark_budget_send_intent(&lease,&id,&ctx.consume_epoch).unwrap();store.save_budget_diagnostic(&lease,&id,&diagnostic).unwrap();ids.push(id);
+        }
+        ids.sort();let task=super::super::video::create_pending("seedance".into(),"fixture".into());store.bind_budget_task(&lease,ids.last().unwrap(),&task.id).unwrap();
+        let before=store.capacity_totals("account").unwrap();drop(lease);drop(store);
+        let runtime=BridgeBudgetRuntime::start(&dir).unwrap();let status=runtime.recovery_status().unwrap();runtime.recover_local_instance(&status.instance_id,&status.generation,true).unwrap();
+        assert_eq!(runtime.diagnose_interrupted_videos().unwrap(),0);assert_eq!(super::super::video::get(&task.id).unwrap().status,"queued");
+        assert_eq!(runtime.diagnose_interrupted_videos().unwrap(),1);assert_eq!(super::super::video::get(&task.id).unwrap().status,"unknown");
+        assert_eq!(runtime.diagnose_interrupted_videos().unwrap(),0);assert_eq!(runtime.diagnose_interrupted_videos().unwrap(),0);
+        runtime.with_store(|s,_| {assert_eq!(s.capacity_totals("account")?,before);assert_eq!(s.budget_diagnostic(ids.last().unwrap())?,Some(diagnostic));assert!(s.latest_budget_receipt_event(ids.last().unwrap())?.is_none());Ok(())}).unwrap();
+        drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn explicit_runtime_recovery_retains_unknown_holds_and_fences_old_tokens() {
         use super::super::{bridge_prepared::{tests::input,ConsumeOutcome},bridge_budget::CapacitySnapshot};
         let (dir,mut store,lease)=fixture();
@@ -330,7 +430,7 @@ mod tests {
         store.finish_activity_lease_cleanly(&mut lease,||Ok(())).unwrap();drop(lease);
         let lease=BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
         value.request_id="request-current-expired".into();let current=store.prepare_budget(&lease,&value,None,20).unwrap();
-        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),chunks:Default::default()});
+        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),video_diagnostic_cursor:Mutex::new(String::new()),chunks:Default::default()});
         assert_eq!(runtime.sweep_expired_budgets(100_000).unwrap(),1,"old-generation unknowns must not occupy the entire expiry page");
         assert_eq!(store.capacity_totals("account").unwrap().pending,128,"do not reinterpret old preparation as a refund proof");
         assert_eq!(store.latest_budget_receipt_event(&current.authorization.budget_id).unwrap().unwrap().kind,"failed_no_charge");
@@ -351,7 +451,7 @@ mod tests {
         for id in &ids[..256] {store.confirm_budget_no_send(&lease,id).unwrap();}
         let latest=&ids[256];
         assert!(store.latest_budget_receipt_event(latest).unwrap().is_none());
-        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),chunks:Default::default()});
+        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),video_diagnostic_cursor:Mutex::new(String::new()),chunks:Default::default()});
         runtime.confirm_account("account").unwrap();
         assert!(store.latest_budget_receipt_event(latest).unwrap().is_some(),
             "newly available receipts must not wait for a full historical sweep");
@@ -369,7 +469,7 @@ mod tests {
         let sent=store.prepare_budget(&lease,&other,None,10).unwrap();
         let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&sent,20).unwrap() else {panic!("consume")};
         store.mark_budget_send_intent(&lease,&sent.authorization.budget_id,&ctx.consume_epoch).unwrap();
-        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),chunks:Default::default()});
+        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),video_diagnostic_cursor:Mutex::new(String::new()),chunks:Default::default()});
         assert_eq!(runtime.sweep_expired_budgets(100_000).unwrap(),1);
         assert_eq!(store.capacity_totals("account").unwrap().pending,80_000_000);
         assert_eq!(store.latest_budget_receipt_event(&first.authorization.budget_id).unwrap().unwrap().kind,"failed_no_charge");
@@ -383,7 +483,7 @@ mod tests {
         let (dir,mut store,lease)=fixture();
         let id=send(&mut store,&lease,"request-runtime");
         cache(&dir,&store,&[(&id,"11.234567")],2000);
-        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),chunks:Default::default()});
+        let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),video_diagnostic_cursor:Mutex::new(String::new()),chunks:Default::default()});
         runtime.confirm_account("account").unwrap();
         assert_eq!(store.latest_budget_receipt_event(&id).unwrap().unwrap().receipt.unwrap().actual_credits.unwrap().to_string(),"11.234567");
         cache(&dir,&store,&[(&id,"12.234567")],3000);

@@ -6,6 +6,8 @@
 
 > 2026-10-12 TRAE CN 视频迁移：视频适配器身份固定为 0.1.50 / 20260811（生成、上传、资源查询、预检），原续写证据绑定该适配器；桌面登录/续期/权益仍用真实客户端版本。schema9 新增专用账号原生 UNUSED 积分包不可变本金见证与查询开始水位，当前包确认最多 60 秒，准备/consume/send 均检查，旧 P/R/D 与回执不改。后续原生读取缺包、未知或失败撤销确认；重基线第二次读取在 fence 后先撤销；显示余额独立更新。紧急启动参数 `--disable-new-package-capacity` 使用同一 schema9 兼容二进制关闭新增容量；产生新费用事实后不可回放 schema8 数据库。见 `docs/video-migration-repair-20261012.md`。
 
+> 2026-10-12 视频读取恢复：视频生成 SSE 首次读取错误即停止、整体等待 780 秒、单事件最多 1 MiB；闭合诊断保留 unknown/P 与原身份，不重发或伪造退款。旧 generation 且 send_intent 的非终态视频以 64 条游标扫描修复诊断/任务 DTO；当前 worker 与权威终态排除。Core 原 GET 状态透传 unknown，迟到 ready 优先。见 `docs/video-stream-recovery-20261012.md`。
+
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
 

@@ -1,5 +1,7 @@
 # 更新日志
 
+> 2026-10-12：修复视频响应读取错误无限等待，增加生成请求总时限与保留原账务的未知任务恢复；已部署及验收。详见 [修复记录](docs/video-stream-recovery-20261012.md)。
+
 本文件记录 AI Work 助手（ai-work-assistant，原 Trae Work Assistant）的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
 ---

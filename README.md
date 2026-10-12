@@ -1,5 +1,7 @@
 <div align="center">
 
+> 2026-10-12：修复视频响应读取错误无限等待，增加生成请求总时限与保留原账务的未知任务恢复；已部署及验收。详见 [修复记录](docs/video-stream-recovery-20261012.md)。
+
 <img src="build-assets/app-icon.png" alt="AI Work 助手" width="128" />
 
 # AI Work 助手（AI Work Assistant）

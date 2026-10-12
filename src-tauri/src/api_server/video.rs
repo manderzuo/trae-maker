@@ -6,7 +6,7 @@
 //! `AIWORK_VIDEO_DIR` 指定独立磁盘目录。
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -83,6 +83,8 @@ pub struct VideoTask {
     /// Safe provider details retained in the durable task/bridge result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_error: Option<aiwork_core::UpstreamFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) execution_diagnostic: Option<super::bridge_diagnostics::Diagnostic>,
     /// 传输层状态，便于客户端区分异步任务桥与其它资源类型。
     pub transport: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +140,8 @@ struct PersistedVideoTask {
     error: Option<String>,
     #[serde(default)]
     upstream_error: Option<aiwork_core::UpstreamFailure>,
+    #[serde(default)]
+    execution_diagnostic: Option<super::bridge_diagnostics::Diagnostic>,
     transport: String,
     video_url: Option<String>,
     resource_uri: Option<String>,
@@ -194,6 +198,13 @@ fn mark_native_worker_unknown(task_id: &str, reason: impl Into<String>) {
             task.status = "unknown".into();
             task.error = Some(reason.clone());
         }
+    });
+}
+
+pub(super) fn mark_native_worker_diagnostic(task_id: &str, diagnostic: super::bridge_diagnostics::Diagnostic) {
+    mark_native_worker_unknown(task_id, diagnostic.code.clone());
+    update_task(task_id, |task| {
+        if task.status == "unknown" { task.execution_diagnostic = Some(diagnostic); }
     });
 }
 
@@ -312,6 +323,7 @@ fn persisted(task: &VideoTask) -> PersistedVideoTask {
         updated_at: task.updated_at,
         error: task.error.clone(),
         upstream_error: task.upstream_error.clone(),
+        execution_diagnostic: task.execution_diagnostic.clone(),
         transport: task.transport.clone(),
         video_url: task.video_url.clone(),
         resource_uri: task.resource_uri.clone(),
@@ -335,6 +347,7 @@ fn restored(task: PersistedVideoTask) -> VideoTask {
         updated_at: task.updated_at,
         error: task.error,
         upstream_error: task.upstream_error,
+        execution_diagnostic: task.execution_diagnostic,
         transport: task.transport,
         video_url: task.video_url,
         resource_uri: task.resource_uri,
@@ -706,6 +719,7 @@ pub fn create_pending_for(model: String, prompt: String, owner_key_id: &str) -> 
         updated_at: now,
         error: None,
         upstream_error: None,
+        execution_diagnostic: None,
         transport: "trae_work_native_sse".into(),
         video_url: None,
         resource_uri: None,
@@ -1174,7 +1188,8 @@ fn parse_sse_event(event: &str, data: &str, task_id: &str) -> Result<bool, Strin
         // “done” 没有 result 资源时不能向调用方报告成功，否则会得到一个
         // 永远无法下载的空任务。允许 done 携带最后一条结果数据作为兜底。
         if !data.trim().is_empty() {
-            if let Ok(value) = serde_json::from_str::<Value>(data) {
+            {
+                let value: Value = serde_json::from_str(data).map_err(|_| "invalid done event".to_string())?;
                 let billing = extract_billing_candidate(data, task_id)
                     .map_err(|error| error.to_string())?;
                 apply_result_payload(task_id, &value, billing);
@@ -1289,7 +1304,7 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
         // 账号切换时必须用新账号重新上传参考素材，不能复用上一个账号的 TOS URI。
         let mut account = account;
         let mut tried = HashSet::from([account.uid.clone()]);
-        let response = loop {
+        let (response, deadline) = loop {
             let body = if let Some(body)=fixed_body.as_ref() {body.clone()} else {match prepare_native_request(
                 &state.data_dir,
                 &owner_key_id,
@@ -1344,7 +1359,8 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
             let referer = format!("{}{}", REFERER_BASE, "/api/ide/v1/tool_text_to_video_stream");
             let request_id = now_id("req");
             let trace_short = trace.chars().take(32).collect::<String>();
-            let response = super::video_protocol::post(&super::streaming_agent(), &url)
+            let deadline = std::time::Instant::now() + super::video_stream::MAX_WAIT;
+            let response = super::video_stream::post(&super::streaming_agent(), &url, super::video_stream::MAX_WAIT)
                 .set("content-type", "application/json")
                 .set("accept", "text/event-stream")
                 .set("accept-encoding", "gzip, deflate")
@@ -1370,7 +1386,7 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
                 .set("referer", &referer)
                 .send_json(body.clone());
             match response {
-                Ok(response) if (200..300).contains(&response.status()) => break response,
+                Ok(response) if (200..300).contains(&response.status()) => break (response, deadline),
                 Ok(response) => {
                     let status = response.status();
                     let text = response.into_string().unwrap_or_default();
@@ -1400,58 +1416,25 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
                     record_upstream_failure(&task_id,&text,Some(status));
                     return;
                 }
-                Err(error) => {
+                Err(_error) => {
                     state.pool.note_error(&account.uid, ErrKind::Server);
                     mark_native_worker_unknown(
                         &task_id,
-                        format!("Seedance 上游连接结果未知: {error}"),
+                        "video_connection_unconfirmed",
                     );
                     return;
                 }
             }
         };
         update_task(&task_id, |task| task.status = "processing".into());
-        let mut event_name = String::new();
-        let mut event_data = String::new();
-        let reader = BufReader::new(response.into_reader());
-        let mut terminal = false;
-        for line in reader.lines().flatten() {
-            if line.trim().is_empty() {
-                if !event_data.is_empty() {
-                    if event_name == "error" {
-                        // SSE 错误通常已经进入原生任务阶段，不能安全重放；仍要把
-                        // 额度/会话错误写入账号状态，避免下一次继续命中同一账号。
-                        let kind = classify_video_error(0, &event_data);
-                        state.pool.note_error(&account.uid, kind);
-                    }
-                    match parse_sse_event(&event_name, &event_data, &task_id) {
-                        Ok(true) => terminal = true,
-                        Ok(false) => {}
-                        Err(error) => {
-                            mark_native_worker_unknown(&task_id, error);
-                            terminal = true;
-                        }
-                    }
-                }
-                event_name.clear();
-                event_data.clear();
-                if terminal { break; }
-            } else if let Some(value) = line.strip_prefix("event:") {
-                event_name = value.trim().to_string();
-            } else if let Some(value) = line.strip_prefix("data:") {
-                if !event_data.is_empty() { event_data.push('\n'); }
-                event_data.push_str(value.trim_start());
+        let outcome = super::video_stream::consume(BufReader::new(response.into_reader()), deadline, |event, data| {
+            if event == "error" {
+                state.pool.note_error(&account.uid, classify_video_error(0, data));
             }
-        }
-        if !terminal && !event_data.is_empty() {
-            if event_name == "error" {
-                let kind = classify_video_error(0, &event_data);
-                state.pool.note_error(&account.uid, kind);
-            }
-            match parse_sse_event(&event_name, &event_data, &task_id) {
-                Ok(_) => {}
-                Err(error) => mark_native_worker_unknown(&task_id, error),
-            }
+            parse_sse_event(event, data, &task_id)
+        });
+        if let Err(error) = outcome {
+            mark_native_worker_diagnostic(&task_id, error.diagnostic());
         }
         let task_status = get(&task_id).map(|task| task.status).unwrap_or_default();
         if task_status == "completed" {
@@ -1512,9 +1495,19 @@ mod tests {
     }
 
     #[test]
+    fn damaged_done_cannot_finalize_a_partial_resource() {
+        let task=create_pending("seedance".into(),"fixture".into());
+        assert!(!parse_sse_event("result",r#"{"uri":"tos://partial"}"#,&task.id).unwrap());
+        assert!(parse_sse_event("done","broken token=private",&task.id).is_err());
+        mark_native_worker_diagnostic(&task.id,super::super::video_stream::Fault::InvalidEvent.diagnostic());
+        let unknown=get(&task.id).unwrap();assert_eq!(unknown.status,"unknown");assert_eq!(unknown.resource_uri.as_deref(),Some("tos://partial"));
+        let restored=restored(persisted(&unknown));assert_eq!(restored.execution_diagnostic,unknown.execution_diagnostic);
+        assert!(!serde_json::to_string(&unknown).unwrap().contains("private"));assert_eq!(unknown.billing.status,BillingStatus::Absent);
+    }
+    #[test]
     fn budget_completion_defers_artifact_io_but_legacy_still_caches() {
         let initial=VideoTask {id:"video-fixture".into(),object:"video".into(),model:"seedance".into(),status:"completed".into(),prompt:"fixture".into(),
-            created_at:1,updated_at:2,error:None,upstream_error:None,transport:"native".into(),video_url:None,resource_uri:Some("tos://completed-resource".into()),video_duration:Some(5.0),
+            created_at:1,updated_at:2,error:None,upstream_error:None,execution_diagnostic:None,transport:"native".into(),video_url:None,resource_uri:Some("tos://completed-resource".into()),video_duration:Some(5.0),
             content_url:None,artifact_error:None,billing:VideoBillingReceipt::default(),request_key:None,owner_key_id:"key".into()};
         let mut deferred=initial.clone();
         finish_artifact_phase(&mut deferred,true,|_|panic!("v2 execution must finish before resource URL lookup"),|_|panic!("v2 execution must not wait for cache download"));
@@ -1833,6 +1826,7 @@ mod tests {
             updated_at: 2,
             error: None,
             upstream_error: None,
+        execution_diagnostic: None,
             transport: "trae_work_native_sse".into(),
             video_url: Some("https://example.invalid/video.mp4".into()),
             resource_uri: Some("tos://video".into()),

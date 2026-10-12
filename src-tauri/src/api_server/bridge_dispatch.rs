@@ -68,6 +68,7 @@ pub(super) fn dispatch(state:Arc<super::ApiSharedState>,runtime:Arc<BridgeBudget
                 match super::video::run_budget_task(worker_state,&runtime,&ctx,account,body.clone(),permit) {
                     Ok(task) if task.status=="completed"=>WorkerResult::Terminal(ExecutionState::Succeeded,serde_json::to_value(task).unwrap_or(Value::Null)),
                     Ok(task) if task.status=="failed"=>WorkerResult::Terminal(ExecutionState::Failed,serde_json::to_value(task).unwrap_or(Value::Null)),
+                    Ok(task) if task.execution_diagnostic.is_some()=>WorkerResult::Diagnostic(task.execution_diagnostic.unwrap()),
                     _=>WorkerResult::Unknown,
                 }
             } else {
