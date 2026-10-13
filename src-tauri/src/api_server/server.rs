@@ -101,6 +101,7 @@ pub async fn start_api_server(
     let app = build_router(state.clone()).layer(axum::Extension(budget_runtime.clone()));
     spawn_wb_health_probe(state.clone());
     let background_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    super::video_cache::start(state.data_dir.clone(),background_stop.clone());
     super::bridge_runtime::BridgeBudgetRuntime::start_maintenance(&budget_runtime,background_stop.clone());
     super::usage_refresh::start_with_runtime(state.clone(), background_stop.clone(), Some(budget_runtime.clone()));
     super::balance_refresh::start(state.pool.clone(),background_stop.clone(),budget_runtime.clone());

@@ -3001,6 +3001,7 @@ pub async fn video_content(
             Ok(path) => path,
             Err(_) => return openai_error(StatusCode::NOT_FOUND, "video_not_found", "video artifact not found"),
         };
+        let cache_lease=super::video_cache::Lease::acquire(&path).ok();
         let Some(metadata) = std::fs::metadata(&path).ok().filter(|metadata| metadata.is_file()) else {
             return openai_error(StatusCode::NOT_FOUND, "video_not_found", "video artifact not found");
         };
@@ -3008,6 +3009,7 @@ pub async fn video_content(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
         let path_for_reader = path.clone();
         std::thread::spawn(move || {
+            let _cache_lease=cache_lease;
             let mut file = match std::fs::File::open(path_for_reader) {
                 Ok(file) => file,
                 Err(error) => {
@@ -3062,6 +3064,7 @@ pub async fn video_content(
         Ok(path) => path,
         Err(_) => return openai_error(StatusCode::NOT_FOUND, "video_not_found", "video artifact not found"),
     };
+    let cache_lease=super::video_cache::Lease::acquire(&path).ok();
     let metadata = std::fs::metadata(&path).ok().filter(|m| m.is_file());
     if metadata.is_none() {
         if let Some(url) = task.video_url {
@@ -3078,6 +3081,7 @@ pub async fn video_content(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
     let path_for_reader = path.clone();
     std::thread::spawn(move || {
+        let _cache_lease=cache_lease;
         let mut file = match std::fs::File::open(path_for_reader) {
             Ok(file) => file,
             Err(error) => {

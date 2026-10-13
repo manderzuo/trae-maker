@@ -10,6 +10,7 @@ pub(super) struct PrepareRequest {
     pub request_fingerprint:String,pub endpoint:String,pub model:String,pub step_kind:String,pub body:Value,
 }
 pub(super) trait PreparationSource {
+    fn check_deadline(&self)->Result<(),String> {Ok(())}
     fn select(&self,video:bool,excluded:&HashSet<String>)->Result<PickedAccount,String>;
     fn capacity(&self,account:&PickedAccount)->Result<Vec<Value>,String>;
     fn estimate(&self,account:&PickedAccount,workload:i64)->Result<i64,String>;
@@ -21,8 +22,9 @@ pub(super) trait PreparationSource {
         } else {Ok(None)}
     }
 }
-pub(super) struct NativePreparationSource<'a>(pub &'a super::ApiSharedState,pub &'a str);
+pub(super) struct NativePreparationSource<'a>(pub &'a super::ApiSharedState,pub &'a str,pub super::native_io::Budget);
 impl PreparationSource for NativePreparationSource<'_> {
+    fn check_deadline(&self)->Result<(),String>{self.2.remaining().map(|_|()).map_err(|_|"budget_policy_expired".into())}
     fn reference_seconds(&self,body:&Value)->Result<Option<u64>,String> {
         super::bridge_reference::owned_reference_seconds(&self.0.data_dir,self.1,body)
     }
@@ -31,7 +33,8 @@ impl PreparationSource for NativePreparationSource<'_> {
             .ok_or("upstream_account_unavailable".into())
     }
     fn capacity(&self,account:&PickedAccount)->Result<Vec<Value>,String> {
-        crate::commands::accounts::query_ent_packs_for_bridge(&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id.clone(),..Default::default()})
+        let agent=self.2.capped(std::time::Duration::from_secs(15)).agent().map_err(|_|"budget_policy_expired")?;
+        crate::commands::accounts::query_ent_packs_with_agent(&agent,&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id.clone(),..Default::default()})
             .map_err(|error| {
                 // Only closed diagnostic classes enter logs; raw upstream
                 // response text may contain account or credential material.
@@ -50,7 +53,7 @@ impl PreparationSource for NativePreparationSource<'_> {
     fn estimate(&self,account:&PickedAccount,workload:i64)->Result<i64,String> {
         let item=format!("estimate-{:032x}",rand::random::<u128>());
         let url=format!("{}/api/v1/commercial/check_estimated_balance",super::AGENT_HOST);
-        let agent=ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20)).build();
+        let agent=self.2.capped(std::time::Duration::from_secs(20)).agent().map_err(|_|"budget_policy_expired")?;
         let response=super::video_protocol::post(&agent,&url)
             .set("content-type","application/json").set("accept","application/json").set("user-agent","TraeClient/TTNet")
             .set("x-ide-token",account.jwt.strip_prefix("Cloud-IDE-JWT ").unwrap_or(&account.jwt).trim())
@@ -64,7 +67,7 @@ impl PreparationSource for NativePreparationSource<'_> {
             .send_json(json!({"access_type":"SoloLite","items":[{"item_id":item,"estimated_token_usage":{"completion_tokens":workload},
                 "config_name":"seedance2-fast","function":"video_generation"}]}))
             .map_err(|_|"native_estimate_unavailable")?;
-        let value:Value=response.into_json().map_err(|_|"native_estimate_invalid")?;
+        let value=super::native_io::json(response).map_err(|_|"native_estimate_invalid")?;
         parse_native_estimate(&value,&item)
     }
     fn policy(&self,profile:&str,now:i64)->Result<(i64,String,i64),String> {
@@ -85,7 +88,7 @@ impl PreparationSource for NativePreparationSource<'_> {
             // Core verifies user ownership before upload. The upstream asset
             // copy is owned by the authenticated bridge credential, not by the
             // opaque Core Key mirror used only for execution/billing identity.
-            let value=super::video::prepare_native_request(&self.0.data_dir,self.1,body,account).map_err(|e| {
+            let value=super::video::prepare_native_request_until(&self.0.data_dir,self.1,body,account,self.2).map_err(|e| {
                 if e.message=="reference_resource_unavailable" {"reference_resource_unavailable"} else {"reference_preparation_failed"}
             })?;
             Ok(super::video::build_request_body(&value))
@@ -269,7 +272,16 @@ fn fallback_video_budget(source:&dyn PreparationSource,profile:&str,now:i64,obse
         Err(error)=>Err(error),
     }
 }
+pub(super) fn prepare_now(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource)->Result<PreparedBudget,String> {
+    prepare_with_clock(runtime,request,source,&||chrono::Utc::now().timestamp_millis())
+}
+#[cfg(test)]
 pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource,now:i64)->Result<PreparedBudget,String> {
+    let started=std::time::Instant::now();
+    prepare_with_clock(runtime,request,source,&||now.saturating_add(started.elapsed().as_millis().min(i64::MAX as u128) as i64))
+}
+fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource,clock:&dyn Fn()->i64)->Result<PreparedBudget,String> {
+    let now=clock();
     use super::{bridge_budget::{CapacityEligibility,CapacitySnapshot,CapacityReservation,check_capacity},bridge_prepared::TrustedPreparation};
     use rusqlite::OptionalExtension;
     if request.wire_version!=2 || now<0 || !request.body.is_object() || serde_json::to_vec(&request.body).map_err(|_|"invalid input")?.len()>7*1024*1024
@@ -326,7 +338,7 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
             return Err("upstream_capacity_unavailable".into());
         }
     }
-    let live=parse_capacity(&packs,now)?;
+    let live=parse_capacity(&packs,clock())?;
     let observation=if dedicated {
         Some(super::bridge_capacity_source::PackObservation::parse(&packs,now).map_err(|_|"upstream_capacity_unavailable")?)
     } else {None};
@@ -339,7 +351,7 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
             crate::fs_utils::app_log(runtime.data_dir(),&format!("Core 准入容量增长核对未更新快照：{}；继续执行原容量检查",super::bridge_capacity_source::safe_error_code(&error)));
         }
     }
-    let (hold,policy,expiry,evidence)=if video {
+    let terms=|now:i64|->Result<(i64,String,i64,&str),String> {Ok(if video {
         let prices=runtime.with_store(|s,_|s.confirmed_video_prices(&account.uid,now.saturating_sub(7*86400*1000),now))?;
         let observed=observed_video_budget(&prices,&profile)?;
         if let Some((hold,version,"observed_actual"))=observed.as_ref() {
@@ -356,13 +368,12 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
     } else {
         let (hold,version,expiry)=source.policy(&profile,now)?;
         (hold,version,expiry,"policy_only")
-    };
-    let expiry=expiry.min(live.valid_until_ms).min(now.checked_add(60_000).ok_or("budget time overflow")?);
-    if expiry<=now || hold<=0 {return Err("budget_policy_expired".into());}
+    })};
+    let (hold,_,_,_)=terms(clock())?;
     // Reject known insufficient capacity before account-bound asset uploads.
     // Repeat this preflight after uploads; the atomic prepare CAS remains the
     // authority when another request competes between either check and commit.
-    let preflight=|store:&mut super::bridge_billing::BridgeBillingStore,lease:&super::bridge_budget_lease::BridgeBudgetLease| {
+    let preflight=|store:&mut super::bridge_billing::BridgeBillingStore,lease:&super::bridge_budget_lease::BridgeBudgetLease,live:&LiveCapacity,hold:i64,now:i64| {
         let epoch:Option<i64>=store.connection.query_row("SELECT snapshot_epoch FROM bridge_capacity_accounts WHERE account_ref=?1",[&account.uid],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         let totals=store.capacity_totals(&account.uid)?;
         let promised=totals.pending.checked_add(totals.awaiting_receipt).and_then(|v|v.checked_add(hold)).ok_or("capacity overflow")?;
@@ -376,10 +387,23 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
             account_ref:account.uid.clone(),snapshot_epoch:epoch.unwrap_or(1),eligibility:if video {CapacityEligibility::GeneralOrWork} else {CapacityEligibility::GeneralOnly},hold})?;
         Ok(epoch.unwrap_or(1))
     };
-    runtime.with_store(|store,lease|preflight(store,lease))?;
+    runtime.with_store(|store,lease|preflight(store,lease,&live,hold,clock()))?;
     let normalized=source.normalize(&account,&body,video,&request.core_key_id)?;
+    // Uploads may consume most of the admission window. Obtain new evidence,
+    // including revoked/new packages, and current policy before minting a token.
+    let packs_started_at=chrono::Utc::now().timestamp_millis();
+    let packs=match source.capacity(&account) {
+        Ok(packs)=>packs,
+        Err(error)=>{if dedicated {runtime.with_store(|s,l|s.invalidate_native_grants(l,&account.uid,packs_started_at))?;}return Err(error);},
+    };
+    if dedicated {runtime.with_store(|s,l|s.refresh_native_grants(l,&account.uid,&packs,packs_started_at))?;}
+    let (hold,policy,policy_expiry,evidence)=terms(clock())?;
     runtime.with_store(|store,lease| {
-        let epoch=preflight(store,lease)?;
+        source.check_deadline()?;
+        let now=clock();
+        let live=parse_capacity(&packs,now)?;
+        let expiry=authorization_expiry(policy_expiry,live.valid_until_ms,now)?;
+        let epoch=preflight(store,lease,&live,hold,now)?;
         store.prepare_budget(lease,&TrustedPreparation {parent_request_id:request.parent_request_id.clone(),request_id:request.request_id.clone(),core_key_id:request.core_key_id.clone(),
             request_fingerprint:request.request_fingerprint.clone(),endpoint:request.endpoint.clone(),model:request.model.clone(),step_kind:request.step_kind.clone(),
             account_ref:account.uid.clone(),snapshot_epoch:epoch,eligibility:if video {CapacityEligibility::GeneralOrWork} else {CapacityEligibility::GeneralOnly},
@@ -394,6 +418,11 @@ pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
     }
     }
     Err(last_error)
+}
+
+fn authorization_expiry(policy_expiry:i64,capacity_expiry:i64,now:i64)->Result<i64,String> {
+    let expiry=policy_expiry.min(capacity_expiry).min(now.checked_add(60_000).ok_or("budget time overflow")?);
+    if expiry<=now {return Err("budget_policy_expired".into());}Ok(expiry)
 }
 
 #[derive(Debug,PartialEq)]
@@ -476,6 +505,52 @@ pub(super) fn video_hold(estimate:i64,observed:i64)->Result<i64,String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preparation_authorization_uses_completion_time_and_current_expiries() {
+        assert_eq!(super::authorization_expiry(i64::MAX,i64::MAX,170_000).unwrap(),230_000);
+        assert_eq!(super::authorization_expiry(180_000,210_000,170_000).unwrap(),180_000);
+        assert_eq!(super::authorization_expiry(160_000,i64::MAX,170_000).unwrap_err(),"budget_policy_expired");
+        assert_eq!(super::authorization_expiry(i64::MAX,170_000,170_000).unwrap_err(),"budget_policy_expired");
+    }
+    // Requires the same exclusive host lease as production. Parent runs this
+    // only in the coordinated maintenance window; never bypass that lock.
+    #[cfg(windows)]
+    #[test]
+    fn prepare_refreshes_evidence_after_slow_normalization_without_reissuing_identity() {
+        use std::cell::Cell;
+        struct Source {clock:Cell<i64>,reads:Cell<u32>,normalized:Cell<bool>,mode:u8}
+        impl PreparationSource for Source {
+            fn select(&self,_:bool,excluded:&HashSet<String>)->Result<PickedAccount,String> {
+                if excluded.contains("account"){return Err("upstream_account_unavailable".into());}
+                Ok(PickedAccount {uid:"account".into(),jwt:"fixture".into(),device_id:"fixture".into(),machine_id:"fixture".into(),domain:String::new(),enterprise_id:String::new(),global_region:false})
+            }
+            fn capacity(&self,_:&PickedAccount)->Result<Vec<Value>,String> {
+                self.reads.set(self.reads.get()+1);
+                Ok(vec![pack(208,if self.normalized.get()&&self.mode==1 {"1"}else{"100"},"0",0,4102444800)])
+            }
+            fn estimate(&self,_:&PickedAccount,_:i64)->Result<i64,String>{panic!("fixture uses a five-second risk profile")}
+            fn policy(&self,_:&str,_:i64)->Result<(i64,String,i64),String>{Ok((40_000_000,"fixture".into(),if self.mode==2 {160_000}else{i64::MAX}))}
+            fn normalize(&self,_:&PickedAccount,body:&Value,_:bool,_:&str)->Result<Value,String>{self.clock.set(170_000);self.normalized.set(true);Ok(body.clone())}
+        }
+        for mode in 0..3 {
+            let root=std::env::temp_dir().join(format!("aiwork-current-preparation-{:032x}",rand::random::<u128>()));
+            let runtime=BridgeBudgetRuntime::start(&root).unwrap();
+            runtime.with_store(|s,_|s.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").map_err(|e|e.to_string())).unwrap();
+            let source=Source {clock:Cell::new(100_000),reads:Cell::new(0),normalized:Cell::new(false),mode};
+            let req=PrepareRequest {wire_version:2,parent_request_id:"request-a".into(),request_id:"request-a".into(),core_key_id:"key-a".into(),request_fingerprint:"fingerprint".into(),endpoint:"videos".into(),model:"seedance".into(),step_kind:"video".into(),body:json!({"prompt":"fixture","duration":5})};
+            let result=prepare_with_clock(&runtime,&req,&source,&||source.clock.get());
+            assert!(source.reads.get()>=2,"capacity must be queried again after uploads");
+            if mode==0 {
+                let budget=result.unwrap();assert_eq!(budget.prepared_at_ms,170_000);assert_eq!(budget.authorization.expires_at_ms,230_000);
+                source.clock.set(250_000);let reads=source.reads.get();let replay=prepare_with_clock(&runtime,&req,&source,&||source.clock.get()).unwrap();
+                assert_eq!(replay.dispatch_token,budget.dispatch_token);assert_eq!(source.reads.get(),reads,"expired replay must not prepare another paid identity");
+            }else{
+                let error=result.err().unwrap();assert_eq!(error,if mode==1 {"upstream_capacity_insufficient"}else{"budget_policy_expired"});
+                runtime.with_store(|s,_|{let count:i64=s.connection.query_row("SELECT COUNT(*) FROM bridge_prepared_budgets",[],|r|r.get(0)).unwrap();assert_eq!(count,0);Ok(())}).unwrap();
+            }
+            drop(runtime);std::fs::remove_dir_all(root).unwrap();
+        }
+    }
     use super::*;
     fn fallback_policy() -> Value {
         json!({"version":1,"profiles":[],"video_fallback":{"enabled":true,"model_family":"seedance2-fast","baseline_resolution":"720p","baseline_duration_seconds":15,"hold_microcredits":413_000_000,"policy_version":"fixture","source":"test risk allowance","expires_at_ms":200}})

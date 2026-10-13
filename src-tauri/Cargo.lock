@@ -101,6 +101,7 @@ dependencies = [
  "ureq 2.12.1",
  "url",
  "urlencoding",
+ "webpki-roots 0.26.11",
  "windows-sys 0.59.0",
 ]
 

@@ -24,6 +24,8 @@ serde_json = "1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 ureq = { version = "2", features = ["json"] }
+# Same trust roots already used by ureq; deadline TLS wrapper preserves validation.
+webpki-roots = "=0.26.11"
 urlencoding = "2"
 url = "2"
 axum = "0.7"
@@ -45,7 +47,7 @@ aiwork-core = { path = "../src-core" }
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_Networking_WinSock"] }
 
 # dev/test 构建对依赖开优化：Stronghold 快照加密派生等在未优化下极慢（写一次 ~100s）
 [profile.dev.package."*"]

@@ -926,7 +926,7 @@ fn account_device_view(map: &DeviceMap, uid: &str) -> Option<String> {
 pub(crate) fn query_ent_packs_for_bridge(jwt:&str,dev:&DeviceEntry)->Result<Vec<serde_json::Value>,String> {
     query_ent_packs_with_agent(&ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build(),jwt,dev)
 }
-fn query_ent_packs_with_agent(agent:&ureq::Agent,jwt:&str,dev:&DeviceEntry)->Result<Vec<serde_json::Value>,String> {
+pub(crate) fn query_ent_packs_with_agent(agent:&ureq::Agent,jwt:&str,dev:&DeviceEntry)->Result<Vec<serde_json::Value>,String> {
     let body = ide_query_post(
         agent,
         "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage",

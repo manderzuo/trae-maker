@@ -7,7 +7,6 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 单个视频最大大小（4 GiB）。超过此值会停止下载并删除临时文件。
 pub const MAX_VIDEO_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -61,9 +60,13 @@ pub fn download_from_url(
     task_id: &str,
     url: &str,
 ) -> Result<(PathBuf, u64), String> {
+    download_until(data_dir,task_id,url,super::native_io::Budget::new(super::native_io::ARTIFACT_LIMIT))
+}
+pub(super) fn download_until(data_dir:&Path,task_id:&str,url:&str,budget:super::native_io::Budget)->Result<(PathBuf,u64),String> {
     let path = artifact_path(data_dir, task_id)?;
     let dir = storage_dir(data_dir);
     fs::create_dir_all(&dir).map_err(|e| format!("创建视频目录失败: {e}"))?;
+    let _lease=super::video_cache::Lease::acquire(&path)?;
     let partial = path.with_extension("mp4.part");
 
     let trimmed = url.trim();
@@ -71,11 +74,10 @@ pub fn download_from_url(
         return Err("视频资源地址不是 HTTP(S) 地址".into());
     }
 
-    let response = super::streaming_agent()
-        .get(trimmed)
+    let response = budget.request("GET",trimmed)?
         .set("accept", "video/mp4,video/*;q=0.9,*/*;q=0.1")
         .call()
-        .map_err(|e| format!("下载视频失败: {e}"))?;
+        .map_err(|_| "native_artifact_download_failed")?;
     let status = response.status();
     if !(200..300).contains(&status) {
         return Err(format!("下载视频失败：上游 HTTP {status}"));
@@ -88,6 +90,7 @@ pub fn download_from_url(
         if length==0 {return Err("视频文件为空".into());}
     }
 
+    let _reservation=super::video_cache::Reservation::acquire(data_dir,&path,expected_length.unwrap_or(MAX_VIDEO_BYTES),super::video_cache::LIMITS)?;
     let result = (|| -> Result<u64, String> {
         let mut reader = response.into_reader();
         let mut writer = File::create(&partial).map_err(|e| format!("创建临时视频文件失败: {e}"))?;
@@ -134,36 +137,7 @@ pub fn download_from_url(
 /// 删除超过保留期的产物。只清理本模块生成的 `.mp4` 和陈旧 `.mp4.part`，
 /// 以免误删用户放入的其它文件。
 pub fn cleanup(data_dir: &Path, retention_secs: u64) -> usize {
-    let dir = storage_dir(data_dir);
-    let Ok(entries) = fs::read_dir(dir) else { return 0 };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
-    let mut removed = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_artifact = path.extension().and_then(|v| v.to_str()) == Some("mp4");
-        let is_partial = path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .map(|v| v.ends_with(".mp4.part"))
-            .unwrap_or(false);
-        if !is_artifact && !is_partial {
-            continue;
-        }
-        let old = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(now);
-        if retention_secs > 0 && now.saturating_sub(old) >= retention_secs && super::video_frames::remove_if_unleased(data_dir,&path) {
-            removed += 1;
-        }
-    }
-    removed
+    super::video_cache::Sweep::default().step(data_dir,retention_secs,super::video_cache::LIMITS)
 }
 
 #[cfg(test)]
@@ -193,6 +167,20 @@ mod tests {
             assert!(outcome.is_err(),"empty or incomplete upstream bodies must not be published");
             assert_eq!(original,b"original-video");assert!(!partial);
         }
+    }
+    #[test]
+    fn native_io_video_download_deadline_removes_partial_without_publishing() {
+        let root=std::env::temp_dir().join(format!("aiwork-download-deadline-{:032x}",rand::random::<u128>()));
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();let url=format!("http://{}/video",listener.local_addr().unwrap());
+        let worker=thread::spawn(move|| {
+            let(mut s,_)=listener.accept().unwrap();let mut request=[0;1024];let _=s.read(&mut request);
+            let _=s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\n");
+            for byte in b"abc" {thread::sleep(std::time::Duration::from_millis(80));if s.write_all(&[*byte]).is_err(){break;}}
+        });
+        let result=download_until(&root,"slow",&url,super::super::native_io::Budget::new(std::time::Duration::from_millis(100)));
+        worker.join().unwrap();let path=artifact_path(&root,"slow").unwrap();
+        let published=path.exists();let partial=path.with_extension("mp4.part").exists();let _=fs::remove_dir_all(&root);
+        assert!(result.is_err(),"slow bodies must stop at the whole retrieval deadline");assert!(!published);assert!(!partial);
     }
 
     #[test]

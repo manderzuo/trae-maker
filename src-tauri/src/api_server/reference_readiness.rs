@@ -70,12 +70,16 @@ fn bounded_probe(start:Instant, timeout:Duration, slots:Arc<AtomicUsize>,
     receive.recv_timeout(wait).map_err(|_|unavailable())?
 }
 pub(super) fn check(account: &PickedAccount, body: &Value) -> Result<(), NativeUploadError> {
+    check_with_budget(account,body,super::native_io::Budget::new(PROBE_DEADLINE))
+}
+pub(super) fn check_with_budget(account:&PickedAccount,body:&Value,budget:super::native_io::Budget)->Result<(),NativeUploadError> {
     if !["image_urls","video_urls"].iter().any(|key|body[key].as_array().is_some_and(|a|!a.is_empty())) {return Ok(());}
     static SLOTS:OnceLock<Arc<AtomicUsize>>=OnceLock::new();
     let start=Instant::now();let account=account.clone();let body=body.clone();
-    bounded_probe(start,PROBE_DEADLINE,SLOTS.get_or_init(||Arc::new(AtomicUsize::new(0))).clone(),move||check_until(&account,&body,start))
+    let budget=budget.capped(PROBE_DEADLINE);let timeout=budget.remaining().map_err(|_|unavailable())?;
+    bounded_probe(start,timeout,SLOTS.get_or_init(||Arc::new(AtomicUsize::new(0))).clone(),move||check_until(&account,&body,budget))
 }
-fn check_until(account: &PickedAccount, body: &Value, start:Instant) -> Result<(), NativeUploadError> {
+fn check_until(account: &PickedAccount, body: &Value, budget:super::native_io::Budget) -> Result<(), NativeUploadError> {
     let mut references = Vec::new();
     for (key, kind) in [("image_urls", "image/"), ("video_urls", "video/")] {
         for uri in body[key].as_array().into_iter().flatten().filter_map(Value::as_str) {
@@ -85,7 +89,7 @@ fn check_until(account: &PickedAccount, body: &Value, start:Instant) -> Result<(
     if references.is_empty() {return Ok(());}
     let agent=probe_agent();
     let response = super::trae_resource_upload::common_request_with_agent(account, "/api/ide/v1/get_resource_url",&agent)
-        .timeout(remaining(start)?)
+        .timeout(budget.remaining().map_err(|_|unavailable())?)
         .send_json(serde_json::json!({"uri_list":references.iter().map(|r|r.0).collect::<Vec<_>>() }))
         .map_err(|_| unavailable())?;
     if response.status()!=200 {return Err(unavailable());}
@@ -96,14 +100,14 @@ fn check_until(account: &PickedAccount, body: &Value, start:Instant) -> Result<(
     // No account credentials or authentication headers are sent to the CDN.
     for (uri, kind) in references {
         let raw = resource_url(&reply, uri, chrono::Utc::now().timestamp()).map_err(|_| unavailable())?;
-        let response = agent.get(raw).timeout(remaining(start)?).set("Range", "bytes=0-31")
+        let response = agent.get(raw).timeout(budget.remaining().map_err(|_|unavailable())?).set("Range", "bytes=0-31")
             .call().map_err(|_| unavailable())?;
         let status = response.status();
         let content_type = response.header("content-type").map(str::to_string);
         let mut prefix = Vec::new();
         response.into_reader().take(PREFIX_BYTES).read_to_end(&mut prefix).map_err(|_| unavailable())?;
         media_prefix(kind, status, content_type.as_deref(), &prefix)?;
-        remaining(start)?;
+        budget.remaining().map_err(|_|unavailable())?;
     }
     Ok(())
 }

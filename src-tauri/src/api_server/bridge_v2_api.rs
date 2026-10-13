@@ -110,8 +110,8 @@ pub(super) async fn prepare(State(state):State<Arc<ApiSharedState>>,
     axum::Extension(runtime):axum::Extension<Arc<super::bridge_runtime::BridgeBudgetRuntime>>,
     axum::Extension(bridge_key):axum::Extension<super::usage::KeyId>,
     Json(request):Json<super::bridge_planner::PrepareRequest>)->Response {
-    let result=tokio::task::spawn_blocking(move || super::bridge_planner::prepare(&runtime,&request,
-        &super::bridge_planner::NativePreparationSource(&state,&bridge_key.0),chrono::Utc::now().timestamp_millis())).await;
+    let result=tokio::task::spawn_blocking(move || super::bridge_planner::prepare_now(&runtime,&request,
+        &super::bridge_planner::NativePreparationSource(&state,&bridge_key.0,super::native_io::Budget::new(super::native_io::PREPARATION_LIMIT)))).await;
     match result {
         Ok(Ok(prepared))=>Json(prepared).into_response(),
         Ok(Err(reason))=>{

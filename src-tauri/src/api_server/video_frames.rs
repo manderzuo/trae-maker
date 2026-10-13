@@ -175,6 +175,7 @@ impl Drop for Slot {
 static MEDIA_LOCK: Mutex<()> = Mutex::new(());
 pub(crate) struct MediaLease {
     path: PathBuf,
+    _cache: super::video_cache::Lease,
 }
 fn lease_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("data/video-frame-leases")
@@ -184,6 +185,7 @@ fn path_digest(path: &Path) -> String {
 }
 impl MediaLease {
     pub(crate) fn acquire(data_dir: &Path, source: &Path) -> Result<Self, String> {
+        let cache=super::video_cache::Lease::acquire(source).map_err(|_|"frame_source_unavailable")?;
         let _lock = MEDIA_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let canonical = source
             .canonicalize()
@@ -209,7 +211,7 @@ impl MediaLease {
             let _ = fs::remove_file(&path);
             return Err("frame_lease_unavailable".into());
         }
-        Ok(Self { path })
+        Ok(Self { path,_cache:cache })
     }
 }
 impl Drop for MediaLease {

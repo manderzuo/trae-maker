@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use super::assets::AssetRecord;
 use super::pool::PickedAccount;
 use super::{streaming_agent, APP_ID, AGENT_HOST, REFERER_BASE};
+use super::native_io::{self,Budget};
 
 #[cfg(test)]
 const RESOURCE_BIZ_TYPE: &str = "remote_resource";
@@ -303,23 +304,15 @@ pub(super) fn common_request_with_agent(account: &PickedAccount, path: &str, age
 fn request_upload_plan_with_payload(
     account: &PickedAccount,
     payload: Value,
+    budget: Budget,
 ) -> Result<UploadPlan, NativeUploadError> {
-    let response = common_request(account, "/api/ide/v1/get_resource_upload_url").send_json(payload);
-    match response {
-        Ok(response) => response
-            .into_json::<Value>()
-            .map_err(|error| NativeUploadError::new(format!("解析 Trae 素材上传响应失败: {error}"), false))
-            .and_then(|value| parse_upload_url_response(&value)),
-        Err(ureq::Error::Status(status, response)) => {
-            let text = response.into_string().unwrap_or_default();
-            Err(request_error(status, &text, "获取 Trae 素材上传地址失败"))
-        }
-        Err(error) => Err(NativeUploadError::new(
-            format!("获取 Trae 素材上传地址失败: {error}"),
-            false,
-        )),
-    }
+    let agent=budget.agent().map_err(|_|resource_unavailable())?;
+    let response=common_request_with_agent(account,"/api/ide/v1/get_resource_upload_url",&agent)
+        .timeout(budget.remaining().map_err(|_|resource_unavailable())?).send_json(payload).map_err(|_|resource_unavailable())?;
+    let value=native_io::json(response).map_err(|_|resource_unavailable())?;
+    parse_upload_url_response(&value)
 }
+fn resource_unavailable()->NativeUploadError {NativeUploadError::new("reference_resource_unavailable",false)}
 
 #[cfg(test)]
 fn upload_bytes(plan: &UploadPlan, bytes: &[u8]) -> Result<(), NativeUploadError> {
@@ -361,6 +354,7 @@ fn upload_image_bytes(
     plan: &UploadPlan,
     bytes: &[u8],
     content_type: &str,
+    budget: Budget,
 ) -> Result<(), NativeUploadError> {
     let host = plan
         .upload_host
@@ -375,63 +369,36 @@ fn upload_image_bytes(
         content_type,
         &plan.upload_headers,
     );
-    let mut request = streaming_agent().put(&url);
+    let mut request = budget.request("PUT",&url).map_err(|_|resource_unavailable())?;
     for (name, value) in &headers {
         request = request.set(name, value);
     }
-    let response = request.send_bytes(bytes);
-    match response {
-        Ok(response) if (200..300).contains(&response.status()) => Ok(()),
-        Ok(response) => {
-            let status = response.status();
-            let text = response.into_string().unwrap_or_default();
-            Err(request_error(status, &text, "上传 Trae 图片素材失败"))
-        }
-        Err(ureq::Error::Status(status, response)) => {
-            let text = response.into_string().unwrap_or_default();
-            Err(request_error(status, &text, "上传 Trae 图片素材失败"))
-        }
-        Err(error) => Err(NativeUploadError::new(
-            format!("上传 Trae 图片素材失败: {error}"),
-            false,
-        )),
-    }
+    let response=request.send_bytes(bytes).map_err(|_|resource_unavailable())?;
+    if !(200..300).contains(&response.status()) {return Err(resource_unavailable());}
+    native_io::reply(response).map(|_|()).map_err(|_|resource_unavailable())
 }
 
 fn commit_upload_for(
     account: &PickedAccount,
     plan: &UploadPlan,
     biz_type: &str,
+    budget: Budget,
 ) -> Result<(), NativeUploadError> {
     let Some(session_key) = plan.session_key.as_deref() else {
         return Ok(());
     };
-    let response = common_request(account, "/api/ide/v1/commit_resource_upload_result")
-        .send_json(build_commit_payload_for(&plan.store_uri, Some(session_key), biz_type));
-    match response {
-        Ok(response) if (200..300).contains(&response.status()) => response.into_json::<Value>()
-            .map_err(|_| NativeUploadError::new("reference_resource_unavailable", false))
-            .and_then(|value| validate_acknowledgement(&value)),
-        Ok(response) => {
-            let status = response.status();
-            let text = response.into_string().unwrap_or_default();
-            Err(request_error(status, &text, "提交 Trae 素材失败"))
-        }
-        Err(ureq::Error::Status(status, response)) => {
-            let text = response.into_string().unwrap_or_default();
-            Err(request_error(status, &text, "提交 Trae 素材失败"))
-        }
-        Err(error) => Err(NativeUploadError::new(
-            format!("提交 Trae 素材失败: {error}"),
-            false,
-        )),
-    }
+    let agent=budget.agent().map_err(|_|resource_unavailable())?;
+    let response=common_request_with_agent(account,"/api/ide/v1/commit_resource_upload_result",&agent)
+        .timeout(budget.remaining().map_err(|_|resource_unavailable())?)
+        .send_json(build_commit_payload_for(&plan.store_uri,Some(session_key),biz_type)).map_err(|_|resource_unavailable())?;
+    validate_acknowledgement(&native_io::json(response).map_err(|_|resource_unavailable())?)
 }
 
-pub fn upload_asset(
+pub(super) fn upload_asset(
     account: &PickedAccount,
     record: &AssetRecord,
     bytes: &[u8],
+    budget: Budget,
 ) -> Result<String, NativeUploadError> {
     if record.mime_type.to_ascii_lowercase().starts_with("image/") {
         let (width, height) = detect_image_dimensions(bytes).ok_or_else(|| {
@@ -444,15 +411,16 @@ pub fn upload_asset(
         let plan = request_upload_plan_with_payload(
             account,
             build_image_upload_payload(&target, width, height),
+            budget,
         )?;
-        upload_image_bytes(&plan, bytes, &record.mime_type)?;
-        commit_upload_for(account, &plan, IMAGE_BIZ_TYPE)?;
+        upload_image_bytes(&plan, bytes, &record.mime_type,budget)?;
+        commit_upload_for(account, &plan, IMAGE_BIZ_TYPE,budget)?;
         return Ok(generation_resource_uri(plan));
     }
     let (payload, content, biz_type) = video_upload_contract(bytes);
-    let plan = request_upload_plan_with_payload(account, payload)?;
-    upload_image_bytes(&plan, &content, &record.mime_type)?;
-    commit_upload_for(account, &plan, biz_type)?;
+    let plan = request_upload_plan_with_payload(account, payload,budget)?;
+    upload_image_bytes(&plan, &content, &record.mime_type,budget)?;
+    commit_upload_for(account, &plan, biz_type,budget)?;
     Ok(generation_resource_uri(plan))
 }
 
@@ -587,11 +555,12 @@ mod tests {
         let bytes=std::fs::read(file).unwrap();assert!(bytes.len()<2*1024*1024 && &bytes[4..8]==b"ftyp");
         let probe_biz=std::env::var("BRIDGE_UPLOAD_PROBE_BIZ").unwrap_or_else(|_|RESOURCE_BIZ_TYPE.into());
         assert!([RESOURCE_BIZ_TYPE,"video"].contains(&probe_biz.as_str()));
-        let plan=request_upload_plan_with_payload(&account,serde_json::json!({"targets":[native_target_path()],"biz_type":probe_biz})).unwrap();
+        let budget=Budget::new(native_io::PREPARATION_LIMIT);
+        let plan=request_upload_plan_with_payload(&account,serde_json::json!({"targets":[native_target_path()],"biz_type":probe_biz}),budget).unwrap();
         println!("native upload identity: override_present={}, differs={}",plan.resource_id.is_some(),plan.resource_id.as_deref().is_some_and(|r|r!=plan.store_uri));
         if probe_biz==RESOURCE_BIZ_TYPE {upload_bytes(&plan,&encode_remote_attachment(&bytes)).unwrap();}
-        else {upload_image_bytes(&plan,&bytes,"video/mp4").unwrap();}
-        commit_upload_for(&account,&plan,&probe_biz).unwrap();
+        else {upload_image_bytes(&plan,&bytes,"video/mp4",budget).unwrap();}
+        commit_upload_for(&account,&plan,&probe_biz,budget).unwrap();
         let resource=generation_resource_uri(plan);
         let signed:Value=common_request(&account,"/api/ide/v1/get_resource_url").send_json(serde_json::json!({"uri_list":[resource],"biz_type":probe_biz})).unwrap().into_json().unwrap();
         let signed=signed.get("data").unwrap_or(&signed);

@@ -53,6 +53,8 @@ pub mod video;
 mod video_protocol;
 mod video_stream;
 mod reference_readiness;
+mod native_io;
+mod video_cache;
 pub(crate) mod video_capabilities;
 pub(crate) mod bridge_capacity_grants;
 pub(crate) mod video_frames;

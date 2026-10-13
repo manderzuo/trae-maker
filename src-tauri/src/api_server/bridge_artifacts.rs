@@ -1,5 +1,6 @@
 //! Recover only files for an already completed and authenticated execution.
-use std::{collections::HashSet,fs::File,path::{Path,PathBuf},sync::{Mutex,OnceLock}};
+use std::{collections::HashSet,path::{Path,PathBuf},sync::{Mutex,OnceLock}};
+use super::video_cache::CachedFile as File;
 
 static RECOVERING:OnceLock<Mutex<HashSet<PathBuf>>>=OnceLock::new();
 struct RecoveryGuard(PathBuf);
@@ -7,13 +8,14 @@ impl Drop for RecoveryGuard {
     fn drop(&mut self) {RECOVERING.get_or_init(Default::default).lock().unwrap_or_else(|e|e.into_inner()).remove(&self.0);}
 }
 fn open_valid(path:&Path)->Result<(File,u64),String> {
-    let file=File::open(path).map_err(|_|"artifact unavailable")?;
-    let size=file.metadata().map_err(|_|"artifact unavailable")?.len();
-    if size==0 || size>super::video_store::MAX_VIDEO_BYTES {return Err("artifact length invalid".into());}
-    Ok((file,size))
+    File::open(path)
 }
 fn open_or_fetch(data_dir:&Path,task:&str,fetch:impl FnOnce()->Result<(),String>)->Result<(File,u64),String> {
     let path=super::video_store::artifact_path(data_dir,task)?;
+    std::fs::create_dir_all(path.parent().ok_or("artifact path invalid")?).map_err(|_|"artifact directory unavailable")?;
+    // Hold through recovery and into CachedFile's own lease; publication must
+    // not create a cleanup gap before the authenticated reader opens it.
+    let _lease=super::video_cache::Lease::acquire(&path)?;
     if let Ok(file)=open_valid(&path) {return Ok(file);}
     {
         let mut busy=RECOVERING.get_or_init(Default::default).lock().unwrap_or_else(|e|e.into_inner());
@@ -31,12 +33,13 @@ fn open_or_fetch(data_dir:&Path,task:&str,fetch:impl FnOnce()->Result<(),String>
 pub(super) fn open_completed(state:&super::ApiSharedState,account_ref:&str,task:&str,result:&serde_json::Value)->Result<(File,u64),String> {
     if result["id"].as_str()!=Some(task) || result["status"]!="completed" {return Err("artifact result binding mismatch".into());}
     open_or_fetch(&state.data_dir,task,|| {
+        let budget=super::native_io::Budget::new(super::native_io::ARTIFACT_LIMIT);
         let refreshed=result["resource_uri"].as_str().filter(|s|!s.is_empty() && s.len()<=2048)
             .and_then(|uri|state.pool.completed_resource_credentials(account_ref)
-                .and_then(|account|super::video::resolve_resource_url(&account,uri).ok()));
+                .and_then(|account|super::video::resolve_resource_url_until(&account,uri,budget.capped(std::time::Duration::from_secs(20))).ok()));
         let url=refreshed.as_deref().or_else(||result["video_url"].as_str()).ok_or("artifact source unavailable")?;
         if !url.starts_with("https://") {return Err("artifact source is not HTTPS".into());}
-        super::video_store::download_from_url(&state.data_dir,task,url).map(|_|())
+        super::video_store::download_until(&state.data_dir,task,url,budget).map(|_|())
     })
 }
 

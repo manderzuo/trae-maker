@@ -669,6 +669,9 @@ pub fn prepare_native_request(
     input: &Value,
     account: &PickedAccount,
 ) -> Result<Value, NativeUploadError> {
+    prepare_native_request_until(data_dir,owner_key_id,input,account,super::native_io::Budget::new(super::native_io::PREPARATION_LIMIT))
+}
+pub(super) fn prepare_native_request_until(data_dir:&std::path::Path,owner_key_id:&str,input:&Value,account:&PickedAccount,budget:super::native_io::Budget)->Result<Value,NativeUploadError> {
     validate_native_reference_inputs(input)
         .map_err(|error| NativeUploadError::new(error, false))?;
     let obj = input
@@ -676,6 +679,7 @@ pub fn prepare_native_request(
         .ok_or_else(|| NativeUploadError::new("video request 必须是 JSON 对象", false))?;
     let mut image_uris = Vec::new();
     let mut video_uris = Vec::new();
+    let upload_budget=budget.capped(std::time::Duration::from_secs(90));
     for (asset_key, output, label) in [
         ("image_asset_ids", &mut image_uris, "图片"),
         ("video_asset_ids", &mut video_uris, "参考视频"),
@@ -692,7 +696,7 @@ pub fn prepare_native_request(
                 .ok_or_else(|| NativeUploadError::new(format!("{asset_key} 只能包含非空字符串"), false))?;
             let (record, bytes) = super::assets::read_owned(data_dir, owner_key_id, id)
                 .map_err(|error| NativeUploadError::new(format!("{label}素材 {id} 无法读取：{error}"), false))?;
-            let uri = trae_resource_upload::upload_asset(account, &record, &bytes)
+            let uri = trae_resource_upload::upload_asset(account, &record, &bytes,upload_budget)
                 .map_err(|error| {
                     if error.message=="reference_resource_unavailable" {error} else {NativeUploadError::new(
                         format!("{label}素材 {id} 原生上传失败：{}", error.message), error.retryable_account,
@@ -703,7 +707,7 @@ pub fn prepare_native_request(
     }
     let body = build_native_request_with_uris(input, &image_uris, &video_uris)
         .map_err(|error| NativeUploadError::new(error, false))?;
-    super::reference_readiness::check(account, &body)?;
+    super::reference_readiness::check_with_budget(account, &body,budget)?;
     Ok(body)
 }
 
@@ -1222,11 +1226,14 @@ fn parse_sse_event(event: &str, data: &str, task_id: &str) -> Result<bool, Strin
 }
 
 pub(super) fn resolve_resource_url(account: &PickedAccount, uri: &str) -> Result<String, String> {
+    resolve_resource_url_until(account,uri,super::native_io::Budget::new(std::time::Duration::from_secs(20)))
+}
+pub(super) fn resolve_resource_url_until(account:&PickedAccount,uri:&str,budget:super::native_io::Budget)->Result<String,String> {
     let url = format!("{}{}", AGENT_HOST, "/api/ide/v1/get_resource_url");
     let body = serde_json::json!({ "uri_list": [uri] });
     let trace = now_id("trace");
     let trace_short = trace.chars().take(32).collect::<String>();
-    let response = super::video_protocol::post(&super::streaming_agent(), &url)
+    let response = super::video_protocol::post(&budget.agent()?, &url).timeout(budget.remaining()?)
         .set("content-type", "application/json")
         .set("accept", "*/*")
         .set("user-agent", "TraeClient/TTNet")
@@ -1241,11 +1248,10 @@ pub(super) fn resolve_resource_url(account: &PickedAccount, uri: &str) -> Result
         .set("x-ide-version-type", "stable")
         .set("x-custom-trace-id", &trace_short)
         .send_json(body)
-        .map_err(|error| format!("获取视频资源地址失败: {error}"))?;
-    let value: Value = response
-        .into_json()
-        .map_err(|error| format!("解析视频资源地址失败: {error}"))?;
-    value
+        .map_err(|_| "native_resource_lookup_failed")?;
+    let value=super::native_io::json(response)?;
+    super::trae_resource_upload::validate_acknowledgement(&value).map_err(|_|"native_resource_lookup_failed")?;
+    value.get("data").unwrap_or(&value)
         .get("url_map")
         .and_then(|map| map.get(uri))
         .and_then(Value::as_str)
