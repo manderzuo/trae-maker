@@ -179,6 +179,7 @@ fn build_commit_payload_for(
 }
 
 fn parse_upload_url_response(value: &Value) -> Result<UploadPlan, NativeUploadError> {
+    validate_acknowledgement(value)?;
     let data = value.get("data").unwrap_or(value);
     let upload_host = data
         .get("upload_hosts")
@@ -263,10 +264,20 @@ fn request_error(status: u16, body: &str, context: &str) -> NativeUploadError {
     )
 }
 
-fn common_request(account: &PickedAccount, path: &str) -> ureq::Request {
+pub(super) fn validate_acknowledgement(value: &Value) -> Result<(), NativeUploadError> {
+    let success = value.is_object() && value.get("error").is_none()
+        && [value.get("code"), value.pointer("/BaseResp/StatusCode")].into_iter().flatten()
+            .all(|code| code.as_i64() == Some(0) || code.as_str() == Some("0"));
+    if success {Ok(())} else {Err(NativeUploadError::new("reference_resource_unavailable", false))}
+}
+
+pub(super) fn common_request(account: &PickedAccount, path: &str) -> ureq::Request {
+    common_request_with_agent(account,path,&streaming_agent())
+}
+pub(super) fn common_request_with_agent(account: &PickedAccount, path: &str, agent:&ureq::Agent) -> ureq::Request {
     let url = format!("{AGENT_HOST}{path}");
     let referer = format!("{REFERER_BASE}{path}");
-    super::video_protocol::post(&streaming_agent(), &url)
+    super::video_protocol::post(agent, &url)
         .set("content-type", "application/json")
         .set("accept", "*/*")
         .set("user-agent", "TraeClient/TTNet")
@@ -398,7 +409,9 @@ fn commit_upload_for(
     let response = common_request(account, "/api/ide/v1/commit_resource_upload_result")
         .send_json(build_commit_payload_for(&plan.store_uri, Some(session_key), biz_type));
     match response {
-        Ok(response) if (200..300).contains(&response.status()) => Ok(()),
+        Ok(response) if (200..300).contains(&response.status()) => response.into_json::<Value>()
+            .map_err(|_| NativeUploadError::new("reference_resource_unavailable", false))
+            .and_then(|value| validate_acknowledgement(&value)),
         Ok(response) => {
             let status = response.status();
             let text = response.into_string().unwrap_or_default();
@@ -512,6 +525,23 @@ fn detect_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resource_preflight_rejects_logical_failure_even_with_an_upload_plan() {
+        let rejected = serde_json::json!({"code":1003,"message":"fixture-private-provider-text",
+            "data":{"upload_hosts":["upload.invalid"],"store_infos":[{"auth":"fixture","store_uri":"tos-bucket/image/fixture.trae"}]}});
+        assert!(parse_upload_url_response(&rejected).is_err(),"HTTP 200 is not an upload acknowledgement");
+    }
+    #[test]
+    fn resource_preflight_checks_commit_acknowledgements_without_copying_provider_text() {
+        for value in [serde_json::json!({"code":1003,"message":"private-provider-body"}),
+            serde_json::json!({"BaseResp":{"StatusCode":401}}),serde_json::json!({"code":null}),
+            serde_json::json!({"error":{"message":"private-provider-body"}}),serde_json::json!([])] {
+            let err=validate_acknowledgement(&value).unwrap_err();
+            assert_eq!(err.message,"reference_resource_unavailable");assert!(!err.retryable_account);
+        }
+        for value in [serde_json::json!({}),serde_json::json!({"code":0}),serde_json::json!({"code":"0"}),
+            serde_json::json!({"BaseResp":{"StatusCode":0}})] {assert!(validate_acknowledgement(&value).is_ok());}
+    }
     #[test]
     fn uploaded_video_resources_keep_the_verified_adapter_identity() {
         let account=PickedAccount {uid:"fixture-user".into(),jwt:"fixture-token".into(),

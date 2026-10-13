@@ -85,7 +85,9 @@ impl PreparationSource for NativePreparationSource<'_> {
             // Core verifies user ownership before upload. The upstream asset
             // copy is owned by the authenticated bridge credential, not by the
             // opaque Core Key mirror used only for execution/billing identity.
-            let value=super::video::prepare_native_request(&self.0.data_dir,self.1,body,account).map_err(|_|"reference_preparation_failed")?;
+            let value=super::video::prepare_native_request(&self.0.data_dir,self.1,body,account).map_err(|e| {
+                if e.message=="reference_resource_unavailable" {"reference_resource_unavailable"} else {"reference_preparation_failed"}
+            })?;
             Ok(super::video::build_request_body(&value))
         } else {
             if !body["model"].as_str().is_some_and(|m|super::payload::model_config(m).is_some()) {

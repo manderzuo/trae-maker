@@ -74,7 +74,7 @@ fn allow_insecure_asset_base() -> bool {
     )
 }
 
-fn private_or_reserved_host(host: &str) -> bool {
+pub(super) fn private_or_reserved_host(host: &str) -> bool {
     let ip_host = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = ip_host.parse::<IpAddr>() {
         return match ip {
@@ -192,7 +192,7 @@ fn public_base_url(data_dir: &Path) -> Result<String, String> {
     validate_public_base_url(&raw, allow_insecure_asset_base())
 }
 
-fn detect_format(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+pub(super) fn detect_format(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Some(("image/png", "png"));
     }

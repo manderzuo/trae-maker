@@ -693,15 +693,18 @@ pub fn prepare_native_request(
             let (record, bytes) = super::assets::read_owned(data_dir, owner_key_id, id)
                 .map_err(|error| NativeUploadError::new(format!("{label}素材 {id} 无法读取：{error}"), false))?;
             let uri = trae_resource_upload::upload_asset(account, &record, &bytes)
-                .map_err(|error| NativeUploadError::new(
-                    format!("{label}素材 {id} 原生上传失败：{}", error.message),
-                    error.retryable_account,
-                ))?;
+                .map_err(|error| {
+                    if error.message=="reference_resource_unavailable" {error} else {NativeUploadError::new(
+                        format!("{label}素材 {id} 原生上传失败：{}", error.message), error.retryable_account,
+                    )}
+                })?;
             output.push(uri);
         }
     }
-    build_native_request_with_uris(input, &image_uris, &video_uris)
-        .map_err(|error| NativeUploadError::new(error, false))
+    let body = build_native_request_with_uris(input, &image_uris, &video_uris)
+        .map_err(|error| NativeUploadError::new(error, false))?;
+    super::reference_readiness::check(account, &body)?;
+    Ok(body)
 }
 
 pub fn create_pending_for(model: String, prompt: String, owner_key_id: &str) -> VideoTask {
