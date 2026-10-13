@@ -34,7 +34,7 @@ impl PreparationSource for NativePreparationSource<'_> {
     }
     fn capacity(&self,account:&PickedAccount)->Result<Vec<Value>,String> {
         let agent=self.2.capped(std::time::Duration::from_secs(15)).agent().map_err(|_|"budget_policy_expired")?;
-        crate::commands::accounts::query_ent_packs_with_agent(&agent,&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id.clone(),..Default::default()})
+        crate::commands::accounts::query_ent_packs_bounded_with_agent(&agent,&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id.clone(),..Default::default()})
             .map_err(|error| {
                 // Only closed diagnostic classes enter logs; raw upstream
                 // response text may contain account or credential material.

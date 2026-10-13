@@ -170,6 +170,11 @@ mod tests {
         let account=PickedAccount {uid:String::new(),jwt:input["jwt"].as_str().unwrap().into(),
             device_id:input["device"].as_str().unwrap().into(),machine_id:input["device"].as_str().unwrap().into(),
             domain:String::new(),enterprise_id:String::new(),global_region:false};
+        let agent=super::super::native_metadata_agent(Duration::from_secs(15)).unwrap();
+        let capacity=crate::commands::accounts::query_ent_packs_bounded_with_agent(&agent,&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id.clone(),..Default::default()});
+        assert!(capacity.is_ok(),"bounded native capacity read failed");
+        let resolved=super::super::video::resolve_resource_url_until(&account,input["resource"].as_str().unwrap(),super::super::native_io::Budget::new(Duration::from_secs(20)));
+        assert!(resolved.is_ok(),"bounded native TLS resource lookup failed");
         check(&account,&serde_json::json!({"image_urls":[input["resource"]]})).unwrap();
     }
 }

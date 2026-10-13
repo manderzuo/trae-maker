@@ -299,9 +299,16 @@ pub(crate) fn extract_uploaded(data_dir: &Path, bytes: &[u8]) -> Result<FrameArt
         return Err("frame_source_invalid".into());
     }
     let extractor=configured_extractor(data_dir)?;
+    with_uploaded_source(data_dir,bytes,|path|extract_last(data_dir,path,&extractor))
+}
+fn with_uploaded_source<T>(data_dir:&Path,bytes:&[u8],consume:impl FnOnce(&Path)->Result<T,String>)->Result<T,String> {
     let root=super::video_store::storage_dir(data_dir);
     fs::create_dir_all(&root).map_err(|_|"frame_source_unavailable")?;
     let path=root.join(format!("reference-frame-{:032x}.mp4",rand::random::<u128>()));
+    // Own the name before creation; keep protection through write, extraction
+    // and Source's cleanup, including all error/unwind paths.
+    let _cache=super::video_cache::Lease::acquire(&path).map_err(|_|"frame_source_unavailable")?;
+    let _reservation=super::video_cache::Reservation::acquire(data_dir,&path,bytes.len() as u64,super::video_cache::LIMITS).map_err(|_|"frame_source_unavailable")?;
     struct Source(PathBuf);
     impl Drop for Source {fn drop(&mut self) {let _=fs::remove_file(&self.0);}}
     let mut file=OpenOptions::new().create_new(true).write(true).open(&path).map_err(|_|"frame_source_unavailable")?;
@@ -309,7 +316,7 @@ pub(crate) fn extract_uploaded(data_dir: &Path, bytes: &[u8]) -> Result<FrameArt
     let written=file.write_all(bytes).and_then(|_|file.sync_all());
     drop(file);
     written.map_err(|_|"frame_source_unavailable")?;
-    extract_last(data_dir,&source.0,&extractor)
+    consume(&source.0)
 }
 fn extract_with_timeout(
     data_dir: &Path,
@@ -498,6 +505,17 @@ fn extract_with_timeout(
 pub(crate) mod tests {
     use super::*;
     use std::{path::PathBuf, process::Command};
+    #[test]
+    fn cache_demand_uploaded_frame_source_is_owned_before_extractor_lease() {
+        let root=std::env::temp_dir().join(format!("aiwork-cache-demand-uploaded-{:032x}",rand::random::<u128>()));
+        let result=with_uploaded_source(&root,b"fixture",|path| {
+            assert!(path.exists());
+            let mut sweep=super::super::video_cache::Sweep::default();
+            assert_eq!(sweep.step(&root,0,super::super::video_cache::Limits {bytes:0,files:0}),0,"staged source must already be protected before extraction starts");
+            assert_eq!(fs::read(path).unwrap(),b"fixture");Err::<(),_>("fixture extraction failed".into())
+        });
+        assert_eq!(result.unwrap_err(),"fixture extraction failed");assert_eq!(fs::read_dir(super::super::video_store::storage_dir(&root)).unwrap().count(),0);fs::remove_dir_all(root).unwrap();
+    }
     pub(crate) struct Fixture(pub(crate) PathBuf, pub(crate) PathBuf);
     impl Fixture {
         pub(crate) fn new() -> Self {

@@ -108,6 +108,12 @@ pub fn ide_query_post(
     dev: &DeviceEntry,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    ide_query_post_inner(agent,url,jwt,dev,body,false)
+}
+fn ide_query_post_inner(
+    agent: &ureq::Agent, url: &str, jwt: &str, dev: &DeviceEntry,
+    body: serde_json::Value, bounded: bool,
+) -> Result<serde_json::Value, String> {
     let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
         jwt.to_string()
     } else {
@@ -141,6 +147,19 @@ pub fn ide_query_post(
         if !sid.is_empty() {
             req = req.set("vscode-sessionid", sid);
         }
+    }
+    if bounded {
+        use std::io::Read;
+        // Bridge capacity evidence is small metadata. Error bodies are not
+        // needed for admission and must never enter credential-bearing logs.
+        let response=req.send_json(body).map_err(|error|match error {
+            ureq::Error::Status(code,_)=>format!("API 请求失败: status code {code}"),
+            _=>"capacity_request_failed".to_string(),
+        })?;
+        let mut bytes=Vec::new();
+        response.into_reader().take(256*1024+1).read_to_end(&mut bytes).map_err(|_|"capacity_response_read_failed")?;
+        if bytes.len()>256*1024 {return Err("capacity_response_too_large".into());}
+        return serde_json::from_slice(&bytes).map_err(|_|"capacity_response_invalid".into());
     }
     let resp = req.send_json(body).map_err(|e| match e {
         // HTTP 错误：读出响应体附带服务端错误码（区分 token 过期/吊销/风控）
@@ -924,15 +943,22 @@ fn account_device_view(map: &DeviceMap, uid: &str) -> Option<String> {
 /// Budget admission/background reconciliation must not occupy a worker for the
 /// desktop refresher's full 120 second timeout.
 pub(crate) fn query_ent_packs_for_bridge(jwt:&str,dev:&DeviceEntry)->Result<Vec<serde_json::Value>,String> {
-    query_ent_packs_with_agent(&ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build(),jwt,dev)
+    query_ent_packs_bounded_with_agent(&crate::api_server::native_metadata_agent(std::time::Duration::from_secs(15))?,jwt,dev)
 }
-pub(crate) fn query_ent_packs_with_agent(agent:&ureq::Agent,jwt:&str,dev:&DeviceEntry)->Result<Vec<serde_json::Value>,String> {
-    let body = ide_query_post(
+fn query_ent_packs_with_agent(agent:&ureq::Agent,jwt:&str,dev:&DeviceEntry)->Result<Vec<serde_json::Value>,String> {
+    query_ent_packs_at(agent,"https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage",jwt,dev,false)
+}
+pub(crate) fn query_ent_packs_bounded_with_agent(agent:&ureq::Agent,jwt:&str,dev:&DeviceEntry)->Result<Vec<serde_json::Value>,String> {
+    query_ent_packs_at(agent,"https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage",jwt,dev,true)
+}
+fn query_ent_packs_at(agent:&ureq::Agent,url:&str,jwt:&str,dev:&DeviceEntry,bounded:bool)->Result<Vec<serde_json::Value>,String> {
+    let body = ide_query_post_inner(
         agent,
-        "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage",
+        url,
         jwt,
         dev,
         ureq::json!({"require_usage": true, "req_source": 2}),
+        bounded,
     )?;
 
     // F-49 宽容解析：字段可能被 data 等包裹键包裹，dig 自动下钻
@@ -1966,6 +1992,31 @@ pub fn resolve_user_ids(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capacity_reply_limit_bounds_success_json_and_discards_private_error_body() {
+        use std::{io::{Read,Write},net::TcpListener,thread,time::Duration};
+        for (status,large) in [(200,false),(200,true),(401,true)] {
+            let listener=TcpListener::bind("127.0.0.1:0").unwrap();let url=format!("http://{}/capacity",listener.local_addr().unwrap());
+            let body=if status==200 {format!("{{\"user_entitlement_pack_list\":[],\"large\":\"{}\"}}","x".repeat(if large {256*1024} else {1}))}else{format!("fixture-private-provider-body-{}","x".repeat(256*1024))};
+            let worker=thread::spawn(move||{
+                let(mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut request=Vec::new();let mut chunk=[0;4096];
+                loop {
+                    let n=stream.read(&mut chunk).unwrap();if n==0{return;}request.extend_from_slice(&chunk[..n]);
+                    if let Some(end)=request.windows(4).position(|v|v==b"\r\n\r\n") {
+                        let headers=String::from_utf8_lossy(&request[..end]);
+                        let length=headers.lines().find_map(|line|line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s|s.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if request.len()>=end+4+length {break;}
+                    }
+                }
+                let _=write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);let _=stream.flush();
+            });
+            let reply=super::query_ent_packs_at(&ureq::AgentBuilder::new().timeout(Duration::from_secs(2)).build(),&url,"fixture",&Default::default(),true);worker.join().unwrap();
+            if !large {assert!(reply.is_ok(),"small valid capacity response must succeed: {reply:?}");continue;}
+            assert!(reply.is_err(),"bridge capacity metadata must reject oversized success bodies");
+            assert!(!reply.err().unwrap().contains("fixture-private-provider-body"),"provider error payload must not enter diagnostics");
+        }
+    }
     use super::*;
 
     #[test]

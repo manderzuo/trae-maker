@@ -54,6 +54,9 @@ mod video_protocol;
 mod video_stream;
 mod reference_readiness;
 mod native_io;
+pub(crate) fn native_metadata_agent(timeout:std::time::Duration)->Result<ureq::Agent,String> {
+    native_io::Budget::new(timeout).agent()
+}
 mod video_cache;
 pub(crate) mod video_capabilities;
 pub(crate) mod bridge_capacity_grants;

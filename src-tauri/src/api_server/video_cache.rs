@@ -50,6 +50,10 @@ impl Drop for Lease {
         }
     }
 }
+fn leased(path:&Path)->bool {
+    let Ok(key)=key(path) else{return true};
+    LEASES.get_or_init(Default::default).lock().unwrap_or_else(|e|e.into_inner()).contains_key(&key)
+}
 pub(super) fn remove_unleased(root: &Path, path: &Path) -> bool {
     let Ok(key) = key(path) else { return false };
     let all = LEASES
@@ -151,6 +155,9 @@ impl Reservation {
         bytes: u64,
         limits: Limits,
     ) -> Result<Self, String> {
+        Self::acquire_with_space(root,path,bytes,limits,&free_space)
+    }
+    fn acquire_with_space(root:&Path,path:&Path,bytes:u64,limits:Limits,space:&impl Fn(&Path)->Result<u64,String>)->Result<Self,String> {
         let path = key(path)?;
         let dir = super::video_store::storage_dir(root)
             .canonicalize()
@@ -174,7 +181,11 @@ impl Reservation {
             total = total.saturating_add(*n);
             count += 1;
         }
-        check_disk_space(free_space(&dir)?, total.saturating_sub(bytes), bytes)?;
+        let pending=total.saturating_sub(bytes);
+        if total>limits.bytes || count>limits.files {return Err("artifact_cache_full".into());}
+        check_disk_space(u64::MAX,pending,bytes)?; // reject impossible/overflowed demand without evicting
+        let mut available=space(&dir)?;
+        let mut candidates=BinaryHeap::new();
         // Bound admission inventory too; excessive directories wait for cleanup.
         for (index, entry) in fs::read_dir(&dir)
             .map_err(|_| "artifact cache unavailable")?
@@ -200,8 +211,26 @@ impl Reservation {
             }
             total = total.saturating_add(metadata.len());
             count += 1;
+            // Active entries do not occupy the bounded candidate set. Recheck
+            // under the same lease lock at removal, since ownership can change.
+            if !leased(&candidate) && !reserved.contains_key(&key(&candidate)?) {
+                let modified=metadata.modified().ok().and_then(|t|t.duration_since(UNIX_EPOCH).ok()).map_or(u64::MAX,|d|d.as_secs());
+                candidates.push((modified,candidate,metadata.len()));if candidates.len()>128 {candidates.pop();}
+            }
         }
-        if total > limits.bytes || count > limits.files {
+        // The new reservation, including other not-yet-published downloads,
+        // drives eviction even when current inventory is exactly at its limit
+        // or free space is still above the idle maintenance watermark.
+        for (_,candidate,size) in candidates.into_sorted_vec() {
+            if total<=limits.bytes && count<=limits.files && check_disk_space(available,pending,bytes).is_ok(){break;}
+            if remove_unleased(root,&candidate) {
+                total=total.saturating_sub(size);count=count.saturating_sub(1);
+                // Actual free space may differ from logical file length (sparse
+                // files, delayed unlink, outside writers). Never invent headroom.
+                available=space(&dir)?;
+            }
+        }
+        if total > limits.bytes || count > limits.files || check_disk_space(available,pending,bytes).is_err() {
             return Err("artifact_cache_full".into());
         }
         reserved.insert(path.clone(), bytes);
@@ -269,9 +298,11 @@ impl Sweep {
             }
             self.bytes = self.bytes.saturating_add(meta.len());
             self.files += 1;
-            self.oldest.push((modified, path, meta.len()));
-            if self.oldest.len() > 128 {
-                self.oldest.pop();
+            if !leased(&path) {
+                self.oldest.push((modified, path, meta.len()));
+                if self.oldest.len() > 128 {
+                    self.oldest.pop();
+                }
             }
         }
         let mut available = free_space(&super::video_store::storage_dir(root)).unwrap_or(u64::MAX);
@@ -422,7 +453,6 @@ mod tests {
             bytes: 10,
             files: 10,
         };
-        assert!(Reservation::acquire(&root, &dir.join("third.mp4"), 3, limits).is_err());
         assert_eq!(Sweep::default().step(&root, 0, limits), 1);
         assert!(first.exists());
         assert!(!second.exists());
@@ -446,5 +476,43 @@ mod tests {
             check_disk_space(u64::MAX, u64::MAX, 1).is_err(),
             "overflow must not invent space"
         );
+    }
+    #[test]
+    fn cache_demand_admits_at_file_limit_without_waiting_for_retention() {
+        let root=std::env::temp_dir().join(format!("aiwork-cache-demand-files-{:032x}",rand::random::<u128>()));
+        let dir=super::super::video_store::storage_dir(&root);fs::create_dir_all(&dir).unwrap();
+        let active=dir.join("active.mp4");let idle=dir.join("idle.mp4");fs::write(&active,b"a").unwrap();fs::write(&idle,b"b").unwrap();
+        let held=Lease::acquire(&active).unwrap();
+        let admitted=Reservation::acquire(&root,&dir.join("new.mp4"),1,Limits {bytes:100,files:2});
+        assert!(admitted.is_ok(),"new demand must reclaim an idle file at the equality boundary");
+        assert!(active.exists());assert!(!idle.exists());drop(admitted);drop(held);fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cache_demand_reclaims_disk_headroom_for_new_and_pending_downloads() {
+        let root=std::env::temp_dir().join(format!("aiwork-cache-demand-space-{:032x}",rand::random::<u128>()));
+        let dir=super::super::video_store::storage_dir(&root);fs::create_dir_all(&dir).unwrap();let idle=dir.join("idle.mp4");fs::write(&idle,b"12").unwrap();
+        let space=|_:&Path|Ok(DISK_RESERVE+if idle.exists(){9}else{11});let limits=Limits {bytes:100,files:10};
+        let first=Reservation::acquire_with_space(&root,&dir.join("first.mp4"),4,limits,&space).unwrap();assert!(idle.exists());
+        let second=Reservation::acquire_with_space(&root,&dir.join("second.mp4"),6,limits,&space);
+        assert!(second.is_ok(),"free space above the watermark can still require demand-driven eviction");assert!(!idle.exists());
+        assert!(Reservation::acquire_with_space(&root,&dir.join("third.mp4"),2,limits,&space).is_err(),"accepted reservations remain exclusive");
+        drop(second);drop(first);fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cache_demand_eviction_is_bounded_and_retry_makes_progress() {
+        let root=std::env::temp_dir().join(format!("aiwork-cache-demand-batch-{:032x}",rand::random::<u128>()));
+        let dir=super::super::video_store::storage_dir(&root);fs::create_dir_all(&dir).unwrap();for i in 0..200 {fs::write(dir.join(format!("file-{i}.mp4")),b"x").unwrap();}
+        let limits=Limits {bytes:1000,files:1};let target=dir.join("new.mp4");assert!(Reservation::acquire(&root,&target,1,limits).is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(),72,"one attempt removes at most 128 candidates");
+        assert!(Reservation::acquire(&root,&target,1,limits).is_ok(),"the next bounded attempt completes admission");fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cache_demand_sweep_passes_a_full_oldest_page_of_active_files() {
+        let root=std::env::temp_dir().join(format!("aiwork-cache-demand-leases-{:032x}",rand::random::<u128>()));
+        let dir=super::super::video_store::storage_dir(&root);fs::create_dir_all(&dir).unwrap();let mut leases=Vec::new();
+        for i in 0..128 {let path=dir.join(format!("active-{i}.mp4"));fs::write(&path,b"a").unwrap();File::options().write(true).open(&path).unwrap().set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH+Duration::from_secs(1))).unwrap();leases.push(Lease::acquire(&path).unwrap());}
+        let idle=dir.join("newer-idle.mp4");fs::write(&idle,b"b").unwrap();let mut sweep=Sweep::default();
+        assert_eq!(sweep.step(&root,0,Limits {bytes:128,files:128}),1,"active oldest entries must not hide eligible later files");
+        assert!(!idle.exists());assert_eq!(fs::read_dir(&dir).unwrap().count(),128);drop(leases);fs::remove_dir_all(root).unwrap();
     }
 }
