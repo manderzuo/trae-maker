@@ -30,6 +30,7 @@
 
 - [x] Add failing upload-acknowledgement, resource-URL, bounded media-probe and deadline tests; implement the adapter preflight in `trae_resource_upload.rs` and call it during native preparation.
 - [x] Add failing Core feedback and replay/status tests plus Studio failure persistence tests; implement closed `reference_resource_unavailable` and `reference_resource_download_failed` codes.
-- [ ] Run focused regressions and offline builds; request an independent review; deploy with ledger/config preservation and publish the affected repositories.
-- [ ] Record what was verified and explicitly retain the upper-service expiry limitation.
+- [x] Run focused regressions and offline builds; request an independent review; deploy with ledger/config preservation and publish the affected repositories.
+- [x] Record what was verified and explicitly retain the upper-service expiry limitation.
+
 

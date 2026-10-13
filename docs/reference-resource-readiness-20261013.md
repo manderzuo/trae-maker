@@ -18,9 +18,21 @@
 
 ## 验证
 
-观察到原逻辑错误上传响应、Core 未终止执行、Studio 同步拒绝被误报未知等回归先失败再通过。AI Work 7 项素材预检回归、Core 85 项反馈/准入/重连回归、Studio 101 项客户端回归及 18 项隔离 PostgreSQL 云端任务回归通过；TypeScript 类型检查和改动范围 lint 通过。Windows AI Work 与 Linux Core使用已有离线依赖构建。
+观察到原逻辑错误上传响应、Core 未终止执行、Studio 同步拒绝被误报未知等回归先失败再通过。AI Work 37 项准备/上传/预检回归、Core 85 项反馈/准入/重连回归、Studio 103 项客户端回归及 18 项隔离 PostgreSQL 云端任务回归通过，合计 243 项相关回归；TypeScript 类型检查和改动范围 lint 通过。Windows AI Work 与 Linux Core 使用已有离线依赖构建。
 
 原失败任务和成功对照任务的素材各通过一次实际生产预检代码的只读调用。凭据文件字节未变，新增视频生成调用为零。
+
+## 运行发布
+
+2026-10-13 已更新执行网关、Core、Studio 后端及桌面/手机入口，健康检查和所有静态资源摘要校验通过。旧静态资源保留，线上 Studio 后端原构建与仓库基线的 SHA256 完全一致后才替换；没有数据库迁移或旧账本回放。
+
+- AI Work 应用来源 `7d8ad9eb9b524185adfb4c9e6247e1329d49cede`，运行二进制 SHA256 `1fbf1df0ecc3873e596bb66bb5305cc2ee248cae0c184a4a0bebb3a4fa3f9010`。
+- Core 应用来源 `cdeed772c24fbc6d1bb7231a470cf096a9a7b9b3`，Linux 二进制 SHA256 `d854064ee0e7cd183fc1b397e3913fdee561f54a7c799c62504c492151d0287e`。
+- Studio 应用来源 `93a6b2b92b49f38df754b76d086b365b77c1be3b`，后端目录 `cloud-reference-readiness-93a6b2b92b49`，桌面/手机入口资源分别为 `index-sV2ZrfGm.js` / `index-CAORWbcg.js`。后续文档和测试提交不改变这些应用代码。
+
+15 张受保护表包含所有执行身份、准备原文、发送意图和财务事实，激活前后完全一致；1 条 P、22 条 R、486 条 D 保留，五份运行配置摘要一致。Studio 运行配置和 keyring 字节未变。首次离线恢复因既有未知任务的 P 占用被守卫拒绝，按已有在线恢复流程启用服务；没有放宽离线守卫、清除预占或回放数据库。
+
+原失败任务经原冻结配置与原密钥 GET 查询得到 `failed / reference_resource_download_failed / pending`，Studio 云端已保存相同具体原因。原视频派发次数仍为 1，185 积分是预留，实际视频费用仍未知。没有新增付费生成来替代原任务。
 
 ## 限制
 
