@@ -6,8 +6,7 @@ pub(super) fn owned_reference_seconds(root:&std::path::Path,owner:&str,body:&ser
     let mut total=0u64;
     for (field,mime) in [("image_asset_ids","image/"),("video_asset_ids","video/")] {
         for id in body[field].as_array().into_iter().flatten() {
-            let (record,bytes)=super::assets::read_owned(root,owner,id.as_str().ok_or(INVALID)?)
-                .map_err(|_|"reference_asset_unavailable")?;
+            let (record,bytes)=super::assets::read_owned(root,owner,id.as_str().ok_or(INVALID)?)?;
             if !record.mime_type.starts_with(mime) {return Err("reference_asset_type_mismatch".into());}
             if field=="video_asset_ids" {
                 if record.mime_type!="video/mp4" {return Err("reference_video_format_unsupported".into());}
@@ -312,7 +311,7 @@ mod tests {
             let body=serde_json::json!({"video_asset_ids":[asset.id]});
             assert_eq!(owned_reference_seconds(&f.0,"owner",&body).unwrap(),Some(seconds));
             assert_eq!(super::super::assets::read_owned(&f.0,"owner",&asset.id).unwrap().1,bytes);
-            assert_eq!(owned_reference_seconds(&f.0,"other-key",&body).unwrap_err(),"reference_asset_unavailable");
+            assert_eq!(owned_reference_seconds(&f.0,"other-key",&body).unwrap_err(),"reference_asset_missing");
         }
     }
     #[test]

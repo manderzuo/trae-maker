@@ -159,6 +159,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/internal/bridge/v2/requests/:request_id/content", get(super::bridge_v2_api::content))
         .route("/internal/bridge/v2/requests/:request_id/last-frame", post(super::bridge_v2_api::last_frame))
         .route("/internal/bridge/v2/reference-last-frame", post(super::bridge_v2_api::reference_last_frame))
+        .route("/internal/bridge/v2/reference-assets/restore", post(super::bridge_v2_api::restore_reference).layer(DefaultBodyLimit::max(46*1024*1024)))
         .route("/internal/bridge/v2/requests/:request_id/billing", get(super::bridge_v2_api::billing))
         .route("/internal/bridge/v2/requests/:request_id/refresh", post(super::bridge_v2_api::refresh))
         .route("/internal/bridge/v2/receipt-events", get(super::bridge_v2_api::events))
@@ -336,6 +337,18 @@ mod tests {
         assert_eq!(store.connection.query_row("SELECT COUNT(*) FROM bridge_prepared_budgets",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         let files=std::fs::read_dir(super::super::video_store::storage_dir(&f.dir)).unwrap().count();
         assert_eq!(files,0,"temporary uploaded source must be removed on success and decode failure");
+    }
+
+    #[tokio::test]
+    async fn reference_restore_requires_bridge_auth_and_never_creates_budget() {
+        use base64::Engine;use sha2::{Digest,Sha256};
+        let mut f=BridgeFixture::new();let app=f.take_app();let bytes=b"\x89PNG\r\n\x1a\nrestored";
+        let body=serde_json::json!({"id":"asset-frozen-test","filename":"ref.png","mime_type":"image/png","sha256":format!("{:x}",Sha256::digest(bytes)),"data_base64":base64::engine::general_purpose::STANDARD.encode(bytes)});
+        let request=|auth:bool|{let mut b=Request::post("/internal/bridge/v2/reference-assets/restore").header("content-type","application/json");if auth {b=b.header("authorization",format!("Bearer {}",f.key));}b.body(Body::from(body.to_string())).unwrap()};
+        assert_eq!(app.clone().oneshot(request(false)).await.unwrap().status(),StatusCode::FORBIDDEN);
+        for _ in 0..2 {assert_eq!(app.clone().oneshot(request(true)).await.unwrap().status(),StatusCode::OK);}
+        let store=super::super::bridge_billing::BridgeBillingStore::open(&f.dir).unwrap();
+        assert_eq!(store.connection.query_row("SELECT COUNT(*) FROM bridge_prepared_budgets",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
 
     #[tokio::test]

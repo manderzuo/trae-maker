@@ -8,6 +8,27 @@ use super::{ApiSharedState, bridge_billing::BridgeBillingStore, bridge_prepared:
 #[derive(Deserialize)]
 pub(crate) struct BudgetQuery { budget_id: String }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReferenceRestore {id:String,filename:String,mime_type:String,sha256:String,data_base64:String}
+pub(super) async fn restore_reference(State(state):State<Arc<ApiSharedState>>,
+    axum::Extension(bridge_key):axum::Extension<super::usage::KeyId>,Json(input):Json<ReferenceRestore>)->Response {
+    static SLOTS:std::sync::OnceLock<Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
+    let slots=SLOTS.get_or_init(||Arc::new(tokio::sync::Semaphore::new(2))).clone();
+    let permit=match slots.try_acquire_owned(){Ok(p)=>p,Err(_)=>return error(StatusCode::TOO_MANY_REQUESTS,"reference_asset_unavailable")};
+    match tokio::task::spawn_blocking(move||{
+        use base64::Engine;
+        let _permit=permit;
+        let bytes=base64::engine::general_purpose::STANDARD.decode(&input.data_base64).map_err(|_|"invalid_reference_restore".to_owned())?;
+        super::assets::restore_reference(&state.data_dir,&bridge_key.0,&input.id,&input.filename,&input.mime_type,&input.sha256,&bytes)
+    }).await {
+        Ok(Ok(r))=>Json(json!({"id":r.id,"sha256":r.sha256,"size":r.size})).into_response(),
+        Ok(Err(code)) if code=="invalid_reference_restore"=>error(StatusCode::BAD_REQUEST,&code),
+        Ok(Err(code)) if code=="reference_restore_conflict"=>error(StatusCode::CONFLICT,&code),
+        _=>error(StatusCode::SERVICE_UNAVAILABLE,"reference_asset_unavailable"),
+    }
+}
+
 /// Authenticated readiness check: no media, budget, upstream I/O or paid work.
 pub(super) async fn frame_extractor_health(State(state):State<Arc<ApiSharedState>>)->Response {
     static SLOTS:std::sync::OnceLock<Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
@@ -119,7 +140,8 @@ pub(super) async fn prepare(State(state):State<Arc<ApiSharedState>>,
                 "budget_policy_unconfigured"|"budget_policy_expired"|"upstream_account_unavailable"|"upstream_capacity_insufficient"|
                 "upstream_capacity_unavailable"|"native_estimate_unavailable"|"bridge_recovery_required"=>reason.as_str(),
                 "reference_video_budget_metadata_required"|"reference_video_metadata_invalid"|
-                "reference_video_format_unsupported"|"reference_asset_type_mismatch"|"reference_asset_unavailable"|"reference_resource_unavailable"=>return error(StatusCode::BAD_REQUEST,&reason),
+                "reference_video_format_unsupported"|"reference_asset_type_mismatch"|"reference_asset_missing"|"reference_asset_expired"|"reference_resource_unavailable"=>return error(StatusCode::BAD_REQUEST,&reason),
+                "reference_asset_unavailable"=>return error(StatusCode::SERVICE_UNAVAILABLE,&reason),
                 "budget_preparation_busy"=>return error(StatusCode::CONFLICT,"budget_preparation_busy"),
                 "prepared request identity conflict"=>return error(StatusCode::CONFLICT,"budget_identity_conflict"),
                 "invalid_budget_business_request"=>return error(StatusCode::BAD_REQUEST,"invalid_budget_business_request"),

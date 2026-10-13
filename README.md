@@ -114,4 +114,5 @@ python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64
 - [迁移交付与验证](docs/trae-cn-migration-validation-2026-10-12.md) — 分阶段运行版本、实际检查与恢复要求
 - [视频迁移修复与验收](docs/video-migration-repair-20261012.md) — Schema9、新积分包准入、三种视频路径及真实结算
 - [仓库同步与交接](docs/repository-sync-20261012.md) — 三个仓库的默认分支、修复代码和运行边界
+- [生产稳定性补丁](docs/production-stability-20261013.md) — 网络时限、预算时效、素材恢复、缓存保护与运维边界
 

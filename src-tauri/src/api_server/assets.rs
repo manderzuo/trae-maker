@@ -247,6 +247,14 @@ fn load_index(data_dir: &Path) -> AssetIndex {
     index
 }
 
+fn read_index(data_dir:&Path)->Result<AssetIndex,String> {
+    match fs::read(index_path(data_dir)) {
+        Ok(bytes)=>serde_json::from_slice(&bytes).map_err(|_|"reference_asset_unavailable".into()),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(AssetIndex::default()),
+        Err(_)=>Err("reference_asset_unavailable".into()),
+    }
+}
+
 fn save_index(data_dir: &Path, index: &AssetIndex) -> Result<(), String> {
     let path = index_path(data_dir);
     if let Some(parent) = path.parent() {
@@ -567,21 +575,49 @@ pub fn read_owned(
 ) -> Result<(AssetRecord, Vec<u8>), String> {
     let _guard = index_lock().lock().unwrap_or_else(|e| e.into_inner());
     let now = now_secs();
-    let mut index = load_index(data_dir);
-    purge_expired_locked(data_dir, &mut index, now);
+    let index = read_index(data_dir)?;
     let record = index
         .assets
         .iter()
         .find(|item| item.id == asset_id.trim() && item.owner_key_id == owner_key_id.trim())
         .cloned()
-        .ok_or_else(|| "素材不存在、已过期或无权访问".to_string())?;
-    let path = file_path(data_dir, &record)?;
-    let bytes = fs::read(path).map_err(|e| format!("读取素材失败: {e}"))?;
+        .ok_or_else(|| "reference_asset_missing".to_string())?;
+    if record.expires_at<=now {return Err("reference_asset_expired".into());}
+    let path = file_path(data_dir, &record).map_err(|_|"reference_asset_unavailable")?;
+    let bytes = fs::read(path).map_err(|e| if e.kind()==std::io::ErrorKind::NotFound {"reference_asset_missing"}else{"reference_asset_unavailable"})?;
     if bytes.len() > MAX_ASSET_BYTES || bytes.len() as u64 != record.size
         || format!("{:x}", Sha256::digest(&bytes)) != record.sha256 {
-        return Err("素材内容与上传时的摘要不一致".into());
+        return Err("reference_asset_unavailable".into());
     }
     Ok((record, bytes))
+}
+
+/// Bridge administrator only: restore identical owned bytes under a frozen ID.
+/// No budget, account selection, upstream upload or dispatch occurs here.
+pub(super) fn restore_reference(data_dir:&Path,owner:&str,id:&str,filename:&str,mime:&str,sha256:&str,bytes:&[u8])->Result<AssetRecord,String> {
+    let (detected,extension)=validate_upload_bytes(filename,Some(mime),bytes).map_err(|_|"invalid_reference_restore")?;
+    let id=safe_asset_id(id).map_err(|_|"invalid_reference_restore")?;
+    let digest=format!("{:x}",Sha256::digest(bytes));
+    if owner.trim().is_empty() || sha256!=digest {return Err("invalid_reference_restore".into());}
+    let _guard=index_lock().lock().unwrap_or_else(|e|e.into_inner());
+    let mut index=read_index(data_dir)?;
+    let now=now_secs();
+    let record=if let Some(existing)=index.assets.iter().find(|r|r.id==id) {
+        if existing.owner_key_id!=owner || existing.sha256!=digest || existing.mime_type!=detected || existing.size!=bytes.len() as u64 {
+            return Err("reference_restore_conflict".into());
+        }
+        let mut record=existing.clone();record.expires_at=now.saturating_add(asset_ttl_secs());record
+    }else{AssetRecord {id:id.into(),owner_key_id:owner.into(),filename:safe_filename(filename,extension),mime_type:detected.into(),extension:extension.into(),size:bytes.len() as u64,sha256:digest,created_at:now,expires_at:now.saturating_add(asset_ttl_secs()),public_token:crate::commands::oauth::random_hex(32)}};
+    let path=file_path(data_dir,&record).map_err(|_|"reference_asset_unavailable")?;
+    match fs::read(&path) {
+        Ok(existing) if existing==bytes=>{},
+        Ok(_)=>return Err("reference_restore_conflict".into()),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{write_record_file(data_dir,&record,bytes).map_err(|_|"reference_asset_unavailable")?;},
+        Err(_)=>return Err("reference_asset_unavailable".into()),
+    }
+    index.assets.retain(|r|r.id!=id);index.assets.push(record.clone());
+    save_index(data_dir,&index).map_err(|_|"reference_asset_unavailable")?;
+    Ok(record)
 }
 
 /// 清理过期素材；返回删除的文件数。
@@ -600,6 +636,45 @@ pub fn cleanup(data_dir: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_reference_errors_distinguish_expiry_missing_and_unreadable_storage() {
+        let root=std::env::temp_dir().join(format!("reference-errors-{}",rand::random::<u64>()));
+        let bytes=b"\x89PNG\r\n\x1a\nreference";
+        let record=create(&root,"owner","ref.png",Some("image/png"),bytes).unwrap();
+        assert_eq!(read_owned(&root,"other",&record.id).unwrap_err(),"reference_asset_missing");
+        let path=file_path(&root,&record).unwrap();
+        fs::remove_file(&path).unwrap();fs::create_dir(&path).unwrap();
+        assert_eq!(read_owned(&root,"owner",&record.id).unwrap_err(),"reference_asset_unavailable");
+        fs::remove_dir(&path).unwrap();
+        assert_eq!(read_owned(&root,"owner",&record.id).unwrap_err(),"reference_asset_missing");
+        let mut index=load_index(&root);index.assets[0].expires_at=1;save_index(&root,&index).unwrap();
+        assert_eq!(read_owned(&root,"owner",&record.id).unwrap_err(),"reference_asset_expired");
+        fs::write(index_path(&root),b"broken index").unwrap();
+        assert_eq!(read_owned(&root,"owner",&record.id).unwrap_err(),"reference_asset_unavailable");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_keeps_id_content_and_owner_and_rejects_conflicts() {
+        let root=std::env::temp_dir().join(format!("reference-restore-{}",rand::random::<u64>()));
+        let bytes=b"\x89PNG\r\n\x1a\nreference";
+        let record=create(&root,"owner","ref.png",Some("image/png"),bytes).unwrap();
+        let mut index=load_index(&root);index.assets[0].expires_at=1;save_index(&root,&index).unwrap();
+        for cleaned in [false,true] {
+            if cleaned {let mut index=load_index(&root);index.assets[0].expires_at=1;save_index(&root,&index).unwrap();cleanup(&root);}
+            let result=restore_reference(&root,"owner",&record.id,"ref.png","image/png",&record.sha256,bytes).unwrap();
+            assert_eq!(result.id,record.id);assert_eq!(result.sha256,record.sha256);
+            assert_eq!(read_owned(&root,"owner",&record.id).unwrap().1,bytes);
+        }
+        assert_eq!(restore_reference(&root,"other",&record.id,"ref.png","image/png",&record.sha256,bytes).unwrap_err(),"reference_restore_conflict");
+        let changed=b"\x89PNG\r\n\x1a\nother";let sha=format!("{:x}",Sha256::digest(changed));
+        assert_eq!(restore_reference(&root,"owner",&record.id,"ref.png","image/png",&sha,changed).unwrap_err(),"reference_restore_conflict");
+        assert_eq!(restore_reference(&root,"owner","../escape","ref.png","image/png",&sha,changed).unwrap_err(),"invalid_reference_restore");
+        fs::write(index_path(&root),b"broken").unwrap();
+        assert_eq!(restore_reference(&root,"owner",&record.id,"ref.png","image/png",&record.sha256,bytes).unwrap_err(),"reference_asset_unavailable");
+        assert_eq!(fs::read(index_path(&root)).unwrap(),b"broken");fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn public_base_url_requires_https_by_default() {

@@ -89,7 +89,13 @@ impl PreparationSource for NativePreparationSource<'_> {
             // copy is owned by the authenticated bridge credential, not by the
             // opaque Core Key mirror used only for execution/billing identity.
             let value=super::video::prepare_native_request_until(&self.0.data_dir,self.1,body,account,self.2).map_err(|e| {
-                if e.message=="reference_resource_unavailable" {"reference_resource_unavailable"} else {"reference_preparation_failed"}
+                match e.message.as_str() {
+                    "reference_resource_unavailable"=>"reference_resource_unavailable",
+                    "reference_asset_missing"=>"reference_asset_missing",
+                    "reference_asset_expired"=>"reference_asset_expired",
+                    "reference_asset_unavailable"=>"reference_asset_unavailable",
+                    _=>"reference_preparation_failed",
+                }
             })?;
             Ok(super::video::build_request_body(&value))
         } else {
@@ -338,9 +344,10 @@ fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
             return Err("upstream_capacity_unavailable".into());
         }
     }
-    let live=parse_capacity(&packs,clock())?;
+    let observed_at=clock();
+    let live=parse_capacity(&packs,observed_at)?;
     let observation=if dedicated {
-        Some(super::bridge_capacity_source::PackObservation::parse(&packs,now).map_err(|_|"upstream_capacity_unavailable")?)
+        Some(super::bridge_capacity_source::PackObservation::parse(&packs,observed_at).map_err(|_|"upstream_capacity_unavailable")?)
     } else {None};
     if observation.is_some() {
         // A top-up with no outstanding debit has no receipt-triggered worker.
@@ -373,7 +380,7 @@ fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
     // Reject known insufficient capacity before account-bound asset uploads.
     // Repeat this preflight after uploads; the atomic prepare CAS remains the
     // authority when another request competes between either check and commit.
-    let preflight=|store:&mut super::bridge_billing::BridgeBillingStore,lease:&super::bridge_budget_lease::BridgeBudgetLease,live:&LiveCapacity,hold:i64,now:i64| {
+    let preflight=|store:&mut super::bridge_billing::BridgeBillingStore,lease:&super::bridge_budget_lease::BridgeBudgetLease,live:&LiveCapacity,hold:i64,now:i64,observation:Option<&super::bridge_capacity_source::PackObservation>| {
         let epoch:Option<i64>=store.connection.query_row("SELECT snapshot_epoch FROM bridge_capacity_accounts WHERE account_ref=?1",[&account.uid],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         let totals=store.capacity_totals(&account.uid)?;
         let promised=totals.pending.checked_add(totals.awaiting_receipt).and_then(|v|v.checked_add(hold)).ok_or("capacity overflow")?;
@@ -381,13 +388,18 @@ fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         if promised>available {return Err("upstream_capacity_insufficient".into());}
         let general_promised:bool=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_slots WHERE account_ref=?1 AND stage IN ('P','R') AND eligibility='general')",[&account.uid],|r|r.get(0)).map_err(|e|e.to_string())?;
         if video && general_promised && promised>live.general {return Err("upstream_capacity_insufficient".into());}
-        if epoch.is_none() {store.initialize_capacity_source(lease,&CapacitySnapshot {account_ref:account.uid.clone(),snapshot_ref:format!("native-entitlements:{now}"),epoch:1,
-            general:live.general,work:live.work,observed_at_ms:now},observation.as_ref())?;}
+        if epoch.is_none() {
+            // Snapshot and proof describe the same read, even when preflight
+            // runs later. A later clock must not invalidate a valid first anchor.
+            let observed_at=observation.map_or(now,|proof|proof.observed_at_ms);
+            store.initialize_capacity_source(lease,&CapacitySnapshot {account_ref:account.uid.clone(),snapshot_ref:format!("native-entitlements:{observed_at}"),epoch:1,
+                general:live.general,work:live.work,observed_at_ms:observed_at},observation)?;
+        }
         check_capacity(&store.connection,&CapacityReservation {budget_id:request.request_id.clone(),core_key_id:request.core_key_id.clone(),
             account_ref:account.uid.clone(),snapshot_epoch:epoch.unwrap_or(1),eligibility:if video {CapacityEligibility::GeneralOrWork} else {CapacityEligibility::GeneralOnly},hold})?;
         Ok(epoch.unwrap_or(1))
     };
-    runtime.with_store(|store,lease|preflight(store,lease,&live,hold,clock()))?;
+    runtime.with_store(|store,lease|preflight(store,lease,&live,hold,clock(),observation.as_ref()))?;
     let normalized=source.normalize(&account,&body,video,&request.core_key_id)?;
     // Uploads may consume most of the admission window. Obtain new evidence,
     // including revoked/new packages, and current policy before minting a token.
@@ -397,13 +409,16 @@ fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         Err(error)=>{if dedicated {runtime.with_store(|s,l|s.invalidate_native_grants(l,&account.uid,packs_started_at))?;}return Err(error);},
     };
     if dedicated {runtime.with_store(|s,l|s.refresh_native_grants(l,&account.uid,&packs,packs_started_at))?;}
+    let latest_observation=if dedicated {
+        Some(super::bridge_capacity_source::PackObservation::parse(&packs,clock()).map_err(|_|"upstream_capacity_unavailable")?)
+    }else{None};
     let (hold,policy,policy_expiry,evidence)=terms(clock())?;
     runtime.with_store(|store,lease| {
         source.check_deadline()?;
         let now=clock();
         let live=parse_capacity(&packs,now)?;
         let expiry=authorization_expiry(policy_expiry,live.valid_until_ms,now)?;
-        let epoch=preflight(store,lease,&live,hold,now)?;
+        let epoch=preflight(store,lease,&live,hold,now,latest_observation.as_ref())?;
         store.prepare_budget(lease,&TrustedPreparation {parent_request_id:request.parent_request_id.clone(),request_id:request.request_id.clone(),core_key_id:request.core_key_id.clone(),
             request_fingerprint:request.request_fingerprint.clone(),endpoint:request.endpoint.clone(),model:request.model.clone(),step_kind:request.step_kind.clone(),
             account_ref:account.uid.clone(),snapshot_epoch:epoch,eligibility:if video {CapacityEligibility::GeneralOrWork} else {CapacityEligibility::GeneralOnly},

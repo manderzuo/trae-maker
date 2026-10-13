@@ -695,7 +695,7 @@ pub(super) fn prepare_native_request_until(data_dir:&std::path::Path,owner_key_i
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| NativeUploadError::new(format!("{asset_key} 只能包含非空字符串"), false))?;
             let (record, bytes) = super::assets::read_owned(data_dir, owner_key_id, id)
-                .map_err(|error| NativeUploadError::new(format!("{label}素材 {id} 无法读取：{error}"), false))?;
+                .map_err(|error| NativeUploadError::new(error, false))?;
             let uri = trae_resource_upload::upload_asset(account, &record, &bytes,upload_budget)
                 .map_err(|error| {
                     if error.message=="reference_resource_unavailable" {error} else {NativeUploadError::new(
