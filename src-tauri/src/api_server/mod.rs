@@ -9,6 +9,7 @@ pub mod bridge_budget_lease;
 pub(crate) mod bridge_prepared;
 pub(crate) mod bridge_execution;
 pub(crate) mod bridge_receipts;
+mod bridge_hold;
 pub(crate) mod bridge_rebase;
 pub(crate) mod bridge_v2_api;
 pub(crate) mod bridge_runtime;

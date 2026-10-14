@@ -195,6 +195,7 @@ pub(super) fn transition_in_transaction(tx: &Transaction<'_>,lease: &BridgeBudge
             if value<0 { return Err("negative actual capacity consumption".into()); }
             match stage.as_str() {
                 "P"|"R" => ("D",Some(value),Some(value)),
+                "released" if tx.query_row("SELECT EXISTS(SELECT 1 FROM bridge_budget_hold_releases WHERE budget_id=?1)",[budget_id],|r|r.get::<_,bool>(0)).map_err(db_error)? => ("D",Some(value),Some(value)),
                 "D" if actual==Some(value) => return Ok(CapacityMutation::Duplicate),
                 _=>return Err("capacity settlement conflicts with prior decision".into()),
             }

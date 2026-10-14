@@ -18,7 +18,7 @@ pub(crate) fn recover_quiet_local_instance(data_dir:&Path,acknowledge_retained_u
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_|"bridge_local_recovery_read_failed")?;
         db.execute_batch("PRAGMA query_only=ON").map_err(|_|"bridge_local_recovery_read_failed")?;
         let schema:i64=db.query_row("SELECT schema_version FROM bridge_schema_meta WHERE singleton=1",[],|r|r.get(0)).map_err(|_|"bridge_local_recovery_read_failed")?;
-        if !matches!(schema,8|9) {return Err("bridge_local_recovery_schema_requires_review".into());}
+        if !matches!(schema,8|9|10) {return Err("bridge_local_recovery_schema_requires_review".into());}
         quiet(&db)?;
     }
     let runtime=BridgeBudgetRuntime::start(data_dir).map_err(|_|"bridge_local_recovery_start_failed")?;

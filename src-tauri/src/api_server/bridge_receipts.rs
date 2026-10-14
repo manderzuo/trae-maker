@@ -119,7 +119,35 @@ fn reject_legacy_collision(tx:&Transaction<'_>,request:&str,account:&str,session
     if collision {return Err("receipt session acquired a conflicting legacy attribution".into());} Ok(())
 }
 impl BridgeBillingStore {
+    pub(super) fn review_budget_billing(&mut self,lease:&BridgeBudgetLease,budget_id:&str,review_ref:&str,expected_actual:Option<i64>)->Result<(),String> {
+        if review_ref.trim().is_empty() || review_ref.len()>200 {return Err("review reference required".into());}
+        let Some(expected)=expected_actual else {
+            return if self.release_absent_budget_hold(lease,budget_id,Some(review_ref))? {Ok(())}else{Err("complete absence evidence or terminal failure not available".into())};
+        };
+        let execution=self.budget_execution(budget_id)?.ok_or("execution missing")?;
+        let now=chrono::Utc::now().timestamp_millis();
+        let finished=match execution.finished_at_ms {
+            Some(finished)=>finished,
+            None if execution.state==super::bridge_execution::ExecutionState::Unknown && now.saturating_sub(execution.started_at_ms)>=86_400_000=>execution.started_at_ms,
+            _=>return Err("reviewed actual cannot settle a live execution".into()),
+        };
+        use super::bridge_billing::CoreBillingSessionLookup;
+        if !matches!(self.usage_session_for_request(&execution.request_id)?,CoreBillingSessionLookup::Unique {core_key_id,account_ref,session_id,..}
+            if core_key_id==execution.core_key_id && account_ref==execution.account_ref && session_id==execution.session_ref) {return Err("reviewed session attribution ambiguous".into());}
+        let source=crate::commands::usage_history::budget_usage_receipt_evidence(&self.data_dir,&execution.account_ref,&execution.session_ref,&execution.request_id,&execution.core_key_id,finished)?.ok_or("reviewed exact source absent")?;
+        self.budget_hold_release(budget_id)?;
+        if source.credits.as_microcredits()!=expected || expected<0 || now.saturating_sub(source.observed_at_ms)>600_000 {return Err("reviewed actual changed or source stale".into());}
+        let identity=bridge_prepared::sent_execution_identity(&self.connection,budget_id)?;
+        let receipt=BillingReceipt {request_id:execution.request_id.clone(),status:BillingReceiptStatus::Final,actual_credits:Some(source.credits),unit:"credits".into(),source_ref:format!("trae-usage-session:{}",source.session_id),task_ref:execution.task_ref,observed_at_ms:source.observed_at_ms};
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
+        if identity!=bridge_prepared::sent_execution_identity(&tx,budget_id)? {return Err("reviewed identity changed".into());}
+        reject_legacy_collision(&tx,&execution.request_id,&execution.account_ref,&execution.session_ref)?;
+        let outcome=persist_fact(&tx,lease,&identity.authorization,&receipt,&format!("reviewed-session-observation-v1:{review_ref}"),Some((source.read_started_at_ms,source.query_end_ms)))?;
+        tx.commit().map_err(db_error)?;
+        if outcome==ReceiptChange::Conflict {return Err("reviewed receipt conflicts with an existing money fact".into());}Ok(())
+    }
     pub(super) fn confirm_budget_usage(&mut self,lease:&BridgeBudgetLease,budget_id:&str)->Result<ReceiptChange,String> {
+        self.budget_hold_release(budget_id)?;
         let execution=self.budget_execution(budget_id)?.ok_or("budget has not been sent")?;
         let Some(finished)=execution.finished_at_ms else {return Ok(ReceiptChange::Pending)};
         use super::bridge_billing::CoreBillingSessionLookup;
@@ -132,7 +160,10 @@ impl BridgeBillingStore {
             reject_legacy_collision(&tx,&execution.request_id,&execution.account_ref,&execution.session_ref)?;
             let result=persist_source_conflict(&tx,lease,&identity.authorization,conflict)?;tx.commit().map_err(db_error)?;return Ok(result);
         }
-        let Some(source)=crate::commands::usage_history::budget_usage_receipt_evidence(&self.data_dir,&execution.account_ref,&execution.session_ref,&execution.request_id,&execution.core_key_id,finished)? else {return Ok(ReceiptChange::Pending)};
+        let Some(source)=crate::commands::usage_history::budget_usage_receipt_evidence(&self.data_dir,&execution.account_ref,&execution.session_ref,&execution.request_id,&execution.core_key_id,finished)? else {
+            self.release_absent_budget_hold(lease,budget_id,None)?;
+            return Ok(ReceiptChange::Pending)
+        };
         let receipt=BillingReceipt {request_id:execution.request_id.clone(),status:BillingReceiptStatus::Final,actual_credits:Some(source.credits),unit:"credits".into(),
             source_ref:format!("trae-usage-session:{}",source.session_id),task_ref:execution.task_ref.clone(),observed_at_ms:source.observed_at_ms};
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;

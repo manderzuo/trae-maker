@@ -1,0 +1,11 @@
+# Failed reservation reconciliation and shared downloads
+
+Bridge schema 10 adds a separate hold-release journal. It does not add zero-fee receipts for missing usage rows. Failed executions with explicit provider failure evidence become eligible after 15 minutes and two complete original-date usage reads at least 60 seconds apart. Incomplete pagination, stale reads, existing consumption, ambiguous attribution and unknown execution cannot automatically release capacity.
+
+The authenticated bridge-only `POST /internal/bridge/v2/requests/{request_id}/review-billing` accepts `budget_id`, `core_key_id`, `account_ref`, `bridge_instance_id`, `review_ref`, and `expected_actual_microcredits`. An exact expected amount requires a fresh real usage observation; unknown execution additionally must be at least 24 hours old. Null expected amount requests a reviewed local reservation release and requires two complete absence observations for a durable failed execution. This endpoint never submits upstream work. Release evidence is returned separately as `hold_release` on the existing billing read. Deploy the Core consumer before enabling schema 10.
+
+Released reservations remain in the usage polling index. A late exact receipt converts their capacity to real consumption, using the existing identity, conflict protection and replayable receipt outbox. Core must debit the original Key once, without returning the already released reservation again.
+
+Result readers now join the same bounded download. Four distinct recovery downloads remain the limit, with a 110-second wait bound, shared failure and unwind cleanup. A later request can retry file retrieval without resubmitting generation.
+
+Verified in isolated fixtures: 191 bridge tests passed (5 explicit live tests ignored), 26 usage-history tests passed, including old lookback, absent/partial evidence, late charge, review identity, transactional rollback and schema-10 migration. Test processes must remove inherited AIWORK environment variables; production service need not stop for these tests. Before activation, independently verify no live paid work or pending delivery, back up the database and preserve credentials. Do not roll a migrated schema back to an older executable or restore money tables.

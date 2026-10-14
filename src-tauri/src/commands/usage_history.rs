@@ -87,6 +87,8 @@ struct CachedAccount {
     /// Actual source reads for each returned row, not account/global cache reads.
     #[serde(default)]
     session_observations: BTreeMap<String, SessionObservation>,
+    #[serde(default)]
+    absent_sessions: BTreeMap<String, BudgetAbsentUsage>,
 }
 
 #[derive(serde::Serialize,serde::Deserialize,Clone,PartialEq,Eq)]
@@ -98,6 +100,37 @@ struct SessionObservation {
     complete:bool,
     #[serde(default)]
     row:Option<CachedSessionUsage>,
+}
+
+#[derive(Clone,Debug,serde::Serialize,serde::Deserialize,PartialEq,Eq)]
+pub(crate) struct BudgetAbsentUsage {
+    pub started_at_ms:i64,pub finished_at_ms:i64,pub query_start_ms:i64,pub query_end_ms:i64,
+    pub first_read_at_ms:i64,pub last_read_at_ms:i64,pub observed_at_ms:i64,
+}
+pub(crate) fn budget_absent_usage(data_dir:&std::path::Path,account:&str,session:&str,started:i64,finished:i64)->Result<Option<BudgetAbsentUsage>,String> {
+    let cache=read_usage_cache_for_merge(&data_dir.join("data/usage_history.json"))?;
+    let Some(account)=cache.accounts.get(account) else{return Ok(None)};
+    if account.session_usage.contains_key(session) || account.session_observations.get(session).is_some_and(|s|s.row.is_some()) {return Ok(None);}
+    Ok(account.absent_sessions.get(session).filter(|s|s.started_at_ms==started && s.finished_at_ms==finished
+        && s.query_start_ms<=started && s.first_read_at_ms.saturating_sub(finished)>=900_000
+        && s.last_read_at_ms.saturating_sub(s.first_read_at_ms)>=60_000 && s.query_end_ms>=s.last_read_at_ms
+        && s.observed_at_ms>=s.last_read_at_ms && chrono::Utc::now().timestamp_millis().saturating_sub(s.observed_at_ms)<=600_000).cloned())
+}
+fn observe_absent_sessions(account:&mut CachedAccount,fetched:&FetchedAccountUsage,windows:&[(String,i64,i64)],start:i64,end:i64,read:i64,completed:i64) {
+    if !fetched.source_complete || completed<read || end<read {return;}
+    for (session,started,finished) in windows {
+        if fetched.sessions.contains_key(session) || account.session_usage.contains_key(session) {
+            account.absent_sessions.remove(session);continue;
+        }
+        if start>*started || *started<=0 || *finished<*started || read.saturating_sub(*finished)<900_000 {continue;}
+        let fresh=BudgetAbsentUsage {started_at_ms:*started,finished_at_ms:*finished,query_start_ms:start,query_end_ms:end,first_read_at_ms:read,last_read_at_ms:read,observed_at_ms:completed};
+        let observation=account.absent_sessions.entry(session.clone()).or_insert_with(||fresh.clone());
+        if observation.started_at_ms!=*started || observation.finished_at_ms!=*finished || read<observation.first_read_at_ms {*observation=fresh;}
+        else if read>=observation.last_read_at_ms {
+            observation.last_read_at_ms=read;observation.observed_at_ms=completed;
+            observation.query_start_ms=observation.query_start_ms.max(start);observation.query_end_ms=end;
+        }
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -567,7 +600,9 @@ where
         }
         // Capture the read window only after acquiring the per-account lock.
         let now_ts = clock();
-        let poll_floor = now_ts.saturating_sub(7 * 86400);
+        // Pending billing is searched from the original attempt, even after a
+        // long outage. fetch_account_usage still bounds each page and 30-day chunk.
+        let poll_floor = attempt_at_ms.div_euclid(1000).min(now_ts);
         let floor_date = local_date_of(poll_floor).unwrap_or_default();
         let attempt_date = local_date_of(attempt_at_ms.div_euclid(1000)).unwrap_or_else(|| floor_date.clone());
         let cache_path = data_dir.join("data").join("usage_history.json");
@@ -592,7 +627,7 @@ where
             (cached_date, session_ids)
         };
         let requested_date = cached_date.map_or(attempt_date.clone(), |date| date.min(attempt_date));
-        let start_date = requested_date.max(floor_date.clone());
+        let start_date = requested_date;
         let start_ts = local_midnight_ts(&start_date).unwrap_or(poll_floor);
 
         // The local Windows clock may lag the upstream clock by several minutes.
@@ -605,6 +640,7 @@ where
                     return Err("pending Core usage refresh stopped".into());
                 }
                 let completed_at_ts = clock();
+                let absent_windows=crate::api_server::bridge_billing::pending_budget_usage_windows(data_dir,uid).unwrap_or_default();
                 let end_date = local_date_of(query_end_ts).unwrap_or_else(|| start_date.clone());
                 attribution_session_ids.extend(fetched.sessions.keys().cloned());
                 let attribution_pairs: Vec<(String, String)> = attribution_session_ids.into_iter()
@@ -630,6 +666,8 @@ where
                         continue;
                     }
                 };
+                observe_absent_sessions(cache.accounts.entry(uid.clone()).or_default(),&fetched,&absent_windows,
+                    start_ts.saturating_mul(1000),query_end_ts.saturating_mul(1000),now_ts.saturating_mul(1000),completed_at_ts.saturating_mul(1000));
                 merge_fetched_account(
                     &mut cache,
                     uid,
@@ -810,6 +848,8 @@ where
             return Ok(complete && total==Some(got));
         }
         for row in &arr {
+            // A missing/malformed session must not become negative evidence.
+            if parse_session_usage_row(row).is_none() {complete=false;}
             ingest_usage_row(row, agg, sessions);
         }
         got=got.checked_add(arr.len()).ok_or("usage pagination count overflow")?;
@@ -1239,6 +1279,27 @@ mod tests {
         assert_eq!(cache.accounts["uid-linked"].session_usage["session-linked"].credits_float.as_deref(), Some("0.625000"));
         assert!(!cache.accounts.contains_key("uid-unrelated"));
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn old_pending_attempt_is_not_truncated_to_seven_days() {
+        let dir=std::env::temp_dir().join(format!("usage-old-{}",rand::random::<u64>()));let now=chrono::Local::now().timestamp();let old=now-20*86400;
+        refresh_pending_core_usage_with(&dir,&[("old".into(),old*1000)],&[("old".into(),"fixture".into(),"fixture".into())],now,|_,_,start,end| {
+            assert!(start<=old);assert!(end>=now);Ok(FetchedAccountUsage {source_complete:true,..Default::default()})
+        }).unwrap();let _=std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn absence_observations_require_full_covering_reads_and_never_override_present_rows() {
+        let mut account=CachedAccount::default();let windows=vec![("session".into(),1000,2000)];
+        let mut fetched=FetchedAccountUsage::default();
+        observe_absent_sessions(&mut account,&fetched,&windows,1,2_000_000,1_000_000,1_000_100);
+        assert!(account.absent_sessions.is_empty());fetched.source_complete=true;
+        observe_absent_sessions(&mut account,&fetched,&windows,1001,2_000_000,1_000_000,1_000_100);assert!(account.absent_sessions.is_empty());
+        observe_absent_sessions(&mut account,&fetched,&windows,1,2_000_000,1_000_000,1_000_100);
+        observe_absent_sessions(&mut account,&fetched,&windows,1,2_100_000,1_061_000,1_061_100);
+        assert_eq!(account.absent_sessions["session"].last_read_at_ms-account.absent_sessions["session"].first_read_at_ms,61000);
+        fetched.sessions.insert("session".into(),CachedSessionUsage {session_id:"session".into(),..Default::default()});
+        observe_absent_sessions(&mut account,&fetched,&windows,1,2_200_000,1_070_000,1_070_100);assert!(account.absent_sessions.is_empty());
     }
 
     #[test]

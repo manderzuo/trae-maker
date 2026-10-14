@@ -10,6 +10,20 @@ pub(crate) struct BudgetQuery { budget_id: String }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct BillingReview {budget_id:String,core_key_id:String,account_ref:String,bridge_instance_id:String,review_ref:String,expected_actual_microcredits:Option<i64>}
+pub(super) async fn review_billing(axum::Extension(runtime):axum::Extension<Arc<super::bridge_runtime::BridgeBudgetRuntime>>,
+    Path(request):Path<String>,Json(review):Json<BillingReview>)->Response {
+    let result=tokio::task::spawn_blocking(move ||runtime.with_store(|store,lease| {
+        let auth=stored_budget_authorization(&store.connection,&review.budget_id)?;
+        if auth.request_id!=request || auth.core_key_id!=review.core_key_id || auth.account_ref!=review.account_ref || auth.bridge_instance_id!=review.bridge_instance_id {return Err("review identity mismatch".into());}
+        store.review_budget_billing(lease,&review.budget_id,&review.review_ref,review.expected_actual_microcredits)?;
+        Ok(json!({"wire_version":2,"status":"review_applied","request_id":request,"budget_id":review.budget_id}))
+    })).await;
+    match result {Ok(Ok(value))=>Json(value).into_response(),_=>error(StatusCode::CONFLICT,"billing_review_not_proven")}
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ReferenceRestore {id:String,filename:String,mime_type:String,sha256:String,data_base64:String}
 pub(super) async fn restore_reference(State(state):State<Arc<ApiSharedState>>,
     axum::Extension(bridge_key):axum::Extension<super::usage::KeyId>,Json(input):Json<ReferenceRestore>)->Response {
@@ -211,6 +225,7 @@ async fn read_request(state: Arc<ApiSharedState>, request: String, budget: Strin
                 value["status"] = json!(event.as_ref().map(|e| e.kind.as_str()).unwrap_or("pending"));
                 value["receipt"] = json!(event.as_ref().and_then(|e| e.receipt.as_ref()));
                 value["event"] = json!(event);
+                value["hold_release"] = json!(store.budget_hold_release(&budget)?);
             }
             "refresh" => {
                 if execution.is_none() {

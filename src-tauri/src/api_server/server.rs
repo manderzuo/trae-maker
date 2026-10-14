@@ -161,6 +161,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/internal/bridge/v2/reference-last-frame", post(super::bridge_v2_api::reference_last_frame))
         .route("/internal/bridge/v2/reference-assets/restore", post(super::bridge_v2_api::restore_reference).layer(DefaultBodyLimit::max(46*1024*1024)))
         .route("/internal/bridge/v2/requests/:request_id/billing", get(super::bridge_v2_api::billing))
+        .route("/internal/bridge/v2/requests/:request_id/review-billing", post(super::bridge_v2_api::review_billing))
         .route("/internal/bridge/v2/requests/:request_id/refresh", post(super::bridge_v2_api::refresh))
         .route("/internal/bridge/v2/receipt-events", get(super::bridge_v2_api::events))
         .route("/internal/bridge/v2/recovery", get(super::bridge_v2_api::recovery_status).post(super::bridge_v2_api::recover))
@@ -280,6 +281,23 @@ mod tests {
     }
 
     // ==================== P2 修复9：优雅停机轮询 ====================
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn billing_review_requires_bridge_auth_and_exact_identity_without_paid_dispatch() {
+        let mut f=BridgeFixture::new();let runtime=super::super::bridge_runtime::BridgeBudgetRuntime::start(&f.dir).unwrap();
+        let app=f.take_app().layer(axum::Extension(runtime.clone()));
+        let body=serde_json::json!({"budget_id":"missing-budget","core_key_id":"other-key","account_ref":"other-account","bridge_instance_id":"other-instance","review_ref":"fixture-review","expected_actual_microcredits":null}).to_string();
+        for (auth,expected) in [(false,StatusCode::FORBIDDEN),(true,StatusCode::CONFLICT)] {
+            let mut request=Request::post("/internal/bridge/v2/requests/missing-request/review-billing").header("content-type","application/json");
+            if auth {request=request.header("authorization",format!("Bearer {}",f.key));}
+            assert_eq!(app.clone().oneshot(request.body(Body::from(body.clone())).unwrap()).await.unwrap().status(),expected);
+        }
+        runtime.with_store(|store,_| {
+            assert_eq!(store.connection.query_row("SELECT COUNT(*) FROM bridge_budget_receipts",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(store.connection.query_row("SELECT COUNT(*) FROM bridge_budget_hold_releases",[],|r|r.get::<_,i64>(0)).unwrap(),0);Ok(())
+        }).unwrap();
+    }
 
     #[cfg(windows)]
     #[test]
