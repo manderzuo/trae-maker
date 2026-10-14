@@ -6,6 +6,8 @@ The authenticated bridge-only `POST /internal/bridge/v2/requests/{request_id}/re
 
 Released reservations remain in the usage polling index. A late exact receipt converts their capacity to real consumption, using the existing identity, conflict protection and replayable receipt outbox. Core must debit the original Key once, without returning the already released reservation again.
 
+Billing lookup retains read-only credentials for disabled/excluded accounts already referenced by pending sessions. The generation candidate set remains unchanged; disabling admission does not erase the ability to reconcile earlier spending. Pool regression verifies a disabled account can be queried for billing while remaining absent from dispatch candidates.
+
 Result readers now join the same bounded download. Four distinct recovery downloads remain the limit, with a 110-second wait bound, shared failure and unwind cleanup. A later request can retry file retrieval without resubmitting generation.
 
 Verified in isolated fixtures: 191 bridge tests passed (5 explicit live tests ignored), 26 usage-history tests passed, including old lookback, absent/partial evidence, late charge, review identity, transactional rollback and schema-10 migration. Test processes must remove inherited AIWORK environment variables; production service need not stop for these tests. Before activation, independently verify no live paid work or pending delivery, back up the database and preserve credentials. Do not roll a migrated schema back to an older executable or restore money tables.

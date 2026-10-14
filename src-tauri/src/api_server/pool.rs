@@ -169,6 +169,9 @@ impl PoolEntry {
 #[derive(Clone)]
 pub struct ApiPool {
     entries: Arc<Mutex<HashMap<String, PoolEntry>>>,
+    // Read-only billing credentials outlive admission eligibility. Disabling an
+    // account must not make its already-submitted sessions impossible to settle.
+    billing_credentials: Arc<Mutex<HashMap<String,(String,String)>>>,
     balances: Arc<Mutex<HashMap<String, CreditBalance>>>,
     strategy: Arc<Mutex<PoolStrategy>>,
     /// 防惊群（T2.2）：100ms 内重复选中同一 uid 且存在其他候选时让位
@@ -184,6 +187,7 @@ impl ApiPool {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
+            billing_credentials: Arc::new(Mutex::new(HashMap::new())),
             balances: Arc::new(Mutex::new(HashMap::new())),
             strategy: Arc::new(Mutex::new(PoolStrategy::ExpireFirst)),
             recent_pick: Arc::new(Mutex::new((String::new(), 0))),
@@ -197,12 +201,12 @@ impl ApiPool {
         &self,
         account_refs: &HashSet<String>,
     ) -> Vec<(String, String, String)> {
+        let billing=safe_lock(&self.billing_credentials).clone();
         let entries = safe_lock(&self.entries);
         account_refs
             .iter()
-            .filter_map(|uid| entries.get(uid))
-            .filter(|entry| !entry.jwt.trim().is_empty())
-            .map(|entry| (entry.uid.clone(), entry.name.clone(), entry.jwt.clone()))
+            .filter_map(|uid| billing.get(uid).map(|(name,jwt)|(uid.clone(),name.clone(),jwt.clone()))
+                .or_else(||entries.get(uid).filter(|entry|!entry.jwt.trim().is_empty()).map(|entry|(entry.uid.clone(),entry.name.clone(),entry.jwt.clone()))))
             .collect()
     }
 
@@ -281,6 +285,11 @@ impl ApiPool {
         expire_times: &HashMap<String, i64>,
         device_map: &DeviceMap,
     ) {
+        let credentials=accounts.iter().filter_map(|account| {
+            let uid=account.user_id.as_ref()?;let jwt=account.jwt.strip_prefix("Cloud-IDE-JWT ").unwrap_or(&account.jwt).trim();
+            (!uid.is_empty() && !jwt.is_empty()).then(||(uid.clone(),(account.name.clone(),jwt.to_owned())))
+        }).collect();
+        *safe_lock(&self.billing_credentials)=credentials;
         let mut entries = safe_lock(&self.entries);
         let mut balances = safe_lock(&self.balances);
         entries.clear();
@@ -878,6 +887,22 @@ impl ApiPool {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod billing_credentials_tests {
+    use super::*;
+    #[test]
+    fn disabled_accounts_remain_billable_without_becoming_dispatch_candidates() {
+        let pool=ApiPool::new();let accounts:Vec<crate::models::RawAccount>=serde_json::from_value(serde_json::json!([
+            {"name":"active","UserID":"enabled","jwt":"Cloud-IDE-JWT enabled-fixture"},
+            {"name":"disabled","UserID":"disabled","jwt":"Cloud-IDE-JWT disabled-fixture"}
+        ])).unwrap();
+        pool.sync_from_accounts(&accounts,&["enabled".into()],&[],&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new(),&HashMap::new());
+        let credentials=pool.usage_credentials_for(&HashSet::from(["disabled".into()]));
+        assert_eq!(credentials,vec![("disabled".into(),"disabled".into(),"disabled-fixture".into())]);
+        let entries=safe_lock(&pool.entries);assert!(entries.contains_key("enabled"));assert!(!entries.contains_key("disabled"));
     }
 }
 
