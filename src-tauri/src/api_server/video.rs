@@ -1436,14 +1436,15 @@ fn run_native_task(state:std::sync::Arc<ApiSharedState>,task_id:String,input:Val
             }
         };
         update_task(&task_id, |task| task.status = "processing".into());
-        let outcome = super::video_stream::consume(BufReader::new(response.into_reader()), deadline, |event, data| {
+        let response_info=super::video_stream::ResponseInfo::capture(&response);
+        let outcome = super::video_stream::consume_detailed(BufReader::new(response.into_reader()), deadline, |event, data| {
             if event == "error" {
                 state.pool.note_error(&account.uid, classify_video_error(0, data));
             }
             parse_sse_event(event, data, &task_id)
         });
         if let Err(error) = outcome {
-            mark_native_worker_diagnostic(&task_id, error.diagnostic());
+            mark_native_worker_diagnostic(&task_id, error.diagnostic(&response_info));
         }
         let task_status = get(&task_id).map(|task| task.status).unwrap_or_default();
         if task_status == "completed" {

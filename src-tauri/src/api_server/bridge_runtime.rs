@@ -148,7 +148,7 @@ impl BridgeBudgetRuntime {
                 // cancellation, success or cost. Preserve the paid hold intact.
                 let existing=store.budget_diagnostic(&id)?;
                 let fresh=existing.is_none();
-                let diagnostic=existing.unwrap_or_else(||super::bridge_diagnostics::Diagnostic {code:"video_execution_interrupted".into(),stage:"video_stream".into(),outcome_known:false,upstream_error:None});
+                let diagnostic=existing.unwrap_or_else(||super::bridge_diagnostics::Diagnostic {code:"video_execution_interrupted".into(),stage:"video_stream".into(),outcome_known:false,upstream_error:None,transport:None});
                 if fresh {store.save_budget_diagnostic(lease,&id,&diagnostic)?;}
                 if let Some(task)=task {
                     let stale=super::video::get(&task).is_some_and(|t| !matches!(t.status.as_str(),"completed"|"failed"|"canceled"|"timeout") && (t.status!="unknown" || t.execution_diagnostic.as_ref()!=Some(&diagnostic)));

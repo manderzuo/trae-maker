@@ -11,14 +11,30 @@ pub(crate) struct Diagnostic {
     pub outcome_known:bool,
     #[serde(skip_serializing_if="Option::is_none")]
     pub upstream_error:Option<aiwork_core::UpstreamFailure>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub transport:Option<TransportDiagnostic>,
+}
+/// Closed metadata only: never retain an IO error's message, URL or headers.
+#[derive(Clone,Debug,Default,Serialize,Deserialize,PartialEq,Eq)]
+pub(crate) struct TransportDiagnostic {
+    pub last_io_kind:Option<String>,
+    pub cause_io_kinds:Vec<String>,
+    pub raw_os_error:Option<i32>,
+    pub read_retry_count:u8,
+    pub bytes_received:u64,
+    pub events_received:u64,
+    pub elapsed_ms:u64,
+    pub deadline_reached:bool,
+    pub http_status:Option<u16>,
+    pub response_content_type:Option<String>,
 }
 impl From<&str> for Diagnostic {
-    fn from(code:&str)->Self {Self {code:code.into(),stage:"assistant_stream".into(),outcome_known:false,upstream_error:None}}
+    fn from(code:&str)->Self {Self {code:code.into(),stage:"assistant_stream".into(),outcome_known:false,upstream_error:None,transport:None}}
 }
 impl Diagnostic {
     pub fn provider(value:&Value)->Self {
         Self {code:"chat_upstream_error".into(),stage:"assistant_stream".into(),outcome_known:true,
-            upstream_error:Some(aiwork_core::UpstreamFailure::from_value(value))}
+            upstream_error:Some(aiwork_core::UpstreamFailure::from_value(value)),transport:None}
     }
     pub fn http(status:u16,body:&str)->Self {
         // make_upstream_request distinguishes HTTP bodies from local transport
@@ -32,7 +48,7 @@ impl Diagnostic {
             return Self {stage:"assistant_connection".into(),..Self::from(code)};
         }
         Self {code:"chat_upstream_error".into(),stage:"assistant_http".into(),outcome_known:true,
-            upstream_error:Some(aiwork_core::UpstreamFailure::from_body(body,Some(status)))}
+            upstream_error:Some(aiwork_core::UpstreamFailure::from_body(body,Some(status))),transport:None}
     }
     pub fn result(&self)->Value {json!({"error":self,"upstream_error":self.upstream_error})}
 }
@@ -101,7 +117,8 @@ mod tests {
     fn persisted_unknown_diagnostic_preserves_money_and_accepts_late_result() {
         let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"request-assist");
         let before=store.capacity_totals("account").unwrap();
-        let diagnostic=Diagnostic::from("chat_stream_read_timeout");
+        let mut diagnostic=Diagnostic::from("video_stream_read_failed");diagnostic.stage="video_stream".into();
+        diagnostic.transport=Some(TransportDiagnostic {last_io_kind:Some("ConnectionReset".into()),raw_os_error:Some(10054),bytes_received:123,read_retry_count:1,..Default::default()});
         store.save_budget_diagnostic(&lease,&id,&diagnostic).unwrap();
         assert_eq!(store.budget_execution(&id).unwrap().unwrap().state,ExecutionState::Unknown);
         assert_eq!(store.capacity_totals("account").unwrap(),before);
@@ -132,5 +149,11 @@ mod tests {
         assert_eq!(detail.upstream_error,None);
         let detail=Diagnostic::http(429,r#"{"error":{"code":"RATE_LIMIT","message":"Too many requests","token":"private"}}"#);
         assert!(detail.outcome_known);assert_eq!(detail.upstream_error.unwrap().http_status,Some(429));
+    }
+    #[test]
+    fn historical_diagnostic_without_transport_metadata_keeps_its_original_shape() {
+        let historical=json!({"code":"video_stream_read_failed","stage":"video_stream","outcome_known":false});
+        let diagnostic:Diagnostic=serde_json::from_value(historical.clone()).unwrap();
+        assert!(diagnostic.transport.is_none());assert_eq!(serde_json::to_value(diagnostic).unwrap(),historical);
     }
 }

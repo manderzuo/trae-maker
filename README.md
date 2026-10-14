@@ -1,6 +1,6 @@
 <div align="center">
 
-> 2026-10-12：修复视频响应读取错误无限等待，增加生成请求总时限与保留原账务的未知任务恢复；已部署及验收。详见 [修复记录](docs/video-stream-recovery-20261012.md)。
+> 2026-10-15：视频响应对临时读取中断允许原连接内最多恢复一次，保留半行数据，总等待统一为 30 分钟，并补充安全诊断。未知结果仍保留原任务与账务，不自动重发。详见 [修复与验证记录](docs/video-stream-read-repair-20261015.md)。
 
 <img src="build-assets/app-icon.png" alt="AI Work 助手" width="128" />
 
