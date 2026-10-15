@@ -1,6 +1,6 @@
 //! Audited release of local capacity; never an invented zero-fee receipt.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD,Engine};
-use rusqlite::{params,OptionalExtension,Transaction,TransactionBehavior};
+use rusqlite::{params,Connection,OptionalExtension,Transaction,TransactionBehavior};
 use serde::{Deserialize,Serialize};
 use super::{bridge_billing::BridgeBillingStore,bridge_budget,bridge_budget_lease::BridgeBudgetLease,bridge_execution::ExecutionState,bridge_prepared};
 
@@ -34,17 +34,20 @@ pub(super) fn validate_schema(tx:&Transaction<'_>)->Result<(),String> {
         if actual.0!=*kind || super::bridge_billing::tokenize_sqlite_schema_sql(&actual.1)?!=super::bridge_billing::tokenize_sqlite_schema_sql(sql)? {return Err("hold release schema invalid".into());}
     }Ok(())
 }
-impl BridgeBillingStore {
-    pub(super) fn budget_hold_release(&self,id:&str)->Result<Option<BudgetHoldRelease>,String> {
-        let row:Option<(String,String)>=self.connection.query_row("SELECT proof_json,evidence_hash FROM bridge_budget_hold_releases WHERE budget_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+pub(super) fn verified_release(connection:&Connection,id:&str)->Result<Option<BudgetHoldRelease>,String> {
+        let row:Option<(String,String)>=connection.query_row("SELECT proof_json,evidence_hash FROM bridge_budget_hold_releases WHERE budget_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
         row.map(|(json,digest)| {
             let proof:BudgetHoldRelease=serde_json::from_str(&json).map_err(|_|"invalid hold proof")?;
-            let auth=bridge_prepared::stored_budget_authorization(&self.connection,id)?;
+            let auth=bridge_prepared::stored_budget_authorization(connection,id)?;
             if hash(&proof)?!=digest || proof.budget_id!=id || proof.request_id!=auth.request_id || proof.core_key_id!=auth.core_key_id
                 || proof.account_ref!=auth.account_ref || proof.bridge_instance_id!=auth.bridge_instance_id || proof.session_ref!=format!("core-v2-{id}")
                 || proof.hold_microcredits!=auth.hold_credits.as_microcredits() {return Err("hold proof binding mismatch".into());}
             Ok(proof)
         }).transpose()
+}
+impl BridgeBillingStore {
+    pub(super) fn budget_hold_release(&self,id:&str)->Result<Option<BudgetHoldRelease>,String> {
+        verified_release(&self.connection,id)
     }
     pub(super) fn release_absent_budget_hold(&mut self,lease:&BridgeBudgetLease,id:&str,review:Option<&str>)->Result<bool,String> {
         if self.budget_hold_release(id)?.is_some() {return Ok(true);}

@@ -60,18 +60,39 @@ pub(super) fn quiet_watermark(conn:&Connection,account:&str)->Result<(i64,i64,i6
     // interpreted as proof that an upstream operation has stopped consuming.
     let unsafe_state:bool=conn.query_row("SELECT
         EXISTS(SELECT 1 FROM bridge_capacity_slots WHERE account_ref=?1 AND stage IN ('P','R')) OR
-        EXISTS(SELECT 1 FROM bridge_prepared_budgets p LEFT JOIN bridge_budget_executions e ON e.budget_id=p.budget_id
-            LEFT JOIN bridge_budget_receipts r ON r.budget_id=p.budget_id WHERE p.account_ref=?1 AND
-            (p.state IN ('prepared','consumed') OR (p.state='send_intent' AND
-            (e.budget_id IS NULL OR e.execution_state NOT IN ('succeeded','failed') OR r.budget_id IS NULL OR r.receipt_state!='final')))) OR
+        EXISTS(SELECT 1 FROM bridge_prepared_budgets p WHERE p.account_ref=?1 AND p.state IN ('prepared','consumed')) OR
         EXISTS(SELECT 1 FROM bridge_capacity_slots s LEFT JOIN bridge_budget_receipts r ON r.budget_id=s.budget_id
             LEFT JOIN bridge_budget_executions e ON e.budget_id=s.budget_id WHERE s.account_ref=?1 AND s.stage='D' AND
             (r.budget_id IS NULL OR r.receipt_state!='final' OR r.actual_microcredits!=s.actual_microcredits OR
-             r.confirmation_policy!='post-terminal-session-observation-v1' OR r.source_read_started_at_ms IS NULL OR
-             e.finished_at_ms IS NULL OR r.source_read_started_at_ms<e.finished_at_ms)) OR
+             r.source_read_started_at_ms IS NULL)) OR
         EXISTS(SELECT 1 FROM bridge_core_upstream_sessions s LEFT JOIN bridge_billing_receipts r ON r.request_id=s.request_id
             WHERE s.account_ref=?1 AND (r.request_id IS NULL OR r.status!='final'))",[account],|r|r.get(0)).map_err(db_error)?;
     if unsafe_state || has_conflict(conn,account)? {return Err("capacity_rebase_not_quiescent".into());}
+    let anchored:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_anchors WHERE account_ref=?1)",[account],|r|r.get(0)).map_err(db_error)?;
+    let now=chrono::Utc::now().timestamp_millis();
+    let mut stmt=conn.prepare("SELECT p.budget_id,e.execution_state,e.finished_at_ms,r.receipt_state,r.confirmation_policy,r.source_read_started_at_ms,s.stage,e.started_at_ms,w.stopped_at_ms
+        FROM bridge_prepared_budgets p LEFT JOIN bridge_budget_executions e USING(budget_id)
+        LEFT JOIN bridge_budget_receipts r USING(budget_id) LEFT JOIN bridge_capacity_slots s USING(budget_id)
+        LEFT JOIN bridge_budget_worker_exits w USING(budget_id) WHERE p.account_ref=?1 AND p.state='send_intent'").map_err(db_error)?;
+    let rows=stmt.query_map([account],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<i64>>(7)?,r.get::<_,Option<i64>>(8)?))).map_err(db_error)?;
+    for row in rows {
+        let (id,state,finished,receipt,policy,read,stage,started,stopped)=row.map_err(db_error)?;
+        if state.as_deref()==Some("failed") && stage.as_deref()==Some("released") && receipt.is_none() {
+            // This is reservation disposition, not an invented zero bill. The
+            // commit still requires complete entitlement debit coverage, and a
+            // later exact charge remains an uncovered D until the next rebase.
+            if super::bridge_hold::verified_release(conn,&id)?.is_some() {continue;}
+        }
+        let terminal=matches!(state.as_deref(),Some("succeeded"|"failed")) && finished.zip(read).is_some_and(|(end,read)|read>=end)
+            && policy.as_deref()==Some("post-terminal-session-observation-v1");
+        // Dedicated accounts additionally prove the entire debit against the
+        // anchored package ledger. Local worker retirement permits that read;
+        // it never changes an unknown result into successful execution.
+        let retired=anchored && state.as_deref()==Some("unknown") && started.is_some_and(|start|now.saturating_sub(start)>=1_800_000)
+            && stopped.zip(read).is_some_and(|(stop,read)|stop>=started.unwrap_or(i64::MAX) && now.saturating_sub(stop)>=60_000 && read>=stop.saturating_add(60_000))
+            && policy.as_deref().is_some_and(|p|p=="post-worker-exit-session-observation-v1" || p.starts_with("reviewed-session-observation-v1:"));
+        if receipt.as_deref()!=Some("final") || !(terminal || retired) {return Err("capacity_rebase_not_quiescent".into());}
+    }
     let event=conn.query_row("SELECT COALESCE(MAX(e.sequence),0) FROM bridge_budget_receipt_events e JOIN bridge_prepared_budgets p ON p.budget_id=e.budget_id WHERE p.account_ref=?1",[account],|r|r.get(0)).map_err(db_error)?;
     let legacy=conn.query_row("SELECT COUNT(*) FROM bridge_core_upstream_sessions WHERE account_ref=?1",[account],|r|r.get(0)).map_err(db_error)?;
     let latest=conn.query_row("SELECT COALESCE(MAX(observed),0) FROM (

@@ -1004,3 +1004,6 @@ mod inflight_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[cfg(all(test, windows))]
+mod production_recovery_tests;

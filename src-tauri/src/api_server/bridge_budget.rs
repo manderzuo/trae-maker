@@ -185,7 +185,13 @@ pub(super) fn transition_in_transaction(tx: &Transaction<'_>,lease: &BridgeBudge
     let (stage,actual,instance,generation):(String,Option<i64>,String,String)=tx.query_row(
         "SELECT stage,actual_microcredits,bridge_instance_id,event_generation FROM bridge_capacity_slots WHERE budget_id=?1",
         [budget_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(db_error)?;
-    if instance!=lease.instance_id() || (transition==CapacityTransition::CancelUnsent && generation!=lease.generation()) { return Err("capacity budget belongs to another lease generation".into()); }
+    if instance!=lease.instance_id() { return Err("capacity budget belongs to another lease generation".into()); }
+    if transition==CapacityTransition::CancelUnsent && generation!=lease.generation() {
+        // The active host lease fences every prior generation. Only a durable
+        // never-consumed preparation may cross that fence for cancellation.
+        let unsent:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bridge_prepared_budgets p WHERE p.budget_id=?1 AND p.state='prepared' AND p.event_generation=?2 AND NOT EXISTS(SELECT 1 FROM bridge_budget_executions e WHERE e.budget_id=p.budget_id))",params![budget_id,generation],|r|r.get(0)).map_err(db_error)?;
+        if !unsent {return Err("capacity budget belongs to another lease generation".into());}
+    }
     let (next,amount,actual)=match transition {
         CapacityTransition::ExecutionTerminal => match stage.as_str() {
             "P" => ("R",None,None), "R"|"D"=>return Ok(CapacityMutation::Duplicate),

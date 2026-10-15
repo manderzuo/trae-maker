@@ -473,9 +473,11 @@ mod tests {
         let lease=BridgeBudgetLease::try_acquire(&store).unwrap().unwrap();
         value.request_id="request-current-expired".into();let current=store.prepare_budget(&lease,&value,None,20).unwrap();
         let runtime=Arc::new(BridgeBudgetRuntime {data_dir:dir.clone(),lease:Mutex::new(lease),planning:Mutex::new(Default::default()),receipt_cursors:Mutex::new(Default::default()),video_diagnostic_cursor:Mutex::new(String::new()),chunks:Default::default()});
-        assert_eq!(runtime.sweep_expired_budgets(100_000).unwrap(),1,"old-generation unknowns must not occupy the entire expiry page");
-        assert_eq!(store.capacity_totals("account").unwrap().pending,128,"do not reinterpret old preparation as a refund proof");
+        assert_eq!(runtime.sweep_expired_budgets(100_000).unwrap(),128,"current expiry is processed before bounded prior-generation recovery");
+        assert_eq!(store.capacity_totals("account").unwrap().pending,1,"only fenced, never-consumed preparations may be released");
         assert_eq!(store.latest_budget_receipt_event(&current.authorization.budget_id).unwrap().unwrap().kind,"failed_no_charge");
+        assert_eq!(runtime.sweep_expired_budgets(100_000).unwrap(),1);
+        assert_eq!(store.capacity_totals("account").unwrap().pending,0);
         drop(runtime);drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

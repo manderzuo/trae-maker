@@ -144,9 +144,12 @@ impl PackObservation {
         self.validate()?;previous.validate()?;
         if self.observed_at_ms<=previous.observed_at_ms || actual<0 {return Err("capacity_source_unproven".into());}
         if previous.packs.iter().any(|(key,old)|!self.packs.contains_key(key)
-            && !(old.used==old.limit && old.end_ms.is_some_and(|end|end<=self.observed_at_ms))) {
+            && !old.end_ms.is_some_and(|end|end<=self.observed_at_ms)) {
             return Err("capacity_source_missing_pack".into());
         }
+        // A known, expired entitlement loses its unused capacity; it is not a
+        // debit or a refund. All actual consumption must still be explained by
+        // exact visible usage deltas below. Missing live/undated packs fail closed.
         let mut delta=0i64;
         for (key,next) in &self.packs {
             let prior=if let Some(old)=previous.packs.get(key) {
@@ -453,8 +456,8 @@ mod tests {
         assert_eq!(PackObservation::parse(&[reward],10_000).unwrap().balances().unwrap(),(145_000_000,0),"reported use always wins over status metadata");
     }
     #[test]
-    fn qa61_missing_partial_or_unexpired_pack_still_cannot_cover_any_debit() {
-        for (used,expiry) in [("499",30),("500",1000)] {
+    fn missing_unexpired_pack_still_cannot_cover_any_debit() {
+        for (used,expiry) in [("499",1000),("500",1000)] {
             let mut old=pack("old",221,"500",used);old["expire_time"]=json!(expiry);
             let before=PackObservation::parse(&[old],10_000).unwrap();
             let after=PackObservation::parse(&[pack("new",221,"500","0")],40_000).unwrap();
