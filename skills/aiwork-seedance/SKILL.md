@@ -26,6 +26,16 @@ reference files.
 
 ## Commands
 
+Reference IDs are temporary upload handles, not permanent canvas references.
+For each new generation, the runner uploads fresh copies of the explicitly
+selected source files. An ID from this client's earlier upload resolves only
+to its recorded original file under the same gateway and credential; changed,
+missing or unknown sources block before generation. Prefer `image_paths` /
+`video_paths` when no such source record exists. Never scan for replacements.
+Keep one idempotency key per intended generation. Repeating a successful key
+returns its saved task receipt; a pending or unknown key is never automatically
+uploaded or submitted again. See [runner contract](references/api.md).
+
 Run the bundled PowerShell runner from this skill directory:
 
 ```powershell

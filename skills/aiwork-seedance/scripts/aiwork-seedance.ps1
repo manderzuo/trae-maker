@@ -28,6 +28,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'reference-lifecycle.ps1')
 
 $script:ConfigPath = Join-Path (Join-Path $env:APPDATA 'AIWork') 'seedance-skill.json'
 $script:Config = $null
@@ -142,9 +143,7 @@ function Invoke-AiworkJson {
         }
         return Convert-ResponseBody $response
     } catch {
-        $detail = $_.Exception.Message
-        if ($detail -match 'AI Work|HTTP') { throw $detail }
-        throw "AI Work 网关请求失败：$detail"
+        throw (New-AiworkHttpError $_)
     }
 }
 
@@ -174,21 +173,20 @@ function Get-MimeType([string]$Path) {
     }
 }
 
-function Upload-Asset([string]$Path) {
-    if ([string]::IsNullOrWhiteSpace($Path)) { throw '素材路径不能为空。' }
-    $resolved = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path)
-    $file = Get-Item -LiteralPath $resolved -ErrorAction Stop
-    if (-not $file.PSIsContainer -and $file.Length -gt 32MB) { throw "素材超过 32 MiB 限制：$resolved" }
-    if ($file.Length -eq 0) { throw "素材为空：$resolved" }
+function Upload-Asset([string]$Path, [string]$ExpectedSha256 = '') {
+    $file = Get-AiworkReferenceFile $Path $ExpectedSha256
     $payload = @{
-        filename = $file.Name
-        mime_type = Get-MimeType $resolved
-        data_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($resolved))
+        filename = [IO.Path]::GetFileName($file.path)
+        mime_type = $file.mime
+        data_base64 = [Convert]::ToBase64String($file.bytes)
     }
     $result = Invoke-AiworkJson -Method POST -Uri (Get-ApiUri '/assets') -Body $payload
-    $assetId = Get-PropertyValue $result 'id'
-    if (-not $assetId) { throw "网关未返回素材 ID：$(Get-ErrorMessage $result)" }
-    return [string]$assetId
+    $assetId = [string](Get-PropertyValue $result 'id')
+    if ($assetId -notmatch '^[-A-Za-z0-9._~]{1,256}$') { throw 'REFERENCE_UPLOAD_INVALID' }
+    $returnedHash = [string](Get-PropertyValue $result 'sha256')
+    if ($returnedHash -and $returnedHash -cne $file.sha256) { throw 'REFERENCE_UPLOAD_DIGEST_MISMATCH' }
+    Save-AiworkReferenceSource $assetId $file.path $file.sha256
+    return $assetId
 }
 
 function Get-TaskId($value) {
@@ -245,19 +243,8 @@ function Submit-Task {
         resolution = $Resolution
         ratio = $Ratio
     }
-    $imageIds = @()
-    if ($ImageAssetId) { $imageIds += $ImageAssetId }
-    if ($ImagePath) { foreach ($path in $ImagePath) { $imageIds += Upload-Asset $path } }
-    if ($imageIds.Count -gt 0) { $payload.image_asset_ids = @($imageIds) }
-    $videoIds = @()
-    if ($VideoAssetId) { $videoIds += $VideoAssetId }
-    if ($VideoPath) { foreach ($path in $VideoPath) { $videoIds += Upload-Asset $path } }
-    if ($videoIds.Count -gt 0) { $payload.video_asset_ids = @($videoIds) }
     $key = if ($IdempotencyKey) { $IdempotencyKey } else { "seedance-$([Guid]::NewGuid().ToString())" }
-    $result = Invoke-AiworkJson -Method POST -Uri (Get-ApiUri '/videos/generations') -Body $payload -ExtraHeaders @{ 'Idempotency-Key' = $key }
-    $id = Get-TaskId $result
-    if ([string]::IsNullOrWhiteSpace($id)) { throw "网关未返回任务 ID：$(Get-ErrorMessage $result)" }
-    return [pscustomobject]@{ task_id = $id; status = 'submitted'; idempotency_key = $key }
+    return Send-AiworkPreparedSubmission -Payload $payload -ImageIds $ImageAssetId -ImagePaths $ImagePath -VideoIds $VideoAssetId -VideoPaths $VideoPath -Key $key
 }
 
 function Wait-Task([string]$Id) {
