@@ -299,7 +299,7 @@ mod tests {
         for (kind,name,_) in super::super::bridge_capacity_grants::SCHEMA_OBJECTS.iter().rev() {
             store.connection.execute_batch(&format!("DROP {kind} {name}")).unwrap();
         }
-        store.connection.execute_batch("DROP TABLE bridge_budget_hold_releases; DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; DROP TABLE bridge_budget_executions; UPDATE bridge_schema_meta SET schema_version=3").unwrap();
+        store.connection.execute_batch("DROP TABLE IF EXISTS bridge_budget_worker_exits; DROP TABLE bridge_budget_hold_releases; DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; DROP TABLE bridge_budget_executions; UPDATE bridge_schema_meta SET schema_version=3").unwrap();
         drop(store);let store=BridgeBillingStore::open(&dir).unwrap();
         let execution=store.budget_execution(&id).unwrap().unwrap();
         assert_eq!(execution.state,ExecutionState::Unknown);assert!(!execution.result_available);

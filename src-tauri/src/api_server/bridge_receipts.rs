@@ -149,7 +149,9 @@ impl BridgeBillingStore {
     pub(super) fn confirm_budget_usage(&mut self,lease:&BridgeBudgetLease,budget_id:&str)->Result<ReceiptChange,String> {
         self.budget_hold_release(budget_id)?;
         let execution=self.budget_execution(budget_id)?.ok_or("budget has not been sent")?;
-        let Some(finished)=execution.finished_at_ms else {return Ok(ReceiptChange::Pending)};
+        let now=chrono::Utc::now().timestamp_millis();
+        let accounting_anchor=if execution.finished_at_ms.is_none() {self.unknown_budget_accounting_anchor(budget_id,now)?}else{None};
+        let Some(finished)=execution.finished_at_ms.or(accounting_anchor) else {return Ok(ReceiptChange::Pending)};
         use super::bridge_billing::CoreBillingSessionLookup;
         if !matches!(self.usage_session_for_request(&execution.request_id)?,CoreBillingSessionLookup::Unique {core_key_id,account_ref,session_id,..}
             if core_key_id==execution.core_key_id && account_ref==execution.account_ref && session_id==execution.session_ref) {return Err("budget session attribution ambiguous".into());}
@@ -164,13 +166,18 @@ impl BridgeBillingStore {
             self.release_absent_budget_hold(lease,budget_id,None)?;
             return Ok(ReceiptChange::Pending)
         };
+        // A stopped unknown has no terminal timestamp. Use its independent
+        // anchor, require a fresh complete exact observation, and retain unknown
+        // execution truth. Never use a cached candidate amount by itself.
+        if accounting_anchor.is_some() && (source.credits.as_microcredits()==0 || source.observed_at_ms>now+60_000 || now.saturating_sub(source.observed_at_ms)>600_000) {return Ok(ReceiptChange::Pending);}
         let receipt=BillingReceipt {request_id:execution.request_id.clone(),status:BillingReceiptStatus::Final,actual_credits:Some(source.credits),unit:"credits".into(),
             source_ref:format!("trae-usage-session:{}",source.session_id),task_ref:execution.task_ref.clone(),observed_at_ms:source.observed_at_ms};
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
         let current=bridge_prepared::sent_execution_identity(&tx,budget_id)?;
         if identity!=current {return Err("receipt preparation binding changed".into());}
         reject_legacy_collision(&tx,&execution.request_id,&execution.account_ref,&execution.session_ref)?;
-        let result=persist_fact(&tx,lease,&identity.authorization,&receipt,SESSION_POLICY,Some((source.read_started_at_ms,source.query_end_ms)))?;
+        let policy=if accounting_anchor.is_some(){"post-worker-exit-session-observation-v1"}else{SESSION_POLICY};
+        let result=persist_fact(&tx,lease,&identity.authorization,&receipt,policy,Some((source.read_started_at_ms,source.query_end_ms)))?;
         tx.commit().map_err(db_error)?;Ok(result)
     }
     pub(super) fn confirm_budget_no_send(&mut self,lease:&BridgeBudgetLease,budget_id:&str)->Result<ReceiptChange,String> {

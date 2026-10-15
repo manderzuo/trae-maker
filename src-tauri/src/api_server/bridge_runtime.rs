@@ -18,7 +18,7 @@ pub(crate) fn recover_quiet_local_instance(data_dir:&Path,acknowledge_retained_u
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_|"bridge_local_recovery_read_failed")?;
         db.execute_batch("PRAGMA query_only=ON").map_err(|_|"bridge_local_recovery_read_failed")?;
         let schema:i64=db.query_row("SELECT schema_version FROM bridge_schema_meta WHERE singleton=1",[],|r|r.get(0)).map_err(|_|"bridge_local_recovery_read_failed")?;
-        if !matches!(schema,8|9|10) {return Err("bridge_local_recovery_schema_requires_review".into());}
+        if !matches!(schema,8|9|10|11) {return Err("bridge_local_recovery_schema_requires_review".into());}
         quiet(&db)?;
     }
     let runtime=BridgeBudgetRuntime::start(data_dir).map_err(|_|"bridge_local_recovery_start_failed")?;
@@ -150,6 +150,9 @@ impl BridgeBudgetRuntime {
                 let fresh=existing.is_none();
                 let diagnostic=existing.unwrap_or_else(||super::bridge_diagnostics::Diagnostic {code:"video_execution_interrupted".into(),stage:"video_stream".into(),outcome_known:false,upstream_error:None,transport:None});
                 if fresh {store.save_budget_diagnostic(lease,&id,&diagnostic)?;}
+                // The exclusive process lease fences every worker in the old
+                // generation. Record local exit without inventing a video result.
+                store.record_budget_worker_exit(lease,&id,chrono::Utc::now().timestamp_millis())?;
                 if let Some(task)=task {
                     let stale=super::video::get(&task).is_some_and(|t| !matches!(t.status.as_str(),"completed"|"failed"|"canceled"|"timeout") && (t.status!="unknown" || t.execution_diagnostic.as_ref()!=Some(&diagnostic)));
                     if fresh || stale {tasks.push((task,diagnostic));}

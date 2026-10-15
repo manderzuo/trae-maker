@@ -24,7 +24,10 @@ pub(super) fn run_consumed(runtime:&BridgeBudgetRuntime,ctx:&ConsumedBudget,send
     if !runtime.with_store(|s,l|s.mark_budget_send_intent(l,id,&ctx.consume_epoch))? {return Ok(());}
     struct SentGuard<'a> {runtime:&'a BridgeBudgetRuntime,id:&'a str}
     impl Drop for SentGuard<'_> {
-        fn drop(&mut self) {let _=self.runtime.with_store(|s,l|s.mark_budget_execution_unknown(l,self.id));}
+        fn drop(&mut self) {let _=self.runtime.with_store(|s,l| {
+            s.mark_budget_execution_unknown(l,self.id)?;
+            s.record_budget_worker_exit(l,self.id,chrono::Utc::now().timestamp_millis()).map(|_|())
+        });}
     }
     let _sent=SentGuard {runtime,id};
     match send(&body) {

@@ -211,6 +211,7 @@ async fn read_request(state: Arc<ApiSharedState>, request: String, budget: Strin
             "execution" => {
                 value["status"] = execution.as_ref().map(|e| json!(e.state)).unwrap_or(json!("not_started"));
                 value["execution"] = json!(execution);
+                value["worker_exit"] = store.budget_worker_exit_proof(&budget,chrono::Utc::now().timestamp_millis())?.unwrap_or(Value::Null);
             }
             "result" => {
                 let result = if execution.is_some() { store.load_budget_result(&budget)? } else { None };

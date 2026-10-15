@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const BILLING_DB_FILE: &str = "bridge-billing.sqlite3";
 const BRIDGE_SCHEMA_META_TABLE: &str = "bridge_schema_meta";
-const BRIDGE_SCHEMA_VERSION: i64 = 10;
+const BRIDGE_SCHEMA_VERSION: i64 = 11;
 const BRIDGE_ACTIVE_OWNER_PREFIX: &str = "bridge-active-v1-";
 const BRIDGE_RECOVERY_REQUIRED_PREFIX: &str = "bridge-recovery-required-v1-";
 
@@ -1485,6 +1485,13 @@ where F: Fn(&Transaction<'_>) -> Result<(), String>,
         transaction.execute("UPDATE bridge_schema_meta SET schema_version=10 WHERE singleton=1 AND schema_version=9",[]).map_err(|e|e.to_string())?;
         validate_versioned_bridge_schema(&transaction)?;
     }
+    if read_bridge_schema_metadata(&transaction)?.0 == 10 {
+        super::bridge_worker_exit::create_schema(&transaction)?;
+        super::bridge_worker_exit::validate_schema(&transaction)?;
+        hook(&transaction)?;
+        transaction.execute("UPDATE bridge_schema_meta SET schema_version=11 WHERE singleton=1 AND schema_version=10",[]).map_err(|e|e.to_string())?;
+        validate_versioned_bridge_schema(&transaction)?;
+    }
     transaction.commit().map_err(|error| format!("bridge capacity migration commit failed: {error}"))
 }
 
@@ -1513,6 +1520,7 @@ fn validate_versioned_bridge_schema(transaction: &Transaction<'_>) -> Result<(),
     if version >= 8 { super::bridge_diagnostics::validate_schema(transaction)?; }
     if version >= 9 { super::bridge_capacity_grants::validate_schema(transaction)?; }
     if version >= 10 { super::bridge_hold::validate_schema(transaction)?; }
+    if version >= 11 { super::bridge_worker_exit::validate_schema(transaction)?; }
     validate_bridge_identity(&instance_id, &generation)?;
     validate_foreign_key_integrity(transaction)?;
     Ok(())
@@ -1587,6 +1595,9 @@ fn validate_bridge_schema(
     }
     if versioned && read_bridge_schema_metadata(transaction)?.0 >= 10 {
         objects.retain(|(_,name)| !super::bridge_hold::SCHEMA_OBJECTS.iter().any(|(_,expected,_)|name==expected));
+    }
+    if versioned && read_bridge_schema_metadata(transaction)?.0 >= 11 {
+        objects.retain(|(_,name)| !super::bridge_worker_exit::SCHEMA_OBJECTS.iter().any(|(_,expected,_)|name==expected));
     }
     let required_count = LEGACY_OBJECTS.len() + usize::from(versioned);
     let complete = objects.len() == required_count
@@ -2303,7 +2314,7 @@ mod tests {
     fn drop_package_grant_schema(connection:&Connection) {
         // Build historic-version fixtures from the current schema. Only these
         // isolated tests may drop witness tables, never deployment recovery.
-        connection.execute_batch("DROP TABLE bridge_budget_hold_releases").unwrap();
+        connection.execute_batch("DROP TABLE IF EXISTS bridge_budget_worker_exits; DROP TABLE bridge_budget_hold_releases").unwrap();
         for (kind,name,_) in super::super::bridge_capacity_grants::SCHEMA_OBJECTS.iter().rev() {
             connection.execute_batch(&format!("DROP {kind} {name}")).unwrap();
         }
@@ -2450,7 +2461,7 @@ mod tests {
         let ConsumeOutcome::Granted(ctx)=store.consume_budget(&lease,&prepared,20).unwrap() else {panic!("first consume")};
         store.mark_budget_send_intent(&lease,&prepared.authorization.budget_id,&ctx.consume_epoch).unwrap();
         drop_package_grant_schema(&store.connection);
-        store.connection.execute_batch("DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; DROP TABLE bridge_budget_executions; UPDATE bridge_schema_meta SET schema_version=3").unwrap();
+        store.connection.execute_batch("DROP TABLE IF EXISTS bridge_budget_worker_exits; DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; DROP TABLE bridge_budget_executions; UPDATE bridge_schema_meta SET schema_version=3").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
             let count:i64=tx.query_row("SELECT COUNT(*) FROM bridge_budget_executions WHERE execution_state='unknown'",[],|r|r.get(0)).unwrap();
@@ -2472,7 +2483,7 @@ mod tests {
         let (dir,mut store,lease)=fixture();
         let prepared=store.prepare_budget(&lease,&input(),None,10).unwrap();
         drop_package_grant_schema(&store.connection);
-        store.connection.execute_batch("DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; UPDATE bridge_schema_meta SET schema_version=4").unwrap();
+        store.connection.execute_batch("DROP TABLE IF EXISTS bridge_budget_worker_exits; DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; DROP TABLE bridge_budget_receipt_events; DROP TABLE bridge_budget_receipts; UPDATE bridge_schema_meta SET schema_version=4").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
             let count:i64=tx.query_row("SELECT COUNT(*) FROM bridge_budget_receipts",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
@@ -2493,7 +2504,7 @@ mod tests {
         let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"request-schema6");
         cache(&dir,&store,&[(&id,"50")],2000);store.confirm_budget_usage(&lease,&id).unwrap();
         drop_package_grant_schema(&store.connection);
-        store.connection.execute_batch("DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; UPDATE bridge_schema_meta SET schema_version=5").unwrap();
+        store.connection.execute_batch("DROP TABLE IF EXISTS bridge_budget_worker_exits; DROP TABLE bridge_execution_diagnostics; DROP TABLE bridge_capacity_anchors; DROP TABLE bridge_capacity_covered; DROP TABLE bridge_capacity_rebases; UPDATE bridge_schema_meta SET schema_version=5").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='bridge_capacity_covered')",[],|r|r.get(0)).unwrap();
@@ -2516,7 +2527,7 @@ mod tests {
         let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"request-schema7");
         cache(&dir,&store,&[(&id,"50")],2000);store.confirm_budget_usage(&lease,&id).unwrap();
         drop_package_grant_schema(&store.connection);
-        store.connection.execute_batch("DROP TABLE bridge_execution_diagnostics; DROP TABLE IF EXISTS bridge_capacity_anchors; UPDATE bridge_schema_meta SET schema_version=6").unwrap();
+        store.connection.execute_batch("DROP TABLE IF EXISTS bridge_budget_worker_exits; DROP TABLE bridge_execution_diagnostics; DROP TABLE IF EXISTS bridge_capacity_anchors; UPDATE bridge_schema_meta SET schema_version=6").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|tx| {
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='bridge_capacity_anchors')",[],|r|r.get(0)).unwrap();
@@ -2542,7 +2553,7 @@ mod tests {
         let totals=store.capacity_totals("account").unwrap();
         let receipt=store.latest_budget_receipt_event(&id).unwrap();
         drop_package_grant_schema(&store.connection);
-        store.connection.execute_batch("DROP TABLE bridge_execution_diagnostics; UPDATE bridge_schema_meta SET schema_version=7").unwrap();
+        store.connection.execute_batch("DROP TABLE IF EXISTS bridge_budget_worker_exits; DROP TABLE bridge_execution_diagnostics; UPDATE bridge_schema_meta SET schema_version=7").unwrap();
         let before=(schema_objects(&store.connection),bridge_metadata(&store.connection).unwrap());
         let result=upgrade_bridge_capacity_schema(&mut store.connection,&|_|Err("injected-v8-migration-failure".into()));
         assert!(result.unwrap_err().contains("injected-v8"));
@@ -2582,10 +2593,10 @@ mod tests {
         use super::super::{bridge_prepared::tests::{fixture,cleanup},bridge_receipts::tests::{send,cache}};
         let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"schema-ten");cache(&dir,&store,&[(&id,"12")],2000);store.confirm_budget_usage(&lease,&id).unwrap();
         let receipt=serde_json::to_value(store.latest_budget_receipt_event(&id).unwrap()).unwrap();let totals=store.capacity_totals("account").unwrap();
-        store.connection.execute_batch("DROP TABLE bridge_budget_hold_releases; UPDATE bridge_schema_meta SET schema_version=9").unwrap();
+        store.connection.execute_batch("DROP TABLE IF EXISTS bridge_budget_worker_exits; DROP TABLE bridge_budget_hold_releases; UPDATE bridge_schema_meta SET schema_version=9").unwrap();
         assert!(upgrade_bridge_capacity_schema(&mut store.connection,&|_|Err("injected-v10".into())).unwrap_err().contains("injected-v10"));
         assert_eq!(bridge_metadata(&store.connection).unwrap().unwrap().0,9);
-        drop(store);let store=BridgeBillingStore::open(&dir).unwrap();assert_eq!(bridge_metadata(&store.connection).unwrap().unwrap().0,10);
+        drop(store);let store=BridgeBillingStore::open(&dir).unwrap();assert_eq!(bridge_metadata(&store.connection).unwrap().unwrap().0,BRIDGE_SCHEMA_VERSION);
         assert_eq!(serde_json::to_value(store.latest_budget_receipt_event(&id).unwrap()).unwrap(),receipt);assert_eq!(store.capacity_totals("account").unwrap(),totals);cleanup(dir,store,lease);
     }
 
