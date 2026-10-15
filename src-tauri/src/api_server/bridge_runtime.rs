@@ -202,7 +202,8 @@ impl BridgeBudgetRuntime {
                     LEFT JOIN bridge_budget_executions e ON e.budget_id=p.budget_id
                     LEFT JOIN bridge_budget_receipts r ON r.budget_id=p.budget_id
                     WHERE p.account_ref=?1 AND p.budget_id>?2
-                      AND (e.finished_at_ms IS NOT NULL OR p.state IN ('canceled','no_send'))
+                      AND (e.finished_at_ms IS NOT NULL OR p.state IN ('canceled','no_send')
+                        OR (e.execution_state='unknown' AND EXISTS(SELECT 1 FROM bridge_budget_worker_exits w WHERE w.budget_id=e.budget_id)))
                       AND ((?3=0 AND r.budget_id IS NULL) OR (?3=1 AND r.receipt_state='final'))
                     ORDER BY p.budget_id LIMIT ?4").map_err(|e|e.to_string())?;
                 let rows=stmt.query_map(rusqlite::params![account,cursor,history,limit],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?;
@@ -215,6 +216,8 @@ impl BridgeBudgetRuntime {
             }
             Ok((candidates,next))
         })?;
+        // Exited unknowns have no terminal timestamp. Include them in both lanes;
+        // confirm_budget_usage independently checks age, quiet time and exact bills.
         // Cursors schedule reads only; money facts/outbox remain transactional.
         let mut failed=false;
         for (id,state) in candidates {
@@ -243,6 +246,42 @@ impl Drop for BridgeBudgetRuntime {
 mod tests {
     use super::*;
     use super::super::{bridge_prepared::tests::fixture,bridge_receipts::tests::{send,cache}};
+    #[test]
+    fn account_refresh_confirms_stopped_unknowns_and_retains_unproven_or_recent_work() {
+        use super::super::{bridge_prepared::{tests::input,ConsumeOutcome},bridge_execution::ExecutionState};
+        let (dir,store,lease)=fixture();drop(lease);drop(store);
+        let runtime=BridgeBudgetRuntime::start(&dir).unwrap();let status=runtime.recovery_status().unwrap();
+        if status.recovery_required {runtime.recover_local_instance(&status.instance_id,&status.generation,true).unwrap();}
+        let now=chrono::Utc::now().timestamp_millis();
+        let ids=runtime.with_store(|s,l| {
+            let mut ids=Vec::new();let mut rows=serde_json::Map::new();let mut observations=serde_json::Map::new();
+            for (index,(unknown,age,exit))in [(true,1_900_000,Some(120_000)),(true,1_900_000,None),(true,1_900_000,Some(30_000)),(true,120_000,Some(90_000)),(false,1_900_000,None)].into_iter().enumerate() {
+                let mut value=input();value.step_kind="video".into();value.request_id=format!("account-unknown-{index}");value.hold_microcredits=1_000_000;
+                let p=s.prepare_budget(l,&value,None,10)?;let ConsumeOutcome::Granted(c)=s.consume_budget(l,&p,20)?else{panic!("consume")};
+                let id=p.authorization.budget_id;s.mark_budget_send_intent(l,&id,&c.consume_epoch)?;
+                s.connection.execute("UPDATE bridge_budget_executions SET started_at_ms=?1 WHERE budget_id=?2",rusqlite::params![now-age,&id]).unwrap();
+                if unknown {s.mark_budget_execution_unknown(l,&id)?;}
+                if let Some(elapsed)=exit {s.record_budget_worker_exit(l,&id,now-elapsed)?;}
+                let e=s.budget_execution(&id)?.unwrap();
+                let row=serde_json::json!({"session_id":e.session_ref,"usage_time":now/1000,"date":"2026-10-15","model_name":"seedance","credits_float":"0.5","core_request_id":e.request_id,"core_key_id":e.core_key_id,"ambiguous":false,"core_attribution_ambiguous":false});
+                rows.insert(e.session_ref.clone(),row.clone());observations.insert(e.session_ref,serde_json::json!({"row":row,"complete":true,"read_started_at_ms":now-1000,"completed_at_ms":now,"query_end_ms":now+300_000}));ids.push(id);
+            }
+            let path=dir.join("data/usage_history.json");std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            crate::fs_utils::write_json(&path,&serde_json::json!({"accounts":{"account":{"name":"fixture","daily":{},"session_usage":rows,"session_observations":observations}}})).unwrap();Ok(ids)
+        }).unwrap();
+        runtime.confirm_account("account").unwrap();runtime.confirm_account("account").unwrap();
+        runtime.with_store(|s,l| {
+            let event=s.latest_budget_receipt_event(&ids[0])?.expect("background account refresh must include an eligible stopped unknown");
+            assert_eq!(event.receipt.unwrap().actual_credits.unwrap().as_microcredits(),500_000);
+            assert_eq!(event.confirmation_policy,"post-worker-exit-session-observation-v1");
+            assert_eq!(s.budget_receipt_events(l.generation(),0,20)?.len(),1,"repeat background scans cannot double charge");
+            for (index,id)in ids.iter().enumerate() {
+                let e=s.budget_execution(id)?.unwrap();assert!(e.finished_at_ms.is_none());assert!(s.load_budget_result(id)?.is_none());
+                assert_eq!(e.state,if index==4{ExecutionState::Running}else{ExecutionState::Unknown});
+                if index>0 {assert!(s.latest_budget_receipt_event(id)?.is_none(),"unproven, recent and running work must retain its hold");}
+            }Ok(())
+        }).unwrap();drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn prior_host_text_execution_ends_without_zero_bill_and_late_receipt_settles_once() {
         use super::super::{bridge_prepared::{tests::input,ConsumeOutcome},bridge_execution::ExecutionState};
