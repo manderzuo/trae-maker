@@ -183,12 +183,29 @@ type Anchor=(i64,i64,i64,String);
 fn anchor(conn:&Connection,account:&str)->Result<Option<Anchor>,String> {
     conn.query_row("SELECT snapshot_epoch,event_sequence,legacy_sessions,observation_json FROM bridge_capacity_anchors WHERE account_ref=?1",[account],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(db_error)
 }
+pub(super) fn reviewed_adjustment(conn:&Connection,account:&str,epoch:i64)->Result<Option<Value>,String>{
+    let prior:Option<String>=conn.query_row("SELECT coverage_json FROM bridge_capacity_rebases WHERE account_ref=?1 AND state='committed' ORDER BY json_extract(coverage_json,'$.snapshot.epoch') DESC LIMIT 1",[account],|r|r.get(0)).optional().map_err(db_error)?;
+    let Some(prior)=prior else{return Ok(None)};let prior:Value=serde_json::from_str(&prior).map_err(|_|"capacity_source_unproven")?;
+    if prior.pointer("/snapshot/epoch").and_then(Value::as_i64)!=Some(epoch){return Err("capacity_anchor_watermark_changed".into());}
+    let Some(adjustment)=prior.get("reviewed_source_adjustment")else{return Ok(None)};
+    adjustment_buffer(adjustment)?;Ok(Some(adjustment.clone()))
+}
+pub(super) fn adjustment_buffer(value:&Value)->Result<i64,String>{
+    if value["policy"]!="full-session-statement-net-v1" || !value["source_hash"].as_str().is_some_and(|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_hexdigit())){return Err("capacity_review_invalid".into());}
+    value["buffer_microcredits"].as_i64().filter(|v|*v>=0).ok_or_else(||"capacity_review_invalid".into())
+}
+pub(super) fn net_balances(observation:&PackObservation,buffer:i64)->Result<(i64,i64),String>{
+    if buffer<0{return Err("capacity_review_invalid".into());}let(g,w)=observation.balances()?;
+    Ok((g.saturating_sub(buffer).max(0),w.saturating_sub(buffer.saturating_sub(g).max(0)).max(0)))
+}
 pub(super) fn verify_anchor(tx:&Transaction<'_>,fence:&RebaseFence,observation:&PackObservation)->Result<Value,String> {
     let (epoch,event,legacy,json)=anchor(tx,&fence.account_ref)?.ok_or("capacity_anchor_missing")?;
     if epoch!=fence.snapshot_epoch || event>fence.event_sequence || legacy!=fence.legacy_sessions {return Err("capacity_anchor_watermark_changed".into());}
     let previous:PackObservation=serde_json::from_str(&json).map_err(|_|"capacity_anchor_invalid")?;
     let snapshot=bridge_rebase::snapshot(tx,&fence.account_ref)?;
-    if snapshot.observed_at_ms!=previous.observed_at_ms || previous.balances()? != (snapshot.general,snapshot.work) {return Err("capacity_anchor_snapshot_changed".into());}
+    let adjustment=reviewed_adjustment(tx,&fence.account_ref,epoch)?;
+    let buffer=adjustment.as_ref().map(adjustment_buffer).transpose()?.unwrap_or(0);
+    if snapshot.observed_at_ms!=previous.observed_at_ms || net_balances(&previous,buffer)? != (snapshot.general,snapshot.work) {return Err("capacity_anchor_snapshot_changed".into());}
     let actual:i64=tx.query_row("SELECT COALESCE(SUM(s.actual_microcredits),0) FROM bridge_capacity_slots s WHERE s.account_ref=?1 AND s.stage='D' AND NOT EXISTS(SELECT 1 FROM bridge_capacity_covered c WHERE c.budget_id=s.budget_id)",[&fence.account_ref],|r|r.get(0)).map_err(db_error)?;
     // Derived coverage stays separate from the exact upstream observation and
     // money receipts. Carry only the remainder of a previously committed proof.
@@ -206,7 +223,8 @@ pub(super) fn verify_anchor(tx:&Transaction<'_>,fence:&RebaseFence,observation:&
     for id in previous.packs.keys().filter(|id|!observation.packs.contains_key(*id)) {expired.insert(id.clone());}
     if expired.len()>4096 {return Err("capacity_source_bounds".into());}
     let remaining=observation.proves_with_allowance(&previous,actual,allowance)?;
-    Ok(serde_json::json!({"expired_allowance_microcredits":remaining,"expired_pack_ids":expired}))
+    let mut derived=serde_json::json!({"expired_allowance_microcredits":remaining,"expired_pack_ids":expired});
+    if let Some(adjustment)=adjustment{derived["reviewed_source_adjustment"]=adjustment;}Ok(derived)
 }
 pub(super) fn advance_anchor(tx:&Transaction<'_>,fence:&RebaseFence,observation:&PackObservation)->Result<(),String> {
     let changed=tx.execute("UPDATE bridge_capacity_anchors SET snapshot_epoch=?1,event_sequence=?2,observation_json=?3 WHERE account_ref=?4 AND snapshot_epoch=?5 AND legacy_sessions=?6",
@@ -283,7 +301,8 @@ pub(super) fn reconcile_with(runtime:&super::bridge_runtime::BridgeBudgetRuntime
 }
 pub(super) fn reconcile_increased_capacity(runtime:&super::bridge_runtime::BridgeBudgetRuntime,account:&str,general:i64,work:i64,fetch:impl FnOnce()->Result<Vec<Value>,String>)->Result<bool,String> {
     let needed=runtime.with_store(|s,_| {
-        let current:Option<(i64,i64)>=s.connection.query_row("SELECT a.general_microcredits,a.work_microcredits FROM bridge_capacity_accounts a JOIN bridge_capacity_anchors b ON b.account_ref=a.account_ref WHERE a.account_ref=?1",[account],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(db_error)?;
+        let raw:Option<String>=s.connection.query_row("SELECT observation_json FROM bridge_capacity_anchors WHERE account_ref=?1",[account],|r|r.get(0)).optional().map_err(db_error)?;
+        let current=raw.map(|v|serde_json::from_str::<PackObservation>(&v).map_err(|_|"capacity_anchor_invalid".to_string())?.balances()).transpose()?;
         Ok(current.is_some_and(|(g,w)|general>g || work>w))
     })?;
     if !needed {return Ok(false);}

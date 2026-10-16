@@ -20,6 +20,7 @@ pub(crate) mod bridge_diagnostics;
 pub(crate) mod bridge_artifacts;
 pub(crate) mod bridge_chunks;
 pub(crate) mod bridge_capacity_source;
+mod bridge_capacity_review;
 pub(crate) mod bridge_reference;
 mod reference_timeline;
 pub(crate) mod balance_refresh;
