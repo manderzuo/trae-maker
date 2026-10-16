@@ -167,6 +167,20 @@ pub(super) async fn prepare(State(state):State<Arc<ApiSharedState>>,
         _=>error(StatusCode::SERVICE_UNAVAILABLE,"budget_preparation_failed"),
     }
 }
+pub(super) async fn preflight(State(state):State<Arc<ApiSharedState>>,
+    axum::Extension(runtime):axum::Extension<Arc<super::bridge_runtime::BridgeBudgetRuntime>>,
+    axum::Extension(bridge_key):axum::Extension<super::usage::KeyId>,
+    Json(request):Json<super::bridge_planner::PrepareRequest>)->Response {
+    let id=request.request_id.clone();
+    let result=tokio::task::spawn_blocking(move ||super::bridge_planner::preflight_now(&runtime,&request,
+        &super::bridge_planner::NativePreparationSource(&state,&bridge_key.0,super::native_io::Budget::new(super::native_io::PREPARATION_LIMIT)))).await;
+    match result {
+        Ok(Ok(()))=>Json(json!({"wire_version":2,"request_id":id,"status":"ready"})).into_response(),
+        Ok(Err(code))=>error(StatusCode::SERVICE_UNAVAILABLE,match code.as_str(){
+            "budget_policy_expired"|"budget_policy_unconfigured"|"budget_policy_invalid"|"upstream_account_unavailable"|"upstream_capacity_insufficient"|"upstream_capacity_unavailable"|"bridge_recovery_required"|"budget_preparation_busy"|"invalid_budget_business_request"=>code.as_str(),_=>"budget_preparation_failed"}),
+        _=>error(StatusCode::SERVICE_UNAVAILABLE,"budget_preparation_failed"),
+    }
+}
 pub(super) async fn cancel(axum::Extension(runtime):axum::Extension<Arc<super::bridge_runtime::BridgeBudgetRuntime>>,
     Json(prepared):Json<super::bridge_prepared::PreparedBudget>)->Response {
     let result=tokio::task::spawn_blocking(move ||runtime.with_store(|store,lease| {

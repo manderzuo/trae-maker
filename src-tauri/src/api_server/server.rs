@@ -166,6 +166,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/internal/bridge/v2/receipt-events", get(super::bridge_v2_api::events))
         .route("/internal/bridge/v2/recovery", get(super::bridge_v2_api::recovery_status).post(super::bridge_v2_api::recover))
         .route("/internal/bridge/v2/budgets/prepare", post(super::bridge_v2_api::prepare).layer(DefaultBodyLimit::max(8*1024*1024)))
+        .route("/internal/bridge/v2/budgets/preflight", post(super::bridge_v2_api::preflight).layer(DefaultBodyLimit::max(8*1024*1024)))
         .route("/internal/bridge/v2/budgets/cancel", post(super::bridge_v2_api::cancel))
         .route("/internal/bridge/v2/budgets/dispatch", post(super::bridge_v2_api::dispatch))
         .route("/internal/bridge/key-registry", put(super::bridge_api::replace_core_key_registry).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))

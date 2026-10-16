@@ -63,6 +63,43 @@ fn audit_expired_partially_unused_package_blocks_new_package_rebase() {
     assert_eq!(after.balances().unwrap(),(100_000_000,0));after.proves(&before,0).unwrap();
     println!("AUDIT rollover: expired partially unused package disappears; verified new package rejected at old anchor");
 }
+#[test]
+fn expired_package_disposal_covers_only_known_debits_within_its_old_remainder() {
+    use super::bridge_capacity_source::PackObservation;
+    let old=json!({"id":"old","entitlement_base_info":{"product_id":208,"quota":{"credits_limit":"100"},"end_time":20},"usage":{"credits_amount":"20"}});
+    let new=json!({"id":"new","entitlement_base_info":{"product_id":208,"quota":{"credits_limit":"100"}},"usage":{"credits_amount":"0"}});
+    let before=PackObservation::parse(&[old],10_000).unwrap();let after=PackObservation::parse(&[new],30_000).unwrap();
+    after.proves(&before,40_000_000).unwrap();after.proves(&before,80_000_000).unwrap();
+    assert!(after.proves(&before,80_000_001).is_err());
+}
+
+#[test]
+fn expired_package_allowance_survives_reopen_for_a_late_exact_bill() {
+    use super::bridge_capacity_source::PackObservation;
+    let (dir,mut s,lease)=fixture();
+    let packs=|prefix:&str,expiry:Option<i64>|[208,209].map(|product|json!({"id":format!("{prefix}-{product}"),"entitlement_base_info":{"product_id":product,"quota":{"credits_limit":"100"},"end_time":expiry},"usage":{"credits_amount":"0"}}));
+    s.initialize_capacity_anchor(&lease,"account",&PackObservation::parse(&packs("old",Some(20)),1).unwrap()).unwrap();
+    let now=chrono::Utc::now().timestamp_millis();let fence=s.begin_capacity_rebase(&lease,"account",now).unwrap();
+    s.commit_dedicated_capacity(&lease,&fence,&PackObservation::parse(&packs("new",None),now+1).unwrap()).unwrap();
+    drop(s);let mut s=super::bridge_billing::BridgeBillingStore::open(&dir).unwrap();
+    let mut value=input();value.request_id="late-expired-pack-bill".into();value.snapshot_epoch=2;value.expires_at_ms=now+60_000;
+    let prepared=s.prepare_budget(&lease,&value,None,now+2).unwrap();let id=&prepared.authorization.budget_id;
+    let ConsumeOutcome::Granted(c)=s.consume_budget(&lease,&prepared,now+3).unwrap()else{panic!("consume")};
+    s.mark_budget_send_intent(&lease,id,&c.consume_epoch).unwrap();s.bind_budget_task(&lease,id,"late-task").unwrap();
+    s.finish_budget_result(&lease,id,ExecutionState::Succeeded,&json!({"status":"completed","id":"late-task"}),now+1000).unwrap();
+    super::bridge_receipts::tests::cache(&dir,&s,&[(id,"50")],2000);s.confirm_budget_usage(&lease,id).unwrap();
+    let fence=s.begin_capacity_rebase(&lease,"account",now+10_000).unwrap();
+    s.commit_dedicated_capacity(&lease,&fence,&PackObservation::parse(&packs("new",None),now+10_001).unwrap()).unwrap();
+    s.commit_dedicated_capacity(&lease,&fence,&PackObservation::parse(&packs("new",None),now+10_001).unwrap()).unwrap();
+    assert_eq!(s.capacity_totals("account").unwrap().confirmed,0);
+    let actual:i64=s.connection.query_row("SELECT actual_microcredits FROM bridge_budget_receipts WHERE budget_id=?1",[id],|r|r.get(0)).unwrap();assert_eq!(actual,50_000_000);
+    let remaining:i64=s.connection.query_row("SELECT json_extract(coverage_json,'$.expired_allowance_microcredits') FROM bridge_capacity_rebases WHERE owner_nonce=?1",[&fence.owner_nonce],|r|r.get(0)).unwrap();assert_eq!(remaining,150_000_000);
+    let next=s.begin_capacity_rebase(&lease,"account",now+20_000).unwrap();
+    let mut resurrected=packs("new",None).to_vec();resurrected.extend(packs("old",Some(20)));
+    assert!(s.commit_dedicated_capacity(&lease,&next,&PackObservation::parse(&resurrected,now+20_001).unwrap()).is_err(),"expired package identity cannot recreate coverage allowance");
+    s.abort_capacity_rebase(&lease,&next).unwrap();
+    drop(lease);drop(s);std::fs::remove_dir_all(dir).unwrap();
+}
 
 #[test]
 fn audit_verified_failed_hold_release_still_blocks_account_capacity_refresh() {

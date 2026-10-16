@@ -141,15 +141,22 @@ impl PackObservation {
         }Ok(())
     }
     pub(super) fn proves(&self,previous:&Self,actual:i64)->Result<(),String> {
+        self.proves_with_allowance(previous,actual,0).map(|_|())
+    }
+    fn proves_with_allowance(&self,previous:&Self,actual:i64,allowance:i64)->Result<i64,String> {
         self.validate()?;previous.validate()?;
-        if self.observed_at_ms<=previous.observed_at_ms || actual<0 {return Err("capacity_source_unproven".into());}
+        if self.observed_at_ms<=previous.observed_at_ms || actual<0 || allowance<0 {return Err("capacity_source_unproven".into());}
         if previous.packs.iter().any(|(key,old)|!self.packs.contains_key(key)
             && !old.end_ms.is_some_and(|end|end<=self.observed_at_ms)) {
             return Err("capacity_source_missing_pack".into());
         }
-        // A known, expired entitlement loses its unused capacity; it is not a
-        // debit or a refund. All actual consumption must still be explained by
-        // exact visible usage deltas below. Missing live/undated packs fail closed.
+        // A known expired package can disappear after some of its old remainder
+        // was consumed. Only already-confirmed D receipts may explain that
+        // bounded amount; unused quota is discarded, never a new credit or bill.
+        let mut expired_remainder=allowance;
+        for (key,old) in &previous.packs {if !self.packs.contains_key(key) {
+            expired_remainder=expired_remainder.checked_add(old.limit-old.used).ok_or("capacity_source_overflow")?;
+        }}
         let mut delta=0i64;
         for (key,next) in &self.packs {
             let prior=if let Some(old)=previous.packs.get(key) {
@@ -159,7 +166,7 @@ impl PackObservation {
             } else {0};
             delta=delta.checked_add(next.used-prior).ok_or("capacity_source_overflow")?;
         }
-        if delta!=actual {return Err("capacity_source_debit_mismatch".into());}Ok(())
+        if actual<delta || actual-delta>expired_remainder {return Err("capacity_source_debit_mismatch".into());}Ok(expired_remainder-(actual-delta))
     }
     pub(super) fn balances(&self)->Result<(i64,i64),String> {
         self.validate()?;let (mut general,mut work)=(0i64,0i64);
@@ -176,14 +183,30 @@ type Anchor=(i64,i64,i64,String);
 fn anchor(conn:&Connection,account:&str)->Result<Option<Anchor>,String> {
     conn.query_row("SELECT snapshot_epoch,event_sequence,legacy_sessions,observation_json FROM bridge_capacity_anchors WHERE account_ref=?1",[account],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(db_error)
 }
-pub(super) fn verify_anchor(tx:&Transaction<'_>,fence:&RebaseFence,observation:&PackObservation)->Result<(),String> {
+pub(super) fn verify_anchor(tx:&Transaction<'_>,fence:&RebaseFence,observation:&PackObservation)->Result<Value,String> {
     let (epoch,event,legacy,json)=anchor(tx,&fence.account_ref)?.ok_or("capacity_anchor_missing")?;
     if epoch!=fence.snapshot_epoch || event>fence.event_sequence || legacy!=fence.legacy_sessions {return Err("capacity_anchor_watermark_changed".into());}
     let previous:PackObservation=serde_json::from_str(&json).map_err(|_|"capacity_anchor_invalid")?;
     let snapshot=bridge_rebase::snapshot(tx,&fence.account_ref)?;
     if snapshot.observed_at_ms!=previous.observed_at_ms || previous.balances()? != (snapshot.general,snapshot.work) {return Err("capacity_anchor_snapshot_changed".into());}
     let actual:i64=tx.query_row("SELECT COALESCE(SUM(s.actual_microcredits),0) FROM bridge_capacity_slots s WHERE s.account_ref=?1 AND s.stage='D' AND NOT EXISTS(SELECT 1 FROM bridge_capacity_covered c WHERE c.budget_id=s.budget_id)",[&fence.account_ref],|r|r.get(0)).map_err(db_error)?;
-    observation.proves(&previous,actual)
+    // Derived coverage stays separate from the exact upstream observation and
+    // money receipts. Carry only the remainder of a previously committed proof.
+    let prior:Option<String>=tx.query_row("SELECT coverage_json FROM bridge_capacity_rebases WHERE account_ref=?1 AND state='committed' ORDER BY json_extract(coverage_json,'$.snapshot.epoch') DESC LIMIT 1",[&fence.account_ref],|r|r.get(0)).optional().map_err(db_error)?;
+    let (allowance,mut expired) = if let Some(prior)=prior {
+        let prior:Value=serde_json::from_str(&prior).map_err(|_|"capacity_source_unproven")?;
+        if prior.pointer("/snapshot/epoch").and_then(Value::as_i64)!=Some(epoch) {return Err("capacity_anchor_watermark_changed".into());}
+        let allowance=match prior.get("expired_allowance_microcredits") {None=>0,Some(v)=>v.as_i64().filter(|v|*v>=0).ok_or("capacity_source_unproven")?};
+        let expired:std::collections::BTreeSet<String>=match prior.get("expired_pack_ids") {None=>Default::default(),Some(v)=>serde_json::from_value(v.clone()).map_err(|_|"capacity_source_unproven")?};
+        (allowance,expired)
+    } else {(0,Default::default())};
+    // A vanished package must never recreate the same allowance by returning
+    // and disappearing again. Keep bounded hashed identities, not source data.
+    if observation.packs.keys().any(|id|expired.contains(id)) {return Err("capacity_source_pack_changed".into());}
+    for id in previous.packs.keys().filter(|id|!observation.packs.contains_key(*id)) {expired.insert(id.clone());}
+    if expired.len()>4096 {return Err("capacity_source_bounds".into());}
+    let remaining=observation.proves_with_allowance(&previous,actual,allowance)?;
+    Ok(serde_json::json!({"expired_allowance_microcredits":remaining,"expired_pack_ids":expired}))
 }
 pub(super) fn advance_anchor(tx:&Transaction<'_>,fence:&RebaseFence,observation:&PackObservation)->Result<(),String> {
     let changed=tx.execute("UPDATE bridge_capacity_anchors SET snapshot_epoch=?1,event_sequence=?2,observation_json=?3 WHERE account_ref=?4 AND snapshot_epoch=?5 AND legacy_sessions=?6",

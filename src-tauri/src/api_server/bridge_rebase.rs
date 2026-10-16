@@ -145,9 +145,12 @@ impl BridgeBillingStore {
         if state!="open" {return Err("capacity_rebase_already_fenced".into());}
         let fence=RebaseFence {account_ref:account.into(),owner_nonce:owner,snapshot_epoch:old.epoch,fence_epoch:epoch.checked_add(1).ok_or("fence overflow")?,
             event_sequence:event,legacy_sessions:legacy,started_at_ms:now,bridge_instance_id:lease.instance_id().into(),generation:lease.generation().into()};
+        let mut prior=serde_json::to_value(&old).map_err(|_|"snapshot encoding failed")?;
+        let source:Option<String>=tx.query_row("SELECT observation_json FROM bridge_capacity_anchors WHERE account_ref=?1",[account],|r|r.get(0)).optional().map_err(db_error)?;
+        if let Some(source)=source {prior["source_observation"]=serde_json::from_str(&source).map_err(|_|"capacity_anchor_invalid")?;}
         tx.execute("UPDATE bridge_capacity_accounts SET rebase_state='fenced',owner_nonce=?1,fence_epoch=?2 WHERE account_ref=?3",params![fence.owner_nonce,fence.fence_epoch,account]).map_err(db_error)?;
         tx.execute("INSERT INTO bridge_capacity_rebases(owner_nonce,account_ref,fence_json,previous_snapshot_json,state) VALUES (?1,?2,?3,?4,'pending')",
-            params![fence.owner_nonce,account,serde_json::to_string(&fence).map_err(|_|"fence encoding failed")?,serde_json::to_string(&old).map_err(|_|"snapshot encoding failed")?]).map_err(db_error)?;
+            params![fence.owner_nonce,account,serde_json::to_string(&fence).map_err(|_|"fence encoding failed")?,serde_json::to_string(&prior).map_err(|_|"snapshot encoding failed")?]).map_err(db_error)?;
         tx.commit().map_err(db_error)?;Ok(fence)
     }
     pub(super) fn commit_capacity_rebase(&mut self,lease:&BridgeBudgetLease,fence:&RebaseFence,coverage:&CoveredCapacity)->Result<(),String> {
@@ -162,19 +165,24 @@ impl BridgeBillingStore {
             || s.observed_at_ms<=fence.started_at_ms || s.general<0 || s.work<0 || s.general.checked_add(s.work).is_none() {
             return Err("capacity_rebase_coverage_unproven".into());
         }
-        let encoded=serde_json::to_string(&serde_json::json!({"snapshot":s,"coverage_ref":coverage.coverage_ref,
+        let mut encoded=serde_json::json!({"snapshot":s,"coverage_ref":coverage.coverage_ref,
             "event_sequence":coverage.covered_event_sequence,"quiescent_since_ms":coverage.quiescent_since_ms,
-            "external_activity_excluded":true})).map_err(|_|"coverage encoding failed")?;
+            "external_activity_excluded":true});
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
         let (state,stored)=check_fence(&tx,lease,fence)?;
-        if state=="committed" {return if stored.as_deref()==Some(encoded.as_str()) {Ok(())} else {Err("capacity_rebase_coverage_conflict".into())};}
+        if state=="committed" {
+            let mut prior:serde_json::Value=serde_json::from_str(stored.as_deref().ok_or("capacity_rebase_coverage_conflict")?).map_err(|_|"capacity_rebase_coverage_conflict")?;
+            if let Some(map)=prior.as_object_mut() {map.remove("expired_allowance_microcredits");map.remove("expired_pack_ids");}
+            return if prior==encoded {Ok(())} else {Err("capacity_rebase_coverage_conflict".into())};
+        }
         if state!="pending" {return Err("capacity_rebase_not_pending".into());}
         require_pending_owner(&tx,fence)?;
         let (event,legacy,latest)=quiet_watermark(&tx,&fence.account_ref)?;
         if event!=fence.event_sequence || legacy!=fence.legacy_sessions || latest>fence.started_at_ms {return Err("capacity_rebase_watermark_changed".into());}
         if let Some(observation)=source {
             if observation.observed_at_ms!=s.observed_at_ms || observation.balances()? != (s.general,s.work) {return Err("capacity_source_snapshot_mismatch".into());}
-            super::bridge_capacity_source::verify_anchor(&tx,fence,observation)?;
+            let derived=super::bridge_capacity_source::verify_anchor(&tx,fence,observation)?;
+            for (key,value) in derived.as_object().ok_or("capacity_source_unproven")? {encoded[key]=value.clone();}
         } else {
             let anchored:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_anchors WHERE account_ref=?1)",[&fence.account_ref],|r|r.get(0)).map_err(db_error)?;
             if anchored {return Err("capacity_source_required".into());}
@@ -182,7 +190,7 @@ impl BridgeBillingStore {
         tx.execute("INSERT INTO bridge_capacity_covered(budget_id,owner_nonce,actual_microcredits,receipt_hash)
             SELECT s.budget_id,?1,s.actual_microcredits,r.semantic_hash FROM bridge_capacity_slots s JOIN bridge_budget_receipts r ON r.budget_id=s.budget_id
             WHERE s.account_ref=?2 AND s.stage='D' AND NOT EXISTS(SELECT 1 FROM bridge_capacity_covered c WHERE c.budget_id=s.budget_id)",params![fence.owner_nonce,fence.account_ref]).map_err(db_error)?;
-        tx.execute("UPDATE bridge_capacity_rebases SET state='committed',coverage_json=?1 WHERE owner_nonce=?2",params![encoded,fence.owner_nonce]).map_err(db_error)?;
+        tx.execute("UPDATE bridge_capacity_rebases SET state='committed',coverage_json=?1 WHERE owner_nonce=?2",params![serde_json::to_string(&encoded).map_err(|_|"coverage encoding failed")?,fence.owner_nonce]).map_err(db_error)?;
         tx.execute("UPDATE bridge_capacity_accounts SET snapshot_ref=?1,snapshot_epoch=?2,general_microcredits=?3,work_microcredits=?4,observed_at_ms=?5,rebase_state='open',owner_nonce=NULL WHERE account_ref=?6",
             params![s.snapshot_ref,s.epoch,s.general,s.work,s.observed_at_ms,s.account_ref]).map_err(db_error)?;
         if let Some(observation)=source {super::bridge_capacity_source::advance_anchor(&tx,fence,observation)?;}

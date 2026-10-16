@@ -78,8 +78,8 @@ fn persist_fact(tx:&Transaction<'_>,lease:&BridgeBudgetLease,auth:&PreparedAutho
             if state=="conflict" {return Ok(ReceiptChange::Conflict);}
             // A later terminal observation can strengthen the evidence for the
             // same immutable money fact. Never settle the amount a second time.
-            if state=="final" && policy==SESSION_POLICY {
-                tx.execute("UPDATE bridge_budget_receipts SET confirmation_policy=?2,source_read_started_at_ms=?3,source_query_end_ms=?4 WHERE budget_id=?1 AND confirmation_policy!=?2",params![auth.budget_id,policy,source_times.map(|t|t.0),source_times.map(|t|t.1)]).map_err(db_error)?;
+            if state=="final" && (policy==SESSION_POLICY || policy=="post-worker-exit-session-observation-v1") {
+                tx.execute("UPDATE bridge_budget_receipts SET confirmation_policy=?2,source_read_started_at_ms=?3,source_query_end_ms=?4 WHERE budget_id=?1 AND confirmation_policy!='post-terminal-session-observation-v1' AND confirmation_policy!=?2",params![auth.budget_id,policy,source_times.map(|t|t.0),source_times.map(|t|t.1)]).map_err(db_error)?;
             };
             // The immutable money outbox remains unchanged; this is local
             // capacity provenance, not a second financial event.

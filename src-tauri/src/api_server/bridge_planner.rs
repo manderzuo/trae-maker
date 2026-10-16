@@ -136,7 +136,12 @@ fn chat_profile(input:&Value,model:&str,kind:&str)->Result<(Value,String),String
         return Err("budget_chat_input_too_large".into());
     }
     body["model"]=json!(model);body["max_tokens"]=json!(4096);
-    if kind=="assist" {body.as_object_mut().unwrap().remove("tools");body.as_object_mut().unwrap().remove("tool_choice");}
+    if kind=="assist" && !body["tools"].is_null() {
+        let valid=body["tools"].as_array().is_some_and(|tools|tools.len()==1 && tools[0]["type"]=="function" && tools[0]["function"]["name"]=="submit_video_plan" && tools[0]["function"]["parameters"]["type"]=="object")
+            && (body["tool_choice"]=="submit_video_plan" || body["tool_choice"]["function"]["name"]=="submit_video_plan");
+        if !valid {return Err("invalid_budget_business_request".into());}
+        body["parallel_tool_calls"]=json!(false);
+    }
     let profile=if images==0 {format!("{kind}:{model}")} else {format!("{kind}:{model}:images{images}")};
     Ok((body,profile))
 }
@@ -281,12 +286,19 @@ fn fallback_video_budget(source:&dyn PreparationSource,profile:&str,now:i64,obse
 pub(super) fn prepare_now(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource)->Result<PreparedBudget,String> {
     prepare_with_clock(runtime,request,source,&||chrono::Utc::now().timestamp_millis())
 }
+pub(super) fn preflight_now(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource)->Result<(),String> {
+    if request.step_kind!="video" {return Err("invalid_budget_business_request".into());}
+    plan_with_clock(runtime,request,source,&||chrono::Utc::now().timestamp_millis(),true).map(|_|())
+}
 #[cfg(test)]
 pub(super) fn prepare(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource,now:i64)->Result<PreparedBudget,String> {
     let started=std::time::Instant::now();
     prepare_with_clock(runtime,request,source,&||now.saturating_add(started.elapsed().as_millis().min(i64::MAX as u128) as i64))
 }
 fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource,clock:&dyn Fn()->i64)->Result<PreparedBudget,String> {
+    plan_with_clock(runtime,request,source,clock,false)?.ok_or_else(||"budget_preparation_failed".into())
+}
+fn plan_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource,clock:&dyn Fn()->i64,check_only:bool)->Result<Option<PreparedBudget>,String> {
     let now=clock();
     use super::{bridge_budget::{CapacityEligibility,CapacitySnapshot,CapacityReservation,check_capacity},bridge_prepared::TrustedPreparation};
     use rusqlite::OptionalExtension;
@@ -302,7 +314,7 @@ fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
     }
     let _planning=runtime.begin_planning(&request.request_id)?;
     let claim=serde_json::to_value(request).map_err(|_|"invalid input")?;
-    if let Some(replay)=runtime.with_store(|store,lease|store.replay_business_preparation(lease,&request.request_id,&claim))? {return Ok(replay);}
+    if !check_only {if let Some(replay)=runtime.with_store(|store,lease|store.replay_business_preparation(lease,&request.request_id,&claim))? {return Ok(Some(replay));}}
     runtime.with_store(|store,lease| {
         if !lease.charge_ready() {return Err("bridge_recovery_required".into());}
         let active:bool=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM bridge_core_api_keys WHERE key_id=?1 AND active=1 AND snapshot_version>0)",[&request.core_key_id],|r|r.get(0)).map_err(|e|e.to_string())?;
@@ -312,7 +324,7 @@ fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         let (body,profile)=chat_profile(&request.body,&request.model,&request.step_kind)?;
         (body,profile,None)
     };
-    if video {if let Some(seconds)=source.reference_seconds(&body)? {profile.push_str(&format!(":ref_seconds{seconds}"));}}
+    if video && !check_only {if let Some(seconds)=source.reference_seconds(&body)? {profile.push_str(&format!(":ref_seconds{seconds}"));}}
     let mut excluded=HashSet::new();
     let mut last_error="upstream_account_unavailable".to_string();
     // Only preparation may try another account. Bound read-side work and never
@@ -376,7 +388,7 @@ fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         let (hold,version,expiry)=source.policy(&profile,now)?;
         (hold,version,expiry,"policy_only")
     })};
-    let (hold,_,_,_)=terms(clock())?;
+    let (hold,_,policy_expiry,_)=terms(clock())?;
     // Reject known insufficient capacity before account-bound asset uploads.
     // Repeat this preflight after uploads; the atomic prepare CAS remains the
     // authority when another request competes between either check and commit.
@@ -400,6 +412,13 @@ fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
         Ok(epoch.unwrap_or(1))
     };
     runtime.with_store(|store,lease|preflight(store,lease,&live,hold,clock(),observation.as_ref()))?;
+    if check_only {
+        // Readiness only: reference identifiers describe the known class/count,
+        // not measured video duration or an authorization to send paid work.
+        // Exact references, prices, policy and capacity are checked on prepare.
+        source.check_deadline()?;authorization_expiry(policy_expiry,live.valid_until_ms,clock())?;
+        return Ok(None);
+    }
     let normalized=source.normalize(&account,&body,video,&request.core_key_id)?;
     // Uploads may consume most of the admission window. Obtain new evidence,
     // including revoked/new packages, and current policy before minting a token.
@@ -423,7 +442,7 @@ fn prepare_with_clock(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,sourc
             request_fingerprint:request.request_fingerprint.clone(),endpoint:request.endpoint.clone(),model:request.model.clone(),step_kind:request.step_kind.clone(),
             account_ref:account.uid.clone(),snapshot_epoch:epoch,eligibility:if video {CapacityEligibility::GeneralOrWork} else {CapacityEligibility::GeneralOnly},
             policy_version:policy,pricing_profile_key:profile.clone(),evidence_level:evidence.into(),hold_microcredits:hold,expires_at_ms:expiry,
-            body:json!({"business_claim":claim,"upstream":normalized})},None,now)
+            body:json!({"business_claim":claim,"upstream":normalized})},None,now).map(Some)
     })
     })();
     match attempt {
@@ -520,6 +539,34 @@ pub(super) fn video_hold(estimate:i64,observed:i64)->Result<i64,String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn assistant_planning_contract_survives_budget_profile_normalization() {
+        let body=serde_json::json!({"messages":[{"role":"user","content":"fixture"}],"tools":[{"type":"function","function":{"name":"submit_video_plan","strict":true,"parameters":{"type":"object","properties":{"action":{"type":"string"}}}}}],"tool_choice":{"type":"function","function":{"name":"submit_video_plan"}},"parallel_tool_calls":false});
+        let (normalized,_)=super::chat_profile(&body,"glm-5.3-flash","assist").unwrap();
+        assert_eq!(normalized["tools"],body["tools"]);assert_eq!(normalized["tool_choice"],body["tool_choice"]);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn video_preflight_checks_policy_without_upload_reservation_or_execution() {
+        use super::*;
+        struct Source(bool);
+        impl PreparationSource for Source {
+            fn select(&self,_:bool,excluded:&HashSet<String>)->Result<PickedAccount,String> {if !excluded.is_empty(){return Err("upstream_account_unavailable".into())}Ok(PickedAccount{uid:"account".into(),jwt:"fixture".into(),device_id:"fixture".into(),machine_id:"fixture".into(),domain:String::new(),enterprise_id:String::new(),global_region:false})}
+            fn capacity(&self,_:&PickedAccount)->Result<Vec<Value>,String>{Ok(vec![pack(208,"1000","0",0,4102444800)])}
+            fn estimate(&self,_:&PickedAccount,_:i64)->Result<i64,String>{Err("native_estimate_unavailable".into())}
+            fn policy(&self,_:&str,_:i64)->Result<(i64,String,i64),String>{if self.0{Err("budget_policy_expired".into())}else{Ok((40_000_000,"fixture".into(),i64::MAX))}}
+            fn normalize(&self,_:&PickedAccount,_:&Value,_:bool,_:&str)->Result<Value,String>{panic!("preflight must not upload or normalize assets")}
+        }
+        for expired in [false,true] {
+            let root=std::env::temp_dir().join(format!("aiwork-preflight-{:032x}",rand::random::<u128>()));let runtime=BridgeBudgetRuntime::start(&root).unwrap();
+            runtime.with_store(|s,_|s.connection.execute_batch("INSERT INTO bridge_core_api_keys VALUES ('key-a','A',1,1)").map_err(|e|e.to_string())).unwrap();
+            let request=PrepareRequest{wire_version:2,parent_request_id:"preflight-request".into(),request_id:"preflight-request".into(),core_key_id:"key-a".into(),request_fingerprint:"fingerprint".into(),endpoint:"videos".into(),model:"seedance".into(),step_kind:"video".into(),body:json!({"prompt":"fixture","duration":5,"image_asset_ids":["owned-fixture"]})};
+            let result=preflight_now(&runtime,&request,&Source(expired));
+            if expired{assert_eq!(result.unwrap_err(),"budget_policy_expired")}else{result.unwrap()}
+            runtime.with_store(|s,_|{let count:i64=s.connection.query_row("SELECT count(*) FROM bridge_prepared_budgets",[],|r|r.get(0)).unwrap();assert_eq!(count,0);Ok(())}).unwrap();
+            drop(runtime);std::fs::remove_dir_all(root).unwrap();
+        }
+    }
     #[test]
     fn preparation_authorization_uses_completion_time_and_current_expiries() {
         assert_eq!(super::authorization_expiry(i64::MAX,i64::MAX,170_000).unwrap(),230_000);
