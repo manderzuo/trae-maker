@@ -32,7 +32,27 @@ pub struct TrayMenu {
     pub proxy_item: MenuItem<tauri::Wry>,
 }
 
+/// 把本进程的 WebView2 用户数据目录固定到应用私有位置。
+///
+/// 背景：`WEBVIEW2_USER_DATA_FOLDER` 是「用户级」环境变量，会作用于本机所有 WebView2 宿主。
+/// 一旦多个应用共用同一目录，先启动者会持有该目录的独占锁，其他应用创建 WebView2 环境失败，
+/// Tauri 随后无法建出主窗口，但进程并不退出——用户看到的是「有托盘图标、点它没反应、窗口永不出现」。
+/// 该变量即使被用户/其他程序设置成共享目录，本应用也必须用自己的目录，故在 main 入口强制覆盖。
+fn isolate_webview2_data_dir() {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("com.aiwork.assistant").join("EBWebView");
+    let _ = std::fs::create_dir_all(&dir);
+    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &dir);
+}
+
 fn main() {
+    // 必须在创建任何窗口之前隔离 WebView2 数据目录。外部可能设置了全局
+    // WEBVIEW2_USER_DATA_FOLDER（本机为 E:\AIWORK\webview2），它会作用于本机所有 WebView2 应用：
+    // 先启动的进程独占该目录后，后启动的应用无法创建 WebView2 环境，Tauri 建窗失败但不报错退出，
+    // 表现为「进程在跑、托盘在、就是没有窗口，点托盘也没反应」。改成本应用私有目录即可。
+    isolate_webview2_data_dir();
     let mut args:Vec<String>=std::env::args().collect();
     if args.iter().any(|a|a=="--disable-new-package-capacity") {
         api_server::bridge_capacity_grants::disable_for_process();
@@ -416,6 +436,10 @@ fn main() {
                     TrayIconBuilder::new()
                         .icon(icon)
                         .tooltip("AI Work 助手")
+                        // 左键=显示/隐藏窗口，右键才弹菜单。Tauri 2 默认 menu_on_left_click=true，
+                        // 不显式关掉时左键会被菜单消费掉：用户看到的是「点托盘图标弹出右键菜单、
+                        // 窗口始终不出现」。菜单仍可用右键唤出。
+                        .show_menu_on_left_click(false)
                         .menu(&menu)
                         .on_tray_icon_event(|tray, event| {
                             if let TrayIconEvent::Click {
@@ -432,6 +456,9 @@ fn main() {
                                         fs_utils::app_log(&st.data_dir, "托盘左键点击：隐藏窗口");
                                     } else {
                                         let _ = window.show();
+                                        // 最小化状态下 show() 不一定还原：先取消最小化再取焦点，
+                                        // 否则用户点了托盘图标仍看不到窗口。
+                                        let _ = window.unminimize();
                                         let _ = window.set_focus();
                                         fs_utils::app_log(&st.data_dir, "托盘左键点击：显示窗口");
                                     }
@@ -449,6 +476,7 @@ fn main() {
                                         fs_utils::app_log(&st.data_dir, "菜单：隐藏窗口");
                                     } else {
                                         let _ = window.show();
+                                        let _ = window.unminimize();
                                         let _ = window.set_focus();
                                         fs_utils::app_log(&st.data_dir, "菜单：显示窗口");
                                     }
@@ -633,6 +661,17 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // 记录主窗口的销毁/关闭事件：窗口「建了又被谁销毁」是排查「点托盘无窗口」的关键线索
+            // （正常关闭会先到 CloseRequested；只有 Destroyed 说明窗口被绕过确认直接销毁）。
+            if window.label() == "main"
+                && matches!(
+                    event,
+                    tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+                )
+            {
+                let st = window.app_handle().state::<AppState>();
+                fs_utils::app_log(&st.data_dir, &format!("窗口事件: {:?}", event));
+            }
             // 关闭即退出应用（前端已弹确认框；退出时 RunEvent::Exit 自动清理代理与 API 服务）
             // 先隐藏窗口再退出：exit(0) 内部的 WebView2 销毁可能耗时数秒（运行越久越明显），
             // 若直接退出，用户会看到窗口冻结「卡死」。隐藏后清理再慢也无感（issue：关闭卡死）。

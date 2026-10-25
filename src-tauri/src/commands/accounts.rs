@@ -1674,7 +1674,10 @@ pub fn refresh_jwt_for_profile(state: &AppState, user_id: &str, profile: &crate:
         if let Some(adopted) = native_refresh_token_for(profile, user_id) {
             let entry = &mut accounts.accounts[account_index];
             entry.refresh_token = Some(adopted);
-            entry.oauth_client_id = Some(crate::native_client::TRAE_CLIENT_ID.to_string());
+            // 不要据此处改写 oauth_client_id：refresh_token 与「签发它的 client」绑定，
+            // 旧 client(en1oxy7wnw8j9n) 签发的 token 用 TRAE client 去换只会得到
+            // 10101 refresh token is not matched to the client。issuer 只能由一次
+            // 真实的原生授权确定，接管时保持原值。
             if entry.credential_source.is_none() {
                 entry.credential_source = Some("native_client".to_string());
             }

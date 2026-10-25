@@ -72,7 +72,15 @@ def captured_device(root,uid,device_info):
     if not info.get('DevicePublicKey'):return
     _write(path,{'device_info':info})
 
-def _import_native_key(root,uid,expected_public,refresh_token):
+DEVICE_KEY_PREFIX='iCubeAuthInfo://icube-dc:'
+
+def _native_key_pairs(root,uid):
+    """Yield (pair, device_id) from client profiles holding a device key pair for uid.
+
+    TRAE CN 3.4 stores it as `iCubeAuthInfo://icube-dc:<deviceId>`; older clients used a
+    `*:<uid>` suffix. Device-level entries are only accepted while the profile's own
+    CloudIDE session belongs to uid, so a key is never borrowed for another account.
+    """
     import native_client
     p=native_client.resolve()
     paths=[Path(root)/'data/profiles_trae'/uid/'User/globalStorage/storage.json',
@@ -82,21 +90,44 @@ def _import_native_key(root,uid,expected_public,refresh_token):
         try:
             storage=json.loads(path.read_text(encoding='utf-8-sig'))
             auth=native_client.decode_tc(storage.get('iCubeAuthInfo://icube.cloudide',''))
-            if not isinstance(auth,dict) or str(auth.get('userId'))!=uid:continue
+            same_uid=isinstance(auth,dict) and str(auth.get('userId'))==uid
+            if not same_uid:continue
             for name,value in storage.items():
-                if not name.endswith(':'+uid) or not isinstance(value,str):continue
-                pair=native_client.decode_tc(value)
+                if not isinstance(value,str):continue
+                if name.endswith(':'+uid):device_id=''
+                elif name.startswith(DEVICE_KEY_PREFIX):device_id=name[len(DEVICE_KEY_PREFIX):]
+                else:continue
+                try:pair=native_client.decode_tc(value)
+                except Exception:continue
                 if not isinstance(pair,dict) or not pair.get('privateKeyPEM') or not pair.get('publicKeyPEM'):continue
-                if expected_public and pair['publicKeyPEM']!=expected_public:continue
-                if not expected_public and auth.get('refreshToken')!=refresh_token:continue
-                imported={'private_key':pair['privateKeyPEM'],'public_key':pair['publicKeyPEM'],'device_id':''}
-                return _store_key(root,imported)
+                yield pair,device_id
         except (OSError,ValueError,TypeError):continue
+
+def _import_native_key(root,uid,expected_public,refresh_token):
+    for pair,device_id in _native_key_pairs(root,uid):
+        matched = pair['publicKeyPEM']==expected_public if expected_public else True
+        if matched:
+            return _store_key(root,{'private_key':pair['privateKeyPEM'],'public_key':pair['publicKeyPEM'],'device_id':device_id})
     raise ValueError('Native refresh device key unavailable; authorize this account again')
+
+def _bootstrap_binding(root,uid):
+    """Create the binding from the key pair already present in the client profile.
+
+    Only public context is persisted here; the private key stays in the DPAPI store via
+    `_store_key`, mirroring what `captured_device` does after a validated exchange.
+    """
+    for pair,device_id in _native_key_pairs(root,uid):
+        ref=_store_key(root,{'private_key':pair['privateKeyPEM'],'public_key':pair['publicKeyPEM'],'device_id':device_id})
+        info={'DevicePublicKey':pair['publicKeyPEM']}
+        if device_id:info['DeviceID']=device_id
+        bind_device(root,uid,ref,info)
+        return True
+    return False
 
 def refresh_request(root,uid,client_id,refresh_token,version,timestamp=None,nonce=None):
     path=Path(root)/'conf/native_oauth_bindings'/(_uid(uid)+'.json')
-    if not path.exists():raise ValueError('Native refresh device binding unavailable; authorize this account again')
+    if not path.exists() and not _bootstrap_binding(root,uid):
+        raise ValueError('Native refresh device binding unavailable; authorize this account again')
     binding=json.loads(path.read_text(encoding='utf-8'))
     info=binding['device_info']
     ref=binding.get('key_ref') or _import_native_key(root,uid,info.get('DevicePublicKey'),refresh_token)
