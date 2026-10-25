@@ -105,6 +105,7 @@ python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64
 
 ## 文档
 
+- [项目交接文档](docs/project-handover.md) — 系统组成、数据边界、运维红线与当前仓库状态
 - [更新日志](CHANGELOG.md) — 各版本变更记录
 - [用户手册](docs/user-manual.md) — 功能说明与使用指南
 - [产品设计](docs/product-design.md) — 需求与产品设计基线（v1.0/v2.0）

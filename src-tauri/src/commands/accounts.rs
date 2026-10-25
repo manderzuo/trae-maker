@@ -1629,6 +1629,23 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
     refresh_jwt_for_profile(state, user_id, &profile)
 }
 
+/// 读取本机原生客户端 storage.json 中与 user_id 一致的 refreshToken（仅用于接管）。
+/// UID 不符、token 为空、refreshExpiredAt 已过期，或读取/解密失败一律返回 None，
+/// 不修改任何状态：让调用方继续走原有的「缺少 refresh_token」错误路径。
+fn native_refresh_token_for(profile: &crate::native_client::NativeClientProfile, user_id: &str) -> Option<String> {
+    let auth = crate::native_snapshot::read_native_auth(&profile.storage_path())?;
+    if auth["userId"].as_str() != Some(user_id) { return None; }
+    let token = auth["refreshToken"].as_str()?.trim();
+    if token.is_empty() { return None; }
+    if let Some(exp) = auth["refreshExpiredAt"]
+        .as_str()
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+    {
+        if exp.timestamp_millis() <= chrono::Utc::now().timestamp_millis() { return None; }
+    }
+    Some(token.to_string())
+}
+
 pub fn refresh_jwt_for_profile(state: &AppState, user_id: &str, profile: &crate::native_client::NativeClientProfile) -> Result<String, String> {
     // 并发安全：持锁防止多个并发请求同时 ExchangeToken
     let _lock = state
@@ -1638,17 +1655,43 @@ pub fn refresh_jwt_for_profile(state: &AppState, user_id: &str, profile: &crate:
 
     // Double-check：持锁后重新读取文件，防止其他线程已刷新
     let mut accounts = crate::vault::load_accounts(state);
-    let account = accounts
+    let account_index = accounts
         .accounts
         .iter()
-        .find(|a| a.user_id.as_deref() == Some(user_id))
+        .position(|a| a.user_id.as_deref() == Some(user_id))
         .ok_or("账号不存在")?;
 
+    // 迁移前导入的账号可能只有 JWT、没有 refresh_token，此时无法调 ExchangeToken。
+    // 若本机 TRAE CN 恰好登录着同一 UID，则接管其原生 refreshToken（校验 UID 与过期时间），
+    // 并固定为该原生 client_id，避免退到旧 CloudIDE 端点导致必然失败。
+    if accounts.accounts[account_index]
+        .refresh_token
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        if let Some(adopted) = native_refresh_token_for(profile, user_id) {
+            let entry = &mut accounts.accounts[account_index];
+            entry.refresh_token = Some(adopted);
+            entry.oauth_client_id = Some(crate::native_client::TRAE_CLIENT_ID.to_string());
+            if entry.credential_source.is_none() {
+                entry.credential_source = Some("native_client".to_string());
+            }
+            crate::vault::save_accounts(state, &mut accounts)?;
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("已从本机客户端接管 refresh_token: uid={user_id}"),
+            );
+        }
+    }
+
+    let account = &accounts.accounts[account_index];
     let refresh_token = account
         .refresh_token
         .as_ref()
         .filter(|s| !s.is_empty())
-        .ok_or("该账号无 refresh_token，无法自动刷新")?;
+        .ok_or("该账号无 refresh_token，本机 TRAE CN 也未提供可接管的原生凭据；请在 TRAE CN 中登录该账号后点「保存当前登录态」，再重试续期")?;
 
     let client_id = crate::native_credentials::refresh_client_id(account.oauth_client_id.as_deref())?;
     let device_binding = state.data_dir.join("conf/native_oauth_bindings").join(format!("{user_id}.json"));

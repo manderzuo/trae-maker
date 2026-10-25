@@ -71,7 +71,10 @@ fn resolve_at(target: &str, settings: &Settings, local: &Path, appdata: &Path, p
 }
 
 fn resolve_at_with_discovery(target: &str, settings: &Settings, local: &Path, appdata: &Path, pf: &Path, discovered: &[PathBuf]) -> NativeClientProfile {
-    let cn = valid(&settings.trae_cn_path).filter(|p| client_kind(p) == Some("Trae")).or_else(|| [local.join("Programs/Trae CN/Trae CN.exe"), pf.join("Trae CN/Trae CN.exe")].into_iter().find(|p| p.is_file())).or_else(|| discovered.iter().find(|p| p.is_file() && client_kind(p) == Some("Trae")).cloned());
+    // 注意：Path::join 不会把参数里的 "/" 规范化成 "\"，直接 join("Programs/Trae CN/Trae CN.exe")
+    // 会得到混合分隔符路径；该值经 AIWORK_NATIVE_EXE 传给切换桥后与 Win32_Process.ExecutablePath
+    // 的全等比较失配，导致客户端不被关闭（切换无效）。逐段 join 保证本机原生分隔符。
+    let cn = valid(&settings.trae_cn_path).filter(|p| client_kind(p) == Some("Trae")).or_else(|| [local.join("Programs").join("Trae CN").join("Trae CN.exe"), pf.join("Trae CN").join("Trae CN.exe")].into_iter().find(|p| p.is_file())).or_else(|| discovered.iter().find(|p| p.is_file() && client_kind(p) == Some("Trae")).cloned());
     if matches!(target.to_ascii_lowercase().as_str(), "trae" | "trae_cn" | "traecn" | "ide") {
         return profile(cn, "Trae", appdata);
     }

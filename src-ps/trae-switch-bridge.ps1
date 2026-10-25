@@ -305,7 +305,12 @@ function Test-ExeMatchesApp {
 }
 
 function Find-TraeExe {
-    if ($env:AIWORK_NATIVE_EXE -and (Test-Path -LiteralPath $env:AIWORK_NATIVE_EXE -PathType Leaf) -and (Test-ExeMatchesApp $env:AIWORK_NATIVE_EXE)) { return $env:AIWORK_NATIVE_EXE }
+    # 归一化后再返回：桌面端传入的 AIWORK_NATIVE_EXE 可能含混合分隔符（见 Test-DefaultTraeProcess 注释），
+    # 统一成本机原生形式，避免下游路径全等比较失配。
+    if ($env:AIWORK_NATIVE_EXE -and (Test-Path -LiteralPath $env:AIWORK_NATIVE_EXE -PathType Leaf) -and (Test-ExeMatchesApp $env:AIWORK_NATIVE_EXE)) {
+        $Script:_TraeExeCache = ConvertTo-NormalizedExePath $env:AIWORK_NATIVE_EXE
+        return $Script:_TraeExeCache
+    }
     # ── 顺序原则（修复「首次切换误用 Trae CN.exe」）─────────────────────────────
     # 旧逻辑把「运行中进程」作为最高优先级，导致残留/错误的 Trae 进程（如旧的
     # Trae CN.exe）被优先采用，从而启动错误的 exe。现改为：
@@ -477,10 +482,25 @@ function Set-CurrentAccount {
     } catch {}
 }
 
+# 路径归一化：Rust 侧 Path::join("Programs/Trae CN/Trae CN.exe") 不会把 "/" 转成 "\"，
+# 经 AIWORK_NATIVE_EXE 传入的 exe 路径是混合分隔符（...\Programs/Trae CN/Trae CN.exe）。
+# Win32_Process.ExecutablePath 始终是原生 "\" 形式，字符串全等比较必然失配，导致
+# 「默认实例未运行」误判、客户端从未被关闭，快照被写到运行中的客户端上并被其覆盖，
+# 表现为切换日志显示成功但账号没变（TRAE CN 3.4 适配缺口）。
+function ConvertTo-NormalizedExePath {
+    param([string]$Path)
+    if (-not $Path) { return '' }
+    try { return [System.IO.Path]::GetFullPath($Path) } catch { return $Path }
+}
+
 function Test-DefaultTraeProcess {
     param($Process, [string]$ExpectedExe)
-    return ($Process.ExecutablePath -and $Process.ExecutablePath -eq $ExpectedExe -and $Process.CommandLine -and
-        $Process.CommandLine -notmatch '--user-data-dir|--type[= ]|--utility-sub-type')
+    if (-not $Process.ExecutablePath -or -not $Process.CommandLine) { return $false }
+    $actual = ConvertTo-NormalizedExePath $Process.ExecutablePath
+    $expected = ConvertTo-NormalizedExePath $ExpectedExe
+    if (-not $actual -or -not $expected) { return $false }
+    if (-not $actual.Equals($expected, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+    return ($Process.CommandLine -notmatch '--user-data-dir|--type[= ]|--utility-sub-type')
 }
 
 function Get-TraeLaunchArguments {
@@ -523,6 +543,26 @@ function Stop-Trae {
     throw '目标应用默认实例尚未退出，请手动关闭后重试'
 }
 
+# 等待同名进程出现（用于确认启动是否真的留下了进程）
+function Wait-AppProcess {
+    param([string[]]$Names, [int]$Seconds)
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    do {
+        if (Get-Process -Name $Names -ErrorAction SilentlyContinue) { return $true }
+        Start-Sleep -Milliseconds 300
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
+# 进程出现不等于启动成功：被 HIPS 拦截时 exe 会创建进程后立即退出。
+# 必须再观察一段时间，仍存活才算真正启动成功。
+function Test-AppProcessStable {
+    param([string[]]$Names, [int]$FirstWaitSeconds = 8, [int]$StableSeconds = 5)
+    if (-not (Wait-AppProcess $Names $FirstWaitSeconds)) { return $false }
+    Start-Sleep -Seconds $StableSeconds
+    return [bool](Get-Process -Name $Names -ErrorAction SilentlyContinue)
+}
+
 function Start-Trae {
     $exe = Find-TraeExe
     if (-not $exe) { throw "未找到 $($Script:AppName) 可执行文件" }
@@ -530,6 +570,32 @@ function Start-Trae {
     Write-Step -Stage 'start' -Message "正在启动 $($Script:AppName): $exe" -Status 'running'
     if ($argsList.Count) { Start-Process -FilePath $exe -ArgumentList $argsList -WindowStyle Hidden }
     else { Start-Process -FilePath $exe -WindowStyle Hidden }
+    # 主机的安全软件（实测：火绒 HIPS）可能拦截非交互宿主直接 CreateProcess：
+    # 进程被创建后立即退出，界面上表现为「切换后客户端没起来」。此时用 ShellExecute
+    # （cmd start，保留启动参数）回退，再确认进程真的存在；仍失败才报错，避免假成功。
+    if (Test-AppProcessStable $Script:ProcNames 8 5) { return }
+    Write-Step -Stage 'start' -Message '直接启动未留下存活进程，改用 ShellExecute 重试' -Status 'warn'
+    # 依次尝试两条 ShellExecute 路径（都经外壳，可绕过 HIPS 对非交互宿主 CreateProcess 的拦截）：
+    #  1) cmd start（保留 --proxy-server 等启动参数）
+    #  2) explorer.exe <exe>（等价用户双击，实测在本机可通过；不支持附加参数）
+    $shellStrategies = @(
+        {
+            param($exePath, $extra)
+            $shellArgs = @('/c', 'start', '""', ('"{0}"' -f $exePath)) + $extra
+            Start-Process -FilePath 'cmd.exe' -ArgumentList $shellArgs -WindowStyle Hidden | Out-Null
+        },
+        {
+            param($exePath, $extra)
+            Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $exePath) | Out-Null
+        }
+    )
+    foreach ($strategy in $shellStrategies) {
+        try { & $strategy $exe $argsList } catch {
+            Write-Step -Stage 'start' -Message "ShellExecute 回退启动失败: $_" -Status 'warn'
+        }
+        if (Test-AppProcessStable $Script:ProcNames 8 5) { return }
+    }
+    throw "$($Script:AppName) 启动后进程立即退出（疑似被安全软件拦截），请手动启动客户端后重试"
 }
 
 # icube 布局启动后登录态确认。
