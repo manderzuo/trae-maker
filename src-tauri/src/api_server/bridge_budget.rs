@@ -30,7 +30,7 @@ pub(super) struct CapacityReservation {
 pub(super) enum CapacityMutation { Created, Changed, Duplicate }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CapacityTransition { ExecutionTerminal, Actual(i64), CancelUnsent }
+pub(super) enum CapacityTransition { ExecutionTerminal, Actual(i64), CancelUnsent, FailedNoCharge }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct CapacityTotals { pub pending: i64, pub awaiting_receipt: i64, pub confirmed: i64 }
@@ -208,6 +208,15 @@ pub(super) fn transition_in_transaction(tx: &Transaction<'_>,lease: &BridgeBudge
         },
         CapacityTransition::CancelUnsent => match stage.as_str() {
             "P"=>("released",Some(0),None), "released"=>return Ok(CapacityMutation::Duplicate),
+            _=>return Err("capacity cannot be released after execution or settlement".into()),
+        },
+        // A sent execution that failed without any billing evidence releases its
+        // hold. 'R' has no other exit: only a final receipt settles it, and a
+        // rejected call never produces one, so the hold would stay reserved and
+        // keep capacity_rebase_not_quiescent true forever.
+        CapacityTransition::FailedNoCharge => match stage.as_str() {
+            "P"|"R"=>("released",Some(0),None),
+            "released"|"D"=>return Ok(CapacityMutation::Duplicate),
             _=>return Err("capacity cannot be released after execution or settlement".into()),
         },
     };

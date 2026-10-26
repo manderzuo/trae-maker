@@ -287,7 +287,11 @@ pub(super) fn prepare_now(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,s
     prepare_with_clock(runtime,request,source,&||chrono::Utc::now().timestamp_millis())
 }
 pub(super) fn preflight_now(runtime:&BridgeBudgetRuntime,request:&PrepareRequest,source:&dyn PreparationSource)->Result<(),String> {
-    if request.step_kind!="video" {return Err("invalid_budget_business_request".into());}
+    // Preflight is the bridge's "can you take this?" probe. Restricting it to
+    // video made every text request (assist/chat) look unsupported to the
+    // upstream dispatcher, which then never prepared a budget and left the
+    // caller waiting. Planning below already covers all three kinds.
+    if !matches!(request.step_kind.as_str(),"video"|"assist"|"chat") {return Err("invalid_budget_business_request".into());}
     plan_with_clock(runtime,request,source,&||chrono::Utc::now().timestamp_millis(),true).map(|_|())
 }
 #[cfg(test)]

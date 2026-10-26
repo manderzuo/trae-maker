@@ -90,6 +90,9 @@ pub(super) fn dispatch(state:Arc<super::ApiSharedState>,runtime:Arc<BridgeBudget
         drop(stream);
         if result.is_err() {eprintln!("[bridge-v2] execution outcome persistence requires recovery");}
         let _=super::usage_refresh::request_refresh(state,&ctx.budget.authorization.request_id);
+        // The task has settled: reconcile this account's capacity against live
+        // upstream usage now, instead of waiting for a periodic sweep.
+        super::balance_refresh::trigger();
     });
     Ok(json!({"wire_version":2,"status":"accepted","budget_id":id,"request_id":request_id}))
 }

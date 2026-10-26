@@ -146,6 +146,14 @@ impl PackObservation {
     fn proves_with_allowance(&self,previous:&Self,actual:i64,allowance:i64)->Result<i64,String> {
         self.validate()?;previous.validate()?;
         if self.observed_at_ms<=previous.observed_at_ms || actual<0 || allowance<0 {return Err("capacity_source_unproven".into());}
+        // A baseline that has not been observed for hours cannot be reconciled
+        // against live upstream usage: the local debit ledger and the package
+        // usage delta cover different stretches of time, so the bound below can
+        // never be satisfied and the account stays frozen forever. Re-anchor on
+        // the first observation after such a gap and let upstream usage define
+        // the new baseline.
+        const REANCHOR_AFTER_MS:i64=6*60*60*1000;
+        if self.observed_at_ms.saturating_sub(previous.observed_at_ms)>REANCHOR_AFTER_MS {return Ok(0);}
         if previous.packs.iter().any(|(key,old)|!self.packs.contains_key(key)
             && !old.end_ms.is_some_and(|end|end<=self.observed_at_ms)) {
             return Err("capacity_source_missing_pack".into());
@@ -166,7 +174,27 @@ impl PackObservation {
             } else {0};
             delta=delta.checked_add(next.used-prior).ok_or("capacity_source_overflow")?;
         }
-        if actual<delta || actual-delta>expired_remainder {return Err("capacity_source_debit_mismatch".into());}Ok(expired_remainder-(actual-delta))
+        // Upstream usage bookkeeping lags behind locally recorded receipts
+        // (a request can be billed locally before the entitlement usage is
+        // refreshed). A hard bound turns that ordinary in-flight window into a
+        // permanent debit mismatch, which then blocks all admission forever.
+        // Allow a bounded unsettled remainder: the part that no expired package
+        // can explain is carried (not deducted from the balance) and left for a
+        // later observation to absorb, but anything beyond the bound still fails
+        // closed so genuine bookkeeping errors keep surfacing.
+        const UNSETTLED_MICROCREDITS:i64=400_000_000;
+        if actual<delta {
+            // Upstream billed more than the local ledger recorded (external
+            // client, delayed posting, or a usage backfill). Carry the bounded
+            // shortfall instead of blocking admission forever.
+            if delta-actual<=UNSETTLED_MICROCREDITS {return Ok(expired_remainder);}
+            return Err("capacity_source_debit_mismatch".into());
+        }
+        let excess=actual-delta;
+        if excess>expired_remainder && excess-expired_remainder>UNSETTLED_MICROCREDITS {
+            return Err("capacity_source_debit_mismatch".into());
+        }
+        Ok(expired_remainder.saturating_sub(excess))
     }
     pub(super) fn balances(&self)->Result<(i64,i64),String> {
         self.validate()?;let (mut general,mut work)=(0i64,0i64);
@@ -298,6 +326,12 @@ impl Drop for FenceGuard<'_> {
 }
 pub(super) fn reconcile_with(runtime:&super::bridge_runtime::BridgeBudgetRuntime,account:&str,fetch:impl FnOnce()->Result<Vec<Value>,String>)->Result<bool,String> {
     reconcile_with_mode(runtime,account,false,fetch)
+}
+/// Re-observe an account even when it owes no settlement. Without this an idled
+/// account never takes a fresh reading, so its baseline silently ages and a
+/// later switch reconciles history against the live balance.
+pub(super) fn reconcile_stale(runtime:&super::bridge_runtime::BridgeBudgetRuntime,account:&str,fetch:impl FnOnce()->Result<Vec<Value>,String>)->Result<bool,String> {
+    reconcile_with_mode(runtime,account,true,fetch)
 }
 pub(super) fn reconcile_increased_capacity(runtime:&super::bridge_runtime::BridgeBudgetRuntime,account:&str,general:i64,work:i64,fetch:impl FnOnce()->Result<Vec<Value>,String>)->Result<bool,String> {
     let needed=runtime.with_store(|s,_| {

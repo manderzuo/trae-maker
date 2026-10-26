@@ -186,37 +186,73 @@ mod tests {
     }
 }
 
-pub(super) fn start(pool:ApiPool,stop:Arc<AtomicBool>,runtime:Arc<super::bridge_runtime::BridgeBudgetRuntime>) {
-    tokio::spawn(async move {
-        while !stop.load(Ordering::Acquire) {
-            let ids:Vec<_>=pool.status_list().into_iter().filter(|s|!s.disabled).map(|s|s.uid).collect();
-            for batch in ids.chunks(4) {
-                if stop.load(Ordering::Acquire) {break;}
-                let mut jobs=Vec::new();
-                for uid in batch {
-                    let pool=pool.clone();let uid=uid.clone();let stop=stop.clone();let runtime=runtime.clone();
-                    jobs.push(tokio::task::spawn_blocking(move || {
-                        if stop.load(Ordering::Acquire) {return;}
-                        // No pool/config/SQLite lock crosses the network call.
-                        let result=refresh_one_with_runtime(&pool,&uid,Some(&runtime),|account| {
-                            if stop.load(Ordering::Acquire) {return Err("capacity_refresh_stopped".into());}
-                            crate::commands::accounts::query_ent_packs_for_bridge(&account.jwt,
-                                &crate::models::DeviceEntry {device_id:account.device_id.clone(),..Default::default()})
-                                .map_err(|_|"upstream_capacity_unavailable".into())
-                        });
-                        if let Err(error)=result {
-                            if !stop.load(Ordering::Acquire) {
-                                crate::fs_utils::app_log(runtime.data_dir(),&format!("Core 专用账号容量刷新未更新准入：{}；保留费用事实",super::bridge_capacity_source::safe_error_code(&error)));
-                            }
-                        }
-                    }));
-                }
-                for job in jobs {let _=job.await;}
-            }
-            for _ in 0..60 {
+/// Reconciliation is event driven, not a periodic sweep: one pass when the
+/// assistant starts, then one pass after each settled task. A 60s loop refreshed
+/// every account whether or not anything had happened, which burned CPU and
+/// re-queried upstream for accounts that could not have changed.
+static TRIGGER: std::sync::OnceLock<Arc<tokio::sync::Notify>> = std::sync::OnceLock::new();
+
+/// Ask for a reconciliation pass. Cheap and safe to call from a request path:
+/// it only wakes the background task and never blocks the caller.
+pub(super) fn trigger() {
+    if let Some(notify) = TRIGGER.get() {
+        notify.notify_one();
+    }
+}
+
+async fn run_pass(pool:&ApiPool,stop:&Arc<AtomicBool>,runtime:&Arc<super::bridge_runtime::BridgeBudgetRuntime>) {
+    let ids:Vec<_>=pool.status_list().into_iter().filter(|s|!s.disabled).map(|s|s.uid).collect();
+    for batch in ids.chunks(4) {
+        if stop.load(Ordering::Acquire) {break;}
+        let mut jobs=Vec::new();
+        for uid in batch {
+            let pool=pool.clone();let uid=uid.clone();let stop=stop.clone();let runtime=runtime.clone();
+            jobs.push(tokio::task::spawn_blocking(move || {
                 if stop.load(Ordering::Acquire) {return;}
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
+                // No pool/config/SQLite lock crosses the network call.
+                let result=refresh_one_with_runtime(&pool,&uid,Some(&runtime),|account| {
+                    if stop.load(Ordering::Acquire) {return Err("capacity_refresh_stopped".into());}
+                    crate::commands::accounts::query_ent_packs_for_bridge(&account.jwt,
+                        &crate::models::DeviceEntry {device_id:account.device_id.clone(),..Default::default()})
+                        .map_err(|_|"upstream_capacity_unavailable".into())
+                });
+                if let Err(error)=result {
+                    if !stop.load(Ordering::Acquire) {
+                        // Collapsing every failure into one generic code makes
+                        // per-account reconciliation undebuggable: carry the
+                        // account and a sanitized raw reason so a stuck account
+                        // can be identified instead of guessed at.
+                        let raw:String=error.chars().filter(|c|c.is_ascii_alphanumeric()||*c=='_'||*c=='-'||*c==' ').take(160).collect();
+                        crate::fs_utils::app_log(runtime.data_dir(),&format!("Core 专用账号容量刷新未更新准入：{}（账号 {} 原始：{}）；保留费用事实",super::bridge_capacity_source::safe_error_code(&error),uid,raw));
+                    }
+                }
+            }));
+        }
+        for job in jobs {let _=job.await;}
+    }
+}
+
+pub(super) fn start(pool:ApiPool,stop:Arc<AtomicBool>,runtime:Arc<super::bridge_runtime::BridgeBudgetRuntime>) {
+    let notify=Arc::new(tokio::sync::Notify::new());
+    if TRIGGER.set(notify.clone()).is_err() {return;}
+    tokio::spawn(async move {
+        // Wait until the bridge can actually charge before the first pass. The
+        // startup pass used to run before the recovery handshake completed, so
+        // every account failed with "active charging lease required" and the
+        // open-the-assistant reconciliation never really happened.
+        for _ in 0..120 {
+            if stop.load(Ordering::Acquire) {return;}
+            if runtime.recovery_status().map(|s|s.charge_ready).unwrap_or(false) {break;}
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        // Once on startup: establish a truthful baseline for every account.
+        run_pass(&pool,&stop,&runtime).await;
+        loop {
+            if stop.load(Ordering::Acquire) {return;}
+            // Wake on demand; the timeout only bounds shutdown latency.
+            let _=tokio::time::timeout(std::time::Duration::from_secs(30),notify.notified()).await;
+            if stop.load(Ordering::Acquire) {return;}
+            run_pass(&pool,&stop,&runtime).await;
         }
     });
 }

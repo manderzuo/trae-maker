@@ -1646,6 +1646,66 @@ fn native_refresh_token_for(profile: &crate::native_client::NativeClientProfile,
     Some(token.to_string())
 }
 
+/// Whether this host holds any adoptable refreshToken for the UID, either in the
+/// live native client or in an AI Work-native snapshot. The account list uses it
+/// to keep the "renew JWT" affordance visible for accounts that only carry a JWT:
+/// hiding that entry also hides the only path that reaches the adoption logic in
+/// `refresh_jwt_for_profile`, so such an account could never be renewed at all.
+/// UIDs that hold an adoptable refreshToken on this host. The account list needs
+/// this per row, but scanning and decrypting every native snapshot per row per
+/// refresh is far too expensive (it saturates the process), so scan once and
+/// cache the result briefly.
+fn refreshable_uids(data_dir: &std::path::Path) -> Vec<String> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>> = std::sync::Mutex::new(None);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((at, list)) = guard.as_ref() {
+            if at.elapsed() < std::time::Duration::from_secs(300) {
+                return list.clone();
+            }
+        }
+    }
+    let mut found = Vec::new();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let root = std::path::PathBuf::from(appdata);
+        for name in ["Trae CN", "TRAE SOLO CN", "TRAE SOLO", "Trae"] {
+            dirs.push(root.join(name));
+        }
+    }
+    for root in [data_dir.to_path_buf(), data_dir.join("data")] {
+        for name in ["profiles_trae", "profiles"] {
+            let base = root.join(name);
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        dirs.push(entry.path());
+                    }
+                }
+            }
+        }
+    }
+    for dir in dirs {
+        let path = dir.join("User/globalStorage/storage.json");
+        if let Some(auth) = crate::native_snapshot::read_native_auth(&path) {
+            let uid = auth["userId"].as_str().unwrap_or_default();
+            if !uid.is_empty()
+                && auth["refreshToken"].as_str().is_some_and(|token| !token.trim().is_empty())
+                && !found.iter().any(|known| known == uid)
+            {
+                found.push(uid.to_string());
+            }
+        }
+    }
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), found.clone()));
+    }
+    found
+}
+
+fn native_refresh_available(data_dir: &std::path::Path, user_id: &str) -> bool {
+    refreshable_uids(data_dir).iter().any(|uid| uid == user_id)
+}
+
 pub fn refresh_jwt_for_profile(state: &AppState, user_id: &str, profile: &crate::native_client::NativeClientProfile) -> Result<String, String> {
     // 并发安全：持锁防止多个并发请求同时 ExchangeToken
     let _lock = state
@@ -1970,11 +2030,18 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
         } else {
             (None, None, None)
         };
-        let has_rt = a
+        let mut has_rt = a
             .refresh_token
             .as_ref()
             .map(|s| !s.is_empty())
             .unwrap_or(false);
+        // Accounts imported before the native takeover existed carry only a JWT.
+        // When this host still holds an adoptable refreshToken for the UID, the
+        // renewal entry must stay visible: clicking it makes refresh_jwt adopt the
+        // native credential (see refresh_jwt_for_profile).
+        if !has_rt {
+            has_rt = native_refresh_available(&state.data_dir, &uid);
+        }
         // 自动刷新条件：有 refresh_token 且 JWT 24h 内过期或已过期
         let need_refresh = has_rt
             && info

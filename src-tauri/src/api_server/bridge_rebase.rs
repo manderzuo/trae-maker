@@ -101,8 +101,17 @@ pub(super) fn quiet_watermark(conn:&Connection,account:&str)->Result<(i64,i64,i6
     )",[account],|r|r.get(0)).map_err(db_error)?;
     Ok((event,legacy,latest))
 }
+/// A rebase that only refreshes the baseline (the account owes no settlement)
+/// is a pure observation and needs fact-write authority only. It must not
+/// require the live charging lease, otherwise an idled account can never be
+/// re-observed and its baseline ages indefinitely. Rebases that do settle
+/// debits keep the strict requirement.
+fn require_rebase_lease(tx:&Transaction<'_>,lease:&BridgeBudgetLease,account:&str)->Result<(),String> {
+    let owes:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bridge_capacity_slots s WHERE s.account_ref=?1 AND s.stage='D' AND NOT EXISTS(SELECT 1 FROM bridge_capacity_covered c WHERE c.budget_id=s.budget_id))",[account],|r|r.get(0)).map_err(db_error)?;
+    if owes {bridge_budget::require_active_lease(tx,lease)} else {bridge_budget::require_fact_lease(tx,lease)}
+}
 pub(super) fn check_fence(tx:&Transaction<'_>,lease:&BridgeBudgetLease,fence:&RebaseFence)->Result<(String,Option<String>),String> {
-    bridge_budget::require_active_lease(tx,lease)?;
+    require_rebase_lease(tx,lease,&fence.account_ref)?;
     if fence.bridge_instance_id!=lease.instance_id() || fence.generation!=lease.generation() {return Err("capacity_rebase_owner_changed".into());}
     let (stored,state,coverage):(String,String,Option<String>)=tx.query_row("SELECT fence_json,state,coverage_json FROM bridge_capacity_rebases WHERE owner_nonce=?1 AND account_ref=?2",
         params![fence.owner_nonce,fence.account_ref],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(db_error)?;
@@ -137,7 +146,7 @@ impl BridgeBillingStore {
         use base64::Engine;
         let owner=format!("rebase-{}",base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(entropy));
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
-        bridge_budget::require_active_lease(&tx,lease)?;
+        require_rebase_lease(&tx,lease,account)?;
         let old=snapshot(&tx,account)?;
         let (event,legacy,latest)=quiet_watermark(&tx,account)?;
         if now<old.observed_at_ms || now<latest {return Err("capacity_rebase_observation_in_future".into());}

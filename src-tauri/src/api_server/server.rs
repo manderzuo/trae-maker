@@ -105,6 +105,31 @@ pub async fn start_api_server(
     super::bridge_runtime::BridgeBudgetRuntime::start_maintenance(&budget_runtime,background_stop.clone());
     super::usage_refresh::start_with_runtime(state.clone(), background_stop.clone(), Some(budget_runtime.clone()));
     super::balance_refresh::start(state.pool.clone(),background_stop.clone(),budget_runtime.clone());
+    // Complete local instance recovery on startup. Without this, a restart leaves
+    // the bridge in recovery_required and rejects every business request until an
+    // external actor (the router or the UI) performs the handshake — that is what
+    // stalled live tasks after a restart. Retained unresolved budgets keep the
+    // manual path: those need a human decision, never a silent acknowledgement.
+    {
+        let rt=budget_runtime.clone();
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..30 {
+                match rt.recovery_status() {
+                    Ok(status) if status.recovery_required => {
+                        if status.retained_unresolved_budgets==0
+                            && rt.recover_local_instance(&status.instance_id,&status.generation,true).is_ok() {
+                            eprintln!("bridge local instance recovered automatically");
+                            return;
+                        }
+                    }
+                    Ok(_) => return,
+                    Err(_) => {}
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            eprintln!("bridge automatic recovery did not complete; awaiting external handshake");
+        });
+    }
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {

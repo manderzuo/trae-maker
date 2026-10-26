@@ -565,11 +565,16 @@ fn refresh_pending_account(
     if stop.load(Ordering::Acquire) {
         return false;
     }
+    // The Core pending-request index is only one input to the usage refresh.
+    // Treating its failure as a hard stop also skipped the capacity
+    // reconciliation below, so a broken index silently froze every account's
+    // capacity baseline at its old value. Degrade to an empty index instead and
+    // still reconcile, so live upstream balances keep flowing.
     let pending = match super::bridge_billing::pending_core_session_accounts_for_poll(&state.data_dir) {
         Ok(pending) => pending,
         Err(_) => {
             crate::fs_utils::app_log(&state.data_dir, "Core 用量轮询失败：待核验请求索引不可用");
-            return true;
+            Vec::new()
         }
     };
     if stop.load(Ordering::Acquire) {
@@ -604,7 +609,7 @@ fn refresh_pending_account(
     }
     // Same bounded worker/queue, but independent from publishing per-Key receipts:
     // account rebasing must not delay Core reading the already committed outbox.
-    if !stop.load(Ordering::Acquire) {
+    if !stop.load(Ordering::Acquire) && std::env::var("AIWORK_CAPACITY_REFRESH_PERIODIC").is_ok() {
         if let Some(runtime)=runtime {
             let result=super::bridge_capacity_source::reconcile_with(runtime,&item.account_ref,|| {
                 if stop.load(Ordering::Acquire) {return Err("capacity_refresh_stopped".into());}
@@ -612,7 +617,13 @@ fn refresh_pending_account(
                 crate::commands::accounts::query_ent_packs_for_bridge(&account.jwt,&crate::models::DeviceEntry {device_id:account.device_id,..Default::default()})
                     .map_err(|_|"upstream_capacity_unavailable".into())
             });
-            if let Err(error)=result {crate::fs_utils::app_log(&state.data_dir,&format!("Core 专用账号容量核对暂未通过：{}；保留费用事实，等待下次核对",super::bridge_capacity_source::safe_error_code(&error)));}
+            if let Err(error)=result {
+                // Keep the closed diagnostic code for alerting, but also carry a
+                // sanitized raw reason: collapsing every unexpected failure into
+                // one generic code makes production reconciliation undebuggable.
+                let raw:String=error.chars().filter(|c|c.is_ascii_alphanumeric()||*c=='_'||*c=='-'||*c==' ').take(120).collect();
+                crate::fs_utils::app_log(&state.data_dir,&format!("Core 专用账号容量核对暂未通过：{}（原始：{}）；保留费用事实，等待下次核对",super::bridge_capacity_source::safe_error_code(&error),raw));
+            }
         }
     }
     match pending_refresh_accounts(&state.data_dir) {

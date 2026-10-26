@@ -175,6 +175,22 @@ impl BridgeBillingStore {
         }
         if current!=previous {return Err("execution changed during result protection; reread required".into());}
         bridge_budget::transition_in_transaction(&tx,lease,budget_id,CapacityTransition::ExecutionTerminal)?;
+        // A failed execution with no billing evidence releases its hold. Without
+        // this the slot stops at 'R', which only a final receipt can leave: the
+        // capacity stays occupied forever, retained_unresolved_budgets never
+        // returns to zero, recovery cannot finish and every later rebase is
+        // blocked by capacity_rebase_not_quiescent.
+        if state==ExecutionState::Failed
+            && result.pointer("/billing/status").and_then(Value::as_str)==Some("absent")
+        {
+            let stage:String=tx.query_row("SELECT stage FROM bridge_capacity_slots WHERE budget_id=?1",[budget_id],|r|r.get(0)).map_err(db_error)?;
+            if stage=="P" || stage=="R" {
+                // A settlement that cannot apply here must not corrupt the
+                // terminal result: if a receipt already settled it, the mutation
+                // reports Duplicate and the hold stays as recorded.
+                let _=bridge_budget::transition_in_transaction(&tx,lease,budget_id,CapacityTransition::FailedNoCharge);
+            }
+        }
         tx.execute("UPDATE bridge_budget_executions SET execution_state=?1,finished_at_ms=?2,result_ciphertext=?3,result_hash=?4 WHERE budget_id=?5 AND execution_state IN ('running','unknown')",params![state.as_str(),now,cipher,hash.as_slice(),budget_id]).map_err(db_error)?;
         tx.commit().map_err(db_error)
     }
