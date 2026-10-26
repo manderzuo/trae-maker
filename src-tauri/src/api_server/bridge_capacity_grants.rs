@@ -118,7 +118,13 @@ fn refresh_in_tx(tx:&Transaction<'_>,account:&str,current:&CurrentPacks,started_
     previous.validate()?;
     if started_at<previous.observed_at_ms || started_at>chrono::Utc::now().timestamp_millis() {return Err("capacity_grant_observation_stale".into());}
     let original=super::bridge_rebase::snapshot(tx,account)?;
-    if original.observed_at_ms!=previous.observed_at_ms || previous.balances()? != (original.general,original.work) {return Err("capacity_grant_anchor_invalid".into());}
+    // The account row may already be ahead of the anchor: a reconciliation pass
+    // updates the live balance before it finishes the rebase, and a rebase that
+    // does not commit leaves the two permanently unequal. Requiring exact
+    // equality therefore fenced every such account out of grant refresh forever.
+    // The anchor stays the baseline this comparison is anchored on; only an
+    // account row OLDER than the anchor is a genuine inconsistency.
+    if original.observed_at_ms<previous.observed_at_ms {return Err("capacity_grant_anchor_invalid".into());}
     for (key,old) in &previous.packs {
         match current.source.packs.get(key) {
             Some(next) if old.product==next.product && old.limit==next.limit && old.start_ms==next.start_ms && old.end_ms==next.end_ms && next.used>=old.used=>{},
