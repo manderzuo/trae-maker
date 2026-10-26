@@ -53,6 +53,7 @@ pub mod upstream_observation;
 pub mod usage;
 pub(crate) mod usage_refresh;
 pub mod video;
+mod video_failure;
 mod video_protocol;
 mod video_stream;
 mod reference_readiness;

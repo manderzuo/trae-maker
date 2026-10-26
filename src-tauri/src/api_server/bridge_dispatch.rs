@@ -70,7 +70,21 @@ pub(super) fn dispatch(state:Arc<super::ApiSharedState>,runtime:Arc<BridgeBudget
             if video {
                 match super::video::run_budget_task(worker_state,&runtime,&ctx,account,body.clone(),permit) {
                     Ok(task) if task.status=="completed"=>WorkerResult::Terminal(ExecutionState::Succeeded,serde_json::to_value(task).unwrap_or(Value::Null)),
-                    Ok(task) if task.status=="failed"=>WorkerResult::Terminal(ExecutionState::Failed,serde_json::to_value(task).unwrap_or(Value::Null)),
+                    Ok(task) if task.status=="failed"=>{
+                        // Upstream rejects a submission for reasons the caller can
+                        // actually fix (a reference image that trips the real-person
+                        // check, an unreachable asset, an unsupported duration). Pass
+                        // the raw text through, but also label the cause so a caller
+                        // can show one actionable line instead of an opaque wall.
+                        let mut value=serde_json::to_value(&task).unwrap_or(Value::Null);
+                        if let Some(error)=task.error.as_deref() {
+                            if let Some((kind,hint))=super::video_failure::classify(error) {
+                                value["failure_kind"]=json!(kind);
+                                value["failure_hint"]=json!(hint);
+                            }
+                        }
+                        WorkerResult::Terminal(ExecutionState::Failed,value)
+                    },
                     Ok(task) if task.execution_diagnostic.is_some()=>WorkerResult::Diagnostic(task.execution_diagnostic.unwrap()),
                     _=>WorkerResult::Unknown,
                 }
