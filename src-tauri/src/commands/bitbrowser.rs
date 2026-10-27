@@ -642,7 +642,12 @@ fn normalise_token(value: &str) -> String {
     token
 }
 
-fn capture_token(target: &Value) -> Result<CapturedToken, String> {
+/// 读取一次目标页面的凭据。
+///
+/// 授权页（`www.trae.cn/authorization?...`）在用户完成登录动作之后才写入
+/// `localStorage["Cloud-IDE-Token"]`，所以单次读取很容易读到"还没有"。
+/// 需要等待的场景走 [`capture_token`]，它对本函数做有限轮询。
+fn capture_token_once(target: &Value) -> Result<CapturedToken, String> {
     let ws_url = target
         .get("webSocketDebuggerUrl")
         .and_then(Value::as_str)
@@ -696,6 +701,33 @@ fn capture_token(target: &Value) -> Result<CapturedToken, String> {
         });
     }
     Err("Trae Work 页面未找到有效的 Cloud-IDE-Token（可能尚未登录或页面尚未加载完成）".into())
+}
+
+/// 在有限时间内轮询页面凭据。
+///
+/// 实测：BitBrowser 打开的是 Trae 授权页，用户点完「登录并打开 TRAE」后
+/// token 才写进 localStorage。原来只读一次，用户在授权完成前点扫描就会
+/// 误报「未找到有效的 Cloud-IDE-Token」。这里最多等 4×700ms ≈ 2.8 秒。
+const CAPTURE_ATTEMPTS: usize = 4;
+const CAPTURE_INTERVAL_MS: u64 = 700;
+
+fn capture_token(target: &Value) -> Result<CapturedToken, String> {
+    let mut last_error = String::new();
+    for attempt in 0..CAPTURE_ATTEMPTS {
+        match capture_token_once(target) {
+            Ok(captured) => return Ok(captured),
+            Err(error) => last_error = error,
+        }
+        if attempt + 1 < CAPTURE_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(CAPTURE_INTERVAL_MS));
+        }
+    }
+    Err(format!(
+        "{}（已轮询 {} 次，共 {} 秒）。如果页面仍在「登录以使用 TRAE」，请先在 BitBrowser 窗口里完成登录授权，再点重新扫描",
+        last_error,
+        CAPTURE_ATTEMPTS,
+        (CAPTURE_ATTEMPTS as u64 * CAPTURE_INTERVAL_MS) / 1000
+    ))
 }
 
 fn capture_profile(base: &str, profile: &BrowserProfile) -> Result<CapturedToken, String> {
