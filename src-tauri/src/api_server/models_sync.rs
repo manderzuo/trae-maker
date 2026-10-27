@@ -233,7 +233,9 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         .accounts
         .iter()
         .filter(|a| !a.jwt.trim().is_empty())
-        .take(3)
+        // 同步只读配置、不消耗积分，也不需要走调度，因此愿意多试几个账号：
+        // 只取前 3 个时，能用的那个账号可能排在文件末尾永远轮不到。
+        .take(10)
         .filter_map(|a| {
             let uid = a.user_id.as_deref()?.to_string();
             let device_id = device_map
@@ -281,14 +283,30 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
     });
 
     let mut last_err = String::new();
+    let mut attempts: Vec<String> = Vec::new();
     let mut parsed: Option<Vec<ModelOption>> = None;
     for (account, device_id, machine_id) in &candidates {
+        // 诊断用：这个账号的 JWT 是什么形态（绝不打印 token 原文）。
+        // 同步失败时把这几行一起回给前端，省得靠猜。
+        let token = bare_token(&account.jwt);
+        let info = crate::jwt::parse(token);
+        let tag = format!(
+            "uid={} jwtLen={} bareLen={} head={} payloadKeys=[{}] exp={}",
+            info.user_id.as_deref().unwrap_or("<none>"),
+            account.jwt.len(),
+            token.len(),
+            token.chars().take(12).collect::<String>(),
+            jwt_payload_keys(token),
+            info.exp_timestamp
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "<none>".into())
+        );
         let resp = super::text_protocol::post(&agent,
             "https://api5-normal.mchost.guru/api/ide/v1/batch_get_detail_param")
             .set("Content-Type", "application/json")
             .set("Request-Traffic-Type", "prod")
             .set("User-Agent", "TraeClient/TTNet")
-            .set("authorization", &format!("Cloud-ID {}", account.jwt.trim()))
+            .set("authorization", &format!("Cloud-ID {token}"))
             .set("x-app-id", super::APP_ID)
             .set("x-app-version", &app_version)
             .set("x-app-version-code", &version_code)
@@ -297,7 +315,7 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
             .set("x-device-cpu", "Intel")
             .set("x-device-id", device_id)
             .set("x-device-type", "windows")
-            .set("x-ide-token", account.jwt.trim())
+            .set("x-ide-token", token)
             .set("x-ide-version", &app_version)
             .set("x-ide-version-code", &version_code)
             .set("x-ide-version-type", "stable")
@@ -328,22 +346,43 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
                         parsed = Some(list);
                         break;
                     }
-                    Ok(_) => last_err = "官网返回模型列表为空".into(),
-                    Err(e) => last_err = e,
+                    Ok(_) => {
+                        last_err = "官网返回模型列表为空".into();
+                        attempts.push(format!("{tag} -> HTTP 200 但解析为空（{} 字节）", text.len()));
+                    }
+                    Err(e) => {
+                        last_err = e.clone();
+                        attempts.push(format!("{tag} -> HTTP 200 解析失败: {e}"));
+                    }
                 },
-                Err(e) => last_err = e,
+                Err(e) => {
+                    last_err = e.clone();
+                    attempts.push(format!("{tag} -> 读响应失败: {e}"));
+                }
             },
             Err(ureq::Error::Status(code, r)) => {
                 // 401 等：换下一个账号重试
                 let detail = into_string(r).unwrap_or_default();
-                last_err = format!("HTTP {code}: {}", detail.chars().take(160).collect::<String>());
+                let head: String = detail.chars().take(140).collect();
+                last_err = format!("HTTP {code}: {head}");
+                attempts.push(format!("{tag} -> HTTP {code}: {head}"));
             }
-            Err(e) => last_err = format!("请求失败: {e}"),
+            Err(e) => {
+                last_err = format!("请求失败: {e}");
+                attempts.push(format!("{tag} -> 请求失败: {e}"));
+            }
         }
     }
 
     let fetched = parsed.ok_or_else(|| {
-        format!("同步失败（已尝试 {} 个账号）: {last_err}", candidates.len())
+        let message = format!(
+            "同步失败（已尝试 {} 个账号）: {last_err}\n--- 每个账号的结果 ---\n{}",
+            candidates.len(),
+            attempts.join("\n")
+        );
+        // 前端可能只显示第一行，所以完整诊断同时落日志。
+        fs_utils::app_log(data_dir, &format!("官网模型同步失败: {message}"));
+        message
     })?;
 
     let list = normalize_order(fetched);
@@ -358,6 +397,44 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
 fn into_string(r: ureq::Response) -> Result<String, String> {
     r.into_string()
         .map_err(|e| format!("读取响应失败: {e}"))
+}
+
+/// 去掉凭据前缀，只留纯 token。
+///
+/// 账号池里存的往往是 `Cloud-IDE-JWT <token>`（或 `Bearer <token>`）这种带前缀的
+/// 形态，长度比裸 token 多十来个字符。上游只认裸 JWT，把带前缀的整串塞进
+/// `x-ide-token` / `authorization` 会直接 401 + code 1001；
+/// `jwt::parse` 内部本来就 strip 掉前缀，所以 uid/exp 能解析、请求却被拒，
+/// 是个很容易误判的坑。
+fn bare_token(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix("Cloud-IDE-JWT ")
+        .or_else(|| trimmed.strip_prefix("Bearer "))
+        .unwrap_or(trimmed)
+        .trim()
+}
+
+/// 只取 JWT payload 的字段名（不取值），用于判断凭据类型。
+fn jwt_payload_keys(token: &str) -> String {
+    use base64::Engine;
+    let token = bare_token(token);
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() < 2 {
+        return "<不是JWT>".into();
+    }
+    let Ok(bytes) =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1].trim_end_matches('='))
+    else {
+        return "<base64解不开>".into();
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return "<json解不开>".into();
+    };
+    match value.as_object() {
+        Some(map) => map.keys().cloned().collect::<Vec<_>>().join(","),
+        None => "<payload不是对象>".into(),
+    }
 }
 
 /// 宽容取值：候选键逐个探测（数值），任一命中即返回（L2 字段名待抓包确认 §3.2）
