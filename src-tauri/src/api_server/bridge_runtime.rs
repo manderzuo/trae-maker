@@ -96,6 +96,16 @@ impl BridgeBudgetRuntime {
         self.with_store(|s,l|s.expire_unconsumed_budgets(l,now))
     }
     pub(super) fn sweep_interrupted_text(&self,now:i64)->Result<usize,String> {
+        // A text step is synchronous: its SSE reader is already bounded by a
+        // 600s total limit and a 120s progress limit. An execution still open
+        // far beyond that cannot be a live read. The executor does report such
+        // timeouts, but a stream that never terminates keeps the diagnostic at
+        // outcome_known=false, which deliberately records no terminal state --
+        // so the record would hold its send_intent and capacity slot forever.
+        // Judge those in place too, not only the previous instance's leftovers.
+        // Videos stay excluded: their asynchronous task may still be running.
+        const STALE_TEXT_MS:i64=30*60*1000;
+        let stale_before=now-STALE_TEXT_MS;
         let requests=self.with_store(|store,lease| {
             if !lease.charge_ready() || lease.is_closing() {return Ok(Vec::new());}
             // The exclusive host/instance lease outlives every local worker.
@@ -103,18 +113,27 @@ impl BridgeBudgetRuntime {
             // LOCAL text execution, not upstream cancellation or free usage.
             // Videos remain unknown: their asynchronous task may still run.
             let ids={
-                let mut stmt=store.connection.prepare("SELECT e.budget_id FROM bridge_budget_executions e
+                let mut stmt=store.connection.prepare("SELECT e.budget_id,
+                    CASE WHEN p.event_generation=?2 THEN 'timeout' ELSE 'interrupted' END
+                    FROM bridge_budget_executions e
                     JOIN bridge_prepared_budgets p ON p.budget_id=e.budget_id
                     WHERE e.execution_state IN ('running','unknown') AND e.finished_at_ms IS NULL
                       AND e.step_kind IN ('assist','chat') AND e.bridge_instance_id=?1
-                      AND p.event_generation<>?2 ORDER BY e.budget_id LIMIT 64").map_err(|e|e.to_string())?;
-                let rows=stmt.query_map(rusqlite::params![lease.instance_id(),lease.generation()],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
+                      AND (p.event_generation<>?2 OR e.started_at_ms<?3)
+                    ORDER BY e.budget_id LIMIT 64").map_err(|e|e.to_string())?;
+                let rows=stmt.query_map(rusqlite::params![lease.instance_id(),lease.generation(),stale_before],
+                    |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?;
                 rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?
             };
             let mut ended=Vec::new();let mut failed=false;
-            for id in ids {
-                let result=serde_json::json!({"status":"failed","error":{"code":"bridge_execution_interrupted",
-                    "message":"原网关进程已退出，文字步骤的执行结果丢失；不会自动重发。费用继续按原会话真实账单核对。"}});
+            for (id,kind) in ids {
+                let result=if kind=="timeout" {
+                    serde_json::json!({"status":"failed","error":{"code":"bridge_execution_timeout",
+                        "message":"文字步骤超过流式时限仍未结束，已判定失败并释放额度；不会自动重发。费用继续按原会话真实账单核对。"}})
+                } else {
+                    serde_json::json!({"status":"failed","error":{"code":"bridge_execution_interrupted",
+                        "message":"原网关进程已退出，文字步骤的执行结果丢失；不会自动重发。费用继续按原会话真实账单核对。"}})
+                };
                 // Uses the same immutable encrypted result and P->R transaction
                 // as the executor. No receipts/amounts are manufactured here.
                 match store.finish_budget_result(lease,&id,super::bridge_execution::ExecutionState::Failed,&result,now) {
@@ -319,6 +338,41 @@ mod tests {
             s.mark_budget_execution_unknown(l,&current.authorization.budget_id)?;Ok(())
         }).unwrap();
         assert_eq!(runtime.sweep_interrupted_text(chrono::Utc::now().timestamp_millis()).unwrap(),0,"current generation may still have a worker");
+        drop(runtime);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn stale_unknown_text_execution_of_live_generation_is_judged_and_releases_capacity() {
+        use super::super::{bridge_prepared::{tests::input,ConsumeOutcome},bridge_execution::ExecutionState};
+        let (dir,mut store,lease)=fixture();
+        drop(lease);drop(store);
+        let runtime=BridgeBudgetRuntime::start(&dir).unwrap();
+        let status=runtime.recovery_status().unwrap();
+        runtime.recover_local_instance(&status.instance_id,&status.generation,true).unwrap();
+        // Everything below belongs to the CURRENT generation, so the
+        // previous-generation rule cannot fire; only the age rule can end it.
+        let budget=runtime.with_store(|s,l| {
+            let mut value=input();
+            value.step_kind="assist".into();value.model="glm-5.3-flash".into();
+            value.request_id="stale-assist".into();
+            let prepared=s.prepare_budget(l,&value,None,10)?;
+            let ConsumeOutcome::Granted(ctx)=s.consume_budget(l,&prepared,20)? else {return Err("consume".to_string())};
+            s.mark_budget_send_intent(l,&prepared.authorization.budget_id,&ctx.consume_epoch)?;
+            // The executor reports a stream timeout with outcome_known=false,
+            // which by design writes no terminal state. Age it past the SSE
+            // bounds: the worker that owned it cannot still be reading.
+            s.mark_budget_execution_unknown(l,&prepared.authorization.budget_id)?;
+            let aged=chrono::Utc::now().timestamp_millis()-2*60*60*1000;
+            s.connection.execute("UPDATE bridge_budget_executions SET started_at_ms=?1 WHERE budget_id=?2",
+                rusqlite::params![aged,prepared.authorization.budget_id]).map_err(|e|e.to_string())?;
+            Ok(prepared.authorization.budget_id)
+        }).unwrap();
+        assert_eq!(runtime.sweep_interrupted_text(chrono::Utc::now().timestamp_millis()).unwrap(),1,
+            "an aged text execution must be judged, otherwise its capacity slot is held forever");
+        runtime.with_store(|s,_l| {
+            assert_eq!(s.budget_execution(&budget)?.unwrap().state,ExecutionState::Failed);
+            assert_eq!(s.load_budget_result(&budget)?.unwrap()["error"]["code"],"bridge_execution_timeout");
+            Ok(())
+        }).unwrap();
         drop(runtime);std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
