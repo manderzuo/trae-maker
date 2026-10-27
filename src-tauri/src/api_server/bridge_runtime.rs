@@ -111,15 +111,20 @@ impl BridgeBudgetRuntime {
             // The exclusive host/instance lease outlives every local worker.
             // A different preparation generation therefore proves loss of its
             // LOCAL text execution, not upstream cancellation or free usage.
+            // Two ways a text execution can be over:
+            //   * this instance, previous generation  -> process restart / rotation
+            //   * any instance, older than the SSE bounds -> the owning worker is
+            //     gone (its instance id is per-boot, so a restart orphans the row
+            //     and the first rule alone would never reach it again)
             // Videos remain unknown: their asynchronous task may still run.
             let ids={
                 let mut stmt=store.connection.prepare("SELECT e.budget_id,
-                    CASE WHEN p.event_generation=?2 THEN 'timeout' ELSE 'interrupted' END
+                    CASE WHEN e.bridge_instance_id=?1 AND p.event_generation<>?2 THEN 'interrupted' ELSE 'timeout' END
                     FROM bridge_budget_executions e
                     JOIN bridge_prepared_budgets p ON p.budget_id=e.budget_id
                     WHERE e.execution_state IN ('running','unknown') AND e.finished_at_ms IS NULL
-                      AND e.step_kind IN ('assist','chat') AND e.bridge_instance_id=?1
-                      AND (p.event_generation<>?2 OR e.started_at_ms<?3)
+                      AND e.step_kind IN ('assist','chat')
+                      AND ((e.bridge_instance_id=?1 AND p.event_generation<>?2) OR e.started_at_ms<?3)
                     ORDER BY e.budget_id LIMIT 64").map_err(|e|e.to_string())?;
                 let rows=stmt.query_map(rusqlite::params![lease.instance_id(),lease.generation(),stale_before],
                     |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?;
