@@ -343,6 +343,16 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
             Ok(r) => match into_string(r) {
                 Ok(text) => match parse_official(&text) {
                     Ok(list) if !list.is_empty() => {
+                        // 记下响应体大小：上游降级时仍回 200，只是内容缩水，
+                        // 只有对比字节数才看得出来。
+                        fs_utils::app_log(
+                            data_dir,
+                            &format!(
+                                "官网模型同步：{tag} 返回 {} 字节，解析出 {} 个模型",
+                                text.len(),
+                                list.len()
+                            ),
+                        );
                         parsed = Some(list);
                         break;
                     }
@@ -385,6 +395,19 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
         message
     })?;
 
+    // 安全护栏：上游偶尔返回降级响应（只含个别 config，或全是内部模型），
+    // 状态码仍是 200。直接落盘会把已有的完整目录冲成三五个，
+    // 所以数量明显不足时宁可不写，保留原文件。
+    if fetched.len() < MIN_OFFICIAL_MODELS {
+        let message = format!(
+            "上游只返回了 {} 个模型（低于 {} 个），疑似降级响应；已保留原有目录，未覆盖",
+            fetched.len(),
+            MIN_OFFICIAL_MODELS
+        );
+        fs_utils::app_log(data_dir, &format!("官网模型同步中止: {message}"));
+        return Err(message);
+    }
+
     let list = normalize_order(fetched);
     fs_utils::write_json(&models_file(data_dir), &list)?;
     fs_utils::app_log(
@@ -398,6 +421,9 @@ fn into_string(r: ureq::Response) -> Result<String, String> {
     r.into_string()
         .map_err(|e| format!("读取响应失败: {e}"))
 }
+
+/// 官网目录的最低可信数量。低于此值视为上游降级响应，不落盘。
+const MIN_OFFICIAL_MODELS: usize = 10;
 
 /// 去掉凭据前缀，只留纯 token。
 ///
