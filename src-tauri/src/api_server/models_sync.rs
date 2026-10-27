@@ -253,6 +253,18 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(30))
         .build();
+    // 官方客户端每次请求都带真实版本号与 authorization 头；缺任一项，上游会按
+    // 「非官方客户端」返回 401 + code 1001（allow_tenant_user_add_model 只是响应里的
+    // 一个配置字段，不是失败原因）。ide_version() 依赖本机已安装的 Trae 客户端，
+    // 读不到时退回最近一次实测的版本号，而不是 0.1.50 这个远古兜底值。
+    let app_version = {
+        let v = super::ide_version();
+        if v == super::IDE_VERSION { "3.4.7".to_string() } else { v }
+    };
+    let version_code = {
+        let c = super::ide_version_code();
+        if c == super::IDE_VERSION_CODE { "20260924".to_string() } else { c }
+    };
     let body = json!({
         "functions": [
             "assistant", "solo_agent_lite", "solo_coder", "solo_agent_remote",
@@ -276,23 +288,36 @@ pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<Mod
             .set("Content-Type", "application/json")
             .set("Request-Traffic-Type", "prod")
             .set("User-Agent", "TraeClient/TTNet")
+            .set("authorization", &format!("Cloud-ID {}", account.jwt.trim()))
             .set("x-app-id", super::APP_ID)
-            .set("x-app-version", "default")
+            .set("x-app-version", &app_version)
+            .set("x-app-version-code", &version_code)
             .set("x-bridge-transport", "aha")
             .set("x-device-brand", "CREFG-XX")
             .set("x-device-cpu", "Intel")
             .set("x-device-id", device_id)
             .set("x-device-type", "windows")
             .set("x-ide-token", account.jwt.trim())
-            .set("x-ide-version", &super::ide_version())
+            .set("x-ide-version", &app_version)
+            .set("x-ide-version-code", &version_code)
             .set("x-ide-version-type", "stable")
             .set("x-lgw-req-sdk-type", "3")
             .set("x-machine-id", machine_id)
             .set("x-os-version", "Windows 11 Home China")
+            .set("x-user-region", "CN")
+            .set("x-harness", "1")
+            .set("x-agent-host-type", "0")
+            .set(
+                "referer",
+                concat!(
+                    "https://trae-api-cn.mchost.guru",
+                    "/api/ide/v1/batch_get_detail_param"
+                ),
+            )
             .set("package-type", "stable_cn")
             .set("x-lscbd-aid", "787976")
             .set("x-lscbd-platform", "windows")
-            .set("app-version", &super::ide_version())
+            .set("app-version", &app_version)
             .set("x-ss-dp", "787976")
             .send_json(body.clone());
 
