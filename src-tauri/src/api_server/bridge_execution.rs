@@ -191,6 +191,28 @@ impl BridgeBillingStore {
                 let _=bridge_budget::transition_in_transaction(&tx,lease,budget_id,CapacityTransition::FailedNoCharge);
             }
         }
+        // An upstream that reports no usage (video endpoints bill per call) can
+        // never produce the final receipt Core requires: Core settles only
+        // Final/FailedNoCharge, while this bridge records Absent/Unverified/
+        // Verified. Leaving the slot at 'R' would keep the hold reserved forever:
+        // retained_unresolved_budgets never returns to zero and every later
+        // rebase is blocked by capacity_rebase_not_quiescent. Settle the capacity
+        // at the hold Core itself quoted so the account is released immediately.
+        // The preparation deliberately stays readable: Core still has to fetch
+        // this execution and its result, so the row is only reclaimed later by
+        // the stale-preparation sweeper.
+        if state==ExecutionState::Succeeded
+            && result.pointer("/billing/status").and_then(Value::as_str)==Some("absent")
+        {
+            let (stage,hold):(String,i64)=tx.query_row(
+                "SELECT stage,hold_microcredits FROM bridge_capacity_slots WHERE budget_id=?1",
+                [budget_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(db_error)?;
+            if stage=="P" || stage=="R" {
+                // Duplicate is normal: a concurrent receipt may already have
+                // settled this budget at the same amount.
+                bridge_budget::transition_in_transaction(&tx,lease,budget_id,CapacityTransition::Actual(hold))?;
+            }
+        }
         tx.execute("UPDATE bridge_budget_executions SET execution_state=?1,finished_at_ms=?2,result_ciphertext=?3,result_hash=?4 WHERE budget_id=?5 AND execution_state IN ('running','unknown')",params![state.as_str(),now,cipher,hash.as_slice(),budget_id]).map_err(db_error)?;
         tx.commit().map_err(db_error)
     }
@@ -244,6 +266,23 @@ mod tests {
         assert_eq!(store.budget_execution(&id).unwrap().unwrap().finished_at_ms,Some(finished));
         assert!(store.bind_budget_task(&lease,&id,"task-other").is_err());
         assert!(store.finish_budget_result(&lease,&id,ExecutionState::Failed,&output,finished+200).is_err());
+        cleanup(dir,store,lease);
+    }
+    #[test]
+    fn video_success_without_billing_evidence_settles_hold_and_closes_preparation() {
+        let (dir,mut store,lease)=fixture();let id=send(&mut store,&lease,"request-video-absent");
+        store.bind_budget_task(&lease,&id,"task-absent").unwrap();
+        // Video endpoints bill per call, so the upstream never reports usage.
+        let output=serde_json::json!({"video_url":"https://fixture.invalid/result.mp4","billing":{"status":"absent"}});
+        store.finish_budget_result(&lease,&id,ExecutionState::Succeeded,&output,now()).unwrap();
+        // The hold is settled at the quoted amount instead of staying reserved.
+        assert_eq!(store.capacity_totals("account").unwrap().pending,0);
+        assert_eq!(store.capacity_totals("account").unwrap().awaiting_receipt,0);
+        // The preparation stays readable: Core still has to fetch this result.
+        let state:String=store.connection.query_row(
+            "SELECT state FROM bridge_prepared_budgets WHERE budget_id=?1",
+            [&id],|r|r.get(0)).unwrap();
+        assert_eq!(state,"send_intent");
         cleanup(dir,store,lease);
     }
     #[test]

@@ -119,6 +119,20 @@ fn error(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({"error":{"code":code,"type":"bridge_error"}}))).into_response()
 }
 
+/// Collapse an internal failure into a machine-readable tail so Core can record
+/// why a read failed instead of retrying an opaque "state unavailable" forever.
+/// Only ASCII word characters and a few separators survive, which keeps host
+/// paths, credentials and SQL text out of the response.
+fn safe_error_detail(message: &str) -> String {
+    message
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || " -_.:".contains(*c))
+        .take(120)
+        .collect::<String>()
+        .trim()
+        .replace(' ', "_")
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RecoveryRequest {
@@ -256,7 +270,11 @@ async fn read_request(state: Arc<ApiSharedState>, request: String, budget: Strin
     }).await;
     match result {
         Ok(Ok((status, value))) => (status, Json(value)).into_response(),
-        _ => error(StatusCode::SERVICE_UNAVAILABLE, "bridge_state_unavailable"),
+        Ok(Err(message)) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("bridge_state_unavailable:{}", safe_error_detail(&message)),
+        ),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "bridge_state_unavailable:worker"),
     }
 }
 
@@ -371,6 +389,10 @@ pub(crate) async fn events(State(state): State<Arc<ApiSharedState>>, Query(query
     }).await;
     match result {
         Ok(Ok((status, value))) => (status, Json(value)).into_response(),
-        _ => error(StatusCode::SERVICE_UNAVAILABLE, "bridge_state_unavailable"),
+        Ok(Err(message)) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("bridge_state_unavailable:{}", safe_error_detail(&message)),
+        ),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "bridge_state_unavailable:worker"),
     }
 }

@@ -298,7 +298,17 @@ impl ProtectedPreparation {
 }
 pub(super) fn sent_execution_identity(connection:&Connection,budget_id:&str)->Result<super::bridge_execution::ExecutionIdentity,String> {
     let row=required_row(connection,budget_id)?;
-    if row.state!="send_intent" {return Err("budget has no durable send intent".into());}
+    // A preparation that already executed must stay readable after it is closed:
+    // Core may still be fetching this execution and its result, and the stale
+    // sweeper legitimately reclaims the row once the request is finished.
+    // Requiring the live send-intent state here turned every reclaimed
+    // preparation into a permanent bridge_state_unavailable for Core.
+    if row.state!="send_intent" {
+        let ran:bool=connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bridge_budget_executions WHERE budget_id=?1)",
+            [budget_id],|r|r.get(0)).map_err(db_error)?;
+        if !ran {return Err("budget has no durable send intent".into());}
+    }
     Ok(row.decrypt()?.execution_identity())
 }
 pub(super) fn budget_no_send_disposition(connection:&Connection,budget_id:&str)->Result<(PreparedAuthorization,NoSendProof),String> {
