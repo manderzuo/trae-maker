@@ -127,8 +127,19 @@ fn refresh_in_tx(tx:&Transaction<'_>,account:&str,current:&CurrentPacks,started_
     if original.observed_at_ms<previous.observed_at_ms {return Err("capacity_grant_anchor_invalid".into());}
     for (key,old) in &previous.packs {
         match current.source.packs.get(key) {
+            // (1) Same package period: consumption may only grow. A used drop
+            //     inside one unchanged period is the only per-period tamper signal.
             Some(next) if old.product==next.product && old.limit==next.limit && old.start_ms==next.start_ms && old.end_ms==next.end_ms && next.used>=old.used=>{},
-            None if old.used==old.limit && old.end_ms.is_some_and(|t|t<=started_at)=>{},
+            // (2) Same product, next renewal period, or a larger limit. Upstream
+            //     monthly packs roll over and get upgraded; treating that as an
+            //     authorization change fenced every account out of grant refresh
+            //     at each rollover, which surfaced to callers as a 503. A smaller
+            //     limit or a different product is still rejected below.
+            Some(next) if old.product==next.product && next.limit>=old.limit
+                && (old.start_ms!=next.start_ms || old.end_ms!=next.end_ms || next.limit>old.limit)=>{},
+            // (3) The old package expired and is no longer reported. Lifetime end
+            //     does not require the package to have been fully consumed.
+            None if old.end_ms.is_some_and(|t|t<=started_at)=>{},
             _=>return Err("capacity_grant_source_binding_changed".into()),
         }
     }
